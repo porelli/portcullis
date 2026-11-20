@@ -111,6 +111,9 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 		if c.Mesh == "" {
 			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s has no mesh address: the admission params aren't rewritten", c.Name))
 		}
+		if rec := st.Nodes[c.Name]; rec.needsLabels() {
+			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s registered but isn't labelled yet: no pinned pod schedules there until nodeadm labels it", c.Name))
+		}
 		if rec := st.Nodes[c.Name]; rec != nil && rec.Removed && st.Ops[c.Name] == nil {
 			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s was removed but registered again (its kubelet still runs; token rotations skip it): revoke it again and reinstall that machine", c.Name))
 		}

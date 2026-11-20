@@ -189,7 +189,7 @@ func labelPatch(n *corev1.Node, req LabelsReq) map[string]any {
 	}
 	taints := []corev1.Taint{}
 	for _, t := range n.Spec.Taints {
-		if t.Key != taintSmall {
+		if t.Key != taintSmall && t.Key != taintUnlabelled {
 			taints = append(taints, t)
 		}
 	}
@@ -242,6 +242,7 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) error {
 	if err := s.mutate(r.Context(), func(st *nodeadmState) error {
 		if rec := st.Nodes[id]; rec != nil {
 			rec.Class, rec.Site, rec.Ingress, rec.Storage = req.Class, req.Site, req.Ingress, req.Storage
+			rec.Labelled = true
 		}
 		return nil
 	}); err != nil {

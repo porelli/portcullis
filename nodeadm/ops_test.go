@@ -1105,3 +1105,41 @@ func TestLabelsLonghornDiskOnlyAtMain(t *testing.T) {
 		}
 	}
 }
+
+// TestNodeLabelledAfterRegistration (ruling R-NODELABELS): a joined node
+// registers unlabelled (the join flags carry no placement label, only the
+// unlabelled taint); the snapshot says so; nodeadm's next round labels it
+// from its record with its own identity and drops the taint.
+func TestNodeLabelledAfterRegistration(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	j := h.issue(t, "n5", "agent", "small", "main", "10.215.0.5")
+	h.enrol(t, j, "")
+	w := h.join(t, j, nearRTT)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "--node-label") || !strings.Contains(w.Body.String(), unlabelledTaint) {
+		t.Fatalf("join: %d %s", w.Code, w.Body)
+	}
+	// k3s registers the Node: no placement label, the registration taint.
+	n := mkNode(nodeSpec{"n5", "agent", "small", "main", "10.215.0.5", nil, nil, true, false})
+	n.Labels = map[string]string{"kubernetes.io/hostname": "n5"}
+	n.Spec.Taints = []corev1.Taint{{Key: taintUnlabelled, Value: "true", Effect: corev1.TaintEffectNoSchedule}}
+	h.kube.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{})
+	snap := h.internal(clientHub, "GET", "/v1/cluster", nil).Body.String()
+	if !strings.Contains(snap, "node n5 registered but isn't labelled yet") {
+		t.Fatalf("the snapshot doesn't say n5 is unlabelled")
+	}
+	h.s.reconcile(ctx)
+	got, _ := h.kube.CoreV1().Nodes().Get(ctx, "n5", metav1.GetOptions{})
+	if got.Labels["portcullis.io/class"] != "small" || got.Labels["portcullis.io/site"] != "main" || got.Labels["topology.kubernetes.io/zone"] != "main" {
+		t.Fatalf("labels %v", got.Labels)
+	}
+	if len(got.Spec.Taints) != 1 || got.Spec.Taints[0].Key != taintSmall {
+		t.Fatalf("taints %v", got.Spec.Taints)
+	}
+	if !h.state(t).Nodes["n5"].Labelled {
+		t.Fatal("not recorded labelled")
+	}
+	if snap := h.internal(clientHub, "GET", "/v1/cluster", nil).Body.String(); strings.Contains(snap, "isn't labelled yet") {
+		t.Fatal("still reported unlabelled")
+	}
+}

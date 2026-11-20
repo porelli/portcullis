@@ -127,10 +127,13 @@ KUBE_FIRST_NODE_NAME="${PORTCULLIS_NODE_NAME:-node-1}"
 
 # kube_k3s_server_flags — the first server's flags, one per line (the
 # shared fixture tests/fixtures/k3s-server-flags.txt; nodeadm's join
-# answer follows it, contract §20.2 / §20.11).
+# answer follows it, contract §20.2 / §20.11). No placement label: the
+# kubelet may not set portcullis.io/, topology.kubernetes.io/,
+# node.longhorn.io/ or svccontroller.k3s.cattle.io/ labels on its own Node
+# (ruling R-NODELABELS); the CLI labels it once it registers
+# (_ki_label_node, kube_k3s_node_labels).
 kube_k3s_server_flags() {
-  local ip="$KUBE_MESH_IP" class
-  class="$(_ki_node_class)" || return 1
+  local ip="$KUBE_MESH_IP"
   [[ "$KUBE_FIRST_NODE_NAME" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || fail "PORTCULLIS_NODE_NAME must match ^[a-z][a-z0-9-]{0,30}$ (a server id)"
   cat <<EOF
 --cluster-init
@@ -153,17 +156,36 @@ kube_k3s_server_flags() {
 --etcd-arg=listen-client-urls=https://$ip:2379,https://127.0.0.1:2379
 --etcd-arg=heartbeat-interval=200
 --etcd-arg=election-timeout=2000
---node-label=portcullis.io/class=$class
---node-label=portcullis.io/site=main
---node-label=topology.kubernetes.io/zone=main
---node-label=portcullis.io/ingress=true
---node-label=svccontroller.k3s.cattle.io/enablelb=true
+EOF
+}
+
+# kube_k3s_node_labels — the first node's placement labels (key=value, one
+# per line; contract §20.1), set by the CLI's identity after it registers.
+kube_k3s_node_labels() {
+  local class
+  class="$(_ki_node_class)" || return 1
+  cat <<EOF
+portcullis.io/class=$class
+portcullis.io/site=main
+topology.kubernetes.io/zone=main
+portcullis.io/ingress=true
+svccontroller.k3s.cattle.io/enablelb=true
 EOF
   # Storage is off by default on small nodes. The first node is at the
   # primary site, so a storage node gets Longhorn's default-disk label too
-  # (contract §20.11: only storage nodes at main; nodeadm's joinFlags and
-  # labels do the same for later nodes).
-  [ "$class" = small ] || printf '%s\n' "--node-label=portcullis.io/storage=true" "--node-label=node.longhorn.io/create-default-disk=true"
+  # (contract §20.11: only storage nodes at main; nodeadm labels later nodes
+  # the same way).
+  [ "$class" = small ] || printf '%s\n' "portcullis.io/storage=true" "node.longhorn.io/create-default-disk=true"
+}
+
+# _ki_label_node — the labels on the registered first node, as the CLI
+# (k3s's admin kubeconfig, never the kubelet's identity).
+_ki_label_node() {
+  local labels=() l
+  while IFS= read -r l; do labels+=("$l"); done < <(kube_k3s_node_labels)
+  [ "${#labels[@]}" -gt 0 ] || fail "could not compute the first node's labels"
+  _ki_sudo k3s kubectl label node "$KUBE_FIRST_NODE_NAME" --overwrite "${labels[@]}" >/dev/null \
+    || fail "could not label the node $KUBE_FIRST_NODE_NAME (re-run ./portcullis init)"
 }
 
 # kube_flannel_conf — flannel's net-conf, used verbatim by k3s (so it
@@ -450,6 +472,7 @@ kube_install_k3s() {
     sh "$tmp/install.sh" server "${flags[@]}" ${1+"$@"} >&2 || { rm -rf "$tmp"; _ki_journal_tail k3s 30; fail "the k3s install script failed (k3s's last journal lines are above)"; }
   rm -rf "$tmp"
   _ki_wait_ready
+  _ki_label_node
   _ki_write_kubeconfig
   _ki_kubeconfig_env
   ok "k3s $KUBE_K3S_VERSION runs: context $(kube_install_context) in $(kube_install_kubeconfig)."

@@ -339,8 +339,15 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 		want = append(want, l)
 	}
 	server := "https://10.215.0.1:6443"
-	want = append(want, "--server="+server)
+	// A joining node registers with nodeadm's unlabelled taint (it gets its
+	// labels from nodeadm, ruling R-NODELABELS).
+	want = append(want, "--server="+server, "--node-taint="+unlabelledTaint)
 	sort.Strings(want)
+	for _, f := range want {
+		if strings.HasPrefix(f, "--node-label=") || strings.HasPrefix(f, "--node-taint=portcullis.io/") {
+			t.Fatalf("the fixture passes %s (R-NODELABELS)", f)
+		}
+	}
 	rec := &nodeRecord{Role: "server", Class: "home", Site: "main", MeshIP: ip, Ingress: true, Storage: true}
 	got := joinFlags(rec, "n7", server, "10.42.0.0/16")
 	if !slices.Equal(got, want) {
@@ -364,14 +371,23 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 	if got := joinFlags(rec, "n7", server, "10.42.0.0/16"); !slices.Equal(got, agentWant) {
 		t.Fatalf("agent flags\n got %q\nwant %q", got, agentWant)
 	}
+	// The labels and taints nodeadm sets on the registered Node instead.
 	small := &nodeRecord{Role: "agent", Class: "small", Site: "tb", MeshIP: ip}
-	got = joinFlags(small, "pi-1", server, "10.42.0.0/16")
-	if !slices.Contains(got, "--node-taint=portcullis.io/small=true:NoSchedule") || slices.Contains(got, "--node-label=portcullis.io/storage=true") {
-		t.Fatalf("small flags %q", got)
+	for _, f := range joinFlags(small, "pi-1", server, "10.42.0.0/16") {
+		if strings.HasPrefix(f, "--node-label=") || strings.HasPrefix(f, "--node-taint=portcullis.io/") {
+			t.Fatalf("a join flag sets %s", f)
+		}
 	}
-	st := &nodeRecord{Role: "agent", Class: "cloud", Site: "edge", MeshIP: ip, Storage: true}
-	if slices.Contains(joinFlags(st, "e1", server, "10.42.0.0/16"), "--node-label=node.longhorn.io/create-default-disk=true") {
-		t.Fatal("a storage node outside main gets Longhorn's default disk")
+	n := &corev1.Node{Spec: corev1.NodeSpec{Taints: []corev1.Taint{{Key: taintUnlabelled, Value: "true", Effect: corev1.TaintEffectNoSchedule}}}}
+	p := labelPatch(n, LabelsReq{Class: "small", Site: "tb"})
+	taints := p["spec"].(map[string]any)["taints"].([]corev1.Taint)
+	labels := p["metadata"].(map[string]any)["labels"].(map[string]any)
+	if len(taints) != 1 || taints[0].Key != taintSmall || labels["portcullis.io/storage"] != nil || labels["portcullis.io/class"] != "small" {
+		t.Fatalf("small: taints %v, labels %v", taints, labels)
+	}
+	p = labelPatch(n, LabelsReq{Class: "cloud", Site: "edge", Storage: true})
+	if l := p["metadata"].(map[string]any)["labels"].(map[string]any); l["node.longhorn.io/create-default-disk"] != nil || l["portcullis.io/storage"] != "true" {
+		t.Fatalf("a storage node outside main: %v", l)
 	}
 }
 

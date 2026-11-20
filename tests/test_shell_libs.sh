@@ -4715,6 +4715,7 @@ ki_reset() {
   printf 'MemTotal:        8000000 kB\n' > "$KI/root/proc/meminfo"
   printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/argv"\nenv > "%s/env"\ncat > "%s/stdin" </dev/null\necho "installer ran"\n' "$KI" "$KI" "$KI" > "$KI/dl/install.sh"
   printf 'K3S-BINARY\n' > "$KI/dl/k3s"
+  printf '#!/bin/sh\necho "$*" >> "%s/k3s-calls"\n' "$KI" > "$KI/bin/k3s"
   cat > "$KI/bin/curl" <<'C'
 #!/bin/sh
 out="" url=""
@@ -4753,6 +4754,7 @@ expect_eq "kube_install_k3s: a refused binary → the installer never ran" "$(te
 ki_reset
 printf 'FIXTURE-K3S-TOKEN-7f3a9c\n' > "$KI/root/etc/rancher/k3s/token"; chmod 600 "$KI/root/etc/rancher/k3s/token"
 OUT="$(kik 'kube_install_k3s' 2>&1)"
+cp "$KI/k3s-calls" "$WORK/k3s-calls.keep" 2>/dev/null || :
 expect_eq "kube_install_k3s: installs (rc=0)" "$(printf '%s\n' "$OUT" | tail -n1)" "rc=0"
 expect_eq "kube_install_k3s: flags exactly (the recorded argv = tests/fixtures/k3s-server-flags.txt, sorted)" \
   "$(head -n1 "$KI/argv"):$(tail -n +2 "$KI/argv" | LC_ALL=C sort | diff - "$HERE/fixtures/k3s-server-flags.txt" >/dev/null && echo same || tail -n +2 "$KI/argv" | LC_ALL=C sort | diff - "$HERE/fixtures/k3s-server-flags.txt")" "server:same"
@@ -4781,19 +4783,25 @@ case "$OUT" in *"already answers"*"rc=0") [ -e "$KI/argv" ] && t_fail "ki answer
 # The class suggestion: small below 3.5 GiB (3 670 016 KiB) or on a Pi (no
 # storage label), cloud when the public address is local, else home.
 ki_reset; printf 'MemTotal:        3600000 kB\n' > "$KI/root/proc/meminfo"
-expect_eq "kube_k3s_server_flags: 3 600 000 KiB (below 3.5 GiB) → small" "$(kik 'kube_k3s_server_flags | grep class=')" "--node-label=portcullis.io/class=small
+expect_eq "kube_k3s_node_labels: 3 600 000 KiB (below 3.5 GiB) → small" "$(kik 'kube_k3s_node_labels | grep class=')" "portcullis.io/class=small
 rc=0"
 ki_reset; printf 'MemTotal:        3700000 kB\n' > "$KI/root/proc/meminfo"
-expect_eq "kube_k3s_server_flags: 3 700 000 KiB (above 3.5 GiB) → home, storage on (and Longhorn's default disk: the first node is at main)" "$(kik 'kube_k3s_server_flags | grep -E "class=|storage=|create-default-disk" | tr "\n" " "')" "--node-label=portcullis.io/class=home --node-label=portcullis.io/storage=true --node-label=node.longhorn.io/create-default-disk=true rc=0"
+expect_eq "kube_k3s_node_labels: 3 700 000 KiB (above 3.5 GiB) → home, storage on (and Longhorn's default disk: the first node is at main)" "$(kik 'kube_k3s_node_labels | grep -E "class=|storage=|create-default-disk" | tr "\n" " "')" "portcullis.io/class=home portcullis.io/storage=true node.longhorn.io/create-default-disk=true rc=0"
 ki_reset; printf 'MemTotal:        2000000 kB\n' > "$KI/root/proc/meminfo"
-expect_eq "kube_k3s_server_flags: 2 GB → class small, no storage label (no default disk)" "$(kik 'kube_k3s_server_flags | grep -E "class=|storage=|create-default-disk"')" "--node-label=portcullis.io/class=small
+expect_eq "kube_k3s_node_labels: 2 GB → class small, no storage label (no default disk)" "$(kik 'kube_k3s_node_labels | grep -E "class=|storage=|create-default-disk"')" "portcullis.io/class=small
 rc=0"
 ki_reset; mkdir -p "$KI/root/proc/device-tree"; printf 'Raspberry Pi 5 Model B Rev 1.0\0' > "$KI/root/proc/device-tree/model"
-expect_eq "kube_k3s_server_flags: a Raspberry Pi → small" "$(kik 'kube_k3s_server_flags | grep -c class=small')" "1
+expect_eq "kube_k3s_node_labels: a Raspberry Pi → small" "$(kik 'kube_k3s_node_labels | grep -c class=small')" "1
 rc=0"
 ki_reset
-expect_eq "kube_k3s_server_flags: the public address on this host → cloud" "$(kik 'PORTCULLIS_PUBLIC_IPV4=198.51.100.1; kube_k3s_server_flags | grep class=')" "--node-label=portcullis.io/class=cloud
+expect_eq "kube_k3s_node_labels: the public address on this host → cloud" "$(kik 'PORTCULLIS_PUBLIC_IPV4=198.51.100.1; kube_k3s_node_labels | grep class=')" "portcullis.io/class=cloud
 rc=0"
+# Ruling R-NODELABELS: no placement label or portcullis.io/ taint among the
+# kubelet's flags; the CLI labels the registered node.
+expect_eq "kube_k3s_server_flags: no --node-label / --node-taint for the reserved prefixes" \
+  "$(kik 'kube_k3s_server_flags' | grep -cE -- '^--node-(label|taint)=(portcullis\.io/|topology\.kubernetes\.io/|node\.longhorn\.io/|svccontroller\.k3s\.cattle\.io/)' || true)" "0"
+expect_eq "kube_install_k3s: after Ready, the CLI labels node-1 (k3s kubectl, its admin identity)" \
+  "$(grep -c '^kubectl label node node-1 --overwrite portcullis.io/class=home portcullis.io/site=main topology.kubernetes.io/zone=main portcullis.io/ingress=true svccontroller.k3s.cattle.io/enablelb=true portcullis.io/storage=true node.longhorn.io/create-default-disk=true$' "$WORK/k3s-calls.keep" 2>/dev/null || true)" "1"
 
 # The mesh: the private key generated here (0600), never printed and never
 # in the config (PostUp loads it), wg-quick@pcmesh enabled.

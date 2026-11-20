@@ -143,6 +143,7 @@ func docJSON(d *AddressesDoc) string {
 // annotateJoined writes portcullis.io/addresses on a node nodeadm enrolled
 // (from its enrolment report: the LAN and public endpoints' addresses).
 func (s *Server) annotateJoined(ctx context.Context, cl []clusterNode, st *nodeadmState) {
+	s.labelRegistered(ctx, cl, st)
 	for i := range cl {
 		c := &cl[i]
 		rec := st.Nodes[c.Name]
@@ -347,4 +348,48 @@ func (s *Server) loop(ctx context.Context) {
 		case <-s.kickCh:
 		}
 	}
+}
+
+// labelRegistered (ruling R-NODELABELS): a node nodeadm enrolled gets its
+// placement labels and taints from nodeadm's identity once its Node
+// registered (the kubelet may not set them); its registration taint goes
+// in the same patch. Until then it carries no placement label: no pinned
+// pod schedules there (fail closed), and the snapshot says so.
+func (s *Server) labelRegistered(ctx context.Context, cl []clusterNode, st *nodeadmState) {
+	for i := range cl {
+		c := &cl[i]
+		rec := st.Nodes[c.Name]
+		if !rec.needsLabels() || st.Ops[c.Name] != nil {
+			continue
+		}
+		p := labelPatch(c.Node, LabelsReq{Class: rec.Class, Site: rec.Site, Ingress: rec.Ingress, Storage: rec.Storage})
+		if c.Node.ResourceVersion != "" {
+			p["metadata"].(map[string]any)["resourceVersion"] = c.Node.ResourceVersion
+		}
+		if err := s.patchNode(ctx, c.Name, p); err != nil {
+			s.log.Warn("couldn't label a registered node (retried)", "node", c.Name, "err", err.Error())
+			continue
+		}
+		name := c.Name
+		if err := s.mutate(ctx, func(st *nodeadmState) error {
+			if r := st.Nodes[name]; r != nil && !r.Removed {
+				r.Labelled = true
+			}
+			return nil
+		}); err != nil {
+			s.log.Warn("couldn't record a node's labels", "node", name, "err", err.Error())
+			continue
+		}
+		rec.Labelled = true
+		if n, err := s.getNode(ctx, name); err == nil {
+			c.Node = n
+		}
+		s.log.Info("registered node labelled", "node", name, "class", rec.Class, "site", rec.Site)
+	}
+}
+
+// needsLabels: a node nodeadm enrolled (its class and site recorded) whose
+// registered Node doesn't carry its labels yet.
+func (n *nodeRecord) needsLabels() bool {
+	return n != nil && !n.Removed && !n.Labelled && n.Serial != "" && n.Class != "" && n.Site != ""
 }

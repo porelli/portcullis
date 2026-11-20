@@ -2125,7 +2125,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 answers over pcmesh",
+   "state": "flags illustrative (no placement label: nodeadm labels the registered Node, ruling R-NODELABELS) (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 answers over pcmesh",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2151,15 +2151,11 @@
      "flags": [
       "--server=https://10.215.0.1:6443",
       "--node-ip=10.215.0.4",
-      "--node-label=portcullis.io/class=cloud",
-      "--node-label=portcullis.io/site=edge",
-      "--node-label=topology.kubernetes.io/zone=edge",
-      "--node-label=portcullis.io/ingress=true",
-      "--node-label=svccontroller.k3s.cattle.io/enablelb=true",
       "--flannel-conf=/etc/rancher/k3s/flannel-net-conf.json",
       "--kubelet-arg=pod-max-pids=1024",
       "--kubelet-arg=sync-frequency=10s",
-      "--kubelet-arg=address=10.215.0.4"
+      "--kubelet-arg=address=10.215.0.4",
+      "--node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule"
      ]
     }
    }

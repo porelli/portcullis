@@ -8,15 +8,16 @@ package main
 //   - the node's own mesh address in --node-ip, --advertise-address,
 //     --bind-address, --kubelet-arg=address and etcd's listen-client-urls;
 //   - --node-name=<server id> (the node's Kubernetes name, §20.1);
-//   - its labels: class, site (and the zone), ingress (+ ServiceLB's
-//     enablelb), storage, node.longhorn.io/create-default-disk=true only on
-//     a storage node at main (§20.11);
-//   - --node-taint=portcullis.io/small=true:NoSchedule on class small.
+//   - no placement label or portcullis.io/ taint (ruling R-NODELABELS):
+//     nodeadm labels the registered Node (class, site and zone, ingress +
+//     enablelb, storage, the Longhorn default disk at main; the small
+//     taint); the joining node registers with --node-taint=
+//     nodeadm.portcullis/unlabelled=true:NoSchedule until then.
 // A server also gets --agent-token-file (init's; the answer's agent_token
 // goes there, 0600, as the token does) and --cluster-cidr (the answer's
 // cluster_cidr, init's too).
 // An agent gets the subset k3s agent takes: --server, --token-file,
-// --node-name, --node-ip, the labels and taint, the flannel interface and
+// --node-name, --node-ip, the registration taint, the flannel interface and
 // net-conf, the kubelet args. The token itself is never a flag: the
 // nodeagent writes it to the --token-file path (0600).
 
@@ -29,6 +30,10 @@ const (
 	meshIface         = "pcmesh"
 	primarySite       = "main"
 	smallTaint        = "portcullis.io/small=true:NoSchedule"
+	// unlabelledTaint: a joining node's registration taint (its key outside
+	// the prefixes kubelets may not set), removed when nodeadm labels it.
+	taintUnlabelled = "nodeadm.portcullis/unlabelled"
+	unlabelledTaint = taintUnlabelled + "=true:NoSchedule"
 )
 
 // nodeLabels are the --node-label values of a node (§20.1).
@@ -75,12 +80,12 @@ func joinFlags(rec *nodeRecord, id, serverURL, clusterCIDR string) []string {
 			"--etcd-arg=election-timeout=2000",
 		)
 	}
-	for _, l := range nodeLabels(rec.Class, rec.Site, rec.Ingress, rec.Storage) {
-		f = append(f, "--node-label="+l)
-	}
-	if rec.Class == "small" {
-		f = append(f, "--node-taint="+smallTaint)
-	}
+	// No placement label and no portcullis.io/ taint (ruling R-NODELABELS:
+	// a kubelet may not set them on its own Node): nodeadm sets them once
+	// the Node registers (labelRegistered). Until then the registration
+	// taint keeps every pod off it but a DaemonSet tolerating it (fail
+	// closed: pinned pods need the labels anyway).
+	f = append(f, "--node-taint="+unlabelledTaint)
 	sort.Strings(f)
 	return f
 }

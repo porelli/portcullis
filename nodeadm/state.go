@@ -69,6 +69,8 @@ type nodeRecord struct {
 	Removed bool `json:"removed,omitempty"`
 	// TokensStale: a removed node a rotation skipped (it keeps old tokens).
 	TokensStale bool `json:"tokens_stale,omitempty"`
+	// Labelled: nodeadm set its placement labels on the registered Node.
+	Labelled bool `json:"labelled,omitempty"`
 	// Renewal: a renewed certificate not yet confirmed (renew.go); until
 	// confirm both it and Serial are valid.
 	Renewal *renewal       `json:"renewal,omitempty"`
