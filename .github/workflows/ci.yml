@@ -500,6 +500,16 @@ jobs:
           # The production build (no tags) never links the fake provider.
           if go list -deps . | grep -q 'internal/fakedns'; then echo "FAIL: production build links internal/fakedns"; exit 1; fi
           CGO_ENABLED=1 go test -race ./...
+      - name: nodeadm unit tests (the HA API vectors; contract §20.2)
+        working-directory: nodeadm
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          # The Hub's byte copies (joincode / site roles) are compared by
+          # unit-tests-kube-static.sh; this module's own vectors are authored here.
+          test -s testdata/nodeadm_api_vectors.json && test -s testdata/joincode_v2_vectors.json && test -s testdata/site_roles_vectors.json
+          CGO_ENABLED=1 go test -race ./...
       - name: mcp-gate unit tests (config, token checks, resource metadata; contract §15)
         working-directory: mcp-gate
         run: |

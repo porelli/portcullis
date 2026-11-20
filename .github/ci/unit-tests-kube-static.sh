@@ -133,8 +133,9 @@ echo "PASS: the egress policy refuses an empty nodeAddresses / apiEndpoints and 
 "$PY" tests/k8s_netpol_matrix.py
 "$PY" tests/k8s_hardening.py
 
-# K13: the Hub authors its Role (and the admission YAML, kube/admission/);
-# core keeps byte copies, compared on the same-named Hub branch, else main.
+# K13: the Hub authors its Role (and the admission YAML, kube/admission/,
+# and the HA vectors below); core keeps byte copies, compared on the
+# same-named Hub branch, else main.
 REF="${REF:-${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}}"
 url="https://github.com/porelli/portcullis-hub"
 heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
@@ -146,6 +147,10 @@ fi
 sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
 copies="charts/portcullis/files/hub-role.yaml=internal/runtime/kube/testdata/role.yaml charts/portcullis/files/hub-role-edge.yaml=internal/runtime/kube/testdata/role-edge.yaml"
+# HA vectors (contract §4, §20.3, §20.11): byte copies of the Hub's.
+copies="$copies tests/published_docs.json=internal/publish/testdata/published_docs.json"
+copies="$copies nodeadm/testdata/joincode_v2_vectors.json=internal/servers/testdata/joincode_v2_vectors.json"
+copies="$copies nodeadm/testdata/site_roles_vectors.json=internal/servers/testdata/site_roles_vectors.json"
 if [ -d kube/admission ]; then
   for f in kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/params.yaml; do
     copies="$copies $f=internal/runtime/kube/testdata/admission/${f##*/}"

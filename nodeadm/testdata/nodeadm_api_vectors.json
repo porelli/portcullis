@@ -1,0 +1,2431 @@
+{
+ "v": 1,
+ "cases": [
+  {
+   "name": "issue a code",
+   "route": "POST /v1/codes",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "role": "agent",
+     "class": "cloud",
+     "site": "edge",
+     "mesh_ip": "10.215.0.4",
+     "ingress": true,
+     "storage": false,
+     "mesh": {
+      "peers": [
+       {
+        "id": "n1",
+        "pub": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "endpoint": "198.51.100.1:51830",
+        "allowed_ips": [
+         "10.215.0.1/32",
+         "10.215.0.2/32",
+         "10.215.0.3/32"
+        ],
+        "keepalive": 25
+       }
+      ],
+      "forward": false
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 201,
+    "headers": {
+     "Cache-Control": "no-store"
+    },
+    "body": {
+     "code": "pcj2.eyJ2IjoyLCJraW5kIjoiY2x1c3RlciIsImVuZHBvaW50IjoiaHR0cHM6Ly9leGFtcGxlLm9yZy9ub2RlIiwic2VydmVycyI6WyIxMC4yMTUuMC4xIiwiMTAuMjE1LjAuMiIsIjEwLjIxNS4wLjMiXSwic2VydmVyX2lkIjoibjQiLCJyb2xlIjoiYWdlbnQiLCJjbGFzcyI6ImNsb3VkIiwic2l0ZSI6ImVkZ2UiLCJjYV9zaGEyNTYiOiJjM2NhYTQwNWFmYzI0ZjViNzlmMjVjZTg2MjQ3MGMwZWRhYThjYTVhOTQ3YmM0YjA1YjFmZDhkYzgyZjQ1NDUyIiwic2NyaXB0X3NoYTI1NiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJhZ2VudF9zaGEyNTYiOnsiYW1kNjQiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwiYXJtNjQiOiJjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjIn0sIm1lc2hfaXAiOiIxMC4yMTUuMC40Iiwic2VjcmV0IjoicTVpZE1ybkZ2ME40cFEyS2pYSEF6bVlFamJFa3BtQ2FLRUhZX21vTWNpTSJ9",
+     "expires_at": "2026-11-18T10:15:00Z"
+    }
+   }
+  },
+  {
+   "name": "issue a code: an unknown field",
+   "route": "POST /v1/codes",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "role": "agent",
+     "class": "cloud",
+     "site": "edge",
+     "mesh_ip": "10.215.0.4",
+     "ingress": true,
+     "storage": false,
+     "mesh": {
+      "peers": [
+       {
+        "id": "n1",
+        "pub": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "endpoint": "198.51.100.1:51830",
+        "allowed_ips": [
+         "10.215.0.1/32",
+         "10.215.0.2/32",
+         "10.215.0.3/32"
+        ],
+        "keepalive": 25
+       }
+      ],
+      "forward": false
+     },
+     "token": "x"
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "the request body is malformed"
+    }
+   }
+  },
+  {
+   "name": "issue a code: a missing field",
+   "route": "POST /v1/codes",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "role": "agent",
+     "class": "cloud",
+     "site": "edge",
+     "mesh_ip": "10.215.0.4",
+     "ingress": true,
+     "storage": false
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "the request body is malformed"
+    }
+   }
+  },
+  {
+   "name": "issue a code: trailing data",
+   "route": "POST /v1/codes",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": null,
+    "body_text": "{\"server_id\": \"n4\", \"role\": \"agent\", \"class\": \"cloud\", \"site\": \"edge\", \"mesh_ip\": \"10.215.0.4\", \"ingress\": true, \"storage\": false, \"mesh\": {\"peers\": [{\"id\": \"n1\", \"pub\": \"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\", \"endpoint\": \"198.51.100.1:51830\", \"allowed_ips\": [\"10.215.0.1/32\", \"10.215.0.2/32\", \"10.215.0.3/32\"], \"keepalive\": 25}], \"forward\": false}} {}"
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "the request body is malformed"
+    }
+   }
+  },
+  {
+   "name": "issue a code: not the leader",
+   "route": "POST /v1/codes",
+   "client": "hub.control",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "role": "agent",
+     "class": "cloud",
+     "site": "edge",
+     "mesh_ip": "10.215.0.4",
+     "ingress": true,
+     "storage": false,
+     "mesh": {
+      "peers": [
+       {
+        "id": "n1",
+        "pub": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "endpoint": "198.51.100.1:51830",
+        "allowed_ips": [
+         "10.215.0.1/32",
+         "10.215.0.2/32",
+         "10.215.0.3/32"
+        ],
+        "keepalive": 25
+       }
+      ],
+      "forward": false
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": "this nodeadm isn't the leader: retry",
+     "kind": "not_leader"
+    }
+   }
+  },
+  {
+   "name": "issue a code: the front door's certificate",
+   "route": "POST /v1/codes",
+   "client": "frontdoor.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "role": "agent",
+     "class": "cloud",
+     "site": "edge",
+     "mesh_ip": "10.215.0.4",
+     "ingress": true,
+     "storage": false,
+     "mesh": {
+      "peers": [
+       {
+        "id": "n1",
+        "pub": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "endpoint": "198.51.100.1:51830",
+        "allowed_ips": [
+         "10.215.0.1/32",
+         "10.215.0.2/32",
+         "10.215.0.3/32"
+        ],
+        "keepalive": 25
+       }
+      ],
+      "forward": false
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "this client may not call this route"
+    }
+   }
+  },
+  {
+   "name": "issue a code: no client certificate",
+   "route": "POST /v1/codes",
+   "client": "none",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "role": "agent",
+     "class": "cloud",
+     "site": "edge",
+     "mesh_ip": "10.215.0.4",
+     "ingress": true,
+     "storage": false,
+     "mesh": {
+      "peers": [
+       {
+        "id": "n1",
+        "pub": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "endpoint": "198.51.100.1:51830",
+        "allowed_ips": [
+         "10.215.0.1/32",
+         "10.215.0.2/32",
+         "10.215.0.3/32"
+        ],
+        "keepalive": 25
+       }
+      ],
+      "forward": false
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "this client may not call this route"
+    }
+   }
+  },
+  {
+   "name": "issue a code: a certificate from another CA",
+   "route": "POST /v1/codes",
+   "client": "other-ca",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "role": "agent",
+     "class": "cloud",
+     "site": "edge",
+     "mesh_ip": "10.215.0.4",
+     "ingress": true,
+     "storage": false,
+     "mesh": {
+      "peers": [
+       {
+        "id": "n1",
+        "pub": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "endpoint": "198.51.100.1:51830",
+        "allowed_ips": [
+         "10.215.0.1/32",
+         "10.215.0.2/32",
+         "10.215.0.3/32"
+        ],
+        "keepalive": 25
+       }
+      ],
+      "forward": false
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "this client may not call this route"
+    }
+   }
+  },
+  {
+   "name": "the snapshot",
+   "route": "GET /v1/cluster",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "GET",
+    "path": "/v1/cluster",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "taken_at": "2026-11-18T10:00:00Z",
+     "nodes": [
+      {
+       "name": "n1",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n1",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.1",
+        "lan": [
+         "192.0.2.11"
+        ],
+        "public": [
+         "198.51.100.1"
+        ]
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      },
+      {
+       "name": "n2",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n2",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.2",
+        "lan": [
+         "192.0.2.12"
+        ],
+        "public": []
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      },
+      {
+       "name": "n3",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n3",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.3",
+        "lan": [
+         "192.0.2.13"
+        ],
+        "public": []
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      }
+     ],
+     "enrolling": [
+      {
+       "id": "n4",
+       "role": "agent",
+       "class": "cloud",
+       "site": "edge",
+       "mesh_ip": "10.215.0.4",
+       "mesh": {
+        "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+        "lan": null,
+        "public": "203.0.113.4:51830"
+       },
+       "enrolled_at": "2026-11-18T09:59:00Z"
+      }
+     ],
+     "pods": [
+      {
+       "name": "vault-0",
+       "namespace": "portcullis",
+       "node": "n1",
+       "priority": 1000000,
+       "priority_class": "portcullis-core",
+       "preemption_policy": "PreemptLowerPriority",
+       "requests": {
+        "cpu_m": 100,
+        "mem_bytes": 300000000
+       },
+       "tolerations": [
+        {
+         "key": "node.kubernetes.io/unreachable",
+         "operator": "Exists",
+         "value": "",
+         "effect": "NoExecute",
+         "seconds": 30
+        }
+       ],
+       "required_affinity": [
+        [
+         {
+          "key": "portcullis.io/site",
+          "operator": "In",
+          "values": [
+           "main"
+          ]
+         }
+        ]
+       ],
+       "anti_affinity_host": true,
+       "spread_host": false,
+       "daemonset": false,
+       "set": {
+        "name": "vault",
+        "min": 2
+       }
+      }
+     ],
+     "quorum": {
+      "etcd": {
+       "voters": 3,
+       "healthy": 3
+      },
+      "vault": {
+       "voters": 3,
+       "healthy": 3
+      },
+      "sentinel": {
+       "voters": 3,
+       "healthy": 3
+      }
+     },
+     "postgres": {
+      "instances": 2,
+      "sync_standbys": 1,
+      "primary": "n1"
+     },
+     "volumes": [
+      {
+       "name": "hub-state-r",
+       "robustness": "healthy",
+       "degraded_since": null
+      }
+     ],
+     "errors": []
+    }
+   }
+  },
+  {
+   "name": "the snapshot for the front door",
+   "route": "GET /v1/cluster",
+   "client": "frontdoor.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "GET",
+    "path": "/v1/cluster",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "taken_at": "2026-11-18T10:00:00Z",
+     "nodes": [
+      {
+       "name": "n1",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n1",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.1",
+        "lan": [
+         "192.0.2.11"
+        ],
+        "public": [
+         "198.51.100.1"
+        ]
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      },
+      {
+       "name": "n2",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n2",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.2",
+        "lan": [
+         "192.0.2.12"
+        ],
+        "public": []
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      },
+      {
+       "name": "n3",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n3",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.3",
+        "lan": [
+         "192.0.2.13"
+        ],
+        "public": []
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      }
+     ],
+     "enrolling": [
+      {
+       "id": "n4",
+       "role": "agent",
+       "class": "cloud",
+       "site": "edge",
+       "mesh_ip": "10.215.0.4",
+       "mesh": {
+        "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+        "lan": null,
+        "public": "203.0.113.4:51830"
+       },
+       "enrolled_at": "2026-11-18T09:59:00Z"
+      }
+     ],
+     "pods": [
+      {
+       "name": "vault-0",
+       "namespace": "portcullis",
+       "node": "n1",
+       "priority": 1000000,
+       "priority_class": "portcullis-core",
+       "preemption_policy": "PreemptLowerPriority",
+       "requests": {
+        "cpu_m": 100,
+        "mem_bytes": 300000000
+       },
+       "tolerations": [
+        {
+         "key": "node.kubernetes.io/unreachable",
+         "operator": "Exists",
+         "value": "",
+         "effect": "NoExecute",
+         "seconds": 30
+        }
+       ],
+       "required_affinity": [
+        [
+         {
+          "key": "portcullis.io/site",
+          "operator": "In",
+          "values": [
+           "main"
+          ]
+         }
+        ]
+       ],
+       "anti_affinity_host": true,
+       "spread_host": false,
+       "daemonset": false,
+       "set": {
+        "name": "vault",
+        "min": 2
+       }
+      }
+     ],
+     "quorum": {
+      "etcd": {
+       "voters": 3,
+       "healthy": 3
+      },
+      "vault": {
+       "voters": 3,
+       "healthy": 3
+      },
+      "sentinel": {
+       "voters": 3,
+       "healthy": 3
+      }
+     },
+     "postgres": {
+      "instances": 2,
+      "sync_standbys": 1,
+      "primary": "n1"
+     },
+     "volumes": [
+      {
+       "name": "hub-state-r",
+       "robustness": "healthy",
+       "degraded_since": null
+      }
+     ],
+     "errors": []
+    }
+   }
+  },
+  {
+   "name": "the snapshot while not the leader",
+   "route": "GET /v1/cluster",
+   "client": "hub.control",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "GET",
+    "path": "/v1/cluster",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "taken_at": "2026-11-18T10:00:00Z",
+     "nodes": [
+      {
+       "name": "n1",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n1",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.1",
+        "lan": [
+         "192.0.2.11"
+        ],
+        "public": [
+         "198.51.100.1"
+        ]
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      },
+      {
+       "name": "n2",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n2",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.2",
+        "lan": [
+         "192.0.2.12"
+        ],
+        "public": []
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      },
+      {
+       "name": "n3",
+       "role": "server",
+       "ready": true,
+       "not_ready_since": null,
+       "unschedulable": false,
+       "allocatable": {
+        "cpu_m": 4000,
+        "mem_bytes": 4000000000
+       },
+       "labels": {
+        "kubernetes.io/hostname": "n3",
+        "portcullis.io/class": "home",
+        "portcullis.io/site": "main",
+        "topology.kubernetes.io/zone": "main"
+       },
+       "taints": [],
+       "addresses": {
+        "mesh": "10.215.0.3",
+        "lan": [
+         "192.0.2.13"
+        ],
+        "public": []
+       },
+       "traefik_ready": true,
+       "fencing_ready": true,
+       "etcd_member": true
+      }
+     ],
+     "enrolling": [
+      {
+       "id": "n4",
+       "role": "agent",
+       "class": "cloud",
+       "site": "edge",
+       "mesh_ip": "10.215.0.4",
+       "mesh": {
+        "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+        "lan": null,
+        "public": "203.0.113.4:51830"
+       },
+       "enrolled_at": "2026-11-18T09:59:00Z"
+      }
+     ],
+     "pods": [
+      {
+       "name": "vault-0",
+       "namespace": "portcullis",
+       "node": "n1",
+       "priority": 1000000,
+       "priority_class": "portcullis-core",
+       "preemption_policy": "PreemptLowerPriority",
+       "requests": {
+        "cpu_m": 100,
+        "mem_bytes": 300000000
+       },
+       "tolerations": [
+        {
+         "key": "node.kubernetes.io/unreachable",
+         "operator": "Exists",
+         "value": "",
+         "effect": "NoExecute",
+         "seconds": 30
+        }
+       ],
+       "required_affinity": [
+        [
+         {
+          "key": "portcullis.io/site",
+          "operator": "In",
+          "values": [
+           "main"
+          ]
+         }
+        ]
+       ],
+       "anti_affinity_host": true,
+       "spread_host": false,
+       "daemonset": false,
+       "set": {
+        "name": "vault",
+        "min": 2
+       }
+      }
+     ],
+     "quorum": {
+      "etcd": {
+       "voters": 3,
+       "healthy": 3
+      },
+      "vault": {
+       "voters": 3,
+       "healthy": 3
+      },
+      "sentinel": {
+       "voters": 3,
+       "healthy": 3
+      }
+     },
+     "postgres": {
+      "instances": 2,
+      "sync_standbys": 1,
+      "primary": "n1"
+     },
+     "volumes": [
+      {
+       "name": "hub-state-r",
+       "robustness": "healthy",
+       "degraded_since": null
+      }
+     ],
+     "errors": []
+    }
+   }
+  },
+  {
+   "name": "the snapshot: no client certificate",
+   "route": "GET /v1/cluster",
+   "client": "none",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "GET",
+    "path": "/v1/cluster",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "this client may not call this route"
+    }
+   }
+  },
+  {
+   "name": "set the labels",
+   "route": "PUT /v1/nodes/{id}/labels",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "PUT",
+    "path": "/v1/nodes/n2/labels",
+    "headers": {},
+    "body": {
+     "class": "cloud",
+     "site": "edge",
+     "ingress": true,
+     "storage": false
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "set the labels: a partial body",
+   "route": "PUT /v1/nodes/{id}/labels",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "PUT",
+    "path": "/v1/nodes/n2/labels",
+    "headers": {},
+    "body": {
+     "class": "cloud"
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "the request body is malformed"
+    }
+   }
+  },
+  {
+   "name": "set the labels: an unknown node",
+   "route": "PUT /v1/nodes/{id}/labels",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "PUT",
+    "path": "/v1/nodes/n9/labels",
+    "headers": {},
+    "body": {
+     "class": "cloud",
+     "site": "edge",
+     "ingress": true,
+     "storage": false
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
+     "error": "unknown node n9",
+     "kind": "unknown_node"
+    }
+   }
+  },
+  {
+   "name": "set the labels: the front door may not",
+   "route": "PUT /v1/nodes/{id}/labels",
+   "client": "frontdoor.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "PUT",
+    "path": "/v1/nodes/n2/labels",
+    "headers": {},
+    "body": {
+     "class": "cloud",
+     "site": "edge",
+     "ingress": true,
+     "storage": false
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "this client may not call this route"
+    }
+   }
+  },
+  {
+   "name": "set the labels: not the leader",
+   "route": "PUT /v1/nodes/{id}/labels",
+   "client": "hub.control",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "PUT",
+    "path": "/v1/nodes/n2/labels",
+    "headers": {},
+    "body": {
+     "class": "cloud",
+     "site": "edge",
+     "ingress": true,
+     "storage": false
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": "this nodeadm isn't the leader: retry",
+     "kind": "not_leader"
+    }
+   }
+  },
+  {
+   "name": "cordon",
+   "route": "POST /v1/nodes/{id}/cordon",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n2/cordon",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "cordon: an unknown node",
+   "route": "POST /v1/nodes/{id}/cordon",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n9/cordon",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
+     "error": "unknown node n9",
+     "kind": "unknown_node"
+    }
+   }
+  },
+  {
+   "name": "cordon: a body with a field",
+   "route": "POST /v1/nodes/{id}/cordon",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n2/cordon",
+    "headers": {},
+    "body": {
+     "force": true
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "the request body is malformed"
+    }
+   }
+  },
+  {
+   "name": "uncordon",
+   "route": "POST /v1/nodes/{id}/uncordon",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n2/uncordon",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "uncordon: an unknown node",
+   "route": "POST /v1/nodes/{id}/uncordon",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n9/uncordon",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
+     "error": "unknown node n9",
+     "kind": "unknown_node"
+    }
+   }
+  },
+  {
+   "name": "uncordon: a body with a field",
+   "route": "POST /v1/nodes/{id}/uncordon",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n2/uncordon",
+    "headers": {},
+    "body": {
+     "force": true
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "the request body is malformed"
+    }
+   }
+  },
+  {
+   "name": "drain",
+   "route": "POST /v1/nodes/{id}/drain",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n4/drain",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "drain a server with 3 healthy servers",
+   "route": "POST /v1/nodes/{id}/drain",
+   "client": "hub.control",
+   "leader": true,
+   "state": "3 healthy servers",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n1/drain",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "removing n1 would leave fewer than 3 servers",
+     "kind": "quorum_minimum"
+    }
+   }
+  },
+  {
+   "name": "drain: a PodDisruptionBudget refuses for 120 s",
+   "route": "POST /v1/nodes/{id}/drain",
+   "client": "hub.control",
+   "leader": true,
+   "state": "vault's PDB refuses the eviction for 120 s",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n2/drain",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "draining n2 would take vault below its minimum",
+     "kind": "replica_minimum"
+    }
+   }
+  },
+  {
+   "name": "drain: an unknown node",
+   "route": "POST /v1/nodes/{id}/drain",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n9/drain",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
+     "error": "unknown node n9",
+     "kind": "unknown_node"
+    }
+   }
+  },
+  {
+   "name": "drain: not the leader",
+   "route": "POST /v1/nodes/{id}/drain",
+   "client": "hub.control",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/nodes/n4/drain",
+    "headers": {},
+    "body": {},
+    "body_text": null
+   },
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": "this nodeadm isn't the leader: retry",
+     "kind": "not_leader"
+    }
+   }
+  },
+  {
+   "name": "remove cooperatively",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n4?mode=cooperative",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "remove cooperatively: a server with 3 healthy servers",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": true,
+   "state": "3 healthy servers",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n3?mode=cooperative",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "removing n3 would leave fewer than 3 servers",
+     "kind": "quorum_minimum"
+    }
+   }
+  },
+  {
+   "name": "remove cooperatively: a PodDisruptionBudget refuses for 120 s",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": true,
+   "state": "keycloak's PDB refuses the eviction for 120 s",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n4?mode=cooperative",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "draining n4 would take keycloak below its minimum",
+     "kind": "replica_minimum"
+    }
+   }
+  },
+  {
+   "name": "remove cooperatively: an enrolling node",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": true,
+   "state": "n4 enrolled, no node object",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n4?mode=cooperative",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "remove cooperatively: an unused code",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": true,
+   "state": "a code for n5, unused",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n5?mode=cooperative",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "remove: an unknown node",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n9?mode=cooperative",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
+     "error": "unknown node n9",
+     "kind": "unknown_node"
+    }
+   }
+  },
+  {
+   "name": "remove: another mode",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n4?mode=force",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "mode must be cooperative or revoke"
+    }
+   }
+  },
+  {
+   "name": "remove: no mode",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n4",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "mode must be cooperative or revoke"
+    }
+   }
+  },
+  {
+   "name": "remove: not the leader",
+   "route": "DELETE /v1/nodes/{id}?mode=cooperative",
+   "client": "hub.control",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n4?mode=cooperative",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": "this nodeadm isn't the leader: retry",
+     "kind": "not_leader"
+    }
+   }
+  },
+  {
+   "name": "revoke",
+   "route": "DELETE /v1/nodes/{id}?mode=revoke",
+   "client": "hub.control",
+   "leader": true,
+   "state": "3 healthy servers",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n3?mode=revoke",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "revoke: etcd without quorum",
+   "route": "DELETE /v1/nodes/{id}?mode=revoke",
+   "client": "hub.control",
+   "leader": true,
+   "state": "etcd 1 of 3 healthy",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n3?mode=revoke",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": "etcd has no quorum: the member can't be removed"
+    }
+   }
+  },
+  {
+   "name": "revoke: an unknown node",
+   "route": "DELETE /v1/nodes/{id}?mode=revoke",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "DELETE",
+    "path": "/v1/nodes/n9?mode=revoke",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
+     "error": "unknown node n9",
+     "kind": "unknown_node"
+    }
+   }
+  },
+  {
+   "name": "the join script",
+   "route": "GET /node/join.sh",
+   "client": "none",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "GET",
+    "path": "/node/join.sh",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Content-Type": "text/x-shellscript; charset=utf-8"
+    },
+    "body": null
+   }
+  },
+  {
+   "name": "the nodeagent binary (amd64)",
+   "route": "GET /node/nodeagent-{arch}",
+   "client": "none",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "GET",
+    "path": "/node/nodeagent-amd64",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Content-Type": "application/octet-stream"
+    },
+    "body": null
+   }
+  },
+  {
+   "name": "the nodeagent binary (arm64)",
+   "route": "GET /node/nodeagent-{arch}",
+   "client": "none",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "GET",
+    "path": "/node/nodeagent-arm64",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Content-Type": "application/octet-stream"
+    },
+    "body": null
+   }
+  },
+  {
+   "name": "the nodeagent binary: another arch",
+   "route": "GET /node/nodeagent-{arch}",
+   "client": "none",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "GET",
+    "path": "/node/nodeagent-riscv64",
+    "headers": {},
+    "body": null,
+    "body_text": null
+   },
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "a nonce",
+   "route": "POST /node/v1/nonce",
+   "client": "none",
+   "leader": true,
+   "state": "a code for n4",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/nonce",
+    "headers": {},
+    "body": {
+     "server_id": "n4"
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY"
+    }
+   }
+  },
+  {
+   "name": "a nonce for an unknown server_id (no oracle)",
+   "route": "POST /node/v1/nonce",
+   "client": "none",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/nonce",
+    "headers": {},
+    "body": {
+     "server_id": "n9"
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY"
+    }
+   }
+  },
+  {
+   "name": "a nonce: a malformed body",
+   "route": "POST /node/v1/nonce",
+   "client": "none",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/nonce",
+    "headers": {},
+    "body": {
+     "server": "n4"
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "the request body is malformed"
+    }
+   }
+  },
+  {
+   "name": "a nonce: not the leader",
+   "route": "POST /node/v1/nonce",
+   "client": "none",
+   "leader": false,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/nonce",
+    "headers": {},
+    "body": {
+     "server_id": "n4"
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": "this nodeadm isn't the leader: retry",
+     "kind": "not_leader"
+    }
+   }
+  },
+  {
+   "name": "enrol",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "certificate": "-----BEGIN CERTIFICATE-----\nMIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0\nY3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4\nMTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJu\nYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQU\nQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30w\nezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMB\nMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40\nLmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBx\nFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbM\nEkXWkAEkHqhpj/snWRZFk2t7\n-----END CERTIFICATE-----\n",
+     "ca": "-----BEGIN CERTIFICATE-----\nMIIBfjCCASOgAwIBAgIBATAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3Vs\nbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDkwMDAwWhcNMzYxMTE1MTAw\nMDAwWjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwWTAT\nBgcqhkjOPQIBBggqhkjOPQMBBwNCAARnvlv7Pq12IVjTn0+gqrE+Ppe9pe/zxQEV\ndl+AQU94/B/S/Dj6zq1rZqmpseBCa5/aMLq5NZJL4FB3v5gKyXGSo0IwQDAOBgNV\nHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUFb7/iN221cqe\n/greMYebnVXHYLQwCgYIKoZIzj0EAwIDSQAwRgIhAKbsBMAucbpFaFLutRZWwcy6\nxRoD2xYsmNVdEWp2ZDA0AiEAlM15LuvtfG0f1enkmcoGB6wSi3TKiNncPQLTVbuS\neyQ=\n-----END CERTIFICATE-----\n",
+     "not_after": "2026-12-18T10:00:00Z",
+     "mesh": {
+      "peers": [
+       {
+        "id": "n1",
+        "pub": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "endpoint": "198.51.100.1:51830",
+        "allowed_ips": [
+         "10.215.0.1/32",
+         "10.215.0.2/32",
+         "10.215.0.3/32"
+        ],
+        "keepalive": 25
+       }
+      ],
+      "forward": false
+     }
+    }
+   }
+  },
+  {
+   "name": "enrol: a wrong proof",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "PZXLOU0Ck6suWesdWYimo0A6oo6wxDiNQEdbxKmsYFM",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join code's proof doesn't match",
+     "kind": "proof_invalid"
+    }
+   }
+  },
+  {
+   "name": "enrol: a reused nonce",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4, the nonce already used",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join code's proof doesn't match",
+     "kind": "proof_invalid"
+    }
+   }
+  },
+  {
+   "name": "enrol: an expired nonce (61 s)",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4, the nonce issued 61 s ago",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join code's proof doesn't match",
+     "kind": "proof_invalid"
+    }
+   }
+  },
+  {
+   "name": "enrol: a nonce issued for another server_id",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4, the nonce issued for n5",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join code's proof doesn't match",
+     "kind": "proof_invalid"
+    }
+   }
+  },
+  {
+   "name": "enrol: an unknown server_id",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n9",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join code's proof doesn't match",
+     "kind": "proof_invalid"
+    }
+   }
+  },
+  {
+   "name": "enrol: an expired code (logged code_expired)",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4, the code issued 16 min ago",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join code's proof doesn't match",
+     "kind": "proof_invalid"
+    }
+   }
+  },
+  {
+   "name": "enrol: a used code (logged code_used)",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4, the code already used",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join code's proof doesn't match",
+     "kind": "proof_invalid"
+    }
+   }
+  },
+  {
+   "name": "enrol: a CSR of another key than the proof's",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABI6E5lWnYyKoY7pKGTfJZx08\n23SZ9G/EM5xoJn209YWQANc+DOpk6fN6NM9aCn8BEaJJXQh6SnbFu+Jgqi+G5q+g\nADAKBggqhkjOPQQDAgNIADBFAiEAybKjGN9igSRL0fD/VV/n/vKlC3q6Zmg4y7+1\nflG6is8CIBUHw7PMQv/3czZJMFVidB88+Qo8FR4+SfwhcuWwYRq5\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join code's proof doesn't match",
+     "kind": "proof_invalid"
+    }
+   }
+  },
+  {
+   "name": "enrol: a malformed body",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n"
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": "the request body is malformed"
+    }
+   }
+  },
+  {
+   "name": "enrol: not the leader",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": false,
+   "state": "the code of valid[0] issued for n4 (sha256(secret) stored), the nonce issued for n4",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": {
+     "server_id": "n4",
+     "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+     "proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w",
+     "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n",
+     "mesh": {
+      "pub": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "lan": null,
+      "public": "203.0.113.4:51830"
+     }
+    },
+    "body_text": null
+   },
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": "this nodeadm isn't the leader: retry",
+     "kind": "not_leader"
+    }
+   }
+  },
+  {
+   "name": "join",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 answers over pcmesh",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Cache-Control": "no-store"
+    },
+    "body": {
+     "role": "agent",
+     "server_url": "https://10.215.0.1:6443",
+     "token": "K10b7335c14c0febed58f896145ef153d44a59bd0dfa5065771f18cc99c514c0edb::abcdef.0123456789abcdef",
+     "flags": [
+      "--server=https://10.215.0.1:6443",
+      "--node-ip=10.215.0.4",
+      "--node-label=portcullis.io/class=cloud",
+      "--node-label=portcullis.io/site=edge",
+      "--node-label=topology.kubernetes.io/zone=edge",
+      "--node-label=portcullis.io/ingress=true",
+      "--node-label=svccontroller.k3s.cattle.io/enablelb=true",
+      "--kubelet-arg=pod-max-pids=1024",
+      "--kubelet-arg=sync-frequency=10s",
+      "--kubelet-arg=address=10.215.0.4"
+     ]
+    }
+   }
+  },
+  {
+   "name": "join: the mesh isn't ready",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 doesn't answer yet",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "the node mesh isn't ready yet: retry",
+     "kind": "mesh_pending"
+    }
+   }
+  },
+  {
+   "name": "join: a signature by another key",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEQCIFkD4a0L8DZSMmntogNrxZCYh_Xc--CuYKuL3x2dz6OKAiANq-00qCvz9qpBOgCBYCnS4cQehwVtnoGQd12CLScjBw"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join request isn't signed by the node"
+    }
+   }
+  },
+  {
+   "name": "join: a time 61 s off",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled, now = 2026-11-18T10:06:01Z",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join request isn't signed by the node"
+    }
+   }
+  },
+  {
+   "name": "join: a reused request nonce",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the request nonce used 2 min ago",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join request isn't signed by the node"
+    }
+   }
+  },
+  {
+   "name": "join: no signature",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join request isn't signed by the node"
+    }
+   }
+  },
+  {
+   "name": "join: a body other than the signed one",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":2,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join request isn't signed by the node"
+    }
+   }
+  },
+  {
+   "name": "join: a server too far",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the RTT report replaced: n2 at 251 ms (re-signed by the test)",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "too far for one cluster: 251 ms (agents need 250 ms or less)"
+    }
+   }
+  },
+  {
+   "name": "join: the site has no reachable node",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, n4's public endpoint gone and edge has no other node",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "site edge needs one node reachable on UDP 51830 first (a cloud node, or one forwarded port)"
+    }
+   }
+  },
+  {
+   "name": "join: not the leader",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": false,
+   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": "this nodeadm isn't the leader: retry",
+     "kind": "not_leader"
+    }
+   }
+  }
+ ],
+ "proof": [
+  {
+   "name": "the enrol proof of the enrol case",
+   "secret": "q5idMrnFv0N4pQ2KjXHAzmYEjbEkpmCaKEHY_moMciM",
+   "nonce": "CqW6WCasHQYr4PLOtcGZ7gfBuAB6vgFJ-Qb5jgguVaY",
+   "server_id": "n4",
+   "spki_sha256": "c726ee0563d2ce8e25c067846fa2d6dbab0296a4345eaabc5ce85e3c3e75b12d",
+   "want_key_sha256": "1de57f10c52ba6f28e80055daa6397daf5c999385f4fec25cdf0dd5d8e5da883",
+   "want_proof": "c50Ol-lExhgJ5mlgGYFTSAaWkxR2SWf26pTz6qKhL-w"
+  }
+ ],
+ "signed_request": [
+  {
+   "name": "the join case",
+   "server_id": "n4",
+   "method": "POST",
+   "path": "/node/v1/join",
+   "time": "2026-11-18T10:05:00Z",
+   "nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+   "body": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}",
+   "want_body_sha256": "1e6f5e7f33436fa85db8e7dfdd8e658a1f4d372b1a7ed6ca2501aad722644e4f",
+   "want_canonical": "{\"server_id\":\"n4\",\"method\":\"POST\",\"path\":\"/node/v1/join\",\"time\":\"2026-11-18T10:05:00Z\",\"nonce\":\"qiHBdkL82Q-Yi0t8u_EJrw\",\"body_sha256\":\"1e6f5e7f33436fa85db8e7dfdd8e658a1f4d372b1a7ed6ca2501aad722644e4f\"}"
+  },
+  {
+   "name": "no HTML escaping, an empty body",
+   "server_id": "edge-1",
+   "method": "POST",
+   "path": "/node/v1/join?a=<b>&c",
+   "time": "2026-11-18T23:59:59Z",
+   "nonce": "AAAAAAAAAAAAAAAAAAAAAA",
+   "body": "",
+   "want_body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "want_canonical": "{\"server_id\":\"edge-1\",\"method\":\"POST\",\"path\":\"/node/v1/join?a=<b>&c\",\"time\":\"2026-11-18T23:59:59Z\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"body_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}"
+  }
+ ],
+ "pki": {
+  "ca_pem": "-----BEGIN CERTIFICATE-----\nMIIBfjCCASOgAwIBAgIBATAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3Vs\nbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDkwMDAwWhcNMzYxMTE1MTAw\nMDAwWjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwWTAT\nBgcqhkjOPQIBBggqhkjOPQMBBwNCAARnvlv7Pq12IVjTn0+gqrE+Ppe9pe/zxQEV\ndl+AQU94/B/S/Dj6zq1rZqmpseBCa5/aMLq5NZJL4FB3v5gKyXGSo0IwQDAOBgNV\nHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUFb7/iN221cqe\n/greMYebnVXHYLQwCgYIKoZIzj0EAwIDSQAwRgIhAKbsBMAucbpFaFLutRZWwcy6\nxRoD2xYsmNVdEWp2ZDA0AiEAlM15LuvtfG0f1enkmcoGB6wSi3TKiNncPQLTVbuS\neyQ=\n-----END CERTIFICATE-----\n",
+  "ca_sha256": "c3caa405afc24f5b79f25ce862470c0edaa8ca5a947bc4b05b1fd8dc82f45452",
+  "node_cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0\nY3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4\nMTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJu\nYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQU\nQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30w\nezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMB\nMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40\nLmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBx\nFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbM\nEkXWkAEkHqhpj/snWRZFk2t7\n-----END CERTIFICATE-----\n",
+  "node_csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nMIHkMIGLAgEAMCkxJzAlBgNVBAMTHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRl\ncm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABECtvGJNT7CWSNIw8BnbpUqE\nRBRC0nb7GdaDFf+Hd5Saq/K4doeoSofBhiMOfb62D2XhBrL0uAip/xWTqu/DyE6g\nADAKBggqhkjOPQQDAgNIADBFAiEArTkk8xfdUOa2iWZnzZQcDApGnnXqGvvV39+y\nFq1ccwwCIFHBE4JSDGQmP8H/NDGGg/aYT5oxZvf5NogAi2hyDlQW\n-----END CERTIFICATE REQUEST-----\n"
+ },
+ "join_tokens": [
+  {
+   "token": "K10b7335c14c0febed58f896145ef153d44a59bd0dfa5065771f18cc99c514c0edb::abcdef.0123456789abcdef",
+   "ok": true
+  },
+  {
+   "token": "K100000000000000000000000000000000000000000000000000000000000000000::server:0123456789abcdef0123456789abcdef",
+   "ok": true
+  },
+  {
+   "token": "abcdef.0123456789abcdef",
+   "ok": false
+  },
+  {
+   "token": "K10::abcdef.0123456789abcdef",
+   "ok": false
+  },
+  {
+   "token": "K10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa::abcdef.0123456789abcdef",
+   "ok": false
+  },
+  {
+   "token": "K10AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA::abcdef.0123456789abcdef",
+   "ok": false
+  },
+  {
+   "token": "K10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa::",
+   "ok": false
+  },
+  {
+   "token": "k10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa::abcdef.0123456789abcdef",
+   "ok": false
+  }
+ ]
+}

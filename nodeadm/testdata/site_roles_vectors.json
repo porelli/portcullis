@@ -1,0 +1,1015 @@
+[
+ {
+  "name": "one site: the second node is a server",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": []
+  }
+ },
+ {
+  "name": "one site: the third node is a server",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": []
+  }
+ },
+ {
+  "name": "one site: the fourth node is an agent",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "one site: the fifth node is an agent",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n4",
+    "site": "main",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "override: a fourth server warns about the even count",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2
+   },
+   "override": "server"
+  },
+  "want": {
+   "role": "server",
+   "warnings": [
+    "an even number of servers doesn't add failure tolerance"
+   ]
+  }
+ },
+ {
+  "name": "override: a fifth server (odd) has no warning",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n4",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2,
+    "n4": 2
+   },
+   "override": "server"
+  },
+  "want": {
+   "role": "server",
+   "warnings": []
+  }
+ },
+ {
+  "name": "override: an agent while servers are missing",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2
+   },
+   "override": "agent"
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "an unhealthy server is replaced: a fourth server, even count",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": false
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": [
+    "an even number of servers doesn't add failure tolerance"
+   ]
+  }
+ },
+ {
+  "name": "RTT to an agent isn't checked",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n4",
+    "site": "main",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2,
+    "n4": 900
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "two sites: the first node at edge is an agent",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "edge",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": [
+    "Only main can survive on its own: add a tie-breaker at a third location (a small cloud VM or a Pi elsewhere)."
+   ]
+  }
+ },
+ {
+  "name": "two sites: servers stay at main even with 2 servers",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "edge",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": [
+    "Only main can survive on its own: add a tie-breaker at a third location (a small cloud VM or a Pi elsewhere)."
+   ]
+  }
+ },
+ {
+  "name": "two sites: a new node at main is an agent once main has 3 servers",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": [
+    "Only main can survive on its own: add a tie-breaker at a third location (a small cloud VM or a Pi elsewhere)."
+   ]
+  }
+ },
+ {
+  "name": "two sites: a new node at main is a server while main has 2",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": [
+    "Only main can survive on its own: add a tie-breaker at a third location (a small cloud VM or a Pi elsewhere)."
+   ]
+  }
+ },
+ {
+  "name": "three sites: main 2, edge 1, a new server at tb (no majority)",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "t1",
+    "site": "tb",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "tb",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "e1": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": [
+    "an even number of servers doesn't add failure tolerance"
+   ]
+  }
+ },
+ {
+  "name": "three sites: main 2, edge 1, a new node at main would be a majority: agent",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "t1",
+    "site": "tb",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "e1": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "three sites: main 2, edge 2, a new server at tb makes 2-2-1",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e2",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "t1",
+    "site": "tb",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "tb",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "e1": 2,
+    "e2": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": []
+  }
+ },
+ {
+  "name": "three sites: main 2, edge 2, a new node at edge would be a majority: agent",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e2",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "t1",
+    "site": "tb",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "edge",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "e1": 2,
+    "e2": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "a server at 101 ms is refused",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 20,
+    "n2": 101
+   },
+   "override": ""
+  },
+  "want_error": "too far for one cluster: 101 ms (servers need 100 ms or less)"
+ },
+ {
+  "name": "a server at 100 ms joins, near the limit",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 20,
+    "n2": 100
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": [
+    "mesh round trip to n2 is 100 ms: near the 100 ms limit"
+   ]
+  }
+ },
+ {
+  "name": "a server at 80 ms warns (80 %)",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 80,
+    "n2": 79
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": [
+    "mesh round trip to n1 is 80 ms: near the 100 ms limit"
+   ]
+  }
+ },
+ {
+  "name": "a server at 79 ms has no warning",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 79,
+    "n2": 1
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": []
+  }
+ },
+ {
+  "name": "an overridden server at 150 ms is refused",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 5,
+    "n2": 150,
+    "n3": 5
+   },
+   "override": "server"
+  },
+  "want_error": "too far for one cluster: 150 ms (servers need 100 ms or less)"
+ },
+ {
+  "name": "an agent at 251 ms is refused",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "edge",
+   "rtt_ms": {
+    "n1": 120,
+    "n2": 251,
+    "n3": 130
+   },
+   "override": ""
+  },
+  "want_error": "too far for one cluster: 251 ms (agents need 250 ms or less)"
+ },
+ {
+  "name": "an agent at 250 ms joins, near the limit",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "edge",
+   "rtt_ms": {
+    "n1": 120,
+    "n2": 250,
+    "n3": 130
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": [
+    "Only main can survive on its own: add a tie-breaker at a third location (a small cloud VM or a Pi elsewhere).",
+    "mesh round trip to n2 is 250 ms: near the 250 ms limit"
+   ]
+  }
+ },
+ {
+  "name": "an agent at 200 ms warns (80 %), 199 doesn't",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "edge",
+   "rtt_ms": {
+    "n1": 199,
+    "n2": 150,
+    "n3": 200
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": [
+    "Only main can survive on its own: add a tie-breaker at a third location (a small cloud VM or a Pi elsewhere).",
+    "mesh round trip to n3 is 200 ms: near the 250 ms limit"
+   ]
+  }
+ },
+ {
+  "name": "an agent at 150 ms to a server joins without a warning",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 150,
+    "n2": 150,
+    "n3": 150
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "a server missing from the RTT report",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2
+   },
+   "override": ""
+  },
+  "want_error": "no mesh answer from n3: the node can't join"
+ },
+ {
+  "name": "an unhealthy server needs no RTT answer",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": false
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": [
+    "an even number of servers doesn't add failure tolerance"
+   ]
+  }
+ }
+]
