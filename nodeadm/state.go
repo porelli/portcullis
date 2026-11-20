@@ -11,10 +11,12 @@ package main
 // or expires; it is never logged, returned or audited.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -144,12 +146,33 @@ func (s *secretStore) Load(ctx context.Context) (*nodeadmState, string, error) {
 	}
 	st := newState()
 	if b := sec.Data[stateKey]; len(b) > 0 {
-		if err := json.Unmarshal(b, st); err != nil {
-			return nil, "", fmt.Errorf("the Secret %s doesn't parse", stateSecret)
+		var err error
+		if st, err = decodeState(b); err != nil {
+			return nil, "", err
 		}
-		st = st.clone()
 	}
 	return st, sec.ResourceVersion, nil
+}
+
+// decodeState: strict (an unknown field, e.g. an older format's, or
+// trailing data refuses the state: never loaded with data silently
+// dropped). The error names the field, never a value (the state holds
+// code hashes).
+func decodeState(b []byte) (*nodeadmState, error) {
+	st := newState()
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(st); err != nil {
+		msg := "it doesn't parse"
+		if f, ok := strings.CutPrefix(err.Error(), "json: unknown field "); ok {
+			msg = "it has the unknown field " + f + " (another nodeadm version's format: nothing is migrated)"
+		}
+		return nil, fmt.Errorf("the Secret %s is refused: %s", stateSecret, msg)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("the Secret %s is refused: trailing data", stateSecret)
+	}
+	return st.clone(), nil
 }
 
 func (s *secretStore) Save(ctx context.Context, st *nodeadmState, version string) (string, error) {

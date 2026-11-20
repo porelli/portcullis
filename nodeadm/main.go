@@ -118,6 +118,12 @@ func run(log *slog.Logger) error {
 		http:       &http.Client{Timeout: 30 * time.Second}}
 	s.agents = agentClient{s: s}
 	s.bootstrap = k3sBootstrap{}
+	// The state must load (strictly) before anything starts: an older or
+	// foreign format refuses the start with a clear error.
+	if _, _, err := s.store.Load(context.Background()); err != nil {
+		log.Error("nodeadm can't start: its state is refused", "err", err.Error())
+		os.Exit(1)
+	}
 	fence := NewFence(kube, core, cfg.PodName)
 	s.leader = fence
 

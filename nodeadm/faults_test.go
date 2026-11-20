@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -145,4 +146,32 @@ func TestFaultsNeverLeakSecrets(t *testing.T) {
 		noLeak(t, h, w.Body.String()+op.LastError, testServerToken, testAgentToken, op.NewServer,
 			strings.SplitN(op.NewServer, "::", 2)[1])
 	})
+}
+
+// TestStateLoadStrict (fix round 9): a state with a field this nodeadm
+// doesn't know (an older format's pending_revoke) is refused, by name and
+// without its values; nodeadm doesn't start on it.
+func TestStateLoadStrict(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	old := `{"v":1,"codes":{},"nodes":{"n4":{"role":"agent","serial":"","mesh_ip":"10.215.0.4","pending_revoke":["aa:bb"],"key_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}}`
+	h.kube.CoreV1().Secrets(coreNS).Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: stateSecret, Namespace: coreNS},
+		Data: map[string][]byte{stateKey: []byte(old)}}, metav1.CreateOptions{})
+	store := &secretStore{kube: h.kube, ns: coreNS}
+	_, _, err := store.Load(ctx)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "pending_revoke"`) || strings.Contains(err.Error(), "aa:bb") || strings.Contains(err.Error(), "0123456789abcdef") {
+		t.Fatalf("an older-format state: %v", err)
+	}
+	for _, bad := range []string{`{"v":1,"codes":{},"nodes":{}} {}`, `{"v":1,"codes":{},"nodes":{},"ops":{"n1":{"node":"n1","bogus":1}}}`, `not json`} {
+		if _, err := decodeState([]byte(bad)); err == nil {
+			t.Errorf("%.40q loaded", bad)
+		}
+	}
+	// The current format round-trips.
+	st := newState()
+	st.queueRevoke("n4", "cc:dd", vecNow)
+	b, _ := json.Marshal(st)
+	if got, err := decodeState(b); err != nil || got.PendingRevokes["cc:dd"] == nil {
+		t.Fatalf("the current format: %v", err)
+	}
 }
