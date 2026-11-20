@@ -662,7 +662,7 @@ _kube_keygen() {
   # exec cat before deleting the pod.
   N="$name" NS="$ns" IMG="$img" U="$u" S="$svc" jq -n '
     {apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "keygen"}},
-     spec: {restartPolicy: "Never", automountServiceAccountToken: false, enableServiceLinks: false, terminationGracePeriodSeconds: 1,
+     spec: {restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false, terminationGracePeriodSeconds: 1,
        securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.U | tonumber), seccompProfile: {type: "RuntimeDefault"}},
        volumes: [{name: "k", emptyDir: {medium: "Memory", sizeLimit: "1Mi"}}],
        containers: [{name: "keygen", image: env.IMG,
@@ -1735,7 +1735,7 @@ _rtk_volume_pod() {
   N="$name" NS="$(kube_ns)" P="$pvc" U="$u" G="$g" RO="$ro" IMG="$PORTCULLIS_HELPER_IMAGE" jq -n '
     {apiVersion: "v1", kind: "Pod",
      metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "volume-helper", "portcullis.io/helper": "volume"}},
-     spec: {restartPolicy: "Never", automountServiceAccountToken: false, enableServiceLinks: false,
+     spec: {restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false,
        securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.G | tonumber), seccompProfile: {type: "RuntimeDefault"}},
        containers: [{name: "helper", image: env.IMG, command: ["sleep", "3600"],
          resources: {limits: {memory: "64Mi"}, requests: {memory: "64Mi"}},
@@ -1834,7 +1834,7 @@ _kube_helper_pod() {
   N="$name" NS="$(kube_ns)" P="$pvc" U="$u" G="$g" RO="$ro" IMG="$img" C="$comp" jq -n '
     {apiVersion: "v1", kind: "Pod",
      metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": env.C}},
-     spec: {restartPolicy: "Never", automountServiceAccountToken: false, enableServiceLinks: false,
+     spec: {restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false,
        securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.G | tonumber), seccompProfile: {type: "RuntimeDefault"}},
        containers: [{name: "helper", image: env.IMG, command: ["sleep", "3600"],
          resources: {limits: {memory: "256Mi"}, requests: {memory: "256Mi"}},

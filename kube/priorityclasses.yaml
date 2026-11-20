@@ -7,7 +7,11 @@
 # checks every pod template of the chart and kube/). The four app classes
 # are the Hub's translator's (state.yaml availability.priority; the
 # admission policy keeps portcullis-core off app pods, contract §6).
-# globalDefault only on portcullis-normal; portcullis-low never preempts.
+# No globalDefault (Task 18 fix round 2, M-B): every pod names its class
+# (the chart, kube/, the CLI's pods, the Hub's translator), so a cluster
+# brought with --kube-context keeps its own default and none is left behind
+# (remove ours with kubectl delete priorityclass -l
+# app.kubernetes.io/managed-by=portcullis). portcullis-low never preempts.
 # The Hub keeps a byte copy (internal/runtime/kube/testdata/priorityclasses.yaml)
 # for its envtest.
 apiVersion: scheduling.k8s.io/v1
@@ -50,7 +54,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: portcullis
 value: 1000
-globalDefault: true
+globalDefault: false
 preemptionPolicy: PreemptLowerPriority
 description: "Apps at priority normal (the default)."
 ---

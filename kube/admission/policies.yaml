@@ -355,8 +355,8 @@ spec:
       capability, non-root, no other portcullis.io/ label
   # HA placement (contract §6 "placement"; vectors tagged ha). Priority:
   # only the four app classes (portcullis-core is core's; an unset class
-  # is the global default portcullis-normal on a pod, and its pods' on a
-  # template).
+  # is admitted: no class is a global default, priority 0, and the Hub's
+  # translator always names one).
   - expression: |-
       variables.cli || (
         !has(variables.spec.priorityClassName) || variables.spec.priorityClassName in ['portcullis-critical', 'portcullis-high', 'portcullis-normal', 'portcullis-low']
@@ -824,8 +824,8 @@ spec:
       capability, non-root, no other portcullis.io/ label
   # HA placement (contract §6 "placement"; vectors tagged ha). Priority:
   # only the four app classes (portcullis-core is core's; an unset class
-  # is the global default portcullis-normal on a pod, and its pods' on a
-  # template).
+  # is admitted: no class is a global default, priority 0, and the Hub's
+  # translator always names one).
   - expression: |-
       variables.skipObj || object.kind in ['Secret', 'PersistentVolumeClaim'] || (
         !has(variables.spec.priorityClassName) || variables.spec.priorityClassName in ['portcullis-critical', 'portcullis-high', 'portcullis-normal', 'portcullis-low']
@@ -1525,7 +1525,9 @@ spec:
 # (owned by it, and created only by the DaemonSet controller or the CLI:
 # a self-declared owner reference isn't enough), the image traefikImage, no
 # command or args (the image's entrypoint; Traefik is configured by
-# environment), environment variables only of traefikEnv's names (values
+# environment), no exec probe but Traefik's own `traefik healthcheck --ping`
+# and no lifecycle hook but sleep (each would run a command in the pod that
+# holds the DNS credentials), environment variables only of traefikEnv's names (values
 # from the traefikSecrets only, no envFrom), ServiceAccount traefik, the
 # label app.kubernetes.io/name: traefik, one container (no init or
 # ephemeral one), volumes only emptyDir and the named ConfigMaps / Secrets
@@ -1670,6 +1672,11 @@ spec:
         && variables.spec.containers.all(c, c.image == params.data.traefikImage && has(c.securityContext)
           && (!has(c.command) || size(c.command) == 0) && (!has(c.args) || size(c.args) == 0)
           && (!has(c.envFrom) || size(c.envFrom) == 0)
+          && (!has(c.startupProbe) || !has(c.startupProbe.exec) || (has(c.startupProbe.exec.command) && c.startupProbe.exec.command == ['traefik', 'healthcheck', '--ping']))
+          && (!has(c.livenessProbe) || !has(c.livenessProbe.exec) || (has(c.livenessProbe.exec.command) && c.livenessProbe.exec.command == ['traefik', 'healthcheck', '--ping']))
+          && (!has(c.readinessProbe) || !has(c.readinessProbe.exec) || (has(c.readinessProbe.exec.command) && c.readinessProbe.exec.command == ['traefik', 'healthcheck', '--ping']))
+          && (!has(c.lifecycle) || ((!has(c.lifecycle.postStart) || (!has(c.lifecycle.postStart.exec) && !has(c.lifecycle.postStart.httpGet) && !has(c.lifecycle.postStart.tcpSocket)))
+              && (!has(c.lifecycle.preStop) || (!has(c.lifecycle.preStop.exec) && !has(c.lifecycle.preStop.httpGet) && !has(c.lifecycle.preStop.tcpSocket)))))
           && (!has(c.env) || (size(c.env) <= 96 && c.env.all(e, e.name in variables.traefikEnv
               && (!has(e.valueFrom) || (has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name in variables.traefikSecrets
                   && !has(e.valueFrom.configMapKeyRef) && !has(e.valueFrom.fieldRef) && !has(e.valueFrom.resourceFieldRef))))))

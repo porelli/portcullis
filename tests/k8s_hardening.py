@@ -526,8 +526,8 @@ def check_psa():
         F.add("scripts/lib/kube.sh spells PSA levels itself: kube_psa reads charts/portcullis/namespaces.json")
 
 
-# The PriorityClasses (NEW, HA; plan Global Constraints): exactly five,
-# globalDefault only on portcullis-normal, portcullis-low never preempts.
+# The PriorityClasses (NEW, HA; plan Global Constraints): exactly five, no
+# globalDefault (every pod names its class), portcullis-low never preempts.
 PRIORITIES = {"portcullis-core": (1000000, "PreemptLowerPriority"), "portcullis-critical": (100000, "PreemptLowerPriority"),
               "portcullis-high": (10000, "PreemptLowerPriority"), "portcullis-normal": (1000, "PreemptLowerPriority"),
               "portcullis-low": (100, "Never")}
@@ -536,7 +536,7 @@ PRIORITIES = {"portcullis-core": (1000000, "PreemptLowerPriority"), "portcullis-
 def check_priorities():
     docs = [d for d in yaml.safe_load_all((K.ROOT / "kube" / "priorityclasses.yaml").read_text()) if d]
     got = {d["metadata"]["name"]: (d["value"], d.get("preemptionPolicy"), d.get("globalDefault", False)) for d in docs if d.get("kind") == "PriorityClass"}
-    want = {n: (v, p, n == "portcullis-normal") for n, (v, p) in PRIORITIES.items()}
+    want = {n: (v, p, False) for n, (v, p) in PRIORITIES.items()}  # no globalDefault (M-B)
     if got != want or len(docs) != len(want):
         F.add(f"kube/priorityclasses.yaml {got} != {want}")
     for p in sorted((K.CHART / "templates").glob("*")):
@@ -545,12 +545,13 @@ def check_priorities():
 
 
 # Every pod that isn't an app's names a class (Task 18 fix round, ruling
-# I5): globalDefault portcullis-normal would otherwise make it an app-level
-# pod that app pods at high / critical preempt, and that N−1 counts as
-# evictable. Core and infrastructure: portcullis-core (portcullis-critical
-# where the plan says so) or a system-* class. Every pod template of the
-# chart (every profile, HA too) and of kube/ (the CLI's manifests, HA
-# infrastructure included).
+# I5): without one it has priority 0 and app pods at any class preempt it,
+# and N−1 counts it as evictable. Core and infrastructure: portcullis-core,
+# or portcullis-critical where the plan assigns it to an infrastructure
+# piece (the coordinator's I5 ruling allows it), or a system-* class. Every
+# pod template of the chart (every profile, HA too) and of kube/ (the CLI's
+# manifests, HA infrastructure included); the CLI's jq-built pods are held
+# to portcullis-core by tests/test_shell_libs.sh.
 CLASS_OK = re.compile(r"^(portcullis-core|portcullis-critical|system-node-critical|system-cluster-critical)$")
 POD_KINDS = {"Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "ReplicaSet"}
 
@@ -608,7 +609,11 @@ def check_token_literal():
 
 # portcullis-ingress-pods' allowlists hold the chart's Traefik pod: its
 # environment names, its Secrets (volumes and valueFrom) and ConfigMaps, no
-# command or args.
+# command or args, no exec probe but `traefik healthcheck --ping`, no
+# lifecycle hook but sleep. A Traefik pod in portcullis-ingress (Task 19's
+# DaemonSet) is also held to the policy's volume kinds (emptyDir,
+# configMap, secret, projected): the chart's acme PVC must be gone by then
+# (today's Traefik is the core namespace's Deployment).
 def check_ingress_allowlists(docs):
     pol = next(d for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "policies.yaml").read_text())
                if d and d["metadata"]["name"] == "portcullis-ingress-pods")
@@ -619,9 +624,17 @@ def check_ingress_allowlists(docs):
             continue
         found = True
         spec = pod_spec_of(d)
+        in_ingress = d["metadata"].get("namespace") == "portcullis-ingress"
         for c in spec["containers"]:
             if c.get("command") or c.get("args") or c.get("envFrom"):
                 F.add("traefik: command / args / envFrom (portcullis-ingress-pods refuses them)")
+            for pr in ("startupProbe", "livenessProbe", "readinessProbe"):
+                ex = c.get(pr, {}).get("exec")
+                if ex is not None and ex.get("command") != ["traefik", "healthcheck", "--ping"]:
+                    F.add(f"traefik: {pr} exec {ex} (only traefik healthcheck --ping)")
+            for hk, h in c.get("lifecycle", {}).items():
+                if set(h) - {"sleep"}:
+                    F.add(f"traefik: lifecycle {hk} {h} (sleep only)")
             for e in c.get("env", []):
                 if e["name"] not in var["traefikEnv"]:
                     F.add(f"traefik: env {e['name']} not in portcullis-ingress-pods' traefikEnv")
@@ -629,6 +642,9 @@ def check_ingress_allowlists(docs):
                 if e.get("valueFrom") and (not ref or ref["name"] not in var["traefikSecrets"]):
                     F.add(f"traefik: env {e['name']} from {e['valueFrom']} (only secretKeyRef of traefikSecrets)")
         for v in spec.get("volumes", []):
+            kinds = set(v) - {"name"}
+            if in_ingress and not kinds <= {"emptyDir", "configMap", "secret", "projected"}:
+                F.add(f"traefik in portcullis-ingress: volume {v['name']} {sorted(kinds)} (only emptyDir, configMap, secret, projected)")
             srcs = v.get("projected", {}).get("sources", []) + [v]
             for s in srcs:
                 if "configMap" in s and s["configMap"]["name"] not in var["traefikConfigMaps"]:

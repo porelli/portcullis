@@ -4946,6 +4946,25 @@ expect_eq "KUBE_BINDINGS lists portcullis-nodeadm-guard-tokens (and the other HA
   "$(for b in portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods; do case " $KUBE_BINDINGS " in *" $b "*) printf y ;; *) printf n ;; esac; done):$(printf '%s\n' $KUBE_BINDINGS | grep -c 'nodeadm-guard-admission')" yyy:0
 expect_eq "cluster setup applies the two policy files (KUBE_POLICY_FILES), never a binding of them" \
   "$KUBE_POLICY_FILES:$(grep -c 'kind: ValidatingAdmissionPolicyBinding' "$HERE/../kube/admission/nodeadm-tokens.yaml" "$HERE/../kube/admission/policies.yaml" | awk -F: '{s += $2} END {print s}')" "policies.yaml nodeadm-tokens.yaml:0"
+# Every pod the CLI builds itself (keygen, the volume helpers) names
+# portcullis-core (Task 18 ruling I5); only the server dry-run probes don't.
+expect_eq "the CLI's jq-built pods name priorityClassName portcullis-core (the dry-run probes aside)" \
+  "$(python3 - "$HERE"/../scripts/lib/*.sh <<'PY3'
+import re, sys
+bad = []
+for f in sys.argv[1:]:
+    lines = open(f).read().split("\n")
+    fn = ""
+    for i, l in enumerate(lines):
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{", l)
+        if m:
+            fn = m.group(1)
+        if 'kind: "Pod"' in l and fn not in ("_kube_probe_object", "_kube_probe_ha"):
+            if 'priorityClassName: "portcullis-core"' not in "\n".join(lines[i:i + 4]):
+                bad.append(f"{f.rsplit('/', 1)[-1]}:{i + 1} ({fn})")
+print(" ".join(bad))
+PY3
+)" ""
 expect_eq "cluster setup applies kube/priorityclasses.yaml (server-side) before the storage step (the provisioner names portcullis-core)" \
   "$(awk '/apply --server-side .* -f .*kube\/priorityclasses.yaml/ { p = NR } /apply --server-side .* -f .*kube\/storage\/namespace.yaml/ { s = NR } END { print (p > 0 && p < s) ? "first" : "p=" p " s=" s }' "$KS/kubectl-calls")" first
 expect_eq "the CLI's KUBE_BINDINGS = bindings.yaml's names" \
