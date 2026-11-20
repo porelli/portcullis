@@ -1,0 +1,24 @@
+{{- /* The five PriorityClasses (NEW, HA; plan Global Constraints, contract
+§20.1): portcullis-core for every core pod (portcullis.deployment and the
+one-shots set it), the four app classes the Hub's translator renders
+(state.yaml availability.priority; the admission policy keeps
+portcullis-core off app pods, contract §6). globalDefault only on
+portcullis-normal: a pod without a class gets it. portcullis-low never
+preempts. Rendered always (an app pod naming a missing class is refused). */ -}}
+{{- range $c := list (list "portcullis-core" 1000000 "PreemptLowerPriority" "Core pods: sign-in, the gates, the Hub, data.")
+                     (list "portcullis-critical" 100000 "PreemptLowerPriority" "Apps at priority critical.")
+                     (list "portcullis-high" 10000 "PreemptLowerPriority" "Apps at priority high.")
+                     (list "portcullis-normal" 1000 "PreemptLowerPriority" "Apps at priority normal (the default).")
+                     (list "portcullis-low" 100 "Never" "Apps at priority low: never preempts.") }}
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ index $c 0 }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+value: {{ index $c 1 }}
+globalDefault: {{ eq (index $c 0) "portcullis-normal" }}
+preemptionPolicy: {{ index $c 2 }}
+description: {{ index $c 3 | quote }}
+{{- end }}

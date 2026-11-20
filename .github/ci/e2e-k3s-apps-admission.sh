@@ -15,7 +15,10 @@
 #   old objects  UPDATE / DELETE of NetworkPolicies (default-deny included),
 #             Services, Secrets and claims only when the old object is owner=hub
 #   template files: only the instance's own <instance>--tpl-*
-# Then a real one-shot Job, whose pod the job controller creates, runs as uid 0.
+# Then a real one-shot Job, whose pod the job controller creates, runs as uid 0,
+# and (HA) every "ha" case of tests/admission_vectors.json
+# (.github/ci/e2e-k3s-ha-admission.py: placement, core exec, nodeadm tokens
+# and params ConfigMaps, portcullis-ingress).
 #   bash .github/ci/e2e-k3s-apps-admission.sh [<context>]   (default ci)
 set -euo pipefail
 CTX="${1:-ci}"
@@ -287,4 +290,6 @@ if ! K -n "$APPS" wait --for=condition=Complete job/e2e-apps-oneshot --timeout=1
   fail "the one-shot Job's pod didn't complete"
 fi
 [ "$(K -n "$APPS" logs job/e2e-apps-oneshot)" = 0 ] || fail "the one-shot pod didn't run as uid 0"
+# The HA vectors (Task 18): placement, core exec, nodeadm, portcullis-ingress.
+python3 -I "$(dirname "$0")/e2e-k3s-ha-admission.py" "$CTX" || fail "the HA admission vectors (see above)"
 echo "PASS: apps admission: $(wc -l < "$CNT/admit" | tr -d ' ') shapes admitted, $(wc -l < "$CNT/refuse" | tr -d ' ') refused by their bindings; a one-shot Job ran as uid 0"

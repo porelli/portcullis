@@ -152,8 +152,10 @@ copies="charts/portcullis/files/hub-role.yaml=internal/runtime/kube/testdata/rol
 copies="$copies tests/published_docs.json=internal/publish/testdata/published_docs.json"
 copies="$copies nodeadm/testdata/joincode_v2_vectors.json=internal/servers/testdata/joincode_v2_vectors.json"
 copies="$copies nodeadm/testdata/site_roles_vectors.json=internal/servers/testdata/site_roles_vectors.json"
+# The admission vectors (the HA cases run in e2e-k3s-apps-admission.sh).
+copies="$copies tests/admission_vectors.json=internal/runtime/kube/testdata/admission_vectors.json"
 if [ -d kube/admission ]; then
-  for f in kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/params.yaml; do
+  for f in kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/params.yaml kube/admission/nodeadm-tokens.yaml kube/admission/nodeadm-admission.yaml; do
     copies="$copies $f=internal/runtime/kube/testdata/admission/${f##*/}"
   done
 fi

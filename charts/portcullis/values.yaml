@@ -165,6 +165,11 @@ storageNamespace: portcullis-storage
 # never a Secret (Traefik's CRD provider lists every Secret of each watched
 # namespace, so the core and apps namespaces are never watched).
 edgeNamespace: portcullis-edge
+# NEW (HA): Traefik's own namespace (PSA privileged for hostPort 80/443;
+# the admission policy portcullis-ingress-pods admits only its DaemonSet's
+# pod shape there). Created by ./portcullis (kube_cluster_setup), like the
+# others.
+ingressNamespace: portcullis-ingress
 
 # rt_run (K16): the one-shot to render (templates/oneshot.yaml), set by
 # ./portcullis only with helm template --show-only.

@@ -154,6 +154,8 @@ spec:
       {{- end }}
       automountServiceAccountToken: {{ $s.token | default false }}
       enableServiceLinks: false
+      {{- /* NEW (HA): every core pod (templates/priorityclasses.yaml). */}}
+      priorityClassName: portcullis-core
       {{- with $s.grace }}
       terminationGracePeriodSeconds: {{ . }}
       {{- end }}

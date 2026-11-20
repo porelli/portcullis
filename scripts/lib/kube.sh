@@ -24,9 +24,11 @@ KUBE_STORAGE_NS="portcullis-storage"
 # Traefik's only watched namespace (the chart's edgeNamespace): the core
 # IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
 KUBE_EDGE_NS="portcullis-edge"
-# The six admission bindings (kube/admission/bindings.yaml), live as
-# <name>-<params generation> (kube_admission_params_apply).
-KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes"
+# The ten admission bindings (kube/admission/bindings.yaml), live as
+# <name>-<params generation> (kube_admission_params_apply); the last four are
+# NEW (HA): the core namespace's exec guard, nodeadm's two, and Traefik's
+# namespace (contract §6).
+KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-nodeadm-guard-admission portcullis-ingress-guard-pods"
 KUBE_PROBE_NS="portcullis-netpol-probe"
 KUBE_MANAGED_LABEL="app.kubernetes.io/managed-by"
 KUBE_INSTALL_ANNOTATION="portcullis.io/install"
@@ -747,7 +749,7 @@ kube_vpn_reserved() {
 }
 
 # kube_status_extra — status --json's kubernetes fields: netpol (the CLI's
-# probe ConfigMap), admission (the six bindings), dns_shadows (an app
+# probe ConfigMap), admission (the ten bindings), dns_shadows (an app
 # Service named like a core one), kube_api_public (K8).
 # kube_crashing_json — the Deployments of both namespaces whose live pods
 # crash: a container waiting in CrashLoopBackOff / Error / an image pull
@@ -874,7 +876,7 @@ _kube_apply_files() {
   done
 }
 
-# kube_psa <core|apps|storage|edge> — the namespace's PSA levels
+# kube_psa <core|apps|storage|edge|ingress> — the namespace's PSA levels
 # "<enforce> <warn> <audit>" from charts/portcullis/namespaces.json (the
 # chart renders the same file); fails on anything but three known levels.
 kube_psa() {
@@ -912,7 +914,8 @@ kube_admission_params() {
   local me
   me="$(kube_ctl auth whoami -o json 2>/dev/null | jq -r '.status.userInfo.username // empty' 2>/dev/null || true)"
   [ -n "$me" ] || fail "can't tell this CLI's own identity (kubectl auth whoami): refusing to write admission params"
-  local reserved maxprio
+  local reserved maxprio traefik
+  traefik="$(kube_traefik_image)" || exit 1
   reserved="$(kube_reserved_hosts)" || exit 1
   maxprio="$(jq -r '.maxAppPriority | select(type == "number" and . >= 0)' "$PORTCULLIS_HOME/charts/portcullis/core-routes.json" 2>/dev/null || true)"
   [ -n "$maxprio" ] || fail "charts/portcullis/core-routes.json has no maxAppPriority: refusing to write admission params"
@@ -935,7 +938,9 @@ kube_admission_params() {
     edgeNamespace "$KUBE_EDGE_NS" \
     edgeCoreMiddlewares "$KUBE_EDGE_CORE_MIDDLEWARES" \
     reservedHosts "$reserved" \
-    maxAppPriority "$maxprio"
+    maxAppPriority "$maxprio" \
+    nodeadmServiceAccount "$KUBE_NODEADM_SA" \
+    traefikImage "$traefik"
 }
 
 # kube_reserved_hosts — every host a core route serves (the chart's
@@ -952,7 +957,7 @@ kube_reserved_hosts() {
 # hex), create-before-delete so no object is ever unbound (contract K6):
 #   1. ConfigMap portcullis-admission-params-<gen> (kube_admission_params +
 #      generation; replaced whole);
-#   2. bindings.yaml's six bindings as <name>-<gen> on those params (labels
+#   2. bindings.yaml's ten bindings as <name>-<gen> on those params (labels
 #      portcullis.io/binding = the base name, portcullis.io/params-generation);
 #      older generations' bindings stay and judge too (stricter, fail safe);
 #   3. kube_admission_probe <gen>: the <gen> bindings are live with these
@@ -962,8 +967,10 @@ kube_reserved_hosts() {
 #   5. every owner=hub object in the edge namespace is re-judged (server
 #      dry-run replace as the probe identity); one the policies now refuse
 #      is deleted and named.
-# The bindings select the apps namespace (kube_apps_ns) and the edge one by
-# name: bindings.yaml's portcullis-apps / portcullis-edge are rewritten.
+# The bindings select the apps namespace (kube_apps_ns), the edge one and
+# (HA) the core namespace (kube_ns), kube-system and portcullis-ingress by
+# name: bindings.yaml's portcullis-apps / portcullis-edge / portcullis are
+# rewritten.
 # A ConfigMap is never replaced under a live binding, so the API server's
 # stale-params cache (seen on k3s 1.37 after a key-set change) can't apply.
 kube_admission_params_apply() {
@@ -982,12 +989,13 @@ kube_admission_params_apply() {
   kube_ctl create configmap "portcullis-admission-params-$gen" -n "$pns" --from-file="$tmp/data" --dry-run=client -o json \
     | G="$gen" jq '.metadata.labels = {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/params-generation": env.G}' > "$tmp/params.json" \
     && kube_ctl create -f "$adm/bindings.yaml" --dry-run=client -o json \
-    | G="$gen" NS="$pns" APPS="$(kube_apps_ns)" EDGE="$KUBE_EDGE_NS" jq -s '{apiVersion: "v1", kind: "List", items: [.[] | (if .kind == "List" then .items[] else . end)
+    | G="$gen" NS="$pns" APPS="$(kube_apps_ns)" EDGE="$KUBE_EDGE_NS" INGRESS="$KUBE_INGRESS_NS" jq -s '{apiVersion: "v1", kind: "List", items: [.[] | (if .kind == "List" then .items[] else . end)
         | .metadata.labels = {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/binding": .metadata.name, "portcullis.io/params-generation": env.G}
         | .metadata.name += "-" + env.G
         | .spec.paramRef.name = "portcullis-admission-params-" + env.G | .spec.paramRef.namespace = env.NS
         | .spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"] |=
-            ({"portcullis-apps": env.APPS, "portcullis-edge": env.EDGE}[.] // error("a binding selects namespace \(.), neither portcullis-apps nor portcullis-edge"))]}' > "$tmp/bindings.json" \
+            ({"portcullis-apps": env.APPS, "portcullis-edge": env.EDGE, "portcullis": env.NS, "kube-system": "kube-system", "portcullis-ingress": env.INGRESS}[.]
+              // error("a binding selects namespace \(.), none of portcullis-apps, portcullis-edge, portcullis, kube-system, portcullis-ingress"))]}' > "$tmp/bindings.json" \
     || { rm -rf "$tmp"; fail "could not build the admission params / bindings"; }
   [ "$(jq '.items | length' "$tmp/bindings.json")" = "$(printf '%s\n' $KUBE_BINDINGS | wc -l | tr -d ' ')" ] \
     || { rm -rf "$tmp"; fail "kube/admission/bindings.yaml doesn't hold the $(printf '%s\n' $KUBE_BINDINGS | wc -l | tr -d ' ') bindings KUBE_BINDINGS names"; }
@@ -1078,9 +1086,13 @@ _kube_hub_sa() { echo "system:serviceaccount:$(kube_ns):portcullis-hub"; }
 # admission), server dry-run, nothing kept:
 #   - one object per policy annotated portcullis.io/params-generation=<gen>
 #     (a Pod, a Deployment, a Service, an apps IngressRoute, a NetworkPolicy,
-#     an edge IngressRoute) is refused by <binding>-<gen> naming <gen> (each
-#     policy refuses exactly its own params' generation first; older
-#     generations' bindings let it by);
+#     an edge IngressRoute; HA: a pod of portcullis-ingress, and as nodeadm's
+#     ServiceAccount a bootstrap token Secret in kube-system and a params
+#     ConfigMap in the core namespace; an exec can't be dry-run, so the exec
+#     guard's probe is the Hub's `hub rev /hub-data probe-<gen>` in a reader
+#     pod name, refused before anything runs) is refused by <binding>-<gen>
+#     naming <gen> (each policy refuses exactly its own params' generation
+#     first; older generations' bindings let it by);
 #   - a route on a reserved host is refused by an edge binding;
 #   - the same route on a free host, unannotated, is admitted.
 # Retried for KUBE_ADMISSION_PROBE_WAIT seconds (60).
@@ -1115,6 +1127,7 @@ _kube_probe_object() {
   local b="$1" ns kind
   case "$b" in
     portcullis-edge-guard-routes) _kube_probe_route "portcullis-admission-probe.${PORTCULLIS_DOMAIN,,}" "$2"; return ;;
+    portcullis-core-guard-exec|portcullis-nodeadm-guard-*|portcullis-ingress-guard-pods) _kube_probe_ha "$b" "$2"; return ;;
     portcullis-apps-guard-pods) kind=Pod ;;
     portcullis-apps-guard-workloads) kind=Deployment ;;
     portcullis-apps-guard-services) kind=Service ;;
@@ -1172,12 +1185,14 @@ _kube_configmap_from() {
 #               privileged: its helpers need hostPath; warn / audit
 #               baseline; pinned by kube/storage/admission.yaml),
 #               portcullis-edge (restricted: Traefik's only watched
-#               namespace, no pod, no Secret), all with K11's label +
+#               namespace, no pod, no Secret), portcullis-ingress (NEW, HA:
+#               privileged, Traefik's DaemonSet with hostPort 80/443; pinned
+#               by portcullis-ingress-pods), all with K11's label +
 #               annotation;
 #   storage     the provisioner portcullis.io/local-path (kube/storage),
 #               its ConfigMap, the StorageClasses, its deny policy + API egress;
 #   crds        the Traefik CRDs (K14: kubectl --server-side, never Helm);
-#   admission   the six VAPs and their six bindings (kube/admission);
+#   admission   the ten VAPs and their ten bindings (kube/admission);
 #   params      portcullis-admission-params: the Hub's resolved digest
 #               (KUBE_HUB_IMAGE, name@sha256:…), roots, ports, networks, peers.
 kube_cluster_setup() {
@@ -1190,8 +1205,8 @@ kube_cluster_setup() {
 
   info "Cluster setup: namespaces..."
   local role nsn psa
-  for role in core apps storage edge; do
-    case "$role" in core) nsn="$(kube_ns)" ;; apps) nsn="$(kube_apps_ns)" ;; storage) nsn="$KUBE_STORAGE_NS" ;; edge) nsn="$KUBE_EDGE_NS" ;; esac
+  for role in core apps storage edge ingress; do
+    case "$role" in core) nsn="$(kube_ns)" ;; apps) nsn="$(kube_apps_ns)" ;; storage) nsn="$KUBE_STORAGE_NS" ;; edge) nsn="$KUBE_EDGE_NS" ;; ingress) nsn="$KUBE_INGRESS_NS" ;; esac
     psa="$(kube_psa "$role")" || exit 1
     # shellcheck disable=SC2086  # three single-word levels
     kube_namespace_apply "$nsn" $psa || fail "could not create the namespace $nsn"
@@ -1227,8 +1242,10 @@ kube_cluster_setup() {
 
   info "Cluster setup: admission policies..."
   # The bindings are per params generation (kube_admission_params_apply).
-  _kube_apply_files "$adm/policies.yaml" || fail "could not apply the admission policies (see above): nothing recorded"
-  _kube_applied_set cluster.admission "$(_kube_sha "$adm/policies.yaml")"
+  local pf=() f
+  for f in $KUBE_POLICY_FILES; do pf+=("$adm/$f"); done
+  _kube_apply_files "${pf[@]}" || fail "could not apply the admission policies (see above): nothing recorded"
+  _kube_applied_set cluster.admission "$(_kube_sha "${pf[@]}")"
 
   info "Cluster setup: admission params..."
   kube_admission_params_apply "$hub"
@@ -1612,7 +1629,7 @@ kube_health_report() {
 }
 
 # kube_cluster_check — the Hub's cluster check input (contract §6): the apps
-# namespace's PSA labels and the six bindings, written as the ConfigMap
+# namespace's PSA labels and the ten bindings, written as the ConfigMap
 # portcullis-cluster-check (checked_at RFC 3339 UTC, ok true|false, why).
 # The Hub refuses every runtime operation once it is 24 h old: `up` writes
 # it, and so does `kube check`, which the portcullis-kube-check.timer init
@@ -2275,7 +2292,7 @@ help_kube_check() {
 Usage: portcullis kube check
 
 Kubernetes only. Re-checks the apps namespace's Pod Security labels and the
-six admission bindings and writes the result into the ConfigMap
+ten admission bindings and writes the result into the ConfigMap
 portcullis-cluster-check (checked_at, ok, why), which the Hub reads: it
 refuses every runtime operation while the check failed or is more than 24 h
 old. `up` writes it too; init installs portcullis-kube-check.timer, which

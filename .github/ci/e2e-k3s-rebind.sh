@@ -4,7 +4,7 @@
 # (real creates, `kubectl --as`), the params change twice through
 # `./portcullis up` (HUB_OVERRIDE_BIND_ROOTS → bindRoots → a new params
 # generation, then back). Not one create may be admitted; every refusal comes
-# from an edge binding; afterwards exactly one generation's six bindings.
+# from an edge binding; afterwards exactly one generation's ten bindings.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 K() { kubectl --context ci "$@"; }

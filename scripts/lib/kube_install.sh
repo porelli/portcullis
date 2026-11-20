@@ -516,3 +516,62 @@ kube_cluster_addresses() {
   fi
   _K_ERR=""
 }
+
+# ── HA admission (plan Task 18; contract §6): the four HA bindings' objects ──
+
+# The admission policy files (kube/admission): policies.yaml and nodeadm's two.
+# shellcheck disable=SC2034  # read by kube.sh (kube_cluster_setup)
+KUBE_POLICY_FILES="policies.yaml nodeadm-tokens.yaml nodeadm-admission.yaml"
+# NEW (HA): Traefik's own namespace (PSA privileged for hostPort 80/443;
+# portcullis-ingress-pods admits only its DaemonSet's pod shape there), and
+# nodeadm's ServiceAccount (params nodeadmServiceAccount, contract §20.2).
+KUBE_INGRESS_NS="portcullis-ingress"
+KUBE_NODEADM_SA="system:serviceaccount:portcullis-nodeadm:nodeadm"
+
+# kube_traefik_image — Traefik's image by digest for params traefikImage:
+# the resolved one (_K_IMAGES), else images.json's pin (name:tag@sha256:…).
+kube_traefik_image() {
+  local t
+  t="$(printf '%s' "${_K_IMAGES:-}" | jq -r '.traefik // empty' 2>/dev/null || true)"
+  [ -n "$t" ] || t="$(jq -r '.images.traefik | if type == "object" then .tag_ref else . end | capture("^(?<n>.+):[^/:@]+@(?<d>sha256:[0-9a-f]{64})$") | .n + "@" + .d' \
+    "$PORTCULLIS_HOME/charts/portcullis/images.json" 2>/dev/null || true)"
+  [[ "$t" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] \
+    || fail "Traefik's image isn't resolved to a digest (images.traefik=${t:-unset}): refusing to write admission params for portcullis-ingress"
+  printf '%s\n' "$t"
+}
+
+# _kube_probe_ha <binding> <gen> — the HA bindings' probes (contract §6
+# "The probe"), each otherwise admissible by every generation's policy:
+#   exec      the Hub's exec of `hub rev /hub-data probe-<gen>` in the
+#             reader pod name group-gate-portcullis-admission-probe (no pod
+#             needed: admission answers before the pod is looked up);
+#   tokens    as nodeadm, a canonical bootstrap token Secret (expiring in
+#             10 min) in kube-system;
+#   admission as nodeadm, the ConfigMap portcullis-admission-params-<16 x 0>
+#             in the core namespace;
+#   ingress   a pod of portcullis-ingress (another generation's binding lets
+#             a dry run annotated with its generation by).
+_kube_probe_ha() {
+  local b="$1" g="$2" cns m
+  cns="$(kube_ns)"
+  m="$(G="$g" jq -nc '{name: "portcullis-admission-probe", annotations: {"portcullis.io/params-generation": env.G}}')"
+  case "$b" in
+    portcullis-core-guard-exec)
+      kube_ctl --as="$(_kube_hub_sa)" --as-group=system:masters create --raw \
+        "/api/v1/namespaces/$cns/pods/group-gate-portcullis-admission-probe/exec?command=/portcullis-bin/hub&command=rev&command=/hub-data&command=probe-$g&stdout=true&stderr=true" \
+        -f - < /dev/null ;;
+    portcullis-nodeadm-guard-tokens)
+      M="$m" jq -n '{apiVersion: "v1", kind: "Secret", metadata: (env.M | fromjson | .name = "bootstrap-token-pcprob"),
+          type: "bootstrap.kubernetes.io/token",
+          stringData: {"token-id": "pcprob", "token-secret": "portcullisprobe0", "expiration": (now + 600 | floor | strftime("%Y-%m-%dT%H:%M:%SZ")),
+            "usage-bootstrap-authentication": "true", "auth-extra-groups": "system:bootstrappers:k3s:default-node-token"}}' \
+        | kube_ctl -n kube-system --as="$KUBE_NODEADM_SA" --as-group=system:masters create --dry-run=server -f - ;;
+    portcullis-nodeadm-guard-admission)
+      M="$m" jq -n '{apiVersion: "v1", kind: "ConfigMap", metadata: (env.M | fromjson | .name = "portcullis-admission-params-0000000000000000")}' \
+        | kube_ctl -n "$cns" --as="$KUBE_NODEADM_SA" --as-group=system:masters create --dry-run=server -f - ;;
+    portcullis-ingress-guard-pods)
+      M="$m" IMG="${KUBE_HUB_IMAGE:-$PORTCULLIS_HELPER_IMAGE}" jq -n '{apiVersion: "v1", kind: "Pod", metadata: (env.M | fromjson),
+          spec: {automountServiceAccountToken: false, containers: [{name: "c", image: env.IMG, command: ["true"]}]}}' \
+        | kube_ctl -n "$KUBE_INGRESS_NS" --as="$(_kube_hub_sa)" --as-group=system:masters create --dry-run=server -f - ;;
+  esac
+}

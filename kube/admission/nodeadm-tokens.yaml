@@ -1,0 +1,92 @@
+# portcullis-nodeadm-tokens (NEW, HA; contract §6 "nodeadm tokens", §20.2):
+# nodeadm's Role in kube-system is `secrets create`, which RBAC can't narrow
+# by type or content. Bound by portcullis-nodeadm-guard-tokens (bindings.yaml)
+# to kube-system, it judges only nodeadmServiceAccount's Secret creates and
+# updates (kube-system's other Secrets are written by k3s and the cluster's
+# controllers, which this policy must not block): a bootstrap token Secret
+# only, expiring within 15 minutes of its creation (an admission policy has
+# no clock: metadata.creationTimestamp is the API server's now on a create),
+# usable for authentication only ("true" = dHJ1ZQ==), carrying exactly the k3s
+# node-token group (c3lzdGVtOmJvb3RzdHJhcHBlcnM6azNzOmRlZmF1bHQtbm9kZS10b2tlbg==).
+# Core is this file's only editor; the Hub keeps a byte copy in
+# internal/runtime/kube/testdata/admission/ (envtest vectors).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-nodeadm-tokens
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ''
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - secrets
+  variables:
+  - name: nodeadm
+    expression: "params.data.nodeadmServiceAccount != '' && request.userInfo.username == params.data.nodeadmServiceAccount"
+  - name: data
+    expression: 'has(object.data) ? object.data : {}'
+  # Secret data reaches CEL as base64 text (no decoder before Kubernetes
+  # 1.37's base64 library): the fixed values are compared in base64, and the
+  # expiration, 'YYYY-MM-DDTHH:MM:SSZ' only (RFC 3339 in UTC, whole
+  # seconds: 20 bytes, 28 base64 characters), is decoded byte by byte here
+  # (exp: the 20 byte values; [] for any other shape).
+  - name: exp
+    expression: >-
+      ('expiration' in variables.data && string(variables.data['expiration']).matches('^[A-Za-z0-9+/]{27}=$'))
+      ? [string(variables.data['expiration'])].map(e, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19].map(i,
+          ((e.charAt(i / 3 * 4 + 0) == '=' ? 0 : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(e.charAt(i / 3 * 4 + 0))) * 262144 + (e.charAt(i / 3 * 4 + 1) == '=' ? 0 : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(e.charAt(i / 3 * 4 + 1))) * 4096 + (e.charAt(i / 3 * 4 + 2) == '=' ? 0 : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(e.charAt(i / 3 * 4 + 2))) * 64 + (e.charAt(i / 3 * 4 + 3) == '=' ? 0 : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(e.charAt(i / 3 * 4 + 3)))) / (i % 3 == 0 ? 65536 : (i % 3 == 1 ? 256 : 1)) % 256))[0]
+      : []
+  # The expiration as the number YYYYMMDDHHMMSS (-1 for any other shape), and
+  # the API server's now + 15 minutes the same way (an admission policy has
+  # no clock: metadata.creationTimestamp is set to now before validation).
+  - name: expNum
+    expression: >-
+      size(variables.exp) == 20 && variables.exp[4] == 45 && variables.exp[7] == 45 && variables.exp[10] == 84
+      && variables.exp[13] == 58 && variables.exp[16] == 58 && variables.exp[19] == 90
+      && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18].all(d, variables.exp[d] >= 48 && variables.exp[d] <= 57)
+      ? (variables.exp[0] - 48) * 10000000000000 + (variables.exp[1] - 48) * 1000000000000 + (variables.exp[2] - 48) * 100000000000 + (variables.exp[3] - 48) * 10000000000 + (variables.exp[5] - 48) * 1000000000 + (variables.exp[6] - 48) * 100000000 + (variables.exp[8] - 48) * 10000000 + (variables.exp[9] - 48) * 1000000 + (variables.exp[11] - 48) * 100000 + (variables.exp[12] - 48) * 10000 + (variables.exp[14] - 48) * 1000 + (variables.exp[15] - 48) * 100 + (variables.exp[17] - 48) * 10 + (variables.exp[18] - 48) * 1
+      : -1
+  - name: bound
+    expression: string(timestamp(string(object.metadata.creationTimestamp)) + duration('15m'))
+  - name: boundNum
+    expression: >-
+      int(variables.bound.substring(0, 4) + variables.bound.substring(5, 7) + variables.bound.substring(8, 10)
+      + variables.bound.substring(11, 13) + variables.bound.substring(14, 16) + variables.bound.substring(17, 19))
+  validations:
+  - expression: >-
+      !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+  - expression: |-
+      !variables.nodeadm || (
+        has(object.type) && object.type == 'bootstrap.kubernetes.io/token'
+      )
+    message: nodeadm may create only bootstrap token Secrets in kube-system
+  - expression: |-
+      !variables.nodeadm || (
+        variables.expNum >= 0 && variables.expNum <= variables.boundNum
+      )
+    message: bootstrap tokens must expire within 15 minutes
+  - expression: |-
+      !variables.nodeadm || (
+        size(variables.data) <= 32
+        && variables.data.all(k, !k.startsWith('usage-bootstrap-') || k == 'usage-bootstrap-authentication')
+        && 'usage-bootstrap-authentication' in variables.data && string(variables.data['usage-bootstrap-authentication']) == 'dHJ1ZQ=='
+      )
+    message: bootstrap tokens may be used for authentication only
+  - expression: |-
+      !variables.nodeadm || (
+        'auth-extra-groups' in variables.data
+        && string(variables.data['auth-extra-groups']) == 'c3lzdGVtOmJvb3RzdHJhcHBlcnM6azNzOmRlZmF1bHQtbm9kZS10b2tlbg=='
+      )
+    message: bootstrap tokens may carry only the group system:bootstrappers:k3s:default-node-token

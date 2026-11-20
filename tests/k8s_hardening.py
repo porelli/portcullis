@@ -43,6 +43,8 @@ RESTRICTED_VOLUMES = {"configMap", "csi", "downwardAPI", "emptyDir", "ephemeral"
 def check_pod(name, ns, labels, spec, ann):
     if labels.get("portcullis.io/component") is None:
         F.add(f"{name}: no portcullis.io/component label")
+    if spec.get("priorityClassName") != "portcullis-core":
+        F.add(f"{name}: priorityClassName {spec.get('priorityClassName')} (every core pod: portcullis-core)")
     if not any(k.startswith("portcullis.io/net-") for k in labels) and labels.get("portcullis.io/component") not in ("hub-oneshot",):
         F.add(f"{name}: no portcullis.io/net-* label")
     tok = spec.get("automountServiceAccountToken")
@@ -367,6 +369,8 @@ def main():
     check_frontdoor()
     check_log_ports()
     check_psa()
+    check_priorities(docs)
+    check_core_exec()
     # Every PVC a pod claims is rendered, with and without the optional
     # profiles (compose's named volumes exist in every profile), and in HA.
     for extra in (None, {"wg": {"enabled": False}}, {"ha": {"enabled": True}}):
@@ -382,10 +386,12 @@ def main():
 
 # The PSA levels: charts/portcullis/namespaces.json is the one source (the
 # CLI's kube_psa and templates/namespaces.yaml read it). Core and edge
-# restricted; apps (root one-shots) and storage (the helpers' hostPath)
+# restricted; apps (root one-shots), storage (the helpers' hostPath) and
+# (HA) ingress (Traefik's hostPort 80/443, pinned by portcullis-ingress-pods)
 # can't be stricter than enforce privileged, warn / audit baseline.
 PSA_WANT = {"core": ["restricted"] * 3, "apps": ["privileged", "baseline", "baseline"],
-            "storage": ["privileged", "baseline", "baseline"], "edge": ["restricted"] * 3}
+            "storage": ["privileged", "baseline", "baseline"], "edge": ["restricted"] * 3,
+            "ingress": ["privileged", "baseline", "baseline"]}
 
 
 def check_psa():
@@ -393,7 +399,7 @@ def check_psa():
     for role, want in PSA_WANT.items():
         if src.get(role) != want:
             F.add(f"namespaces.json {role}: {src.get(role)} (want {want})")
-    names = {"core": K.NS, "apps": K.APPS_NS, "storage": "portcullis-storage", "edge": K.EDGE_NS}
+    names = {"core": K.NS, "apps": K.APPS_NS, "storage": "portcullis-storage", "edge": K.EDGE_NS, "ingress": "portcullis-ingress"}
     ns = {d["metadata"]["name"]: d["metadata"].get("labels", {}) for d in K.by_kind(K.render({"renderNamespaces": True}), "Namespace")}
     for role, n in names.items():
         got = [ns.get(n, {}).get(f"pod-security.kubernetes.io/{m}") for m in ("enforce", "warn", "audit")]
@@ -402,6 +408,45 @@ def check_psa():
     kube = (K.ROOT / "scripts" / "lib" / "kube.sh").read_text()
     if re.search(r"kube_namespace_apply\s+\S+\s+(privileged|baseline|restricted)\b", kube) or re.search(r"(privileged|baseline|restricted),(privileged|baseline|restricted)", kube):
         F.add("scripts/lib/kube.sh spells PSA levels itself: kube_psa reads charts/portcullis/namespaces.json")
+
+
+# The PriorityClasses (NEW, HA; plan Global Constraints): exactly five,
+# globalDefault only on portcullis-normal, portcullis-low never preempts.
+PRIORITIES = {"portcullis-core": (1000000, "PreemptLowerPriority"), "portcullis-critical": (100000, "PreemptLowerPriority"),
+              "portcullis-high": (10000, "PreemptLowerPriority"), "portcullis-normal": (1000, "PreemptLowerPriority"),
+              "portcullis-low": (100, "Never")}
+
+
+def check_priorities(docs):
+    got = {d["metadata"]["name"]: (d["value"], d.get("preemptionPolicy"), d.get("globalDefault", False)) for d in K.by_kind(docs, "PriorityClass")}
+    want = {n: (v, p, n == "portcullis-normal") for n, (v, p) in PRIORITIES.items()}
+    if got != want:
+        F.add(f"PriorityClasses {got} != {want}")
+
+
+# portcullis-core-exec (NEW, HA; contract §6 "core exec"): its document
+# literals are tests/published_docs.json's: /vpn-doc vpn, /hub-data the
+# other seven; the reader pod prefixes are the documents' readers.
+def check_core_exec():
+    pol = next((d for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "policies.yaml").read_text())
+                if d and d.get("metadata", {}).get("name") == "portcullis-core-exec"), None)
+    if not pol:
+        F.add("kube/admission/policies.yaml has no portcullis-core-exec")
+        return
+    expr = "\n".join(v["expression"] for v in pol["spec"]["validations"])
+    docs = json.loads((K.ROOT / "tests" / "published_docs.json").read_text())
+    by_mount = {}
+    for d in docs:
+        by_mount.setdefault(d["mount"], []).append(d["doc"])
+    hub = re.search(r"variables\.cmd\[2\] == '/hub-data'\s*&& \(variables\.cmd\[3\] in \[([^\]]*)\]", expr)
+    vpn = re.findall(r"variables\.cmd\[2\] == '/vpn-doc' && variables\.cmd\[3\] == '([^']*)'", expr)
+    hub_docs = re.findall(r"'([^']*)'", hub.group(1)) if hub else None
+    if hub_docs != by_mount.get("/hub-data") or vpn != by_mount.get("/vpn-doc"):
+        F.add(f"portcullis-core-exec documents /hub-data {hub_docs}, /vpn-doc {vpn} != tests/published_docs.json {by_mount}")
+    prefixes = re.search(r"\[([^\]]*)\]\.exists\(p, request\.name\.startsWith\(p\)\)", expr)
+    readers = sorted({r + "-" for d in docs for r in d["readers"]})
+    if not prefixes or sorted(re.findall(r"'([^']*)'", prefixes.group(1))) != readers:
+        F.add(f"portcullis-core-exec reader pods {prefixes and prefixes.group(1)} != the documents' readers {readers}")
 
 
 APP_ENTRYPOINTS = {"web", "websecure", "vpnsecure"}

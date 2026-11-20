@@ -115,6 +115,14 @@ spec:
     expression: >-
       string(cidr(params.data.serviceCIDR).ip()) + '/' + string(32 - ((32 - cidr(params.data.serviceCIDR).prefixLength()) - 4 < 4 ? 4
       : ((32 - cidr(params.data.serviceCIDR).prefixLength()) - 4 > 8 ? 8 : (32 - cidr(params.data.serviceCIDR).prefixLength()) - 4)))
+  # HA placement (contract §6 "placement"): the pod's required node
+  # affinity terms (none = []).
+  - name: requiredTerms
+    expression: >-
+      has(variables.spec.affinity) && has(variables.spec.affinity.nodeAffinity)
+      && has(variables.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution)
+      && has(variables.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms)
+      ? variables.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms : []
   validations:
   - expression: >-
       !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
@@ -345,6 +353,67 @@ spec:
     message: >-
       a probe pod: the Hub's image running hub helper listen|idle|dial, instance portcullis-probe, no volume, no
       capability, non-root, no other portcullis.io/ label
+  # HA placement (contract §6 "placement"; vectors tagged ha). Priority:
+  # only the four app classes (portcullis-core is core's; an unset class
+  # is the global default portcullis-normal on a pod, and its pods' on a
+  # template).
+  - expression: |-
+      variables.cli || (
+        !has(variables.spec.priorityClassName) || variables.spec.priorityClassName in ['portcullis-critical', 'portcullis-high', 'portcullis-normal', 'portcullis-low']
+      )
+    message: app pods may use only portcullis-critical|high|normal|low
+  # The small taint's toleration (or a keyless Exists toleration, which
+  # tolerates every taint) only with a required node affinity that has a
+  # term on portcullis.io/class In [small] and a class expression (In or
+  # NotIn [small]) in every term: a VAP can't read Node objects (R2).
+  - expression: |-
+      variables.cli || (
+        !has(variables.spec.tolerations) || (size(variables.spec.tolerations) <= 32
+          && !variables.spec.tolerations.exists(t, !has(t.key) || t.key == '' || t.key == 'portcullis.io/small'))
+        || (size(variables.requiredTerms) > 0 && size(variables.requiredTerms) <= 32
+          && variables.requiredTerms.exists(t, has(t.matchExpressions) && t.matchExpressions.exists(e,
+               e.key == 'portcullis.io/class' && e.operator == 'In' && has(e.values) && e.values == ['small']))
+          && variables.requiredTerms.all(t, has(t.matchExpressions) && size(t.matchExpressions) <= 32 && t.matchExpressions.exists(e,
+               e.key == 'portcullis.io/class' && e.operator in ['In', 'NotIn'] && has(e.values) && e.values == ['small'])))
+      )
+    message: the portcullis.io/small toleration needs a required node affinity on portcullis.io/class In [small]
+  # nodeName bypasses the scheduler, taints and affinity. (A scheduled
+  # pod has one: only a create is judged; the binding subresource sets it.)
+  - expression: |-
+      variables.cli || (
+        request.operation != 'CREATE' || !has(variables.spec.nodeName) || variables.spec.nodeName == ''
+      )
+    message: nodeName is refused
+  # Placement keys are node label keys of portcullis.io/* and
+  # kubernetes.io/hostname only (matchFields too); the labelSelector keys
+  # of pod affinity and spread are pod labels and aren't judged.
+  - expression: |-
+      variables.cli || (
+        (!has(variables.spec.nodeSelector) || (size(variables.spec.nodeSelector) <= 32 && variables.spec.nodeSelector.all(k, k.startsWith('portcullis.io/') || k == 'kubernetes.io/hostname')))
+        && (!has(variables.spec.topologySpreadConstraints) || (size(variables.spec.topologySpreadConstraints) <= 32
+            && variables.spec.topologySpreadConstraints.all(c, c.topologyKey.startsWith('portcullis.io/') || c.topologyKey == 'kubernetes.io/hostname')))
+        && (!has(variables.spec.affinity) || (
+          (!has(variables.spec.affinity.nodeAffinity) || (
+            (size(variables.requiredTerms) <= 32 && variables.requiredTerms.all(t,
+               (!has(t.matchExpressions) || (size(t.matchExpressions) <= 32 && t.matchExpressions.all(e, e.key.startsWith('portcullis.io/') || e.key == 'kubernetes.io/hostname')))
+               && (!has(t.matchFields) || (size(t.matchFields) <= 32 && t.matchFields.all(e, e.key.startsWith('portcullis.io/') || e.key == 'kubernetes.io/hostname')))))
+            && (!has(variables.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution)
+                || (size(variables.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution) <= 32
+                    && variables.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w,
+                 (!has(w.preference.matchExpressions) || (size(w.preference.matchExpressions) <= 32 && w.preference.matchExpressions.all(e, e.key.startsWith('portcullis.io/') || e.key == 'kubernetes.io/hostname')))
+                 && (!has(w.preference.matchFields) || (size(w.preference.matchFields) <= 32 && w.preference.matchFields.all(e, e.key.startsWith('portcullis.io/') || e.key == 'kubernetes.io/hostname'))))))))
+          && (!has(variables.spec.affinity.podAffinity) || (
+            (!has(variables.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) || (size(variables.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) <= 32
+                && variables.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey.startsWith('portcullis.io/') || t.topologyKey == 'kubernetes.io/hostname')))
+            && (!has(variables.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) || (size(variables.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) <= 32
+                && variables.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.podAffinityTerm.topologyKey.startsWith('portcullis.io/') || w.podAffinityTerm.topologyKey == 'kubernetes.io/hostname')))))
+          && (!has(variables.spec.affinity.podAntiAffinity) || (
+            (!has(variables.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution) || (size(variables.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution) <= 32
+                && variables.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey.startsWith('portcullis.io/') || t.topologyKey == 'kubernetes.io/hostname')))
+            && (!has(variables.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution) || (size(variables.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution) <= 32
+                && variables.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.podAffinityTerm.topologyKey.startsWith('portcullis.io/') || w.podAffinityTerm.topologyKey == 'kubernetes.io/hostname')))))))
+      )
+    message: topologySpreadConstraints and affinity may use only portcullis.io/* and kubernetes.io/hostname keys
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -499,6 +568,14 @@ spec:
     expression: >-
       string(cidr(params.data.serviceCIDR).ip()) + '/' + string(32 - ((32 - cidr(params.data.serviceCIDR).prefixLength()) - 4 < 4 ? 4
       : ((32 - cidr(params.data.serviceCIDR).prefixLength()) - 4 > 8 ? 8 : (32 - cidr(params.data.serviceCIDR).prefixLength()) - 4)))
+  # HA placement (contract §6 "placement"): the pod's required node
+  # affinity terms (none = []).
+  - name: requiredTerms
+    expression: >-
+      has(variables.spec.affinity) && has(variables.spec.affinity.nodeAffinity)
+      && has(variables.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution)
+      && has(variables.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms)
+      ? variables.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms : []
   validations:
   - expression: >-
       request.operation == 'DELETE' || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
@@ -745,6 +822,66 @@ spec:
     message: >-
       a probe pod: the Hub's image running hub helper listen|idle|dial, instance portcullis-probe, no volume, no
       capability, non-root, no other portcullis.io/ label
+  # HA placement (contract §6 "placement"; vectors tagged ha). Priority:
+  # only the four app classes (portcullis-core is core's; an unset class
+  # is the global default portcullis-normal on a pod, and its pods' on a
+  # template).
+  - expression: |-
+      variables.skipObj || object.kind in ['Secret', 'PersistentVolumeClaim'] || (
+        !has(variables.spec.priorityClassName) || variables.spec.priorityClassName in ['portcullis-critical', 'portcullis-high', 'portcullis-normal', 'portcullis-low']
+      )
+    message: app pods may use only portcullis-critical|high|normal|low
+  # The small taint's toleration (or a keyless Exists toleration, which
+  # tolerates every taint) only with a required node affinity that has a
+  # term on portcullis.io/class In [small] and a class expression (In or
+  # NotIn [small]) in every term: a VAP can't read Node objects (R2).
+  - expression: |-
+      variables.skipObj || object.kind in ['Secret', 'PersistentVolumeClaim'] || (
+        !has(variables.spec.tolerations) || (size(variables.spec.tolerations) <= 32
+          && !variables.spec.tolerations.exists(t, !has(t.key) || t.key == '' || t.key == 'portcullis.io/small'))
+        || (size(variables.requiredTerms) > 0 && size(variables.requiredTerms) <= 32
+          && variables.requiredTerms.exists(t, has(t.matchExpressions) && t.matchExpressions.exists(e,
+               e.key == 'portcullis.io/class' && e.operator == 'In' && has(e.values) && e.values == ['small']))
+          && variables.requiredTerms.all(t, has(t.matchExpressions) && size(t.matchExpressions) <= 32 && t.matchExpressions.exists(e,
+               e.key == 'portcullis.io/class' && e.operator in ['In', 'NotIn'] && has(e.values) && e.values == ['small'])))
+      )
+    message: the portcullis.io/small toleration needs a required node affinity on portcullis.io/class In [small]
+  # nodeName bypasses the scheduler, taints and affinity.
+  - expression: |-
+      variables.skipObj || object.kind in ['Secret', 'PersistentVolumeClaim'] || (
+        !has(variables.spec.nodeName) || variables.spec.nodeName == ''
+      )
+    message: nodeName is refused
+  # Placement keys are node label keys of portcullis.io/* and
+  # kubernetes.io/hostname only (matchFields too); the labelSelector keys
+  # of pod affinity and spread are pod labels and aren't judged.
+  - expression: |-
+      variables.skipObj || object.kind in ['Secret', 'PersistentVolumeClaim'] || (
+        (!has(variables.spec.nodeSelector) || (size(variables.spec.nodeSelector) <= 32 && variables.spec.nodeSelector.all(k, k.startsWith('portcullis.io/') || k == 'kubernetes.io/hostname')))
+        && (!has(variables.spec.topologySpreadConstraints) || (size(variables.spec.topologySpreadConstraints) <= 32
+            && variables.spec.topologySpreadConstraints.all(c, c.topologyKey.startsWith('portcullis.io/') || c.topologyKey == 'kubernetes.io/hostname')))
+        && (!has(variables.spec.affinity) || (
+          (!has(variables.spec.affinity.nodeAffinity) || (
+            (size(variables.requiredTerms) <= 32 && variables.requiredTerms.all(t,
+               (!has(t.matchExpressions) || (size(t.matchExpressions) <= 32 && t.matchExpressions.all(e, e.key.startsWith('portcullis.io/') || e.key == 'kubernetes.io/hostname')))
+               && (!has(t.matchFields) || (size(t.matchFields) <= 32 && t.matchFields.all(e, e.key.startsWith('portcullis.io/') || e.key == 'kubernetes.io/hostname')))))
+            && (!has(variables.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution)
+                || (size(variables.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution) <= 32
+                    && variables.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w,
+                 (!has(w.preference.matchExpressions) || (size(w.preference.matchExpressions) <= 32 && w.preference.matchExpressions.all(e, e.key.startsWith('portcullis.io/') || e.key == 'kubernetes.io/hostname')))
+                 && (!has(w.preference.matchFields) || (size(w.preference.matchFields) <= 32 && w.preference.matchFields.all(e, e.key.startsWith('portcullis.io/') || e.key == 'kubernetes.io/hostname'))))))))
+          && (!has(variables.spec.affinity.podAffinity) || (
+            (!has(variables.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) || (size(variables.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) <= 32
+                && variables.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey.startsWith('portcullis.io/') || t.topologyKey == 'kubernetes.io/hostname')))
+            && (!has(variables.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) || (size(variables.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) <= 32
+                && variables.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.podAffinityTerm.topologyKey.startsWith('portcullis.io/') || w.podAffinityTerm.topologyKey == 'kubernetes.io/hostname')))))
+          && (!has(variables.spec.affinity.podAntiAffinity) || (
+            (!has(variables.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution) || (size(variables.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution) <= 32
+                && variables.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey.startsWith('portcullis.io/') || t.topologyKey == 'kubernetes.io/hostname')))
+            && (!has(variables.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution) || (size(variables.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution) <= 32
+                && variables.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.podAffinityTerm.topologyKey.startsWith('portcullis.io/') || w.podAffinityTerm.topologyKey == 'kubernetes.io/hostname')))))))
+      )
+    message: topologySpreadConstraints and affinity may use only portcullis.io/* and kubernetes.io/hostname keys
   - expression: |-
       variables.skipObj || (
         object.kind in ['Secret', 'PersistentVolumeClaim'] || !('portcullis.io/helper' in variables.labels)
@@ -1319,3 +1456,165 @@ spec:
                ? (m.name in variables.fileNames && !has(m.namespace))
                : ((!has(m.namespace) || m.namespace == variables.edge) && !(m.name in variables.coreMiddlewares) && m.name.startsWith(variables.ownName)))
       message: "a chain may name only this instance's own middlewares (never a core one) or the @file allowlist"
+---
+# portcullis-core-exec (NEW, HA; contract §6 "core exec", scan P12): the
+# Hub's core Role has pods/exec create on the core namespace, which RBAC
+# can't narrow by pod or command. On CONNECT, everyone but the CLI may run
+# only the Hub's `/portcullis-bin/hub rev <dir> <doc>` (no stdin, no tty)
+# in a reader pod (group-gate-*, keycloak-*, mcp-gate-*, wg-*): <dir>
+# /vpn-doc with vpn, or /hub-data with one of the other seven documents of
+# tests/published_docs.json (tests/k8s_hardening.py compares these
+# literals), or probe-<16 hex> (another params generation's probe: prints
+# nothing). Every other exec there (the front door's DNS credentials, Vault,
+# a shell) is refused. The probe: `hub rev /hub-data probe-<generation>`.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-core-exec
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ''
+      apiVersions:
+      - v1
+      operations:
+      - CONNECT
+      resources:
+      - pods/exec
+  variables:
+  - name: cli
+    expression: "params.data.cliUsername != '' && request.userInfo.username == params.data.cliUsername"
+  - name: cmd
+    expression: 'has(object.command) && type(object.command) == list ? object.command : []'
+  validations:
+  - expression: >-
+      !(size(variables.cmd) == 4 && variables.cmd[0] == '/portcullis-bin/hub' && variables.cmd[1] == 'rev'
+      && variables.cmd[2] == '/hub-data' && variables.cmd[3] == 'probe-' + params.data.generation)
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+  - expression: |-
+      variables.cli || (
+        request.userInfo.username == params.data.hubServiceAccount
+        && ['group-gate-', 'keycloak-', 'mcp-gate-', 'wg-'].exists(p, request.name.startsWith(p))
+        && size(variables.cmd) == 4 && variables.cmd[0] == '/portcullis-bin/hub' && variables.cmd[1] == 'rev'
+        && ((variables.cmd[2] == '/vpn-doc' && variables.cmd[3] == 'vpn')
+          || (variables.cmd[2] == '/hub-data'
+            && (variables.cmd[3] in ['group-gate-policy', 'user-attributes', 'portal-apps', 'signin-keycloak', 'impersonation', 'mcp-gate', 'mcp-credentials']
+              || variables.cmd[3].matches('^probe-[0-9a-f]{16}$'))))
+        && !(has(object.stdin) && object.stdin) && !(has(object.tty) && object.tty)
+      )
+    message: the Hub may exec only hub rev <dir> <doc> in a reader pod of the core namespace
+---
+# portcullis-ingress-pods (NEW, HA; contract §6 "ingress pods", Amendment
+# 3): portcullis-ingress is PSA privileged (baseline forbids hostPort), so
+# this is its only pod guard, for every identity (the CLI and the DaemonSet
+# controller included): only the Traefik DaemonSet `traefik` and its pods
+# (owned by it), the image traefikImage, ServiceAccount traefik, the label
+# app.kubernetes.io/name: traefik, one container (no init or ephemeral
+# one), the PSA restricted profile in every field (non-root, no privilege
+# escalation, drop ALL with nothing added, seccomp RuntimeDefault, the
+# restricted volume types, so no hostPath) except hostPort 80 / 443 on that
+# container, and no host namespaces. A dry run annotated with another
+# params generation (16 hex) is another generation's probe and is let by:
+# a dry run persists nothing.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-ingress-pods
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ''
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - pods
+      - pods/ephemeralcontainers
+    - apiGroups:
+      - apps
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - daemonsets
+  variables:
+  - name: ds
+    expression: "object.kind == 'DaemonSet'"
+  - name: spec
+    expression: 'variables.ds ? object.spec.template.spec : object.spec'
+  - name: meta
+    expression: 'variables.ds ? object.spec.template.metadata : object.metadata'
+  - name: labels
+    expression: 'has(variables.meta.labels) ? variables.meta.labels : {}'
+  - name: annotations
+    expression: 'has(variables.meta.annotations) ? variables.meta.annotations : {}'
+  - name: volumes
+    expression: 'has(variables.spec.volumes) ? variables.spec.volumes : []'
+  - name: otherProbe
+    expression: >-
+      request.dryRun && has(object.metadata.annotations) && 'portcullis.io/params-generation' in object.metadata.annotations
+      && object.metadata.annotations['portcullis.io/params-generation'].matches('^[0-9a-f]{16}$')
+      && object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+  validations:
+  - expression: >-
+      !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+  - expression: |-
+      variables.otherProbe || (
+        (variables.ds ? object.metadata.name == 'traefik'
+          : (has(object.metadata.ownerReferences) && size(object.metadata.ownerReferences) <= 8
+             && object.metadata.ownerReferences.exists(o, o.apiVersion == 'apps/v1' && o.kind == 'DaemonSet' && o.name == 'traefik'
+               && has(o.controller) && o.controller)))
+        && 'app.kubernetes.io/name' in variables.labels && variables.labels['app.kubernetes.io/name'] == 'traefik'
+        && has(variables.spec.serviceAccountName) && variables.spec.serviceAccountName == 'traefik'
+        && size(variables.spec.containers) == 1
+        && (!has(variables.spec.initContainers) || size(variables.spec.initContainers) == 0)
+        && (!has(variables.spec.ephemeralContainers) || size(variables.spec.ephemeralContainers) == 0)
+        && !(has(variables.spec.hostNetwork) && variables.spec.hostNetwork)
+        && !(has(variables.spec.hostPID) && variables.spec.hostPID)
+        && !(has(variables.spec.hostIPC) && variables.spec.hostIPC)
+        && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsUser) && variables.spec.securityContext.runAsUser == 0)
+        && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.windowsOptions) && has(variables.spec.securityContext.windowsOptions.hostProcess) && variables.spec.securityContext.windowsOptions.hostProcess)
+        && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.appArmorProfile) && variables.spec.securityContext.appArmorProfile.type == 'Unconfined')
+        && (!has(variables.spec.securityContext) || !has(variables.spec.securityContext.seLinuxOptions) || (!has(variables.spec.securityContext.seLinuxOptions.user) && !has(variables.spec.securityContext.seLinuxOptions.role)
+            && (!has(variables.spec.securityContext.seLinuxOptions.type) || variables.spec.securityContext.seLinuxOptions.type in ['container_t', 'container_init_t', 'container_kvm_t', 'container_engine_t'])))
+        && (!has(variables.spec.securityContext) || !has(variables.spec.securityContext.sysctls) || (size(variables.spec.securityContext.sysctls) <= 32 && variables.spec.securityContext.sysctls.all(s, s.name in ['kernel.shm_rmid_forced',
+            'net.ipv4.ip_local_port_range', 'net.ipv4.ip_unprivileged_port_start', 'net.ipv4.tcp_syncookies', 'net.ipv4.ping_group_range',
+            'net.ipv4.ip_local_reserved_ports', 'net.ipv4.tcp_keepalive_time', 'net.ipv4.tcp_fin_timeout', 'net.ipv4.tcp_keepalive_intvl',
+            'net.ipv4.tcp_keepalive_probes'])))
+        && variables.annotations.all(k, !k.startsWith('container.apparmor.security.beta.kubernetes.io/') || variables.annotations[k] != 'unconfined')
+        && size(variables.volumes) <= 32 && variables.volumes.all(v, has(v.configMap) || has(v.csi) || has(v.downwardAPI) || has(v.emptyDir)
+            || has(v.ephemeral) || has(v.persistentVolumeClaim) || has(v.projected) || has(v.secret))
+        && variables.spec.containers.all(c, c.image == params.data.traefikImage && has(c.securityContext)
+          && !(has(c.securityContext.privileged) && c.securityContext.privileged)
+          && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false
+          && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop
+          && (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)
+          && (has(c.securityContext.runAsNonRoot) ? c.securityContext.runAsNonRoot
+              : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsNonRoot) && variables.spec.securityContext.runAsNonRoot))
+          && !(has(c.securityContext.runAsUser) && c.securityContext.runAsUser == 0)
+          && (has(c.securityContext.seccompProfile) ? c.securityContext.seccompProfile.type == 'RuntimeDefault'
+              : (has(variables.spec.securityContext) && has(variables.spec.securityContext.seccompProfile) && variables.spec.securityContext.seccompProfile.type == 'RuntimeDefault'))
+          && (!has(c.securityContext.procMount) || c.securityContext.procMount == 'Default')
+          && !(has(c.securityContext.windowsOptions) && has(c.securityContext.windowsOptions.hostProcess) && c.securityContext.windowsOptions.hostProcess)
+          && !(has(c.securityContext.appArmorProfile) && c.securityContext.appArmorProfile.type == 'Unconfined')
+          && (!has(c.securityContext.seLinuxOptions) || (!has(c.securityContext.seLinuxOptions.user) && !has(c.securityContext.seLinuxOptions.role)
+              && (!has(c.securityContext.seLinuxOptions.type) || c.securityContext.seLinuxOptions.type in ['container_t', 'container_init_t', 'container_kvm_t', 'container_engine_t'])))
+          && (!has(c.ports) || (size(c.ports) <= 16 && c.ports.all(p, !has(p.hostPort) || p.hostPort in [0, 80, 443]))))
+      )
+    message: only the Traefik DaemonSet's pod shape may run in portcullis-ingress

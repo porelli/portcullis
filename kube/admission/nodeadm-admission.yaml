@@ -1,0 +1,51 @@
+# portcullis-nodeadm-admission (NEW, HA; contract §6 "nodeadm admission
+# writes", scan P32): nodeadm's Role in the core namespace has `configmaps
+# create` (the params generations it writes after each join or removal),
+# which RBAC can't narrow by name. Bound by portcullis-nodeadm-guard-admission
+# (bindings.yaml) to the core namespace, it judges nodeadmServiceAccount's
+# ConfigMap creates there: only portcullis-admission-params-<16 hex> (never
+# portcullis-cluster-check, the published documents or anything else).
+#
+# The binding half of the contract text (a binding only in its canonical
+# form; never an update or delete of a portcullis-* policy or binding) is
+# NOT here: the API server never evaluates API-defined
+# ValidatingAdmissionPolicies on validatingadmissionpolicies or
+# validatingadmissionpolicybindings (k8s.io/apiserver
+# admission/plugin/policy/generic: admission configuration resources are
+# excluded from API-based hooks; Hub envtest
+# TestAdmissionPolicyObjectsNotJudged pins it). nodeadm's ClusterRole
+# (create only, no update or delete) is what stands there (Task 18 report).
+# Core is this file's only editor; the Hub keeps a byte copy in
+# internal/runtime/kube/testdata/admission/ (envtest vectors).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-nodeadm-admission
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ''
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      resources:
+      - configmaps
+  variables:
+  - name: nodeadm
+    expression: "params.data.nodeadmServiceAccount != '' && request.userInfo.username == params.data.nodeadmServiceAccount"
+  validations:
+  - expression: >-
+      !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+  - expression: |-
+      !variables.nodeadm || (
+        object.metadata.name.matches('^portcullis-admission-params-[0-9a-f]{16}$')
+      )
+    message: nodeadm may create only portcullis-admission-params-<16 hex> ConfigMaps
