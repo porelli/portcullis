@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -504,20 +505,14 @@ func (h *harness) setReady(t *testing.T, id string, ready bool) {
 // removal step.
 func TestRevokeQuorumLive(t *testing.T) {
 	ctx := context.Background()
+	// The down server itself may go (2 healthy of 2 after).
 	h := newHarness(t)
 	h.agents.onRotate = h.bootFollows
 	h.setReady(t, "n2", false)
-	w := h.internal(clientHub, "DELETE", "/v1/nodes/n3?mode=revoke", nil)
-	if w.Code != 409 || !strings.Contains(w.Body.String(), `"kind":"quorum_minimum"`) {
-		t.Fatalf("a live server with another down: %d %s", w.Code, w.Body)
-	}
-	if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n3", metav1.GetOptions{}); err != nil || h.state(t).Ops["n3"] != nil {
-		t.Fatal("a refused revoke changed something")
-	}
-	// The down server itself may go (2 healthy of 2 after).
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n2?mode=revoke", nil); w.Code != 204 {
 		t.Fatalf("revoking the down server: %d %s\n%s", w.Code, w.Body, h.logs)
 	}
+	var w *httptest.ResponseRecorder
 
 	// A stuck revoke hides no voter: n2's op stopped before etcd_removed,
 	// its Node gone; n1 and n3 Ready. Revoking n3 leaves 1 healthy of 2.
@@ -530,6 +525,9 @@ func TestRevokeQuorumLive(t *testing.T) {
 	h.kube.CoreV1().Nodes().Delete(ctx, "n2", metav1.DeleteOptions{})
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n3?mode=revoke", nil); w.Code != 409 || !strings.Contains(w.Body.String(), "quorum_minimum") {
 		t.Fatalf("with a stuck server revoke: %d %s", w.Code, w.Body)
+	}
+	if op := h.state(t).Ops["n3"]; op == nil || op.Step != "tokens_deleted" {
+		t.Fatalf("n3's op isn't parked before node_deleted: %+v", op)
 	}
 
 	// Re-checked before every step: a server going down mid-op stops it
@@ -636,5 +634,62 @@ func TestRotationSkipsReRegistered(t *testing.T) {
 	}
 	if r := h.state(t).Nodes["n0"]; r == nil || !r.TokensStale {
 		t.Fatalf("the skip isn't recorded: %+v", r)
+	}
+}
+
+// TestRevokeParksSecurityDone (fix round 4): revoking a live server while
+// another is down: the certificate is revoked, the node marked removed and
+// its bootstrap tokens deleted at once; the op parks before its Node and
+// etcd member go (409 quorum_minimum, the snapshot says so); the revoked
+// node's signed join and its bootstrap tokens are refused.
+func TestRevokeParksSecurityDone(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	j := h.issue(t, "n5", "server", "home", "main", "10.215.0.5")
+	if w := h.enrol(t, j, ""); w.Code != 200 {
+		t.Fatalf("enrol: %d", w.Code)
+	}
+	if w := h.join(t, j, nearRTT); w.Code != 200 {
+		t.Fatalf("join: %d %s", w.Code, w.Body)
+	}
+	h.kube.CoreV1().Nodes().Create(ctx, mkNode(nodeSpec{"n5", "server", "home", "main", "10.215.0.5", nil, nil, true, false}), metav1.CreateOptions{})
+	// A bootstrap token recorded for n5 (as an agent join would have).
+	h.kube.CoreV1().Secrets(bootstrapNS).Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-abc123", Namespace: bootstrapNS}}, metav1.CreateOptions{})
+	h.putState(t, func(st *nodeadmState) { st.Nodes["n5"].TokenIDs = []string{"abc123"} })
+	serial := h.state(t).Nodes["n5"].Serial
+	// 4 servers, n2 and n3 down: removing the Ready n5 leaves 1 of 3.
+	h.setReady(t, "n2", false)
+	h.setReady(t, "n3", false)
+	w := h.internal(clientHub, "DELETE", "/v1/nodes/n5?mode=revoke", nil)
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"kind":"quorum_minimum"`) || !strings.Contains(w.Body.String(), "its certificate is revoked") {
+		t.Fatalf("revoke without quorum: %d %s", w.Code, w.Body)
+	}
+	st := h.state(t)
+	if r := st.Nodes["n5"]; r == nil || !r.Removed || r.Serial != "" || !slices.Contains(h.enroll.revoked, serial) {
+		t.Fatalf("the security steps didn't run: %+v revoked %v", r, h.enroll.revoked)
+	}
+	if _, err := h.kube.CoreV1().Secrets(bootstrapNS).Get(ctx, "bootstrap-token-abc123", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatal("its bootstrap token wasn't deleted")
+	}
+	if op := st.Ops["n5"]; op == nil || op.Step != "tokens_deleted" || op.LastKind != "quorum_minimum" {
+		t.Fatalf("the op isn't parked before the Node / etcd steps: %+v", op)
+	}
+	if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n5", metav1.GetOptions{}); err != nil || len(h.agents.etcdRm) != 0 {
+		t.Fatal("the Node or the etcd member went without quorum")
+	}
+	if w := h.join(t, j, nearRTT); w.Code != 403 {
+		t.Fatalf("the revoked node's join: %d", w.Code)
+	}
+	snap := h.internal(clientHub, "GET", "/v1/cluster", nil).Body.String()
+	if !strings.Contains(snap, "the revocation of n5 is parked before its Node and etcd member are removed") {
+		t.Fatalf("the snapshot doesn't say it: %s", snap)
+	}
+	// Quorum back: resumed to the end.
+	h.agents.onRotate = h.bootFollows
+	h.setReady(t, "n2", true)
+	h.setReady(t, "n3", true)
+	h.resume(t, "n5")
+	if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n5", metav1.GetOptions{}); !apierrors.IsNotFound(err) || len(h.agents.etcdRm) != 1 {
+		t.Fatal("the parked revoke didn't finish once quorum was back")
 	}
 }

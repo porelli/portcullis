@@ -165,7 +165,11 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 	snap.Errors = append(snap.Errors, s.addrErrors()...)
 	for id, op := range st.Ops {
 		if op.LastError != "" {
-			snap.Errors = append(snap.Errors, fmt.Sprintf("the revocation of %s waits at %s: %s", id, op.Step, op.LastError))
+			if op.LastKind == "quorum_minimum" {
+				snap.Errors = append(snap.Errors, fmt.Sprintf("the revocation of %s is parked before its Node and etcd member are removed: %s", id, op.LastError))
+			} else {
+				snap.Errors = append(snap.Errors, fmt.Sprintf("the revocation of %s waits at %s: %s", id, op.Step, op.LastError))
+			}
 		}
 	}
 	s.metrics.observe(snap)

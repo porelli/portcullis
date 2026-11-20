@@ -113,13 +113,9 @@ func (s *Server) revoke(ctx context.Context, id string) error {
 			}
 			op.Serial, op.TokenIDs = rec.Serial, append([]string{}, rec.TokenIDs...)
 		}
-		if op.Role == "server" {
-			// etcd's own quorum rule, before anything changes (and again
-			// before every removal step: revokeStep).
-			if err := s.revokeQuorum(ctx, id); err != nil {
-				return err
-			}
-		}
+		// No quorum gate here: the security steps (marked, tokens_deleted)
+		// always run at once; revokeStep gates only node_deleted and
+		// etcd_removed (fix round 4).
 		if err := s.mutate(ctx, func(st *nodeadmState) error {
 			if st.Ops[id] == nil {
 				st.Ops[id] = op
@@ -142,7 +138,7 @@ func (s *Server) revoke(ctx context.Context, id string) error {
 	}
 	if op := st.Ops[id]; op != nil {
 		if op.LastKind != "" {
-			return errKind(http.StatusConflict, op.LastKind, "%s (the revocation of %s waits at %s)", op.LastError, id, op.Step)
+			return errKind(http.StatusConflict, op.LastKind, "%s", op.LastError)
 		}
 		return fmt.Errorf("revoking %s stopped at %s: %s", id, op.Step, op.LastError)
 	}
@@ -187,7 +183,7 @@ func (s *Server) revokeQuorum(ctx context.Context, target string) error {
 	}
 	if h*2 <= v {
 		return errKind(http.StatusConflict, "quorum_minimum",
-			"revoking %s would leave etcd %d healthy of %d members: not a majority", target, h, v)
+			"removing %s would leave etcd %d healthy of %d members: not a majority (its certificate is revoked and its bootstrap tokens deleted; its Node and etcd member stay until etcd has a healthy majority)", target, h, v)
 	}
 	return nil
 }
@@ -214,7 +210,7 @@ func (s *Server) driveOp(id string) <-chan struct{} {
 		s.opMu.Lock()
 		defer s.opMu.Unlock()
 		if err := s.runRevoke(ctx, id); err != nil {
-			msg := trunc(redact(err.Error()), 200)
+			msg := trunc(redact(err.Error()), 400)
 			s.log.Warn("revocation stopped (resumed later)", "node", id, "err", msg)
 			if !s.leader.Leading() {
 				return // the next holder resumes it
@@ -293,7 +289,11 @@ func (s *Server) runRevoke(ctx context.Context, id string) error {
 func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 	id := op.Node
 	next := revokeSteps[stepIndex(op.Step)+1]
-	if op.Role == "server" && stepIndex(next) <= stepIndex("etcd_removed") {
+	// etcd's quorum gates only the steps that delete the Node or change etcd
+	// membership; the certificate revoke, the mark and the bootstrap token
+	// deletes never wait for it (fix round 4). A refusal parks the op
+	// before node_deleted with quorum_minimum, resumed by reconcile.
+	if op.Role == "server" && (next == "node_deleted" || next == "etcd_removed") {
 		if err := s.revokeQuorum(ctx, id); err != nil {
 			return err
 		}
