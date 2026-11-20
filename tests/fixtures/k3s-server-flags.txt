@@ -1,4 +1,5 @@
 --advertise-address=10.215.0.1
+--agent-token-file=/etc/rancher/k3s/agent-token
 --bind-address=10.215.0.1
 --cluster-init
 --disable=traefik
@@ -18,6 +19,7 @@
 --node-label=portcullis.io/storage=true
 --node-label=svccontroller.k3s.cattle.io/enablelb=true
 --node-label=topology.kubernetes.io/zone=main
+--node-name=node-1
 --secrets-encryption
 --token-file=/etc/rancher/k3s/token
 --write-kubeconfig-mode=0600

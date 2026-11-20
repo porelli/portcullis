@@ -670,3 +670,7 @@ source "$PORTCULLIS_LIB/kube.sh"
 # cluster addresses; plan R8).
 # shellcheck source=kube_install.sh
 source "$PORTCULLIS_LIB/kube_install.sh"
+# nodeadm's objects, `kube params-sync` and its timer, the per-node host
+# checks (plan R8).
+# shellcheck source=node.sh
+source "$PORTCULLIS_LIB/node.sh"

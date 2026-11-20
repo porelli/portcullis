@@ -39,6 +39,10 @@ KUBE_FLANNEL_PORT=51840
 KUBE_CLUSTER_CIDR=10.42.0.0/16
 # Host paths (KUBE_INSTALL_PREFIX in front when written; the flags name them bare).
 KUBE_K3S_TOKEN_FILE=/etc/rancher/k3s/token
+# The agents' own token (--agent-token-file): agents never hold the server
+# token (nodeadm gives a joining agent a bootstrap token, a rotation gives
+# agents this one).
+KUBE_K3S_AGENT_TOKEN_FILE=/etc/rancher/k3s/agent-token
 KUBE_FLANNEL_CONF=/etc/rancher/k3s/flannel-net-conf.json
 KUBE_K3S_YAML=/etc/rancher/k3s/k3s.yaml
 # The key lives under /etc/wireguard: Ubuntu's AppArmor profile for wg
@@ -117,18 +121,25 @@ _ki_node_class() {
   echo home
 }
 
+# The first node's Kubernetes name: its server id (contract §20.1, §17.3;
+# Task 17 ruling: default node-1, later nodes get theirs from the join code).
+KUBE_FIRST_NODE_NAME="${PORTCULLIS_NODE_NAME:-node-1}"
+
 # kube_k3s_server_flags — the first server's flags, one per line (the
 # shared fixture tests/fixtures/k3s-server-flags.txt; nodeadm's join
 # answer follows it, contract §20.2 / §20.11).
 kube_k3s_server_flags() {
   local ip="$KUBE_MESH_IP" class
   class="$(_ki_node_class)" || return 1
+  [[ "$KUBE_FIRST_NODE_NAME" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || fail "PORTCULLIS_NODE_NAME must match ^[a-z][a-z0-9-]{0,30}$ (a server id)"
   cat <<EOF
 --cluster-init
+--node-name=$KUBE_FIRST_NODE_NAME
 --secrets-encryption
 --disable=traefik
 --write-kubeconfig-mode=0600
 --token-file=$KUBE_K3S_TOKEN_FILE
+--agent-token-file=$KUBE_K3S_AGENT_TOKEN_FILE
 --kubelet-arg=pod-max-pids=1024
 --kubelet-arg=sync-frequency=10s
 --kubelet-arg=address=$ip
@@ -225,8 +236,9 @@ _ki_mesh_taken() {
 
 _ki_have() { command -v "$1" >/dev/null 2>&1; }
 
-# _ki_link_up — the pcmesh interface exists.
-_ki_link_up() { ip link show "$KUBE_MESH_IF" >/dev/null 2>&1; }
+# _ki_link_up — the pcmesh interface exists and is up (wg-quick sets it up;
+# Task 17 re-review N2).
+_ki_link_up() { ip link show "$KUBE_MESH_IF" 2>/dev/null | grep -q ',UP'; }
 
 # _ki_mesh_ours — pcmesh is a half-finished init's: the interface is up
 # with our config (its header) and our key.
@@ -243,7 +255,7 @@ _ki_k3s_ours() {
 }
 
 # The teardown of a half-finished install that isn't recognised as ours.
-KUBE_INSTALL_TEARDOWN="if it is a half-finished Portcullis install, remove it first: sudo /usr/local/bin/k3s-uninstall.sh; sudo systemctl disable --now wg-quick@pcmesh; sudo rm -f /etc/wireguard/pcmesh.conf /etc/wireguard/pcmesh.key — otherwise name the existing cluster with --kube-context"
+KUBE_INSTALL_TEARDOWN="if it is a half-finished Portcullis install, remove it first: sudo /usr/local/bin/k3s-uninstall.sh; sudo systemctl disable --now wg-quick@pcmesh; sudo rm -f /etc/wireguard/pcmesh.conf /etc/wireguard/pcmesh.key /etc/systemd/system/k3s.service.d/10-pcmesh.conf; sudo systemctl daemon-reload — otherwise name the existing cluster with --kube-context"
 
 # kube_install_host_checks — "ok|warn|fail<TAB>text" lines before anything
 # is installed (fail = refuse). A half-finished init of our own (pcmesh up
@@ -367,11 +379,13 @@ _ki_fetch() {
   [ "$got" = "$2" ] || { rm -rf "$(dirname "$3")"; fail "$1 doesn't match its pinned sha256 (want $2, got $got): nothing was installed"; }
 }
 
-# _ki_token_file — the k3s token: 32 random bytes as hex, generated once into
-# a 0600 file (k3s reads it through --token-file; it never reaches argv).
+# _ki_token_file [path] — a k3s token (the server's, else the agents'
+# --agent-token-file): 32 random bytes as hex, generated once into a 0600
+# file (k3s reads it through the file; it never reaches argv).
 _ki_token_file() {
-  _ki_sudo sh -c 'mkdir -p "$(dirname "$1")" && umask 077 && { [ -s "$1" ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n" > "$1.tmp" && mv -f "$1.tmp" "$1"; }; } && chmod 600 "$1"' _ "$(_ki_p "$KUBE_K3S_TOKEN_FILE")" \
-    || fail "could not write the k3s token file"
+  local f="${1:-$KUBE_K3S_TOKEN_FILE}"
+  _ki_sudo sh -c 'mkdir -p "$(dirname "$1")" && umask 077 && { [ -s "$1" ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n" > "$1.tmp" && mv -f "$1.tmp" "$1"; }; } && chmod 600 "$1"' _ "$(_ki_p "$f")" \
+    || fail "could not write the k3s token file $f"
 }
 
 # _ki_wait_ready — k3s wrote its kubeconfig and the node is Ready (5 min).
@@ -420,6 +434,7 @@ kube_install_k3s() {
   _ki_fetch "$KUBE_K3S_SCRIPT_URL" "$KUBE_K3S_SCRIPT_SHA256" "$tmp/install.sh"
   _ki_fetch "https://github.com/k3s-io/k3s/releases/download/$(printf '%s' "$KUBE_K3S_VERSION" | sed 's/+/%2B/')/$asset" "$sha" "$tmp/k3s"
   _ki_token_file
+  _ki_token_file "$KUBE_K3S_AGENT_TOKEN_FILE"
   kube_flannel_conf | _ki_write "$(_ki_p "$KUBE_FLANNEL_CONF")" 644 || fail "could not write $KUBE_FLANNEL_CONF"
   _ki_sudo mkdir -p "$(_ki_p /usr/local/bin)"
   _ki_sudo install -m 0755 "$tmp/k3s" "$(_ki_p /usr/local/bin/k3s)" || { rm -rf "$tmp"; fail "could not install the k3s binary"; }

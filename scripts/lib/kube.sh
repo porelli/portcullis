@@ -87,9 +87,8 @@ kube_detect_cidrs() {
   case "$(printf '%s' "$nodes" | jq -r '.items | length' 2>/dev/null)" in
     0|"") _K_ERR="the cluster has no node"; return 1 ;;
     1) [ -n "$_K_POD_CIDR" ] || _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '.items[0].spec | (.podCIDRs // [.podCIDR // empty]) | join(" ")' 2>/dev/null || true)" ;;
-    # The node checks read one node (flags, pids cap, AppArmor): fail closed
-    # until nodeadm's per-node checks exist.
-    *) _K_ERR="the cluster has more than one node: multi-node clusters are added with ./portcullis node add (not yet available)"; return 1 ;;
+    # k3s: every node checked on its own (node.sh); another one: one node.
+    *) [ -n "$_K_POD_CIDR" ] || { _K_ERR="the cluster has more than one node and isn't k3s: Portcullis supports multi-node k3s clusters only"; return 1; } ;;
   esac
   [ -n "$_K_POD_CIDR" ] || { _K_ERR="the node has no spec.podCIDRs"; return 1; }
   # A Service no cluster can allocate: the API server names the range.
@@ -229,7 +228,8 @@ kube_host_checks() {
   nodes="$(kube_ctl get nodes -o json 2>/dev/null || true)"
   # k3s records its server flags on the node.
   args="$(printf '%s' "$nodes" | jq -r '.items[0].metadata.annotations["k3s.io/node-args"] // empty' 2>/dev/null | jq -r 'join(" ")' 2>/dev/null || true)"
-  if [ -n "$args" ]; then
+  if kube_multi_node_checks "$nodes"; then :
+  elif [ -n "$args" ]; then
     args=" $args "
     case "$args" in
       *" --secrets-encryption "*|*" --secrets-encryption=true "*) _rt_chk ok "k3s --secrets-encryption" ;;
@@ -259,7 +259,8 @@ kube_host_checks() {
   [ "${PORTCULLIS_KUBE_CONTEXT:-}" != "$(kube_install_context)" ] || [ ! -s "$(kube_install_kubeconfig)" ] || _ki_node_checks
   cfg="$(kube_ctl get --raw "/api/v1/nodes/$(printf '%s' "$nodes" | jq -r '.items[0].metadata.name // "?"' 2>/dev/null)/proxy/configz" 2>/dev/null || true)"
   pids="$(printf '%s' "$cfg" | jq -r '.kubeletconfig.podPidsLimit // empty' 2>/dev/null || true)"
-  if [ "$pids" = 1024 ]; then
+  if [ -n "${_K_MULTI:-}" ]; then :
+  elif [ "$pids" = 1024 ]; then
     _rt_chk ok "kubelet podPidsLimit 1024"
   else
     _rt_chk fail "kubelet podPidsLimit is ${pids:-unset}, not 1024: reinstall k3s with --kubelet-arg=pod-max-pids=1024 (the only per-pod pids cap)"
@@ -329,7 +330,7 @@ _kube_apparmor_check() {
   local sysctl="${KUBE_AA_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_unconfined}"
   local enabled="${KUBE_AA_ENABLED:-/sys/module/apparmor/parameters/enabled}"
   local profiles="${KUBE_AA_PROFILES:-/sys/kernel/security/apparmor/profiles}"
-  ips="$(printf '%s' "$nodes" | jq -r '[.items[0].status.addresses[]? | select(.type == "InternalIP" or .type == "ExternalIP") | .address] | join(" ")' 2>/dev/null || true)"
+  ips="$(printf '%s' "$nodes" | jq -r '[.items[].status.addresses[]? | select(.type == "InternalIP" or .type == "ExternalIP") | .address] | join(" ")' 2>/dev/null || true)"
   addrs=" $(_kube_local_addrs) "
   for ip in $ips; do case "$addrs" in *" $ip "*) local_node=true ;; esac; done
   if [ "$local_node" = false ]; then
@@ -904,9 +905,8 @@ kube_admission_params() {
   local hub="$1" ns roots nodes api a ep
   ns="$(kube_ns)"
   roots="${HUB_OVERRIDE_BIND_ROOTS:-/srv:/mnt:/media}"
-  nodes="" api=""
-  for a in ${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}; do nodes+="${nodes:+ }$a/32"; done
-  for ep in ${PORTCULLIS_KUBE_API_ENDPOINTS:-}; do api+="${api:+ }${ep%:*}/32"; done
+  kube_params_addresses
+  nodes="$_K_PARAM_NODES" api="$_K_PARAM_API"
   [ -n "$nodes" ] || fail "no node address (PORTCULLIS_KUBE_NODE_ADDRESSES): refusing to write admission params that couldn't exclude the nodes"
   [ -n "$api" ] || fail "no kube API endpoint (PORTCULLIS_KUBE_API_ENDPOINTS): refusing to write admission params"
   local me
@@ -978,11 +978,11 @@ kube_admission_params_apply() {
   pns="$(kube_ns)"
   # Captured first: a refusal inside it (no node address, no identity, no
   # domain) must stop the setup, which a process substitution would hide.
-  params="$(kube_admission_params "$hub")" || fail "the admission params can't be built (see above): nothing written"
+  params="${2:-}"; [ -n "$params" ] || params="$(kube_admission_params "$hub")" || fail "the admission params can't be built (see above): nothing written"
   tmp="$(mktemp -d)"
   mkdir "$tmp/data"
   while IFS=$'\t' read -r f ep; do printf '%s' "$ep" > "$tmp/data/$f"; done <<< "$params"
-  gen="$(printf '%s\n' "$params" | LC_ALL=C sort | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
+  gen="$(printf '%s\n' "$params" | kube_params_generation)"
   printf '%s' "$gen" > "$tmp/data/generation"
   kube_ctl create configmap "portcullis-admission-params-$gen" -n "$pns" --from-file="$tmp/data" --dry-run=client -o json \
     | G="$gen" jq '.metadata.labels = {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/params-generation": env.G}' > "$tmp/params.json" \
@@ -1002,6 +1002,7 @@ kube_admission_params_apply() {
   _kube_applied_set cluster.params "$gen"
   rm -rf "$tmp"
   kube_admission_probe "$gen" || fail "the admission bindings of params generation $gen aren't live with their params (see above): the older bindings still judge; nothing deployed"
+  kube_admission_active_put "$gen" "$params"
   # Only now: the other generations.
   local old
   old="$(kube_ctl get validatingadmissionpolicybinding -l "portcullis.io/binding,portcullis.io/params-generation!=$gen" -o name 2>/dev/null)" \
@@ -1503,6 +1504,7 @@ kube_sync_secrets() {
   local full=false item kind name dir h ns want live
   [ "${1:-}" = --full ] || [ "${KUBE_SYNC_FULL:-}" = 1 ] && full=true
   ns="$(kube_ns)"
+  kube_nodeadm_prepare
   kube_sync_stage
   _K_HASHES='{}'
   live="$_K_STAGE/.live" want="$_K_STAGE/.live/want.json"
@@ -1542,6 +1544,7 @@ kube_sync_secrets() {
       spec: {headers: {customRequestHeaders: {"X-Portcullis-Proxy-Secret": env.HUB_CLI_PROXY_SECRET}}}}' > "$want" \
     && _kube_put "$want" || { rm -rf "$_K_STAGE"; fail "could not apply the hub-cli-proxy-secret Middleware"; }
   rm -rf "$_K_STAGE"
+  kube_nodeadm_sync
 }
 
 # ── values (no secret ever) ──
@@ -1606,6 +1609,7 @@ kube_render_values() {
            certExpiryWarnDays: $warn, impersonationMaxMinutes: $imp, selfImage: $images.hub, appsNamespace: $apps},
      alerting: {smtpFrom: $smtp}, appsNamespace: $apps}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
     || fail "could not write $f"
+  kube_nodeadm_values "$f"
 }
 
 # ── the release ──
@@ -2169,77 +2173,6 @@ _backup_verify_dir_kube() {
 KUBE_CHECK_WARN_S=72000   # 20 h: status warns
 KUBE_CHECK_MAX_S=86400    # 24 h: the Hub refuses (its guard's clusterCheckMaxAge)
 
-# kube_check_timer_units <dir> — portcullis-kube-check.service / .timer:
-# backup schedule's system-unit pattern (User=, After network-online and
-# k3s.service when this host runs it, Requires it then), every 6 h
-# (Persistent: a host that was off catches up at boot). KUBECONFIG goes
-# along when set (the operator's kubeconfig, never copied).
-kube_check_timer_units() {
-  local out="$1" user after="network-online.target" requires="" env_root="" env_kc=""
-  user="$(id -un)"
-  if systemctl cat k3s.service >/dev/null 2>&1; then after="$after k3s.service" requires="k3s.service"; fi
-  [ "$PORTCULLIS_ROOT" = "$PORTCULLIS_HOME" ] || env_root="Environment=PORTCULLIS_ROOT=$PORTCULLIS_ROOT"
-  [ -z "${KUBECONFIG:-}" ] || env_kc="Environment=KUBECONFIG=$KUBECONFIG"
-  mkdir -p "$out"
-  cat > "$out/portcullis-kube-check.service" <<UNIT
-# portcullis-kube-check.service — generated by ./portcullis init (kubernetes)
-[Unit]
-Description=Portcullis cluster check (the Hub refuses runtime operations once it is 24 h old)
-Wants=network-online.target
-After=$after
-${requires:+Requires=$requires
-}
-[Service]
-Type=oneshot
-User=$user
-WorkingDirectory=$PORTCULLIS_ROOT
-Environment=NO_COLOR=1
-${env_root}
-${env_kc}
-ExecStart=$PORTCULLIS_HOME/portcullis kube check
-TimeoutStartSec=10min
-UNIT
-  cat > "$out/portcullis-kube-check.timer" <<UNIT
-# portcullis-kube-check.timer — generated by ./portcullis init (kubernetes)
-[Unit]
-Description=Portcullis cluster check every 6 hours
-
-[Timer]
-OnCalendar=*-*-* 00/6:00:00
-RandomizedDelaySec=10min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-UNIT
-}
-
-# kube_check_timer_install — init on kubernetes: the units into
-# /etc/systemd/system (root, else sudo), enabled and started. Without
-# systemd or after a failed install: a warning with the manual steps (status
-# warns at 20 h, the Hub refuses at 24 h: fail closed either way).
-kube_check_timer_install() {
-  local tmp sudo="" kd="$PORTCULLIS_ROOT/secrets/kube/systemd"
-  if ! command -v systemctl >/dev/null 2>&1 || [ ! -d "${KUBE_SYSTEMD_RUN:-/run/systemd/system}" ]; then
-    warn "No systemd: run ./portcullis kube check at least every 20 h (cron); the Hub refuses every runtime operation once the cluster check is 24 h old."
-    return 0
-  fi
-  [ "$(id -u)" = 0 ] || sudo=sudo
-  tmp="$(mktemp -d)"
-  kube_check_timer_units "$tmp"
-  info "Installing portcullis-kube-check.timer (the cluster check every 6 h)..."
-  if $sudo install -m 0644 "$tmp/portcullis-kube-check.service" "$tmp/portcullis-kube-check.timer" /etc/systemd/system/ \
-     && $sudo systemctl daemon-reload && $sudo systemctl enable --now portcullis-kube-check.timer >/dev/null 2>&1; then
-    ok "portcullis-kube-check.timer enabled (systemctl list-timers portcullis-kube-check.timer)"
-  else
-    kube_check_timer_units "$kd"
-    warn "Could not install portcullis-kube-check.timer. As root:"
-    printf '  install -m 0644 %s %s /etc/systemd/system/\n  systemctl daemon-reload && systemctl enable --now portcullis-kube-check.timer\n' \
-      "$(_sq "$kd/portcullis-kube-check.service")" "$(_sq "$kd/portcullis-kube-check.timer")" >&2
-  fi
-  rm -rf "$tmp"
-}
-
 # kube_cluster_check_json — the live portcullis-cluster-check as status
 # reads it: {checked_at, ok, why, age_s}, null when missing or unreadable
 # (KUBE_NOW: a fixed now, for tests).
@@ -2280,7 +2213,8 @@ help_kube() {
   cat <<'HELP'
 Usage: portcullis kube <subcommand>
 
-  check   Refresh the cluster check the Hub reads (Kubernetes only)
+  check        Refresh the cluster check the Hub reads (Kubernetes only)
+  params-sync  Rewrite the admission params from the cluster addresses (Kubernetes only)
 
 Run 'portcullis kube <subcommand> --help' for details.
 HELP
@@ -2308,6 +2242,7 @@ cmd_kube() {
   case "$sub" in
     ""|-h|--help|help) help_kube; [ -n "$sub" ] || exit 2; return 0 ;;
     check) ;;
+    params-sync) cmd_kube_params_sync "$@"; return ;;
     *) usage_error kube "unknown subcommand: $sub" ;;
   esac
   while [ $# -gt 0 ]; do
@@ -2320,6 +2255,7 @@ cmd_kube() {
   _rt_is_kube || { warn "kube check: CONTAINER_RUNTIME is $(runtime_name), not kubernetes"; exit 1; }
   _K_CHECK_WHY=""
   kube_cluster_check
+  ( kube_params_sync ) || warn "kube check: params-sync failed (see above): the active admission params stay"
   [ -z "$_K_CHECK_WHY" ] || exit 1
   ok "cluster check ok (portcullis-cluster-check written)"
 }

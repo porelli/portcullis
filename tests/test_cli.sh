@@ -289,11 +289,23 @@ expect_eq "mail enable on podman with port start 80 → refused naming net.ipv4.
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
 # --rawfile / env.X) ── lines marked "secret-argv-ok" are reviewed exceptions.
 ARGV_RE='--from-literal|--set(-string|-json)?[ =][^ ]*(secrets/|\$\(cat|PASSWORD|SECRET|TOKEN)|--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat |K3S_TOKEN=|--new-token|--agent-token[ =]'
-HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh | grep -v 'secret-argv-ok' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh "$HERE/../nodeadm/join.sh" | grep -v 'secret-argv-ok' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
 expect_eq "no secrets on argv in the CLI" "$HITS" ""
 # HA (Task 17): the grep covers the k3s installer (the token reaches k3s as
 # --token-file only, the mesh key through wg-quick's PostUp file).
 expect_eq "the argv grep covers scripts/lib/kube_install.sh" "$(printf '%s\n' "$HERE"/../scripts/lib/*.sh | grep -c '/kube_install\.sh$')" 1
+# HA (Task 21): and nodeadm's join script (the join code from /dev/tty or a
+# 0600 --code-file, to the nodeagent on stdin) and scripts/lib/node.sh
+# (the server token and nodeadm's bearer through --from-file).
+expect_eq "the argv grep covers nodeadm/join.sh and scripts/lib/node.sh" \
+  "$(grep -cE '^HITS=.*/nodeadm/join\.sh"' "$0"):$(printf '%s\n' "$HERE"/../scripts/lib/*.sh | grep -c '/node\.sh$')" "1:1"
+# join.sh: the code never on argv (an argument is refused), read with echo
+# off or from a root-owned 0600 file, and given to the nodeagent on stdin.
+JS="$HERE/../nodeadm/join.sh"
+expect_eq "join.sh reads the code with echo off, checks --code-file's mode/owner, pipes it to nodeagent join" \
+  "$(grep -c 'stty -echo </dev/tty' "$JS"):$(grep -c '"600 0"' "$JS"):$(grep -c 'nodeagent" join < "$work/code"' "$JS")" "1:1:1"
+OUT="$(sh "$JS" pcj2.secret 2>&1; echo "rc=$?")"
+case "$OUT" in *"the join code is a secret"*"rc=2") t_pass "join.sh refuses the code as an argument (exit 2)" ;; *) t_fail "join.sh argv: $OUT" ;; esac
 # Container root is the operator under rootless Podman: an operator-owned
 # file is chowned to ct_operator_id, never $(id -u) (a subuid there).
 # Contract §6: the engine socket reaches only the two socket proxies, from
@@ -1829,6 +1841,9 @@ pki_int/crl/rotate read
 pki_file/crl/rotate read
 pki_node/sign/node-worker update deny=alt_names,ip_sans,uri_sans,other_sans
 pki_node/sign/node-control update deny=alt_names,ip_sans,uri_sans,other_sans
+pki_node/sign/node-cluster update deny=alt_names,ip_sans,uri_sans,other_sans
+pki_node/sign/node-frontdoor update deny=alt_names,ip_sans,uri_sans,other_sans
+pki_node/sign/node-nodeadm update
 pki_node/cert/* read
 pki_node/revoke update
 pki_node/crl/rotate read
@@ -1837,9 +1852,14 @@ EOF
 expect_eq "enroll.hcl grants exactly the D21 paths (sign/client-cert, sign/browser-cert, certs list, cert read, revoke, crl/rotate on both mounts) and the pki_node ones (sign node-worker / node-control, cert read, revoke, crl/rotate), nothing else" \
   "$POLICY_GOT" "$POLICY_WANT"
 expect_eq "enroll.hcl's client certificate part has one path block per grant" \
-  "$(grep -c '^[[:space:]]*path[[:space:]]' "$POLICY_PKI")" 15
-expect_eq "enroll.hcl's client certificate part: only capabilities and denied_parameters (no allowed_parameters, no wildcard grants)" \
-  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file|node)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$POLICY_PKI")" ""
+  "$(grep -c '^[[:space:]]*path[[:space:]]' "$POLICY_PKI")" 18
+# node-nodeadm (HA, contract §17.5) alone pins its parameters' values
+# (allowed_parameters: the CN, its one SAN, exclude_cn_from_sans).
+POLICY_NA="$(sed -n '/^path "pki_node\/sign\/node-nodeadm"/,/^}/p' "$POLICY_PKI")"
+expect_eq "enroll.hcl's client certificate part: only capabilities and denied_parameters (no wildcard grants), allowed_parameters only on node-nodeadm" \
+  "$(sed '/^path "pki_node\/sign\/node-nodeadm"/,/^}/d' "$POLICY_PKI" | grep -vE '^[[:space:]]*(#|$|path "pki_(int|file|node)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})')" ""
+expect_eq "enroll.hcl: node-nodeadm's allowed_parameters are exactly csr, ttl, its CN, its SAN and exclude_cn_from_sans" \
+  "$(printf '%s\n' "$POLICY_NA" | grep -vE '^[[:space:]]*(path "pki_node/sign/node-nodeadm" \{|capabilities = \["update"\]|allowed_parameters = \{|"csr" += \[\]|"ttl" += \[\]|"common_name" += \["nodeadm\.control"\]|"alt_names" += \["nodeadm\.portcullis-nodeadm\.svc"\]|"exclude_cn_from_sans" = \["true"\]|\})$')" ""
 # The SSH part (contract §18.7), comments and blank lines aside, is exactly
 # this: no role TTL above 12 h (ttl / max_ttl pinned to whole hours up to
 # 43200), no host certificates from a user role, no critical options or

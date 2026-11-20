@@ -1049,8 +1049,15 @@ expect_ok "pki_node: node-control role (hub.control, client only, 30 d)" \
   grep -q 'write pki_node/roles/node-control allowed_domains=hub.control allow_subdomains=false allow_bare_domains=true .* client_flag=true server_flag=false .* ttl=720h max_ttl=720h no_store=false not_before_duration=30s' "$STUB_DIR/pki-calls"
 expect_ok "pki_node: node-link role (link.control, client only, 90 d)" \
   grep -q 'write pki_node/roles/node-link allowed_domains=link.control allow_subdomains=false allow_bare_domains=true .* client_flag=true server_flag=false .* ttl=2160h max_ttl=2160h no_store=false not_before_duration=30s' "$STUB_DIR/pki-calls"
+# HA (contract §17.5): nodeadm's three roles.
+expect_ok "pki_node: node-cluster role (client + server, 30 d, subdomains of cluster.portcullis.internal)" \
+  grep -q 'write pki_node/roles/node-cluster allowed_domains=cluster.portcullis.internal allow_subdomains=true allow_bare_domains=false .* client_flag=true server_flag=true .* ttl=720h max_ttl=720h' "$STUB_DIR/pki-calls"
+expect_ok "pki_node: node-frontdoor role (frontdoor.control, client only, 30 d)" \
+  grep -q 'write pki_node/roles/node-frontdoor allowed_domains=frontdoor.control allow_subdomains=false allow_bare_domains=true .* client_flag=true server_flag=false .* ttl=720h max_ttl=720h' "$STUB_DIR/pki-calls"
+expect_ok "pki_node: node-nodeadm role (nodeadm.control + its serving name, client + server, 30 d)" \
+  grep -q 'write pki_node/roles/node-nodeadm allowed_domains=nodeadm.control,nodeadm.portcullis-nodeadm.svc allow_subdomains=false allow_bare_domains=true .* client_flag=true server_flag=true .* ttl=720h max_ttl=720h' "$STUB_DIR/pki-calls"
 expect_eq "pki_node: every node role refuses IP / URI / other SANs and the CSR's names" \
-  "$(grep 'write pki_node/roles/' "$STUB_DIR/pki-calls" | grep -c 'allow_any_name=false allow_localhost=false allow_wildcard_certificates=false enforce_hostnames=true use_csr_common_name=false use_csr_sans=false allow_ip_sans=false allowed_uri_sans= allowed_other_sans=')" 3
+  "$(grep 'write pki_node/roles/' "$STUB_DIR/pki-calls" | grep -c 'allow_any_name=false allow_localhost=false allow_wildcard_certificates=false enforce_hostnames=true use_csr_common_name=false use_csr_sans=false allow_ip_sans=false allowed_uri_sans= allowed_other_sans=')" 6
 expect_ok "pki_node: CRL auto-rebuild + delta" grep -q 'write pki_node/config/crl .*enable_delta=true' "$STUB_DIR/pki-calls"
 NODE_C="$PKI_ROOT/certs"
 expect_ok "pki_node: certs/node-ca.crt is pki_node's CA" cmp -s "$NODE_C/node-ca.crt" "$STUB_DIR/pem/node"
@@ -1117,9 +1124,15 @@ NODE_POLICY="$(awk '
 NODE_POLICY_WANT="$(printf '%s\n' \
   'pki_node/sign/node-worker update deny=alt_names,ip_sans,uri_sans,other_sans' \
   'pki_node/sign/node-control update deny=alt_names,ip_sans,uri_sans,other_sans' \
+  'pki_node/sign/node-cluster update deny=alt_names,ip_sans,uri_sans,other_sans' \
+  'pki_node/sign/node-frontdoor update deny=alt_names,ip_sans,uri_sans,other_sans' \
+  'pki_node/sign/node-nodeadm update' \
   'pki_node/cert/* read' 'pki_node/revoke update' 'pki_node/crl/rotate read' | sort)"
-expect_eq "enroll.hcl: the pki_node paths are exactly sign node-worker / node-control (no SANs), cert read, revoke, crl/rotate" \
+expect_eq "enroll.hcl: the pki_node paths are exactly sign node-worker / node-control / node-cluster / node-frontdoor (no SANs), node-nodeadm, cert read, revoke, crl/rotate" \
   "$NODE_POLICY" "$NODE_POLICY_WANT"
+# node-nodeadm takes exactly its one SAN and the CN out of the SANs.
+expect_eq "enroll.hcl: node-nodeadm's allowed_parameters pin the CN, its one alt_names value and exclude_cn_from_sans" \
+  "$(sed -n '/path "pki_node\/sign\/node-nodeadm"/,/^}/p' "$HERE/../vault/policies/enroll.hcl" | grep -cE '"(common_name" += \["nodeadm.control"\]|alt_names" += \["nodeadm.portcullis-nodeadm.svc"\]|exclude_cn_from_sans" = \["true"\]|csr" += \[\]|ttl" += \[\])')" 5
 expect_fail "enroll.hcl: never node-link, issue, roles, root or a pki_node wildcard" \
   grep -Eq 'path "pki_node/(sign/node-link|issue|roles|root|sign-verbatim|intermediate|config|\*|sign/\*)' "$HERE/../vault/policies/enroll.hcl"
 
@@ -4176,7 +4189,7 @@ case "$*" in
   "get nodes -o json") cat "$K/nodes.json" ;;
   "create --dry-run=server -f -") cat >/dev/null; cat "$K/svc-dryrun.err" >&2; exit 1 ;;
   "get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o json") cat "$K/eps.json" ;;
-  "get --raw /api/v1/nodes/"*"/proxy/configz") cat "$K/configz.json" 2>/dev/null || exit 1 ;;
+  "get --raw /api/v1/nodes/"*"/proxy/configz") n="$*"; n="${n#*nodes/}"; n="${n%%/*}"; cat "$K/configz-$n.json" 2>/dev/null || cat "$K/configz.json" 2>/dev/null || exit 1 ;;
   "get services -A -o json") [ ! -e "$K/svcs.fail" ] || { echo 'Error from server (Forbidden)' >&2; exit 1; }; cat "$K/svcs.json" 2>/dev/null || echo '{"items":[]}' ;;
   "get service traefik -o json") cat "$K/traefik-svc.json" 2>/dev/null || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
   "get namespace "*" -o json")
@@ -4321,6 +4334,8 @@ case "$*" in
   "exec client-egress -- nc"*) exit "${STUB_DIAL_EGRESS:-1}" ;;
   "get pod server -o jsonpath={.status.podIP}") echo 10.42.0.9 ;;
   "get configmap portcullis-cluster-addresses -o json") cat "$K/cluster-addresses.json" 2>/dev/null || { echo 'Error from server (NotFound): configmaps "portcullis-cluster-addresses" not found' >&2; exit 1; } ;;
+  "get configmap portcullis-admission-active -o json") cat "$K/active.json" 2>/dev/null || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
+  "get configmap portcullis-admission-params-"*" -o json") g="${3#portcullis-admission-params-}"; cat "$K/params-$g.json" 2>/dev/null || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
   *) [ -n "${STUB_KUBE_SCRIPT:-}" ] && . "$STUB_KUBE_SCRIPT" ;;
 esac
 exit 0
@@ -4491,15 +4506,29 @@ echo 'error: something else entirely' > "$KS/kube/svc-dryrun.err"
 OUT="$(kt 'kube_detect_cidrs')"
 case "$OUT" in *"rc=1") t_pass "kube_detect_cidrs: an unparsable dry-run answer → refused" ;; *) t_fail "kube unparsable svc cidr: $OUT" ;; esac
 # ── HA Task 17: init installs k3s on pcmesh (scripts/lib/kube_install.sh) ──
-# kube_detect_cidrs: more than one node is refused (fail closed: the node
-# checks read one node) until nodeadm's per-node checks exist (Task 21).
+# A multi-node k3s cluster (Task 21, the Task 17 ruling): accepted, every
+# node checked on its own — the server flags on every server, podPidsLimit
+# on every node, AppArmor on this host only ("not checked" elsewhere); a
+# multi-node cluster that isn't k3s stays refused.
 k_fixtures
-jq '.items = [.items[0], (.items[0] | .metadata.name = "n2" | .spec.podCIDRs = ["10.42.1.0/24"]), (.items[0] | .metadata.name = "n3" | .spec.podCIDRs = ["10.42.2.0/24"])]' "$KS/kube/nodes.json" > "$KS/kube/n3.json" && mv "$KS/kube/n3.json" "$KS/kube/nodes.json"
-OUT="$(kt 'kube_detect_cidrs || { echo "$_K_ERR"; exit 1; }')"
-case "$OUT" in *"multi-node clusters are added with ./portcullis node add (not yet available)"*"rc=1") t_pass "kube_detect_cidrs: three nodes → refused (multi-node waits for node add)" ;; *) t_fail "kube detect multi: $OUT" ;; esac
-echo '{"kubeletconfig":{"podPidsLimit":0}}' > "$KS/kube/configz.json"
+jq '.items = [.items[0], (.items[0] | .metadata.name = "n2" | .spec.podCIDRs = ["10.42.1.0/24"] | .status.addresses = [{"type":"InternalIP","address":"10.215.0.2"}]),
+              (.items[0] | .metadata.name = "n3" | .spec.podCIDRs = ["10.42.2.0/24"] | .status.addresses = [{"type":"InternalIP","address":"10.215.0.3"}]
+                 | .metadata.annotations["k3s.io/node-args"] = "[\"server\",\"--disable\",\"traefik\",\"--cluster-cidr\",\"10.42.0.0/24\"]")]' \
+  "$KS/kube/nodes.json" > "$KS/kube/n3.json" && mv "$KS/kube/n3.json" "$KS/kube/nodes.json"
+expect_eq "kube_detect_cidrs: a 3-node k3s cluster → accepted, the cluster CIDR from the servers' node-args" \
+  "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR"')" "10.42.0.0/24
+rc=0"
+echo '{"kubeletconfig":{"podPidsLimit":0}}' > "$KS/kube/configz-n2.json"
 OUT="$(kt 'kube_host_checks')"
-case "$OUT" in *"fail	can't read the cluster's networks: the cluster has more than one node: multi-node"*) t_pass "kube_host_checks: a 3-node cluster (one node without the pids cap) → refused" ;; *) t_fail "kube host multi: $OUT" ;; esac
+if [ "$(printf '%s\n' "$OUT" | grep -c "^fail	node n2: kubelet podPidsLimit is 0"):$(printf '%s\n' "$OUT" | grep -c "^fail	k3s server n3 runs without --secrets-encryption"):$(printf '%s\n' "$OUT" | grep -c "^ok	node node1: kubelet podPidsLimit 1024"):$(printf '%s\n' "$OUT" | grep -c "^ok	k3s server node1:")" = "1:1:1:1" ]; then
+  t_pass "kube_host_checks (3 nodes): n2's podPidsLimit 0 and n3 without --secrets-encryption fail; node1 passes both"
+else t_fail "kube_host_checks 3 nodes: $OUT"; fi
+expect_eq "kube_host_checks (3 nodes): AppArmor not checked on the two other nodes" \
+  "$(printf '%s\n' "$OUT" | grep -c "^warn	AppArmor stacking on node n[23]: not checked")" 2
+rm -f "$KS/kube/configz-n2.json"
+jq '.items |= map(.metadata.annotations = {})' "$KS/kube/nodes.json" > "$KS/kube/n3.json" && mv "$KS/kube/n3.json" "$KS/kube/nodes.json"
+OUT="$(kt 'kube_detect_cidrs || { echo "$_K_ERR"; exit 1; }')"
+case "$OUT" in *"more than one node and isn't k3s"*"rc=1") t_pass "kube_detect_cidrs: three nodes of another distribution → refused" ;; *) t_fail "kube detect multi non-k3s: $OUT" ;; esac
 k_fixtures
 expect_eq "kube_detect_cidrs: k3s's --cluster-cidr node arg is the pod CIDR" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR"')" "10.42.0.0/24
 rc=0"
@@ -4531,6 +4560,71 @@ ca "$(jq -c '.cluster_cidr = "10.99.0.0/16"' <<< "$CA_OK")"
 case "$(car)" in *"give pods 10.99.0.0/16 and services 10.43.0.0/16, but the cluster has 10.42.0.0/24"*"rc=1") t_pass "kube_cluster_addresses: a cluster CIDR ≠ the cluster's → refused" ;; *) t_fail "ca cidr: $(car)" ;; esac
 OUT="$(kt "PORTCULLIS_KUBE_API_ENDPOINTS='10.215.0.10:6443 10.215.0.1:6443'; kube_host_checks")"
 case "$OUT" in *"fail	can't read the cluster's networks: the cluster addresses give pods 10.99.0.0/16"*) t_pass "kube_host_checks: a mismatched cluster addresses document → fail" ;; *) t_fail "ca host: $OUT" ;; esac
+# ── HA Task 21: nodeadm's CLI side (scripts/lib/node.sh, ruling R-ADM) ──
+# The params generation is nodeadm's (shared vectors).
+PGV="$HERE/../nodeadm/testdata/params_generation_vectors.json"
+bad=""
+for i in $(seq 0 $(( $(jq length "$PGV") - 1 ))); do
+  got="$(jq -r --argjson i "$i" '.[$i].params | to_entries[] | "\(.key)\t\(.value)"' "$PGV" | kt 'kube_params_generation' | head -n1)"
+  [ "$got" = "$(jq -r --argjson i "$i" '.[$i].want_generation' "$PGV")" ] || bad="$bad $i"
+done
+expect_eq "params generation: vectors equal nodeadm's (kube_params_generation)" "$bad" ""
+expect_eq "kube_admission_params_apply's generation is kube_params_generation, and it writes the active record after the probe" \
+  "$(sed -n '/^kube_admission_params_apply() {/,/^}/p' "$HERE/../scripts/lib/kube.sh" | grep -c 'kube_params_generation\|kube_admission_active_put "$gen" "$params"')" 2
+# The cluster addresses → the params' addresses: pending and active nodes,
+# never a removed one; anything that doesn't validate changes nothing.
+CA_ST='{"v":1,"mesh_cidr":"10.215.0.0/24","cluster_cidr":"10.42.0.0/24","service_cidr":"10.43.0.0/16","api":["10.215.0.10","10.215.0.1"],"nodes":{"n1":{"mesh":"10.215.0.1","lan":["192.0.2.10"],"public":["198.51.100.7"],"state":"active"},"n2":{"mesh":"10.215.0.10","lan":[],"public":[],"state":"pending"},"n3":{"mesh":"10.215.0.30","lan":["192.0.2.30"],"public":[],"state":"removed"}}}'
+kda() { kt "kube_doc_addresses && echo \"\$_K_DOC_NODES|\$_K_DOC_API\" || { r=\$?; echo \"rc\$r \${_K_ERR:-}\"; exit \$r; }"; }
+ca "$CA_ST"
+expect_eq "kube_doc_addresses: every address of the pending and active nodes (not the removed one), api, each /32" "$(kda)" "10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32|10.215.0.1/32 10.215.0.10/32
+rc=0"
+ca "$(printf '%s' "$CA_ST" | jq -c '.nodes.n2.state = "joining"')"
+case "$(kda)" in *"rc1 the cluster addresses (ConfigMap portcullis-cluster-addresses) don't parse"*) t_pass "kube_doc_addresses: an unknown node state → refused" ;; *) t_fail "kda state: $(kda)" ;; esac
+ca "$(printf '%s' "$CA_ST" | jq -c '.nodes.n1.public = ["not an address"]')"
+case "$(kda)" in *"rc1 "*"don't parse"*) t_pass "kube_doc_addresses: a malformed address → refused" ;; *) t_fail "kda addr: $(kda)" ;; esac
+rm -f "$KS/kube/cluster-addresses.json"
+case "$(kda)" in *"rc2"*) t_pass "kube_doc_addresses: no document yet → 2 (the .env addresses)" ;; *) t_fail "kda none: $(kda)" ;; esac
+# params-sync: the active generation's params with the document's four
+# keys; unchanged → nothing; changed → the swap; refused → nothing.
+PS_BASE="$(printf 'hubImage\tghcr.io/porelli/portcullis-hub@sha256:%064d\nappsNamespace\tportcullis-apps\nnodeAddresses\t10.215.0.1/32\napiAddresses\t10.215.0.1/32 10.215.0.10/32\npodCIDR\t10.42.0.0/24\nserviceCIDR\t10.43.0.0/16' 1)"
+psync() { # psync <base params lines> → kube_params_sync with the stub's active record / params
+  local g; g="$(printf '%s\n' "$1" | kt kube_params_generation | head -n1)"
+  printf '%s\n' "$1" | jq -R 'split("\t") | {(.[0]): .[1]}' | jq -s --arg g "$g" '{data: (add + {generation: $g})}' > "$KS/kube/params-$g.json"
+  jq -n --arg g "$g" '{data: {"active.json": ({generation: $g, node_addresses: [], api_addresses: [], proven_at: "x"} | tojson)}}' > "$KS/kube/active.json"
+  kt "kube_admission_params_apply() { echo \"APPLY \$1\"; printf '%s\n' \"\$2\" | awk -F'\t' '\$1 ~ /Addresses\$/'; }; kube_params_sync"
+}
+ca "$CA_ST"
+OUT="$(psync "$(printf '%s\n' "$PS_BASE" | sed 's#^nodeAddresses\t.*#nodeAddresses\t10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32#')")"
+expect_eq "kube params-sync: the document's addresses already in the active generation → nothing" "$OUT" "rc=0"
+OUT="$(psync "$PS_BASE")"
+case "$OUT" in *"APPLY ghcr.io/porelli/portcullis-hub@sha256:"*"nodeAddresses	10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32"*"apiAddresses	10.215.0.1/32 10.215.0.10/32"*"rc=0")
+  t_pass "kube params-sync: a pending node's addresses → the swap with the document's addresses and the active hub image" ;; *) t_fail "psync change: $OUT" ;; esac
+ca "$(printf '%s' "$CA_ST" | jq -c '.nodes.n2.mesh = "10.9.0.1"')"
+OUT="$(psync "$PS_BASE")"
+case "$OUT" in *APPLY*) t_fail "psync bad doc applied: $OUT" ;; *"rc=1") t_pass "kube params-sync: a node outside the mesh → nothing changed, exit 1" ;; *) t_fail "psync bad: $OUT" ;; esac
+rm -f "$KS/kube/active.json"; ca "$CA_ST"
+case "$(kt 'kube_params_sync')" in *"no active admission params yet"*"rc=1") t_pass "kube params-sync: no active record → refused (run up first)" ;; *) t_fail "psync no active" ;; esac
+rm -f "$KS/kube/cluster-addresses.json"
+case "$(kt 'kube_params_sync')" in *"no cluster addresses yet"*"rc=0") t_pass "kube params-sync: no document yet → nothing to sync" ;; *) t_fail "psync no doc" ;; esac
+# portcullis-kube-params.timer: every 30 s, as the operator, kube params-sync.
+OUT="$(kt "PATH='$KCT/bin':\$PATH; kube_params_timer_units '$KCT/p'; cat '$KCT/p/portcullis-kube-params.service' '$KCT/p/portcullis-kube-params.timer'")"
+expect_eq "kube params timer: a oneshot as the operator running kube params-sync, every 30 s from boot" \
+  "$(printf '%s\n' "$OUT" | grep -cE '^(Type=oneshot|User=.+|ExecStart=.*/portcullis kube params-sync|OnBootSec=30s|OnUnitActiveSec=30s|WantedBy=timers.target)$')" 6
+expect_eq "init on kubernetes installs the params timer" "$(sed -n '/^init_run() {/,/^}/p' "$HERE"/../scripts/lib/stack.sh | grep -c '_rt_is_kube || kube_params_timer_install')" 1
+# nodeadm's objects: off unless init installed k3s and the image is known;
+# the server token reaches its Secret through --from-file only, once.
+expect_eq "kube_nodeadm_on: needs PORTCULLIS_K3S_VERSION and a nodeadm image by digest" \
+  "$(kt 'PORTCULLIS_K3S_VERSION=v1; PORTCULLIS_NODEADM_IMAGE=ghcr.io/x/nodeadm:edge; kube_nodeadm_on' | tail -n1):$(kt "PORTCULLIS_K3S_VERSION=v1; PORTCULLIS_NODEADM_IMAGE=ghcr.io/x/nodeadm@sha256:$(printf '%064d' 4); kube_nodeadm_on" | tail -n1)" "rc=1:rc=0"
+KN="$WORK/kn"; rm -rf "$KN"; mkdir -p "$KN/var/lib/rancher/k3s/server" "$KN/root/secrets/enroll"
+printf 'K10%064d::server:%s' 7 "s3cr3t-server-token-value" > "$KN/var/lib/rancher/k3s/server/token"
+mkdir -p "$KN/etc/rancher/k3s"; printf 'agent-s3cr3t-value' > "$KN/etc/rancher/k3s/agent-token"
+OUT="$(kt "PORTCULLIS_ROOT='$KN/root'; KUBE_INSTALL_PREFIX='$KN'; PORTCULLIS_K3S_VERSION=v1; PORTCULLIS_NODEADM_IMAGE=ghcr.io/x/nodeadm@sha256:$(printf '%064d' 4)
+  kube_ctl() { printf 'ARGV %s\n' \"\$*\" >&2; case \"\$*\" in *'get secret nodeadm-k3s-token'*|*'get secret nodeadm-state'*|*'get configmap portcullis-cluster-addresses'*) return 1 ;;
+    *'--dry-run=client -o json'*) printf '{\"metadata\":{}}' ;; *' get nodes -o json'*) echo '{\"items\":[]}' ;; esac; }
+  kube_namespace_apply() { echo \"NS \$*\"; }; _kube_put() { echo PUT; }
+  kube_nodeadm_prepare; kube_nodeadm_sync; stat -c %a '$KN/root/secrets/enroll/nodeadm-api-secret'")"
+case "$OUT" in *"NS portcullis-nodeadm privileged baseline baseline"*"--from-file=bearer="*"--from-file=token="*"--from-file=agent="*"create --field-manager"*"state.json"*"addr.json"*"600"*"rc=0") t_pass "kube_nodeadm_sync: its namespace, its bearer and the server token by --from-file, the state Secret and the addresses ConfigMap created" ;; *) t_fail "nodeadm sync: $OUT" ;; esac
+case "$OUT" in *"s3cr3t-server-token-value"*|*"agent-s3cr3t-value"*) t_fail "a k3s token reached argv or the output" ;; *) t_pass "kube_nodeadm_sync: the server and agent tokens are on no argv" ;; esac
 rm -f "$KS/kube/cluster-addresses.json"
 k_fixtures
 
