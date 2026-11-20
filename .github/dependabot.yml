@@ -168,6 +168,15 @@ updates:
       mailctl-go:
         patterns: ["*"]
 
+  # nodeadm/go.mod (the HA node administrator; no dependencies yet).
+  - package-ecosystem: gomod
+    directory: /nodeadm
+    schedule:
+      interval: weekly
+    groups:
+      nodeadm-go:
+        patterns: ["*"]
+
   # Actions are pinned by commit SHA with a `# vX.Y.Z` comment; Dependabot
   # updates both (workflows and the local composite actions).
   - package-ecosystem: github-actions

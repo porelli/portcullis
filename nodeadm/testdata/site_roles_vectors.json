@@ -507,7 +507,7 @@
   }
  },
  {
-  "name": "three sites: main 2, edge 1, a new node at main would be a majority: agent",
+  "name": "three sites: main 2, edge 1, a new node at main would be a majority: agent, the server suggested at tb",
   "cluster": [
    {
     "id": "n1",
@@ -545,7 +545,9 @@
   },
   "want": {
    "role": "agent",
-   "warnings": []
+   "warnings": [
+    "main holds a majority of the servers: add the next server at tb."
+   ]
   }
  },
  {
@@ -598,7 +600,7 @@
   }
  },
  {
-  "name": "three sites: main 2, edge 2, a new node at edge would be a majority: agent",
+  "name": "three sites: main 2, edge 2, a new node at edge would be a majority: agent (tb could take it)",
   "cluster": [
    {
     "id": "n1",
@@ -644,6 +646,257 @@
   "want": {
    "role": "agent",
    "warnings": []
+  }
+ },
+ {
+  "name": "the cap: a sixth server is never suggested (3 sites, 2-2-1)",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e2",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "t1",
+    "site": "tb",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "tb",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "e1": 2,
+    "e2": 2,
+    "t1": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "the cap: a sixth server is never suggested (one site, 3 of 5 unhealthy)",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": false
+   },
+   {
+    "id": "n4",
+    "site": "main",
+    "role": "server",
+    "healthy": false
+   },
+   {
+    "id": "n5",
+    "site": "main",
+    "role": "server",
+    "healthy": false
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2,
+    "n4": 2,
+    "n5": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": []
+  }
+ },
+ {
+  "name": "three sites, main holds a majority: the server goes to the site with the fewest (edge before tb)",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "agent",
+    "healthy": true
+   },
+   {
+    "id": "t1",
+    "site": "tb",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "edge",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "server",
+   "warnings": [
+    "an even number of servers doesn't add failure tolerance"
+   ]
+  }
+ },
+ {
+  "name": "three sites, main holds a majority: elsewhere an agent, the fewest-server site named",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "agent",
+    "healthy": true
+   },
+   {
+    "id": "t1",
+    "site": "tb",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "tb",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": [
+    "main holds a majority of the servers: add the next server at edge."
+   ]
+  }
+ },
+ {
+  "name": "three sites, no site can take a server without a majority: agent + warning",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e1",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e2",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "e3",
+    "site": "edge",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "t1",
+    "site": "tb",
+    "role": "agent",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "tb",
+   "rtt_ms": {
+    "n1": 2,
+    "e1": 2,
+    "e2": 2,
+    "e3": 2
+   },
+   "override": ""
+  },
+  "want": {
+   "role": "agent",
+   "warnings": [
+    "no site can take another server without holding a majority of them: this node joins as an agent."
+   ]
   }
  },
  {

@@ -11,8 +11,11 @@ import (
 // internal/hub/testdata/). A round is the front door's view at time t: the
 // in-cluster readiness (node and Traefik Ready) and the probe rounds the
 // nodeagents answered (GET /v1/probes, §20.4, the round shape verbatim);
-// a node that is down has no probe round. Cases tagged cross_site hold the
-// R10/R11 rules (blind probers, the two-site span, whole sites).
+// a node that is down has no probe round. A prober probes every ingress
+// node, its own site and its own address included (§20.4), but only
+// probers at another site count (spike S6); a single site is always
+// internal-only. Cases tagged cross_site hold the multi-site rules (R10
+// blind probers and the two-site span, R11 whole sites).
 type fdProbeResult struct {
 	OK    bool   `json:"ok"`
 	Class string `json:"class"`
@@ -33,7 +36,6 @@ type fdVector struct {
 	Provider       string   `json:"provider"`
 	ProviderName   string   `json:"provider_name"`
 	ProviderMinTTL int      `json:"provider_min_ttl"`
-	Hairpin        bool     `json:"hairpin"`
 	Lease          bool     `json:"lease"`
 	Names          []string `json:"names"`
 	Nodes          map[string]struct {
@@ -61,7 +63,7 @@ type fdVector struct {
 	WantSiteWorstCaseText map[string]string `json:"want_site_worst_case_text"`
 }
 
-var fdClasses = map[string]bool{"ok": true, "timeout": true, "refused": true, "tls": true, "http_status": true, "no_route_inside": true}
+var fdClasses = map[string]bool{"ok": true, "timeout": true, "refused": true, "tls": true, "http_status": true}
 
 // TestFrontdoorVectorsShape: the file decodes strictly; rounds are 10 s
 // apart; every prober's round has the §20.4 shape (ok iff class ok,
@@ -78,7 +80,7 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 	if err := strictVectors(b, &vs); err != nil {
 		t.Fatal(err)
 	}
-	if len(vs) < 20 {
+	if len(vs) < 24 {
 		t.Fatalf("%d vectors", len(vs))
 	}
 	cross, porkbun, internal, noLease := 0, false, false, false
@@ -116,9 +118,12 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 				if !ok || n.Site != p.Site || !p.T.Equal(r.T) {
 					t.Errorf("%s: round %d: prober %s", v.Name, i, p.Prober)
 				}
+				if _, own := p.Results[p.Prober]; n.Ingress && !own {
+					t.Errorf("%s: round %d: ingress prober %s has no result for its own address", v.Name, i, p.Prober)
+				}
 				any := false
 				for target, res := range p.Results {
-					if target == p.Prober || !v.Nodes[target].Ingress || !fdClasses[res.Class] || res.OK != (res.Class == "ok") {
+					if !v.Nodes[target].Ingress || !fdClasses[res.Class] || res.OK != (res.Class == "ok") {
 						t.Errorf("%s: round %d: %s → %s %+v", v.Name, i, p.Prober, target, res)
 					}
 					any = any || res.OK
@@ -128,13 +133,57 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 				}
 			}
 		}
+		sites := map[string]bool{}
+		for _, n := range v.Nodes {
+			sites[n.Site] = true
+		}
+		if v.Want.InternalOnly != (len(sites) == 1) {
+			t.Errorf("%s: internal_only %v with %d sites (S6: exactly when single-site)", v.Name, v.Want.InternalOnly, len(sites))
+		}
+		if v.CrossSite != (len(sites) > 1) {
+			t.Errorf("%s: cross_site %v with %d sites", v.Name, v.CrossSite, len(sites))
+		}
+		if !v.Lease && len(v.Want.Changes) > 0 {
+			t.Errorf("%s: changes without the Lease", v.Name)
+		}
+		// Replay the changes: one per name per 60 s, never an empty set,
+		// ending at want.addresses.
+		set, last := map[string]map[string]bool{}, map[string]time.Time{}
+		for name, as := range v.Initial {
+			set[name] = map[string]bool{}
+			for _, a := range as {
+				set[name][a] = true
+			}
+		}
 		for _, c := range v.Want.Changes {
-			if c.Op != "add" && c.Op != "remove" {
+			if l, ok := last[c.Name]; ok && c.T.Sub(l) < 60*time.Second {
+				t.Errorf("%s: two changes of %s within 60 s", v.Name, c.Name)
+			}
+			last[c.Name] = c.T
+			switch c.Op {
+			case "add":
+				set[c.Name][c.Value] = true
+			case "remove":
+				delete(set[c.Name], c.Value)
+			default:
 				t.Errorf("%s: op %q", v.Name, c.Op)
+			}
+			if len(set[c.Name]) == 0 {
+				t.Errorf("%s: %s left with no address", v.Name, c.Name)
+			}
+		}
+		for name, want := range v.Want.Addresses {
+			if len(want) != len(set[name]) {
+				t.Errorf("%s: %s replays to %d addresses, want %v", v.Name, name, len(set[name]), want)
+			}
+			for _, a := range want {
+				if !set[name][a] {
+					t.Errorf("%s: %s replays without %s", v.Name, name, a)
+				}
 			}
 		}
 	}
-	if cross < 8 || !porkbun || !internal || !noLease {
-		t.Errorf("coverage: %d cross-site cases (want ≥ 8), Porkbun ~10 min %v, internal-only %v, without the Lease %v", cross, porkbun, internal, noLease)
+	if cross < 10 || !porkbun || !internal || !noLease {
+		t.Errorf("coverage: %d cross-site cases (want ≥ 10), Porkbun ~10 min %v, internal-only %v, without the Lease %v", cross, porkbun, internal, noLease)
 	}
 }

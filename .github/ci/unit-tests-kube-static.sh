@@ -164,5 +164,8 @@ for pair in $copies; do
   fi
   cmp -s "$own" "$TOOLS/theirs" || { echo "::error::$own differs from portcullis-hub $ref:$theirs ($sha)"; diff "$own" "$TOOLS/theirs" | head -40; fail=1; }
 done
+# The two Go modules' strict vector decoders are one file, kept in step.
+cmp -s domains/strict_vectors_test.go nodeadm/strict_vectors_test.go \
+  || { echo "::error::domains/ and nodeadm/strict_vectors_test.go differ: keep them byte-identical"; fail=1; }
 [ "$fail" = 0 ] || exit 1
 echo "PASS: the chart lints, validates and matches compose; the Hub's copies are equal ($ref $sha)"

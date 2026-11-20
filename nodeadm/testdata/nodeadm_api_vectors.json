@@ -146,6 +146,28 @@
    }
   },
   {
+   "name": "issue a code: a body over 64 KiB",
+   "route": "POST /v1/codes",
+   "client": "hub.control",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/v1/codes",
+    "headers": {},
+    "body": null,
+    "body_text": null,
+    "body_bytes": 65537
+   },
+   "response": {
+    "status": 413,
+    "headers": {},
+    "body": {
+     "error": "the request body is over 64 KiB"
+    }
+   }
+  },
+  {
    "name": "issue a code: not the leader",
    "route": "POST /v1/codes",
    "client": "hub.control",
@@ -2018,6 +2040,28 @@
    }
   },
   {
+   "name": "enrol: a body over 64 KiB",
+   "route": "POST /node/v1/enrol",
+   "client": "none",
+   "leader": true,
+   "state": "",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/enrol",
+    "headers": {},
+    "body": null,
+    "body_text": null,
+    "body_bytes": 65537
+   },
+   "response": {
+    "status": 413,
+    "headers": {},
+    "body": {
+     "error": "the request body is over 64 KiB"
+    }
+   }
+  },
+  {
    "name": "enrol: a malformed body",
    "route": "POST /node/v1/enrol",
    "client": "none",
@@ -2080,7 +2124,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 answers over pcmesh",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 answers over pcmesh",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2110,6 +2154,7 @@
       "--node-label=topology.kubernetes.io/zone=edge",
       "--node-label=portcullis.io/ingress=true",
       "--node-label=svccontroller.k3s.cattle.io/enablelb=true",
+      "--flannel-conf=/etc/rancher/k3s/flannel-net-conf.json",
       "--kubelet-arg=pod-max-pids=1024",
       "--kubelet-arg=sync-frequency=10s",
       "--kubelet-arg=address=10.215.0.4"
@@ -2122,7 +2167,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 doesn't answer yet",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 doesn't answer yet",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2149,7 +2194,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2201,7 +2246,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the request nonce used 2 min ago",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the request nonce used 2 min ago",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2227,7 +2272,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2252,7 +2297,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2278,7 +2323,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the RTT report replaced: n2 at 251 ms (re-signed by the test)",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the RTT report replaced: n2 at 251 ms (re-signed by the test)",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2304,7 +2349,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": true,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, n4's public endpoint gone and edge has no other node",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, n4's public endpoint gone and edge has no other node",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",
@@ -2330,7 +2375,7 @@
    "route": "POST /node/v1/join",
    "client": "none",
    "leader": false,
-   "state": "n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z",
    "request": {
     "method": "POST",
     "path": "/node/v1/join",

@@ -35,6 +35,9 @@ type apiCase struct {
 		Headers  map[string]string `json:"headers"`
 		Body     json.RawMessage   `json:"body"`
 		BodyText *string           `json:"body_text"`
+		// BodyBytes: a body of that many bytes ('x'), for the 64 KiB limit
+		// (checked before decoding).
+		BodyBytes int `json:"body_bytes,omitempty"`
 	} `json:"request"`
 	Response struct {
 		Status  int               `json:"status"`
@@ -114,6 +117,192 @@ type canon struct {
 	BodySHA256 string `json:"body_sha256"`
 }
 
+// The §20.2 bodies, for the strict per-route check of the cases.
+type meshPeerBody struct {
+	ID         string   `json:"id"`
+	Pub        string   `json:"pub"`
+	Endpoint   *string  `json:"endpoint"`
+	AllowedIPs []string `json:"allowed_ips"`
+	Keepalive  int      `json:"keepalive"`
+}
+
+type meshPlanBody struct {
+	Peers   []meshPeerBody `json:"peers"`
+	Forward bool           `json:"forward"`
+}
+
+type codeRequest struct {
+	ServerID string       `json:"server_id"`
+	Role     string       `json:"role"`
+	Class    string       `json:"class"`
+	Site     string       `json:"site"`
+	MeshIP   string       `json:"mesh_ip"`
+	Ingress  bool         `json:"ingress"`
+	Storage  bool         `json:"storage"`
+	Mesh     meshPlanBody `json:"mesh"`
+}
+
+type labelsRequest struct {
+	Class   string `json:"class"`
+	Site    string `json:"site"`
+	Ingress bool   `json:"ingress"`
+	Storage bool   `json:"storage"`
+}
+
+type resources struct {
+	CPUm     int64 `json:"cpu_m"`
+	MemBytes int64 `json:"mem_bytes"`
+}
+
+type voters struct {
+	Voters  int `json:"voters"`
+	Healthy int `json:"healthy"`
+}
+
+type snapshotBody struct {
+	V       int    `json:"v"`
+	TakenAt string `json:"taken_at"`
+	Nodes   []struct {
+		Name          string            `json:"name"`
+		Role          string            `json:"role"`
+		Ready         bool              `json:"ready"`
+		NotReadySince *string           `json:"not_ready_since"`
+		Unschedulable bool              `json:"unschedulable"`
+		Allocatable   resources         `json:"allocatable"`
+		Labels        map[string]string `json:"labels"`
+		Taints        []struct {
+			Key    string `json:"key"`
+			Value  string `json:"value"`
+			Effect string `json:"effect"`
+		} `json:"taints"`
+		Addresses struct {
+			Mesh   string   `json:"mesh"`
+			LAN    []string `json:"lan"`
+			Public []string `json:"public"`
+		} `json:"addresses"`
+		TraefikReady bool `json:"traefik_ready"`
+		FencingReady bool `json:"fencing_ready"`
+		EtcdMember   bool `json:"etcd_member"`
+	} `json:"nodes"`
+	Enrolling []struct {
+		ID     string `json:"id"`
+		Role   string `json:"role"`
+		Class  string `json:"class"`
+		Site   string `json:"site"`
+		MeshIP string `json:"mesh_ip"`
+		Mesh   struct {
+			Pub    string  `json:"pub"`
+			LAN    *string `json:"lan"`
+			Public *string `json:"public"`
+		} `json:"mesh"`
+		EnrolledAt string `json:"enrolled_at"`
+	} `json:"enrolling"`
+	Pods []struct {
+		Name             string    `json:"name"`
+		Namespace        string    `json:"namespace"`
+		Node             string    `json:"node"`
+		Priority         int       `json:"priority"`
+		PriorityClass    string    `json:"priority_class"`
+		PreemptionPolicy string    `json:"preemption_policy"`
+		Requests         resources `json:"requests"`
+		Tolerations      []struct {
+			Key      string `json:"key"`
+			Operator string `json:"operator"`
+			Value    string `json:"value"`
+			Effect   string `json:"effect"`
+			Seconds  *int64 `json:"seconds"`
+		} `json:"tolerations"`
+		RequiredAffinity [][]struct {
+			Key      string   `json:"key"`
+			Operator string   `json:"operator"`
+			Values   []string `json:"values"`
+		} `json:"required_affinity"`
+		AntiAffinityHost bool `json:"anti_affinity_host"`
+		SpreadHost       bool `json:"spread_host"`
+		DaemonSet        bool `json:"daemonset"`
+		Set              *struct {
+			Name string `json:"name"`
+			Min  int    `json:"min"`
+		} `json:"set"`
+	} `json:"pods"`
+	Quorum struct {
+		Etcd     voters `json:"etcd"`
+		Vault    voters `json:"vault"`
+		Sentinel voters `json:"sentinel"`
+	} `json:"quorum"`
+	Postgres struct {
+		Instances    int     `json:"instances"`
+		SyncStandbys int     `json:"sync_standbys"`
+		Primary      *string `json:"primary"`
+	} `json:"postgres"`
+	Volumes []struct {
+		Name          string  `json:"name"`
+		Robustness    string  `json:"robustness"`
+		DegradedSince *string `json:"degraded_since"`
+	} `json:"volumes"`
+	Errors []string `json:"errors"`
+}
+
+type empty struct{}
+
+// routeBodies: the request body type of a well-formed request and the
+// answer type of a success, per route (nil = no body).
+var routeBodies = map[string][2]func() any{
+	"POST /v1/codes": {func() any { return &codeRequest{} }, func() any {
+		return &struct {
+			Code      string `json:"code"`
+			ExpiresAt string `json:"expires_at"`
+		}{}
+	}},
+	"GET /v1/cluster":              {nil, func() any { return &snapshotBody{} }},
+	"PUT /v1/nodes/{id}/labels":    {func() any { return &labelsRequest{} }, nil},
+	"POST /v1/nodes/{id}/cordon":   {func() any { return &empty{} }, nil},
+	"POST /v1/nodes/{id}/uncordon": {func() any { return &empty{} }, nil},
+	"POST /v1/nodes/{id}/drain":    {func() any { return &empty{} }, nil},
+	"POST /node/v1/nonce": {func() any {
+		return &struct {
+			ServerID string `json:"server_id"`
+		}{}
+	}, func() any {
+		return &struct {
+			Nonce string `json:"nonce"`
+		}{}
+	}},
+	"POST /node/v1/enrol": {func() any {
+		return &struct {
+			ServerID string `json:"server_id"`
+			Nonce    string `json:"nonce"`
+			Proof    string `json:"proof"`
+			CSR      string `json:"csr"`
+			Mesh     struct {
+				Pub    string  `json:"pub"`
+				LAN    *string `json:"lan"`
+				Public *string `json:"public"`
+			} `json:"mesh"`
+		}{}
+	}, func() any {
+		return &struct {
+			Certificate string       `json:"certificate"`
+			CA          string       `json:"ca"`
+			NotAfter    string       `json:"not_after"`
+			Mesh        meshPlanBody `json:"mesh"`
+		}{}
+	}},
+	"POST /node/v1/join": {func() any {
+		return &struct {
+			ServerID string         `json:"server_id"`
+			RTTms    map[string]int `json:"rtt_ms"`
+		}{}
+	}, func() any {
+		return &struct {
+			Role      string   `json:"role"`
+			ServerURL string   `json:"server_url"`
+			Token     string   `json:"token"`
+			Flags     []string `json:"flags"`
+		}{}
+	}},
+}
+
 // TestAPIVectorsShape: the file decodes strictly; every route and every
 // error kind has a case with its status; errors are ≤ 200 characters and
 // carry a kind only from the table; the proof, the canonical signed bytes,
@@ -128,8 +317,36 @@ func TestAPIVectorsShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	routes, kinds := map[string]int{}, map[string]int{}
+	tooBig := map[bool]bool{}
 	for _, c := range vs.Cases {
 		routes[c.Route]++
+		if c.Request.BodyBytes > 0 {
+			if c.Request.BodyBytes <= 64<<10 || c.Response.Status != 413 {
+				t.Errorf("%s: a %d-byte body answers %d", c.Name, c.Request.BodyBytes, c.Response.Status)
+			}
+			tooBig[strings.HasPrefix(c.Route, "POST /node/")] = true
+		}
+		// A well-formed request (any answer but 400 / 413) and a success
+		// carry the route's exact body shape.
+		rb := routeBodies[c.Route]
+		reqBody := c.Request.Body
+		if c.Request.BodyText != nil {
+			reqBody = json.RawMessage(*c.Request.BodyText)
+		}
+		if rb[0] != nil && c.Response.Status != 400 && c.Response.Status != 413 {
+			if err := strictVectors(reqBody, rb[0]()); err != nil {
+				t.Errorf("%s: request body: %v", c.Name, err)
+			}
+		}
+		if c.Response.Status < 300 {
+			if rb[1] == nil {
+				if string(c.Response.Body) != "null" {
+					t.Errorf("%s: a success with a body on a route that answers none", c.Name)
+				}
+			} else if err := strictVectors(c.Response.Body, rb[1]()); err != nil {
+				t.Errorf("%s: answer body: %v", c.Name, err)
+			}
+		}
 		if c.Request.BodyText != nil && len(c.Request.Body) > 0 && string(c.Request.Body) != "null" {
 			t.Errorf("%s: both body and body_text", c.Name)
 		}
@@ -161,6 +378,9 @@ func TestAPIVectorsShape(t *testing.T) {
 	}
 	if len(routes) != len(apiRoutes) {
 		t.Errorf("routes %v", routes)
+	}
+	if !tooBig[false] || !tooBig[true] {
+		t.Error("a 413 case is needed on both listeners (internal and public)")
 	}
 	for k := range apiKinds {
 		if kinds[k] == 0 {

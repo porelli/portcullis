@@ -12,7 +12,8 @@ import (
 // (case-sensitive; omitempty keys may be absent), no duplicate key, no
 // trailing data, and null only where the Go type is a pointer or a
 // json.RawMessage (the Hub's jsonstrict rules, with its Nullable as a
-// pointer).
+// pointer). The same file is domains/strict_vectors_test.go and
+// nodeadm/strict_vectors_test.go (unit-tests-kube-static.sh compares them).
 func strictVectors(b []byte, v any) error {
 	if !json.Valid(b) {
 		return fmt.Errorf("not valid JSON (or trailing data)")
