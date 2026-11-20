@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -90,5 +91,50 @@ func TestStatusEndpoint(t *testing.T) {
 		if _, err := loadConfig(get(over)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// TestStatusPortBounds: at most statusMaxConns connections (a further one
+// waits), each ended at its deadline.
+func TestStatusPortBounds(t *testing.T) {
+	old := statusDeadline
+	statusDeadline = time.Second
+	defer func() { statusDeadline = old }()
+	file := filepath.Join(t.TempDir(), "status.json")
+	if err := status.Write(file, status.Doc{Mode: "apps"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newStatusServer(file)
+	go func() {
+		_ = srv.Serve(newBoundedListener(ln, statusMaxConns, func() time.Duration { return statusDeadline }))
+	}()
+	defer srv.Close()
+	for i := 0; i < statusMaxConns; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+	}
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte("GET /v1/status HTTP/1.1\r\nHost: x\r\n\r\n"))
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	b := make([]byte, 64)
+	n, _ := c.Read(b)
+	if !bytes.HasPrefix(b[:n], []byte("HTTP/1.1 200")) {
+		t.Fatalf("fifth: %q", b[:n])
+	}
+	if el := time.Since(start); el < 700*time.Millisecond || el > 5*time.Second {
+		t.Fatalf("the fifth connection after %s (want after the idle ones' deadline)", el)
 	}
 }

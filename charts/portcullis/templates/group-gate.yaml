@@ -51,7 +51,9 @@ the Hub on :8091 and pruned by the gate itself (portcullis.haGate). */ -}}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
 {{- if .Values.ha.enabled }}
+{{- if ge (int .Values.ha.gateReplicas) 2 }}
 {{ include "portcullis.pdb" (list . "group-gate") }}
+{{- end }}
 {{- else }}
 {{ include "portcullis.pvc" (list . "group-gate-data" .Values.uids.groupGate .Values.uids.hub "0750") }}
 {{- end }}

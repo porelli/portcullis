@@ -41,7 +41,9 @@ StatefulSet, one access log per replica, served to the Hub on :8092
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
 {{- if .Values.ha.enabled }}
+{{- if ge (int .Values.ha.gateReplicas) 2 }}
 {{ include "portcullis.pdb" (list . "mcp-gate") }}
+{{- end }}
 {{- else }}
 {{ include "portcullis.pvc" (list . "mcp-gate-data" .Values.uids.mcpGate .Values.uids.hub "0750") }}
 {{- end }}

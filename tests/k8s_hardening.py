@@ -13,7 +13,8 @@ Secret; the Hub only the apps namespace; nobody the core one, which holds
 portcullis-env, the age / wg / vault Secrets); Traefik watches only the edge
 namespace, and every core IngressRoute / Middleware lives there.
 HA (contract §20.10): the baseline on every HA pod; group-gate and mcp-gate
-StatefulSets ×2 with a data PVC per replica and a PDB, the log ports and
+StatefulSets with a data PVC per replica, spread, a PDB from 2 replicas and
+never more than 1 while they mount hub-data / vpn-doc; the log ports and
 the gate's own pruning only in HA, no shared gate / wg data mount.
 
   python3 tests/k8s_hardening.py
@@ -145,6 +146,62 @@ LOG_PORTS = {"group-gate": ("GATE_LOG_PORT", "8091", 8091), "mcp-gate": ("MCP_GA
              "wg": ("WG_STATUS_LISTEN", "$(WG_POD_IP):8093", 8093)}
 
 
+SINGLE_NODE_PVCS = {"hub-data", "vpn-doc"}
+
+
+def gate_pod_specs(docs):
+    return {n: sp for n, _, _, sp, _ in K.pod_specs(docs) if n in ("group-gate", "mcp-gate")}
+
+
+def gate_mounts_shared(spec):
+    return {(v.get("persistentVolumeClaim") or {}).get("claimName") for v in spec.get("volumes", [])} & SINGLE_NODE_PVCS
+
+
+def gate_shape_problems(docs):
+    """The HA gates' shape: StatefulSets of at least 1 replica, more than
+    1 only once no gate pod mounts a single-node PVC (hub-data, vpn-doc:
+    every replica would be pinned to that node, and its own PVC would keep
+    it there), one data PVC per replica (portcullis-core, the owner
+    annotations, Retain), Parallel, spread over the nodes, port-bound,
+    a PDB minAvailable 1 exactly when there are 2 or more."""
+    out = []
+    sts = {d["metadata"]["name"]: d for d in K.by_kind(docs, "StatefulSet")}
+    if sorted(sts) != ["group-gate", "mcp-gate"]:
+        out.append(f"StatefulSets {sorted(sts)} (want group-gate, mcp-gate)")
+    pdbs = {d["spec"]["selector"]["matchLabels"].get("portcullis.io/component"): d["spec"] for d in K.by_kind(docs, "PodDisruptionBudget")}
+    for name, d in sts.items():
+        sp = d["spec"]
+        n = sp.get("replicas")
+        claims = sp.get("volumeClaimTemplates") or []
+        if not isinstance(n, int) or n < 1:
+            out.append(f"{name}: replicas {n}")
+        elif n > 1 and gate_mounts_shared(sp["template"]["spec"]):
+            out.append(f"{name}: {n} replicas pinned to one node by {sorted(gate_mounts_shared(sp['template']['spec']))}")
+        if [c["metadata"]["name"] for c in claims] != ["data"]:
+            out.append(f"{name}: one data PVC per replica, got {[c['metadata']['name'] for c in claims]}")
+        for c in claims:
+            a = c["metadata"].get("annotations", {})
+            if c["spec"].get("storageClassName") != "portcullis-core" or not {"portcullis.io/uid", "portcullis.io/gid", "portcullis.io/mode"} <= set(a):
+                out.append(f"{name}: its data PVCs need portcullis-core and the owner annotations")
+        if sp.get("persistentVolumeClaimRetentionPolicy") != {"whenDeleted": "Retain", "whenScaled": "Retain"}:
+            out.append(f"{name}: its PVCs must be kept (Retain)")
+        if sp.get("podManagementPolicy") != "Parallel":
+            out.append(f"{name}: podManagementPolicy {sp.get('podManagementPolicy')} (want Parallel)")
+        spread = sp["template"]["spec"].get("topologySpreadConstraints") or []
+        if not any(c.get("topologyKey") == "kubernetes.io/hostname" and c.get("whenUnsatisfiable") == "ScheduleAnyway"
+                   and c.get("maxSkew") == 1 and c.get("labelSelector", {}).get("matchLabels") == {"portcullis.io/component": name}
+                   for c in spread):
+            out.append(f"{name}: no spread over the nodes (hostname, maxSkew 1, ScheduleAnyway)")
+        if sp["template"]["metadata"]["labels"].get("portcullis.io/ingress") != "bound":
+            out.append(f"{name}: not port-bound (portcullis.io/ingress: bound)")
+        want_pdb = isinstance(n, int) and n >= 2
+        if want_pdb and (pdbs.get(name) is None or pdbs[name].get("minAvailable") != 1):
+            out.append(f"{name}: no PodDisruptionBudget minAvailable 1")
+        if not want_pdb and name in pdbs:
+            out.append(f"{name}: a PodDisruptionBudget with {n} replica(s) blocks every drain")
+    return out
+
+
 def check_log_ports():
     """HA (contract §20.10): every HA pod has the baseline; group-gate and
     mcp-gate are StatefulSets of ha.gateReplicas, each replica its own
@@ -170,25 +227,21 @@ def check_log_ports():
         F.add("group-gate prunes its own log (GATE_OPENED_PRUNE_DAYS=365) in HA only")
     if he.get("hub", {}).get("HUB_GATE_LOG_SOURCES") != "http" or "HUB_GATE_LOG_SOURCES" in pe.get("hub", {}):
         F.add("the Hub reads the gates over HTTP (HUB_GATE_LOG_SOURCES=http) in HA only")
-    sts = {d["metadata"]["name"]: d for d in K.by_kind(ha, "StatefulSet")}
-    if sorted(sts) != ["group-gate", "mcp-gate"] or K.by_kind(plain, "StatefulSet"):
-        F.add(f"ha: StatefulSets {sorted(sts)} (want group-gate, mcp-gate; none without HA)")
-    pdbs = {d["spec"]["selector"]["matchLabels"].get("portcullis.io/component"): d["spec"] for d in K.by_kind(ha, "PodDisruptionBudget")}
-    for name, d in sts.items():
-        sp = d["spec"]
-        claims = sp.get("volumeClaimTemplates") or []
-        if sp.get("replicas") != 2 or [c["metadata"]["name"] for c in claims] != ["data"]:
-            F.add(f"ha: {name}: 2 replicas with one data PVC each, got {sp.get('replicas')} / {[c['metadata']['name'] for c in claims]}")
-        for c in claims:
-            a = c["metadata"].get("annotations", {})
-            if c["spec"].get("storageClassName") != "portcullis-core" or not {"portcullis.io/uid", "portcullis.io/gid", "portcullis.io/mode"} <= set(a):
-                F.add(f"ha: {name}: its data PVCs need portcullis-core and the owner annotations")
-        if sp.get("persistentVolumeClaimRetentionPolicy") != {"whenDeleted": "Retain", "whenScaled": "Retain"}:
-            F.add(f"ha: {name}: its PVCs must be kept (Retain)")
-        if sp["template"]["metadata"]["labels"].get("portcullis.io/ingress") != "bound":
-            F.add(f"ha: {name}: not port-bound (portcullis.io/ingress: bound)")
-        if pdbs.get(name) is None or pdbs[name].get("minAvailable") != 1:
-            F.add(f"ha: {name}: no PodDisruptionBudget minAvailable 1")
+    for p in gate_shape_problems(ha):
+        F.add(f"ha: {p}")
+    if K.by_kind(plain, "StatefulSet"):
+        F.add("StatefulSets without ha.enabled")
+    # The pinning rule bites: 2 replicas while a gate still mounts a
+    # single-node PVC must fail (until Task 19 removes those mounts).
+    two = K.render({"ha": {"enabled": True, "gateReplicas": 2}})
+    pinned = any(gate_mounts_shared(sp) for sp in gate_pod_specs(two).values())
+    if pinned != any("pinned" in p for p in gate_shape_problems(two)):
+        F.add("ha: the gate pinning check doesn't follow the hub-data / vpn-doc mounts")
+    try:
+        K.render({"ha": {"enabled": True, "gateReplicas": 0}})
+        F.add("ha: gateReplicas 0 renders (must be refused)")
+    except K.subprocess.CalledProcessError:
+        pass
     pvcs = {c["metadata"]["name"] for c in K.by_kind(ha, "PersistentVolumeClaim")}
     if pvcs & {"group-gate-data", "mcp-gate-data"}:
         F.add(f"ha: the shared gate PVCs still render: {sorted(pvcs & {'group-gate-data', 'mcp-gate-data'})}")

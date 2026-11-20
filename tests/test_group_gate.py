@@ -4,6 +4,7 @@
 Run: python3 tests/test_group_gate.py
 Starts group-gate in-process on an ephemeral port with temp map/policy files.
 """
+import base64
 import datetime
 import importlib.util
 import html
@@ -12,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -4344,13 +4346,14 @@ class VpnTest(GateTest):
 
 class LogPortTest(GateTest):
     """The log port (contract §20.10, Kubernetes HA): GET /v1/log on its own
-    listener, from/limit, at most 4 MiB, every other method 405; and the
-    gate's own pruning (GATE_OPENED_PRUNE_DAYS)."""
+    listener, cursor / from / limit, the exclusive cursor and the truncated
+    flag, at most 4 MiB, every other method 405, at most 4 connections of
+    30 s; and the gate's own pruning (GATE_OPENED_PRUNE_DAYS)."""
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.log_srv = gg.ThreadingHTTPServer(("127.0.0.1", 0), gg.LogHandler)
+        cls.log_srv = gg.LogServer(("127.0.0.1", 0), gg.LogHandler)
         cls.log_port = cls.log_srv.server_address[1]
         threading.Thread(target=cls.log_srv.serve_forever, daemon=True).start()
 
@@ -4371,18 +4374,36 @@ class LogPortTest(GateTest):
         body = b"{}" if method in ("POST", "PUT", "PATCH") else None
         r = urllib.request.Request(f"http://127.0.0.1:{port or self.log_port}{path}", data=body, method=method)
         try:
-            with urllib.request.urlopen(r) as resp:
+            with urllib.request.urlopen(r, timeout=10) as resp:
                 return resp.status, dict(resp.headers), resp.read()
         except urllib.error.HTTPError as e:
             with e:
                 return e.code, dict(e.headers), e.read()
 
-    def lines(self, path="/v1/log"):
-        code, headers, body = self.call(path)
+    def page(self, query=""):
+        """(lines as dicts, next cursor, truncated) of one 200 answer."""
+        code, headers, body = self.call("/v1/log" + (("?" + query) if query else ""))
         self.assertEqual(code, 200, body)
         self.assertEqual(headers.get("Content-Type"), "application/x-ndjson")
+        self.assertIn(headers.get("X-Portcullis-Truncated"), ("true", "false"))
+        self.assertTrue(headers.get("X-Portcullis-Next"))
         self.assertTrue(body == b"" or body.endswith(b"\n"))
-        return [json.loads(x) for x in body.decode().split("\n") if x]
+        return ([json.loads(x) for x in body.decode().split("\n") if x], headers["X-Portcullis-Next"],
+                headers["X-Portcullis-Truncated"] == "true")
+
+    def all_pages(self, first="", limit=1000):
+        """Every line, paging with the cursor until truncated is false; the
+        flags of the pages."""
+        got, flags = [], []
+        lines, cur, trunc = self.page("&".join(x for x in (first, f"limit={limit}") if x))
+        got += lines
+        flags.append(trunc)
+        while trunc:
+            lines, cur, trunc = self.page(f"cursor={cur}&limit={limit}")
+            got += lines
+            flags.append(trunc)
+            self.assertLess(len(flags), 1000)
+        return got, flags, cur
 
     def write_day(self, day, docs, raw_tail=b""):
         os.makedirs(self.dir, exist_ok=True)
@@ -4397,7 +4418,7 @@ class LogPortTest(GateTest):
 
     def test_log_endpoint_get_only(self):
         self.write_day("2026-11-18", [self.line("2026-11-18T10:00:00Z")])
-        self.assertEqual(len(self.lines()), 1)
+        self.assertEqual(len(self.page()[0]), 1)
         for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "FOO"):
             with self.subTest(method=method):
                 code, headers, _ = self.call(method=method)
@@ -4410,67 +4431,132 @@ class LogPortTest(GateTest):
         self.assertNotEqual(code, 200)
         self.assertNotIn(b"192.0.2.1", body)
 
-    def test_log_endpoint_from_limit(self):
+    def test_log_endpoint_serves_the_gates_lines(self):
         # Requests through the gate write lines; the port serves them as written.
         for i in range(5):
             tok = token(amr=["hwk"], preferred_username="bob", sid="s-bob")
             self.assertEqual(self.req(f"app{i}.example.com", groups="lldap_admin",
                                       extra={"X-Forwarded-Access-Token": tok}), 200)
         self.assertTrue(gg.OPENED_LOG.flush())
-        got = self.lines()
-        self.assertEqual(sorted(x["host"] for x in got), [f"app{i}.example.com" for i in range(5)])
+        lines, _, trunc = self.page()
+        self.assertEqual(sorted(x["host"] for x in lines), [f"app{i}.example.com" for i in range(5)])
+        self.assertFalse(trunc)
         on_disk = b"".join(open(os.path.join(self.dir, n), "rb").read() for n in sorted(os.listdir(self.dir)))
         self.assertEqual(self.call()[2], on_disk)
-        self.assertEqual(len(self.lines("/v1/log?limit=2")), 2)
+        lines, _, trunc = self.page("limit=2")
+        self.assertEqual((len(lines), trunc), (2, True))
 
-    def test_log_endpoint_order_and_from(self):
-        # Two days, a line out of order within a day, a torn and an
-        # unparsable line, a non-day file and a directory: oldest first by
-        # time, from inclusive, the bad lines never served.
-        shutil.rmtree(self.dir, ignore_errors=True)
+    def test_log_endpoint_file_order_and_from(self):
+        # Two days, a torn and unparsable line, a non-day file and a
+        # directory: file order, from = the first line at or after it, the
+        # bad lines never served.
         self.write_day("2026-11-17", [self.line("2026-11-17T23:59:59Z", "d1.example.com")])
-        self.write_day("2026-11-18", [self.line("2026-11-18T10:00:02Z", "c.example.com"),
-                                      self.line("2026-11-18T10:00:00Z", "a.example.com"),
+        self.write_day("2026-11-18", [self.line("2026-11-18T10:00:00Z", "a.example.com"),
+                                      self.line("2026-11-18T10:00:02Z", "c.example.com"),
                                       self.line("2026-11-18T10:00:01Z", "b.example.com")],
                        raw_tail=b'not json\n{"time":"x"}\n{"time":"2026-11-18T11:00:00Z","host":"torn')
         open(os.path.join(self.dir, "notes.txt"), "w").write(json.dumps(self.line("2026-11-18T12:00:00Z")) + "\n")
         os.mkdir(os.path.join(self.dir, "2026-11-19.jsonl"))
-        hosts = lambda q="": [x["host"] for x in self.lines("/v1/log" + q)]
-        self.assertEqual(hosts(), ["d1.example.com", "a.example.com", "b.example.com", "c.example.com"])
-        self.assertEqual(hosts("?from=2026-11-18T10:00:01Z"), ["b.example.com", "c.example.com"])
+        hosts = lambda q="": [x["host"] for x in self.page(q)[0]]
+        self.assertEqual(hosts(), ["d1.example.com", "a.example.com", "c.example.com", "b.example.com"])
+        self.assertEqual(hosts("from=2026-11-18T10:00:01Z"), ["c.example.com", "b.example.com"])
         # Offsets and fractions: 11:00:00.5+01:00 = 10:00:00.5Z, so 10:00:00 is before it.
-        self.assertEqual(hosts("?from=" + urllib.parse.quote("2026-11-18T11:00:00.5+01:00")),
-                         ["b.example.com", "c.example.com"])
-        self.assertEqual(hosts("?from=2026-11-18T10:00:00Z&limit=1"), ["a.example.com"])
-        self.assertEqual(hosts("?from=2026-11-19T00:00:00Z"), [])
-        self.assertEqual(hosts("?limit=10000"), hosts())
-        # No log at all: an empty answer.
+        self.assertEqual(hosts("from=" + urllib.parse.quote("2026-11-18T11:00:00.5+01:00")),
+                         ["c.example.com", "b.example.com"])
+        # A fraction finer than a microsecond still rounds up.
+        self.assertEqual(hosts("from=2026-11-18T10:00:00.0000001Z"), ["c.example.com", "b.example.com"])
+        self.assertEqual(hosts("from=2026-11-18T10:00:00Z&limit=1"), ["a.example.com"])
+        self.assertEqual(hosts("from=2026-11-19T00:00:00Z"), [])
+        self.assertEqual(hosts("limit=10000"), hosts())
+        # No log at all: an empty answer, still with its headers.
         shutil.rmtree(self.dir)
-        code, _, body = self.call()
-        self.assertEqual((code, body), (200, b""))
+        self.assertEqual(self.page(), ([], self.page()[1], False))
 
-    def test_log_endpoint_bad_queries(self):
-        for q in ("limit=0", "limit=10001", "limit=20000", "limit=-1", "limit=1.5", "limit=", "limit=abc",
-                  "from=2026-11-18", "from=2026-11-18T10:00:00", "from=yesterday", "from=",
-                  "from=2026-11-18T10:00:00+01:00",  # an unescaped + is a space
-                  "from=2026-13-40T10:00:00Z", "limit=1&limit=2", "since=2026-11-18T10:00:00Z", "x"):
-            with self.subTest(q=q):
-                self.assertEqual(self.call("/v1/log?" + q)[0], 400)
+    def test_log_paging_lines_sharing_one_second(self):
+        # 2500 lines in one second, and more around them: the cursor pages
+        # through every line once, in file order, truncated until the last.
+        docs = ([self.line("2026-11-18T09:59:59Z", "before.example.com")]
+                + [self.line("2026-11-18T10:00:00Z", f"h{i}.example.com") for i in range(2500)]
+                + [self.line("2026-11-18T10:00:01Z", "after.example.com")])
+        self.write_day("2026-11-18", docs)
+        got, flags, _ = self.all_pages(limit=1000)
+        self.assertEqual([x["host"] for x in got], [d["host"] for d in docs])
+        self.assertEqual(flags, [True, True, False])
+        # A first page by from, then the cursor: the same, from the second.
+        got, flags, _ = self.all_pages("from=2026-11-18T10:00:00Z", limit=999)
+        self.assertEqual([x["host"] for x in got], [d["host"] for d in docs[1:]])
+        self.assertEqual(flags, [True, True, False])
+        # Exactly `limit` lines left: not truncated.
+        lines, _, trunc = self.page("from=2026-11-18T10:00:01Z&limit=1")
+        self.assertEqual((len(lines), trunc), (1, False))
 
-    def test_log_endpoint_at_most_4_mib(self):
-        # 8 lines of ~1 MiB each: the answer stops at whole lines, ≤ 4 MiB.
-        shutil.rmtree(self.dir, ignore_errors=True)
-        big = "x" * (1 << 20)
-        self.write_day("2026-11-18", [self.line(f"2026-11-18T10:00:0{i}Z", ua=big) for i in range(8)])
-        code, _, body = self.call("/v1/log?limit=10000")
+    def test_log_paging_4_mib_cut(self):
+        # 100 lines of ~60 KiB (6 MiB) and one longer than any line the gate
+        # writes (skipped): pages stop at whole lines ≤ 4 MiB, truncated set
+        # by the cut, and the cursor continues right after it.
+        big = "x" * 60000
+        docs = [self.line(f"2026-11-18T10:{i // 60:02d}:{i % 60:02d}Z", ua=big) for i in range(100)]
+        self.write_day("2026-11-18", docs[:50] + [self.line("2026-11-18T10:00:50Z", ua="y" * 70000)] + docs[50:])
+        code, headers, body = self.call("/v1/log?limit=10000")
         self.assertEqual(code, 200)
         self.assertLessEqual(len(body), 4 << 20)
-        got = [json.loads(x) for x in body.split(b"\n") if x]
-        self.assertEqual(len(got), 3)
-        self.assertEqual([x["time"] for x in got], [f"2026-11-18T10:00:0{i}Z" for i in range(3)])
+        self.assertGreater(len(body), (4 << 20) - 70000)
+        self.assertEqual(headers["X-Portcullis-Truncated"], "true")
+        got, flags, _ = self.all_pages(limit=10000)
+        self.assertEqual([x["time"] for x in got], [d["time"] for d in docs])
+        self.assertEqual(flags, [True, False])
+
+    def test_log_cursor_follows_new_lines_and_days(self):
+        self.write_day("2026-11-18", [self.line("2026-11-18T10:00:00Z", "a.example.com")])
+        lines, cur, trunc = self.page()
+        self.assertEqual((len(lines), trunc), (1, False))
+        lines, cur2, trunc = self.page(f"cursor={cur}")
+        self.assertEqual((lines, trunc, cur2), ([], False, cur))  # nothing new: the same position
+        self.write_day("2026-11-18", [self.line("2026-11-18T23:59:59Z", "b.example.com")])
+        self.write_day("2026-11-19", [self.line("2026-11-19T00:00:01Z", "c.example.com")])
+        lines, cur, _ = self.page(f"cursor={cur}")
+        self.assertEqual([x["host"] for x in lines], ["b.example.com", "c.example.com"])
+        self.assertEqual(self.page(f"cursor={cur}")[0], [])
+        # The cursor's day pruned: the later days from their start.
+        os.remove(os.path.join(self.dir, "2026-11-19.jsonl"))
+        self.write_day("2026-11-20", [self.line("2026-11-20T08:00:00Z", "d.example.com")])
+        self.assertEqual([x["host"] for x in self.page(f"cursor={cur}")[0]], ["d.example.com"])
+
+    def test_log_cursor_that_no_longer_holds_restarts_at_its_time(self):
+        self.write_day("2026-11-18", [self.line("2026-11-18T10:00:00Z", "a.example.com"),
+                                      self.line("2026-11-18T10:00:05Z", "b.example.com"),
+                                      self.line("2026-11-18T10:00:09Z", "c.example.com")])
+        _, cur, _ = self.page("limit=2")  # after b (10:00:05)
+        # The file rewritten shorter, then longer: the offset is mid-line or past the end.
+        for docs in ([self.line("2026-11-18T10:00:05Z", "b.example.com")],
+                     [self.line("2026-11-18T10:00:00Z", "a-long-name.example.com"),
+                      self.line("2026-11-18T10:00:05Z", "b.example.com"),
+                      self.line("2026-11-18T10:00:09Z", "c.example.com")]):
+            os.remove(os.path.join(self.dir, "2026-11-18.jsonl"))
+            self.write_day("2026-11-18", docs)
+            got = [x["time"] for x in self.page(f"cursor={cur}")[0]]
+            self.assertTrue(got and all(t >= "2026-11-18T10:00:05Z" for t in got), got)
+
+    def test_log_endpoint_bad_queries(self):
+        good = gg.encode_cursor(("2026-11-18", 0, 0))
+        for q in ("limit=0", "limit=10001", "limit=20000", "limit=-1", "limit=1.5", "limit=", "limit=abc",
+                  "limit=00001", "limit=01", "limit=%2B5",
+                  "from=2026-11-18", "from=2026-11-18T10:00:00", "from=yesterday", "from=",
+                  "from=2026-11-18T10:00:00+01:00",  # an unescaped + is a space
+                  "from=2026-13-40T10:00:00Z", "limit=1&limit=2", "since=2026-11-18T10:00:00Z", "x",
+                  # out of range once normalised (were 500s)
+                  "from=0001-01-01T00:00:00%2B23:59", "from=9999-12-31T23:59:59.5Z",
+                  "from=9999-12-31T23:59:59-23:59",
+                  "cursor=", "cursor=***", "cursor=" + good + "A", f"cursor={good}&from=2026-11-18T10:00:00Z",
+                  "cursor=" + base64.urlsafe_b64encode(b"gg1|2026-11-18|01|0").decode().rstrip("="),
+                  "cursor=" + base64.urlsafe_b64encode(b"gg1|2026-02-30|0|0").decode().rstrip("="),
+                  "cursor=" + base64.urlsafe_b64encode(b"gg1|2026-11-18|0|999999999999").decode().rstrip("="),
+                  f"cursor={good}&cursor={good}"):
+            with self.subTest(q=q):
+                self.assertEqual(self.call("/v1/log?" + q)[0], 400)
+        self.assertEqual(self.call(f"/v1/log?cursor={good}")[0], 200)
 
     def test_log_endpoint_refuses_a_symlinked_day(self):
-        shutil.rmtree(self.dir, ignore_errors=True)
         self.write_day("2026-11-18", [self.line("2026-11-18T10:00:00Z")])
         secret = os.path.join(TMP, "secret.jsonl")
         open(secret, "w").write(json.dumps(self.line("2026-11-19T10:00:00Z", "secret.example.com")) + "\n")
@@ -4478,6 +4564,66 @@ class LogPortTest(GateTest):
         code, _, body = self.call()
         self.assertEqual(code, 500)
         self.assertNotIn(b"secret.example.com", body)
+        # A symlink in the directory's place: never followed.
+        shutil.rmtree(self.dir)
+        target = tempfile.mkdtemp(dir=TMP)
+        open(os.path.join(target, "2026-11-18.jsonl"), "w").write(json.dumps(self.line("2026-11-18T10:00:00Z", "secret.example.com")) + "\n")
+        os.symlink(target, self.dir)
+        code, _, body = self.call()
+        self.assertEqual(code, 500)
+        self.assertNotIn(b"secret.example.com", body)
+
+    def raw_conn(self):
+        c = socket.create_connection(("127.0.0.1", self.log_port), timeout=5)
+        self.addCleanup(c.close)
+        return c
+
+    def test_log_port_connection_cap(self):
+        # 4 idle connections hold every slot: a 5th is closed at once; once
+        # they go, requests are served again.
+        idle = [self.raw_conn() for _ in range(4)]
+        time.sleep(0.2)
+        fifth = self.raw_conn()
+        fifth.sendall(b"GET /v1/log HTTP/1.0\r\n\r\n")
+        self.assertEqual(fifth.recv(100), b"")
+        for c in idle:
+            c.close()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                if self.call()[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+        self.assertEqual(self.call()[0], 200)
+
+    def test_log_port_whole_request_deadline(self):
+        # A client trickling its request is cut off at the deadline, though
+        # each byte comes well inside the per-operation timeout.
+        old = gg.LOG_REQUEST_DEADLINE
+        gg.LOG_REQUEST_DEADLINE = 1.0
+        self.addCleanup(setattr, gg, "LOG_REQUEST_DEADLINE", old)
+        c = self.raw_conn()
+        t0 = time.monotonic()
+        closed = False
+        for ch in b"GET /v1/log HTTP/1.0\r\nX-A: " + b"a" * 40:
+            try:
+                c.sendall(bytes([ch]))
+            except OSError:
+                closed = True
+                break
+            c.settimeout(0.2)
+            try:
+                if c.recv(100) == b"":
+                    closed = True
+                    break
+            except socket.timeout:
+                pass
+        self.assertTrue(closed)
+        self.assertLess(time.monotonic() - t0, 5)
+        gg.LOG_REQUEST_DEADLINE = old
+        self.assertEqual(self.call()[0], 200)
 
     def write_days(self, *ages):
         today = datetime.datetime.now(datetime.timezone.utc).date()
@@ -4503,6 +4649,24 @@ class LogPortTest(GateTest):
         shutil.rmtree(self.dir)
         self.assertEqual(gg.OPENED_LOG.prune(7), 0)
 
+    def test_prune_symlinks(self):
+        # A symlinked old day file: the link goes, never its target.
+        os.makedirs(self.dir)
+        target = os.path.join(tempfile.mkdtemp(dir=TMP), "keep.jsonl")
+        open(target, "w").close()
+        old = (datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(days=30)).isoformat()
+        os.symlink(target, os.path.join(self.dir, old + ".jsonl"))
+        self.assertEqual(gg.OPENED_LOG.prune(7), 1)
+        self.assertFalse(os.path.lexists(os.path.join(self.dir, old + ".jsonl")))
+        self.assertTrue(os.path.exists(target))
+        # A symlink in the directory's place: nothing deleted.
+        elsewhere = tempfile.mkdtemp(dir=TMP)
+        open(os.path.join(elsewhere, old + ".jsonl"), "w").close()
+        shutil.rmtree(self.dir)
+        os.symlink(elsewhere, self.dir)
+        self.assertEqual(gg.OPENED_LOG.prune(7), 0)
+        self.assertTrue(os.path.exists(os.path.join(elsewhere, old + ".jsonl")))
+
     def test_prune_at_start_and_daily(self):
         names = self.write_days(10, 1)
         stop = threading.Event()
@@ -4520,6 +4684,31 @@ class LogPortTest(GateTest):
             time.sleep(0.01)
         self.assertFalse(os.path.exists(again))  # on the next round
         self.assertTrue(os.path.exists(names[1]))
+
+    def test_prune_survives_an_unexpected_failure(self):
+        log = gg.OPENED_LOG
+        calls = []
+        real = log.prune
+
+        def flaky(days):
+            calls.append(days)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return real(days)
+        log.prune = flaky
+        names = self.write_days(10)
+        before = gg.METRICS.get("group_gate_opened_log_failures_total")
+        stop = threading.Event()
+        t = threading.Thread(target=log.prune_forever, args=(7, 0.05, stop), daemon=True)
+        t.start()
+        self.addCleanup(t.join, 2)
+        self.addCleanup(stop.set)
+        deadline = time.monotonic() + 2
+        while os.path.exists(names[10]) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(os.path.exists(names[10]))
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertGreater(gg.METRICS.get("group_gate_opened_log_failures_total"), before)
 
     def test_startup_refuses_bad_values(self):
         for var, value in (("LOG_PORT", "x"), ("LOG_PORT", "0"), ("LOG_PORT", "70000"), ("LOG_PORT", str(gg.LISTEN_PORT)),

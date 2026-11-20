@@ -131,9 +131,11 @@ ha:
   meshCIDR: 10.215.0.0/24
   nodeadmNamespace: portcullis-nodeadm
   # group-gate and mcp-gate in HA (contract §20.10): StatefulSets of this
-  # many replicas, each with its own log, served to the Hub on :8091 /
-  # :8092 (wg's status on :8093).
-  gateReplicas: 2
+  # many replicas (at least 1; a PDB from 2), each with its own log, served
+  # to the Hub on :8091 / :8092 (wg's status on :8093). 1 while the gates
+  # still mount the single-node hub-data / vpn-doc (Task 19 makes it 2):
+  # their replicas would all be pinned to that node (k8s_hardening).
+  gateReplicas: 1
   # group-gate prunes its own opened log to this many days in HA
   # (GATE_OPENED_PRUNE_DAYS; the Hub's default history_days, contract §8.2).
   openedPruneDays: 365

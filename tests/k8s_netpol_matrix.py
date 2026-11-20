@@ -22,7 +22,8 @@ HA (ha.enabled, contract §20.1 "Network flows", §20.8, §20.10): the
 whole compose matrix again, with group-gate and mcp-gate port-bound (their
 gate port as compose says; the log ports group-gate :8091, mcp-gate :8092
 and wg :8093 admit the Hub pod alone, every other core pod, an app pod, a
-gateway and the internet denied). The front door
+gateway, a pod of another namespace labelled as the Hub and the internet
+denied). The front door
 reaches exactly nodeadm :8443, the nodeagents :7443 on the node mesh, the
 public internet on 443 and the API endpoints; only Prometheus reaches it
 (:9106); every other core pod, an app pod and the internet are denied both
@@ -164,7 +165,10 @@ def check_log_ports():
     pods = {name: Peer(name, ns, labels) for name, ns, labels, _, _ in K.pod_specs(docs)}
     others = [Peer("app", K.APPS_NS, {"portcullis.io/instance": "echo", "portcullis.io/service": "web"}),
               Peer("gateway-0", K.APPS_NS, {"portcullis.io/instance": "hs", "portcullis.io/vpn-slot": "0"}),
-              Peer("external", None, {}, ip=EXTERNAL), Peer("node", None, {}, ip=NODE)]
+              Peer("external", None, {}, ip=EXTERNAL), Peer("node", None, {}, ip=NODE),
+              # A pod elsewhere wearing the Hub's label: never the Hub.
+              Peer("fake-hub-apps", K.APPS_NS, {"portcullis.io/component": "hub", "portcullis.io/instance": "x"}),
+              Peer("fake-hub-edge", K.EDGE_NS, {"portcullis.io/component": "hub"})]
     for dst, port in (("group-gate", 8091), ("mcp-gate", 8092), ("wg", 8093)):
         if dst not in pods:
             F.add(f"ha: no {dst} pod")
@@ -175,7 +179,7 @@ def check_log_ports():
             if name != "hub" and allowed(pols, src, pods[dst], port):
                 F.add(f"ha: {name} → {dst}:{port} allowed (the Hub alone)")
         for src in others:
-            if allowed(pols, src, pods[dst], port, ingress_only=src.ns == K.APPS_NS):
+            if allowed(pols, src, pods[dst], port, ingress_only=src.ns in (K.APPS_NS, K.EDGE_NS)):
                 F.add(f"ha: {src} → {dst}:{port} allowed (the Hub alone)")
         # Without HA the port isn't there and no policy names it.
     for p in K.by_kind(K.render(), "NetworkPolicy"):

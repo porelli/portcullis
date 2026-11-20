@@ -98,6 +98,8 @@ metadata:
 spec:
   {{- if $sts }}
   replicas: {{ $sts.replicas }}
+  {{- /* The ClusterIP Service, not a headless one: no per-pod DNS names (the
+  Hub finds the replicas by listing pods, contract §20.10). */}}
   serviceName: {{ $s.name }}
   podManagementPolicy: Parallel
   updateStrategy:
@@ -316,6 +318,7 @@ bound: netpol-gate-logs.yaml admits the Hub alone on the log port).
 */}}
 {{- define "portcullis.haGate" -}}
 {{- $s := .s -}}
+{{- if lt (int .root.Values.ha.gateReplicas) 1 }}{{ fail "ha.gateReplicas must be at least 1" }}{{ end -}}
 {{- $vols := list -}}
 {{- range $s.volumes }}{{ if ne .name "data" }}{{ $vols = append $vols . }}{{ end }}{{ end -}}
 {{- $_ := set $s "volumes" $vols -}}
@@ -327,7 +330,8 @@ bound: netpol-gate-logs.yaml admits the Hub alone on the log port).
 
 {{/*
 portcullis.pdb <root> <name> — a PodDisruptionBudget keeping one pod of a
-replicated core service up (HA).
+replicated core service up (HA; only for 2 replicas or more: with one,
+minAvailable 1 would block every node drain).
 */}}
 {{- define "portcullis.pdb" -}}
 {{- $root := index . 0 -}}

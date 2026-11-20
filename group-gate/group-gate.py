@@ -104,11 +104,13 @@ reads it). A failed write is counted, never a deny.
 The log port (contract §20.10, Kubernetes HA only: the chart sets both
 variables, Docker sets neither and the Hub reads and prunes the files):
   - GATE_LOG_PORT (e.g. 8091): a second listener serving only
-    GET /v1/log?from=<RFC 3339>&limit=<1-10000, default 1000> — the opened
-    log's lines as they are on disk (JSONL, oldest first, at most `limit`
-    lines and 4 MiB), every other method 405. No auth: only the Hub pod may
-    reach it (NetworkPolicy, a stated delta in hardening.md). The gate port
-    never serves it.
+    GET /v1/log?cursor=<c>|from=<RFC 3339>&limit=<1-10000, default 1000> —
+    the opened log's lines as they are on disk (JSONL, file order, at most
+    `limit` lines and 4 MiB; headers X-Portcullis-Next, the exclusive
+    cursor of the next page, and X-Portcullis-Truncated), every other
+    method 405; at most 4 connections, 30 s each. No auth: only the Hub pod
+    may reach it (NetworkPolicy, a stated delta in hardening.md). The gate
+    port never serves it.
   - GATE_OPENED_PRUNE_DAYS (e.g. 365): the gate deletes the opened log's day
     files older than that many days, at start and then daily (the Hub's
     rule: never today's file).
@@ -202,6 +204,7 @@ import math
 import os
 import queue
 import re
+import socket
 import stat
 import threading
 import time
@@ -2529,135 +2532,229 @@ class OpenedLog:
     # ── the log port's read and the gate's own pruning (contract §20.10) ──
 
     DAY_FILE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl$")
-    LINE_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+    # A served line starts with its time, as record() writes it.
+    LINE_HEAD_RE = re.compile(rb'^\{"time":"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"[,}]')
+    LINE_MAX = 64 << 10  # longer is not a line record() wrote: skipped
 
-    def _day_files(self) -> List[Tuple[datetime.date, str]]:
-        """(day, name) of every day file, oldest first. A missing directory
-        is no files; one that isn't a directory (a symlink included) is an
-        error."""
+    def _open_dir(self) -> Optional[int]:
+        """The directory's fd (never through a symlink; something else in
+        its place is an error), or None when it doesn't exist. Every read
+        and delete below is relative to it."""
         try:
-            st = os.lstat(self.directory)
+            return os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                           | getattr(os, "O_CLOEXEC", 0))
         except FileNotFoundError:
-            return []
-        if not stat.S_ISDIR(st.st_mode):
-            raise OSError(f"{self.directory} is not a directory")
+            return None
+        except OSError as e:
+            raise OSError(f"{self.directory} is not a directory ({e.strerror})") from None
+
+    def _day_files(self, dfd: int) -> List[Tuple[str, str]]:
+        """(day, name) of every day file name, oldest first."""
         out = []
-        for name in os.listdir(self.directory):
+        for name in os.listdir(dfd):
             m = self.DAY_FILE_RE.match(name)
             if not m:
                 continue
             try:
-                day = datetime.date.fromisoformat(m.group(1))
+                datetime.date.fromisoformat(m.group(1))
             except ValueError:
                 continue
-            out.append((day, name))
+            out.append((m.group(1), name))
         out.sort()
         return out
 
-    def _read_day(self, name: str) -> bytes:
-        """A day file's bytes (at most DAY_FILE_MAX, from its start): never
-        through a symlink, never a FIFO or other non-regular file (an
-        error); a directory or a file gone meanwhile is empty."""
-        path = os.path.join(self.directory, name)
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    def _open_day(self, dfd: int, name: str):
+        """A day file opened for reading (a binary file object), or None
+        for a directory or a file gone meanwhile; never through a symlink,
+        a FIFO or other non-regular file is an error."""
         try:
-            fd = os.open(path, flags)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+                         dir_fd=dfd)
         except FileNotFoundError:
-            return b""
-        try:
-            mode = os.fstat(fd).st_mode
-            if stat.S_ISDIR(mode):
-                return b""  # not a day file (prune leaves it alone too)
-            if not stat.S_ISREG(mode):
-                raise OSError(f"{name} is not a regular file")
-            chunks, left = [], self.DAY_FILE_MAX
-            while left > 0:
-                b = os.read(fd, min(left, 1 << 20))
-                if not b:
-                    break
-                chunks.append(b)
-                left -= len(b)
-            return b"".join(chunks)
-        finally:
+            return None
+        except IsADirectoryError:
+            return None
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
             os.close(fd)
+            return None
+        if not stat.S_ISREG(mode):
+            os.close(fd)
+            raise OSError(f"{name} is not a regular file")
+        return os.fdopen(fd, "rb", buffering=1 << 16)
 
-    def read(self, since: Optional[datetime.datetime], limit: int, max_bytes: int) -> bytes:
-        """The log port's answer: the lines written at or after `since`
-        (None = all), oldest first (by their `time`, then file order), at
-        most `limit` lines and `max_bytes` bytes, each exactly as it is on
-        disk. Torn (no final newline) and unparsable lines are skipped, so
-        nothing is served that isn't a whole line the gate wrote."""
-        since = since.astimezone(datetime.timezone.utc) if since is not None else None
-        from_key = since.strftime("%Y-%m-%dT%H:%M:%SZ") if since is not None else ""
-        if since is not None and since.microsecond:
-            # A line's time has whole seconds: one inside that second is
-            # before `since`.
-            from_key = (since.replace(microsecond=0) + datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    def _lines(self, f, start: int):
+        """(offset after the line, raw line without its newline, time) of
+        every whole line from `start`; a line too long or without a
+        newline (torn: the end) is skipped / ends the file. `time` is None
+        for a line that isn't one record() wrote (never served)."""
+        f.seek(start)
+        pos = start
+        while True:
+            raw = f.readline(self.LINE_MAX + 1)
+            if not raw.endswith(b"\n"):
+                if len(raw) <= self.LINE_MAX:
+                    return  # the end, or a torn last line
+                while raw and not raw.endswith(b"\n"):  # too long: skip it whole
+                    pos += len(raw)
+                    raw = f.readline(self.LINE_MAX + 1)
+                if not raw:
+                    return
+                pos += len(raw)
+                continue
+            pos += len(raw)
+            body = raw[:-1]
+            m = self.LINE_HEAD_RE.match(body)
+            t = None
+            if m:
+                try:
+                    if isinstance(json.loads(body), dict):
+                        t = m.group(1).decode()
+                except ValueError:
+                    pass
+            yield pos, body, t
+
+    def _start_of(self, f, from_key: str) -> int:
+        """The offset of the first line whose time is at or after from_key
+        (a prefix compare, no decoding), else the end of the whole lines."""
+        f.seek(0)
+        pos = 0
+        while True:
+            raw = f.readline(self.LINE_MAX + 1)
+            if not raw.endswith(b"\n"):
+                if len(raw) <= self.LINE_MAX:
+                    return pos
+                while raw and not raw.endswith(b"\n"):
+                    pos += len(raw)
+                    raw = f.readline(self.LINE_MAX + 1)
+                if not raw:
+                    return pos
+                pos += len(raw)
+                continue
+            m = self.LINE_HEAD_RE.match(raw)
+            if m and m.group(1).decode() >= from_key:
+                return pos
+            pos += len(raw)
+
+    @staticmethod
+    def _unix(key: str) -> int:
+        return int(datetime.datetime.strptime(key, "%Y-%m-%dT%H:%M:%SZ")
+                   .replace(tzinfo=datetime.timezone.utc).timestamp())
+
+    @staticmethod
+    def _key(unix: int) -> str:
+        return datetime.datetime.fromtimestamp(unix, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def read(self, from_key: Optional[str], cursor: Optional[Tuple[str, int, int]], limit: int,
+             max_bytes: int) -> Tuple[bytes, Tuple[str, int, int], bool]:
+        """The log port's answer (contract §20.10): (body, next cursor,
+        truncated). Starts at `cursor` (day, byte offset, time: exclusive,
+        right after the last line served) or at the first line whose time
+        is at or after `from_key` (whole seconds, UTC), else at the start.
+        Lines in file order, exactly as on disk, whole lines record() wrote
+        only, at most `limit` and `max_bytes`; truncated = a cut stopped
+        the answer while another line was there. A cursor whose position
+        doesn't hold (not after a newline, past the end) restarts at its
+        time."""
+        dfd = self._open_dir()
+        if cursor is not None:
+            day, off, t = cursor
+            from_key = None
+        elif from_key is not None:
+            day, off, t = from_key[:10], None, self._unix(from_key)
+        else:
+            day, off, t = "0001-01-01", 0, 0
         out: List[bytes] = []
         size = 0
-        for day, name in self._day_files():
-            if since is not None and day < since.date():
-                continue
-            lines = []
-            for i, raw in enumerate(self._read_day(name).split(b"\n")[:-1]):
-                try:
-                    doc = json.loads(raw)
-                except ValueError:
+        nxt = (day, off or 0, t)
+        if dfd is None:
+            return b"", nxt, False
+        try:
+            for fday, name in self._day_files(dfd):
+                if fday < day:
                     continue
-                t = doc.get("time") if isinstance(doc, dict) else None
-                if not isinstance(t, str) or not self.LINE_TIME_RE.match(t) or t < from_key:
+                f = self._open_day(dfd, name)
+                if f is None:
                     continue
-                lines.append((t, i, raw))
-            lines.sort(key=lambda x: (x[0], x[1]))
-            for _, _, raw in lines:
-                if len(out) >= limit or size + len(raw) + 1 > max_bytes:
-                    return b"".join(out)
-                out.append(raw + b"\n")
-                size += len(raw) + 1
-        return b"".join(out)
+                with f:
+                    start = 0
+                    if fday == day:
+                        if off is None:
+                            start = self._start_of(f, from_key)
+                        else:
+                            end = os.fstat(f.fileno()).st_size
+                            ok = off <= end
+                            if ok and off > 0:
+                                f.seek(off - 1)
+                                ok = f.read(1) == b"\n"
+                            start = off if ok else self._start_of(f, self._key(t))
+                    nxt = (fday, start, t)
+                    for pos, body, lt in self._lines(f, start):
+                        if lt is None:
+                            nxt = (fday, pos, nxt[2])
+                            continue
+                        if len(out) >= limit or size + len(body) + 1 > max_bytes:
+                            return b"".join(out), nxt, True
+                        out.append(body + b"\n")
+                        size += len(body) + 1
+                        nxt = (fday, pos, self._unix(lt))
+        finally:
+            os.close(dfd)
+        return b"".join(out), nxt, False
 
     def prune(self, days: int, now: Optional[datetime.datetime] = None) -> int:
         """Deletes the day files older than `days` (their day before today −
         days, UTC); today's file (and any later one) is never deleted,
         whatever `days` is (the Hub's Prune, internal/signinhistory).
-        Other names and directories are left alone; a missing log prunes
-        nothing. Returns how many were deleted; a failure is printed and
-        counted, never raised."""
+        Other names and directories are left alone, a symlink in a day
+        file's place is removed itself (never its target), and a missing
+        log or a symlink in the directory's place prunes nothing. Returns
+        how many were deleted; a failure is printed and counted, never
+        raised."""
         today = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(datetime.timezone.utc).date()
-        cutoff = today - datetime.timedelta(days=max(int(days), 0))
+        cutoff = (today - datetime.timedelta(days=max(int(days), 0))).isoformat()
+        today = today.isoformat()
         removed = 0
         try:
-            files = self._day_files()
+            dfd = self._open_dir()
+            if dfd is None:
+                return 0
         except OSError as e:
             print(f"group-gate: opened log prune: {e}", flush=True)
             METRICS.inc("group_gate_opened_log_failures_total")
             return 0
-        for day, name in files:
-            if not (day < cutoff and day < today):
-                continue
-            path = os.path.join(self.directory, name)
-            try:
-                if stat.S_ISDIR(os.lstat(path).st_mode):
+        try:
+            for day, name in self._day_files(dfd):
+                if not (day < cutoff and day < today):
                     continue
-                os.remove(path)
-                removed += 1
-            except FileNotFoundError:
-                continue
-            except OSError as e:
-                print(f"group-gate: opened log prune: {name}: {e}", flush=True)
-                METRICS.inc("group_gate_opened_log_failures_total")
+                try:
+                    if stat.S_ISDIR(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode):
+                        continue
+                    os.unlink(name, dir_fd=dfd)
+                    removed += 1
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    print(f"group-gate: opened log prune: {name}: {e}", flush=True)
+                    METRICS.inc("group_gate_opened_log_failures_total")
+        finally:
+            os.close(dfd)
         return removed
 
     def prune_forever(self, days: int, every: float = 86400.0, stop: Optional[threading.Event] = None):
-        """prune(days) now and then every `every` seconds until `stop`."""
+        """prune(days) now and then every `every` seconds until `stop`; an
+        unexpected failure is printed and counted, never the end of it."""
         stop = stop or threading.Event()
         while True:
-            n = self.prune(days)
-            if n:
-                print(f"group-gate: pruned {n} opened log day file(s) older than {days} days", flush=True)
+            try:
+                n = self.prune(days)
+                if n:
+                    print(f"group-gate: pruned {n} opened log day file(s) older than {days} days", flush=True)
+            except Exception as e:  # noqa: BLE001 — pruning keeps running
+                print(f"group-gate: opened log prune failed ({type(e).__name__}: {e})", flush=True)
+                METRICS.inc("group_gate_opened_log_failures_total")
             if stop.wait(every):
                 return
-
 
 OPENED_LOG = OpenedLog(OPENED_DIR)
 
@@ -4104,67 +4201,166 @@ LOG_PATH = "/v1/log"
 LOG_ANSWER_MAX = 4 << 20
 LOG_LIMIT_DEFAULT = 1000
 LOG_LIMIT_MAX = 10000
+LOG_MAX_CONNECTIONS = 4
+LOG_REQUEST_DEADLINE = 30.0  # seconds, from the connection's accept
 RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})$")
-# One read at a time: an answer holds at most a day file (8 MiB) and 4 MiB
-# of lines, so the gate's memory stays bounded whoever asks how often.
+CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
+CURSOR_BODY_RE = re.compile(r"^gg1\|(\d{4}-\d{2}-\d{2})\|(0|[1-9]\d{0,9})\|(0|[1-9]\d{0,10})$")
+# One read at a time, held until its answer is written: at most one answer
+# (4 MiB) and one read buffer in memory, whoever asks how often.
 _LOG_READ_LOCK = threading.Lock()
 
 
 def parse_rfc3339(text: str) -> Optional[datetime.datetime]:
     """An RFC 3339 timestamp (seconds required, any fraction, Z or an
-    offset) as an aware datetime, or None."""
+    offset) as an aware datetime, or None. A fraction finer than a
+    microsecond rounds up (never before the instant it names)."""
     if not RFC3339_RE.match(text):
         return None
     head, frac, zone = text[:19], "", text[19:]
     if zone.startswith("."):
-        i = 1
-        while i < len(zone) and zone[i].isdigit():
-            i += 1
-        frac, zone = zone[1:i], zone[i:]
+        k = 1
+        while k < len(zone) and zone[k].isdigit():
+            k += 1
+        frac, zone = zone[1:k], zone[k:]
     zone = "+00:00" if zone in ("Z", "z") else zone
     try:
         t = datetime.datetime.fromisoformat(head.replace("t", "T") + zone)
-    except ValueError:
+        if frac:
+            micro = int((frac + "000000")[:6])
+            t = t.replace(microsecond=micro)
+            if frac[6:].strip("0"):
+                t += datetime.timedelta(microseconds=1)
+    except (ValueError, OverflowError):
         return None
-    return t.replace(microsecond=int((frac + "000000")[:6])) if frac else t
+    return t
 
 
-def log_query(query: str) -> Tuple[Optional[datetime.datetime], int]:
-    """`from` and `limit` of a /v1/log query; ValueError (the 400's text)
-    for anything else: an unknown or repeated parameter, a `from` that
-    isn't RFC 3339, a `limit` outside 1–10000."""
+def encode_cursor(cur: Tuple[str, int, int]) -> str:
+    raw = f"gg1|{cur[0]}|{cur[1]}|{cur[2]}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cursor(text: str) -> Tuple[str, int, int]:
+    """A cursor of encode_cursor (day, byte offset, unix time); ValueError
+    for anything else."""
+    if not CURSOR_RE.match(text):
+        raise ValueError("malformed cursor")
+    try:
+        raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("malformed cursor")
+    m = CURSOR_BODY_RE.match(raw)
+    if not m or encode_cursor((m.group(1), int(m.group(2)), int(m.group(3)))) != text:
+        raise ValueError("malformed cursor")
+    try:
+        datetime.date.fromisoformat(m.group(1))
+        OpenedLog._key(int(m.group(3)))
+    except (ValueError, OverflowError, OSError):
+        raise ValueError("malformed cursor")
+    return m.group(1), int(m.group(2)), int(m.group(3))
+
+
+def log_query(query: str) -> Tuple[Optional[str], Optional[Tuple[str, int, int]], int]:
+    """(from as a whole-second UTC key, rounded up; cursor; limit) of a
+    /v1/log query; ValueError (the 400's text) for anything else: an
+    unknown or repeated parameter, both from and cursor, a `from` that
+    isn't RFC 3339 or is out of range, a bad cursor, a `limit` outside
+    1–10000 or with a sign or leading zero."""
     try:
         params = urllib.parse.parse_qs(query, keep_blank_values=True, strict_parsing=bool(query),
                                        max_num_fields=4)
     except ValueError:
         raise ValueError("malformed query")
-    unknown = sorted(set(params) - {"from", "limit"})
+    unknown = sorted(set(params) - {"from", "cursor", "limit"})
     if unknown:
         raise ValueError(f"unknown parameter {unknown[0]!r}")
     if any(len(v) != 1 for v in params.values()):
         raise ValueError("a parameter given twice")
-    since = None
+    if "from" in params and "cursor" in params:
+        raise ValueError("from and cursor together")
+    from_key = None
     if "from" in params:
         since = parse_rfc3339(params["from"][0])
-        if since is None:
+        try:
+            if since is None:
+                raise ValueError
+            since = since.astimezone(datetime.timezone.utc)
+            if since.microsecond:
+                since = since.replace(microsecond=0) + datetime.timedelta(seconds=1)
+            from_key = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, OverflowError):
             raise ValueError("from must be an RFC 3339 timestamp")
+    cursor = decode_cursor(params["cursor"][0]) if "cursor" in params else None
     limit = LOG_LIMIT_DEFAULT
     if "limit" in params:
         text = params["limit"][0]
-        if not re.fullmatch(r"[0-9]{1,5}", text) or not 1 <= int(text) <= LOG_LIMIT_MAX:
+        if not re.fullmatch(r"[1-9][0-9]{0,4}", text) or int(text) > LOG_LIMIT_MAX:
             raise ValueError(f"limit must be 1-{LOG_LIMIT_MAX}")
         limit = int(text)
-    return since, limit
+    return from_key, cursor, limit
+
+
+class LogServer(ThreadingHTTPServer):
+    """The log port's server: at most LOG_MAX_CONNECTIONS connections at
+    once (one more is closed at once), each served by a daemon thread."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(LOG_MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        pass  # a client gone or cut off at the deadline: nothing to log
 
 
 class LogHandler(BaseHTTPRequestHandler):
     """The log port (GATE_LOG_PORT): GET /v1/log only, every other method
-    405 (contract §20.10). Reachable only from the Hub pod (NetworkPolicy);
-    no auth of its own. Logs nothing."""
+    405 (contract §20.10). One request per connection (HTTP/1.0), the
+    whole of it within LOG_REQUEST_DEADLINE of the accept (then the
+    connection is shut down). Reachable only from the Hub pod
+    (NetworkPolicy); no auth of its own. Logs nothing."""
 
-    timeout = 30  # a stalled client holds a thread at most this long
+    timeout = 10  # per socket operation; the deadline bounds the whole
     server_version = "group-gate"
     sys_version = ""
+
+    def setup(self):
+        self._deadline = time.monotonic() + LOG_REQUEST_DEADLINE
+        self._timer = threading.Timer(LOG_REQUEST_DEADLINE, self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+        super().setup()
+
+    def _expire(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def finish(self):
+        self._timer.cancel()
+        try:
+            super().finish()
+        except OSError:
+            pass
 
     def _answer(self, code: int, body: bytes, ctype: str = "text/plain; charset=utf-8",
                 headers: Optional[dict] = None):
@@ -4194,22 +4390,28 @@ class LogHandler(BaseHTTPRequestHandler):
             self._answer(404, b"not found\n")
             return
         try:
-            since, limit = log_query(parts.query)
+            from_key, cursor, limit = log_query(parts.query)
         except ValueError as e:
             self._answer(400, f"{e}\n".encode())
             return
-        try:
-            with _LOG_READ_LOCK:
-                body = OPENED_LOG.read(since, limit, LOG_ANSWER_MAX)
-        except Exception as e:  # noqa: BLE001 — the gate's requests are never affected
-            print(f"group-gate: log port: reading the opened log failed ({type(e).__name__})", flush=True)
-            self._answer(500, b"the opened log can't be read\n")
+        if not _LOG_READ_LOCK.acquire(timeout=max(self._deadline - time.monotonic(), 0)):
+            self._answer(503, b"busy\n")
             return
-        self._answer(200, body, "application/x-ndjson")
+        try:
+            try:
+                body, nxt, truncated = OPENED_LOG.read(from_key, cursor, limit, LOG_ANSWER_MAX)
+            except Exception as e:  # noqa: BLE001 — the gate's requests are never affected
+                print(f"group-gate: log port: reading the opened log failed ({type(e).__name__})", flush=True)
+                self._answer(500, b"the opened log can't be read\n")
+                return
+            self._answer(200, body, "application/x-ndjson",
+                         {"X-Portcullis-Next": encode_cursor(nxt),
+                          "X-Portcullis-Truncated": "true" if truncated else "false"})
+        finally:
+            _LOG_READ_LOCK.release()
 
     def log_message(self, fmt, *args):
         pass
-
 
 def startup_problem() -> Optional[str]:
     """Why the gate must not start, or None."""
@@ -4254,8 +4456,7 @@ if __name__ == "__main__":
                          name="opened-prune").start()
         print(f"group-gate: pruning the opened log to {OPENED_PRUNE_DAYS} days (daily)", flush=True)
     if LOG_PORT:
-        log_srv = ThreadingHTTPServer(("0.0.0.0", int(LOG_PORT)), LogHandler)
-        log_srv.daemon_threads = True
+        log_srv = LogServer(("0.0.0.0", int(LOG_PORT)), LogHandler)
         threading.Thread(target=log_srv.serve_forever, daemon=True, name="log-port").start()
         print(f"group-gate: log port :{LOG_PORT} (GET {LOG_PATH})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()

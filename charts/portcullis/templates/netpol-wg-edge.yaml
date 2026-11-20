@@ -38,7 +38,10 @@ spec:
     {{- if .Values.ha.enabled }}
     # HA: the status port (contract §20.10), the Hub alone.
     - from:
-        - podSelector:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
             matchLabels:
               portcullis.io/component: hub
       ports:

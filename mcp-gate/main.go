@@ -187,8 +187,9 @@ func serve() error {
 		if err != nil {
 			return fmt.Errorf("log port: %w", err)
 		}
+		bl := newBoundedListener(ln, logMaxConns, func() time.Duration { return logDeadline })
 		go func() {
-			if err := ls.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			if err := ls.Serve(bl); !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("mcp-gate: log port: %v", err)
 			}
 		}()

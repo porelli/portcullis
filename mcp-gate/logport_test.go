@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -75,8 +76,14 @@ func TestAccessLogEndpoint(t *testing.T) {
 	if strings.Contains(string(disk), "s3cret-value") {
 		t.Fatal("the log carries a secret")
 	}
-	if got := times(do("GET", "/v1/log?limit=2")); len(got) != 2 || got[0] != ts(0) {
-		t.Fatalf("limit=2: %v", got)
+	w2 := do("GET", "/v1/log?limit=2")
+	if got := times(w2); len(got) != 2 || got[0] != ts(0) || w2.Header().Get("X-Portcullis-Truncated") != "true" {
+		t.Fatalf("limit=2: %v %v", got, w2.Header())
+	}
+	// The cursor continues right after it, to the end (not truncated).
+	w3 := do("GET", "/v1/log?cursor="+w2.Header().Get("X-Portcullis-Next")+"&limit=3")
+	if got := times(w3); strings.Join(got, ",") != ts(2)+","+ts(3)+","+ts(4) || w3.Header().Get("X-Portcullis-Truncated") != "false" {
+		t.Fatalf("cursor page: %v %v", got, w3.Header())
 	}
 	if got := times(do("GET", "/v1/log?from="+url.QueryEscape(ts(3)))); len(got) != 2 || got[0] != ts(3) {
 		t.Fatalf("from: %v", got)
@@ -93,7 +100,9 @@ func TestAccessLogEndpoint(t *testing.T) {
 		}
 	}
 	for _, q := range []string{"limit=0", "limit=10001", "limit=-1", "limit=+5", "limit=", "limit=x", "from=2026-11-18",
-		"from=2026-11-18T10:00:00", "from=", "from=x&from=y", "limit=1&limit=2", "since=x", "%zz"} {
+		"from=2026-11-18T10:00:00", "from=", "from=x&from=y", "limit=1&limit=2", "since=x", "%zz", "limit=01",
+		"from=0001-01-01T00:00:00Z", "cursor=", "cursor=***", "cursor=x&cursor=y",
+		"cursor=" + accesslog.Cursor{Off: 1}.String() + "&from=" + url.QueryEscape(ts(1))} {
 		if w := do("GET", "/v1/log?"+q); w.Code != http.StatusBadRequest {
 			t.Errorf("?%s: %d", q, w.Code)
 		}
@@ -107,7 +116,7 @@ func TestAccessLogEndpoint(t *testing.T) {
 		}
 	}
 
-	// Out of order, torn, malformed and unknown-key lines: sorted, skipped.
+	// Out of order, torn, malformed and unknown-key lines: file order, skipped.
 	line := func(i int) string {
 		var b bytes.Buffer
 		_ = json.NewEncoder(&b).Encode(map[string]any{"time": ts(i), "user": "", "client": "", "resource": "r", "instance": "",
@@ -119,7 +128,7 @@ func TestAccessLogEndpoint(t *testing.T) {
 	if err := os.WriteFile(path, []byte(odd), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if got := times(do("GET", "/v1/log")); strings.Join(got, ",") != ts(6)+","+ts(7) {
+	if got := times(do("GET", "/v1/log")); strings.Join(got, ",") != ts(7)+","+ts(6) {
 		t.Fatalf("odd lines: %v", got)
 	}
 
@@ -145,7 +154,108 @@ func TestAccessLogEndpoint(t *testing.T) {
 		t.Fatalf("symlink: %d %s", w.Code, w.Body)
 	}
 	_ = os.Remove(path)
-	if w := do("GET", "/v1/log"); w.Code != 200 || w.Body.Len() != 0 {
-		t.Fatalf("missing log: %d %q", w.Code, w.Body)
+	if w := do("GET", "/v1/log"); w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("X-Portcullis-Next") == "" ||
+		w.Header().Get("X-Portcullis-Truncated") != "false" {
+		t.Fatalf("missing log: %d %q %v", w.Code, w.Body, w.Header())
 	}
+}
+
+// TestLogPortBounds: at most logMaxConns connections (a further one waits
+// for a free slot), each cut off at its deadline however slowly it
+// trickles; the read slot is held until the answer is written.
+func TestLogPortBounds(t *testing.T) {
+	old := logDeadline
+	logDeadline = time.Second
+	defer func() { logDeadline = old }()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLogServer(ln.Addr().String(), filepath.Join(t.TempDir(), "access.jsonl"))
+	bl := newBoundedListener(ln, logMaxConns, func() time.Duration { return logDeadline })
+	go func() { _ = srv.Serve(bl) }()
+	defer srv.Close()
+	dial := func() net.Conn {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	// Four idle connections: a fifth request isn't answered until they
+	// are cut off at their deadline.
+	for i := 0; i < logMaxConns; i++ {
+		dial()
+	}
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	c := dial()
+	_, _ = c.Write([]byte("GET /v1/log HTTP/1.1\r\nHost: x\r\n\r\n"))
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	b := make([]byte, 64)
+	n, _ := c.Read(b)
+	if !strings.HasPrefix(string(b[:n]), "HTTP/1.1 200") {
+		t.Fatalf("fifth: %q", b[:n])
+	}
+	if el := time.Since(start); el < 700*time.Millisecond {
+		t.Fatalf("the fifth connection was served at once (%s): no cap", el)
+	}
+	// A trickling client is cut off at the deadline.
+	tr := dial()
+	start = time.Now()
+	cut := false
+	for _, ch := range []byte("GET /v1/log HTTP/1.1\r\nHost: x\r\nX-A: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		if _, err := tr.Write([]byte{ch}); err != nil {
+			cut = true
+			break
+		}
+		_ = tr.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if _, err := tr.Read(b); err != nil && !os.IsTimeout(err) {
+			cut = true
+			break
+		}
+	}
+	if !cut || time.Since(start) > 5*time.Second {
+		t.Fatalf("trickling client not cut off (cut %v after %s)", cut, time.Since(start))
+	}
+}
+
+// TestLogSlotHeldUntilWritten: a second read waits while the first one's
+// answer is still being written.
+func TestLogSlotHeldUntilWritten(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "access.jsonl")
+	_ = os.WriteFile(path, nil, 0o640)
+	h := newLogHandler(path)
+	release := make(chan struct{})
+	first := &blockingWriter{ResponseRecorder: httptest.NewRecorder(), release: release, started: make(chan struct{})}
+	go h.ServeHTTP(first, httptest.NewRequest("GET", "/v1/log", nil))
+	<-first.started
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/log", nil))
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("the second read ran while the first answer was being written")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second read never ran")
+	}
+}
+
+type blockingWriter struct {
+	*httptest.ResponseRecorder
+	release, started chan struct{}
+}
+
+func (b *blockingWriter) WriteHeader(code int) {
+	close(b.started)
+	<-b.release
+	b.ResponseRecorder.WriteHeader(code)
 }
