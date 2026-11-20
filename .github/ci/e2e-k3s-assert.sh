@@ -31,6 +31,9 @@ probe_pod() {
 dial() { K -n "$1" exec "$2" -- nc -w 3 "$3" "$4" </dev/null >/dev/null 2>&1; }
 svc_ip() { K -n "$NS" get svc "$1" -o jsonpath='{.spec.clusterIP}'; }
 pod_ip() { K -n "$NS" get pods -l "portcullis.io/component=$1" -o jsonpath='{.items[0].status.podIP}'; }
+# Postgres is the CNPG Cluster portcullis-pg in cnpg-system (plan Task 23):
+# its primary's address (the pod portcullis-pg-rw selects).
+pg_ip() { K -n cnpg-system get pods -l cnpg.io/cluster=portcullis-pg,cnpg.io/instanceRole=primary -o jsonpath='{.items[0].status.podIP}'; }
 
 # ── § 6: the probe, PSA ──
 K -n "$APPS" get configmap portcullis-netpol-probe -o jsonpath='{.data.proven_at}' | grep -Eq '^20[0-9-]+T' \
@@ -88,13 +91,44 @@ probe_pod "$APPS" e2e-app '{"portcullis.io/instance": "e2eprobe", "portcullis.io
   || probe_pod "$APPS" e2e-app '{"portcullis.io/instance": "e2eprobe"}'
 NODE="$(K get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
 for t in "keycloak:8080" "vault:8200" "postgres:5432" "lldap:3890" "hub:8888"; do
-  ip="$(pod_ip "${t%%:*}")"
+  if [ "${t%%:*}" = postgres ]; then ip="$(pg_ip)"; else ip="$(pod_ip "${t%%:*}")"; fi
   if dial "$APPS" e2e-app "$ip" "${t#*:}"; then fail "an app pod reaches ${t%%:*} ($ip:${t#*:})"; fi
 done
 for p in 6443 10250; do
   if dial "$APPS" e2e-app "$NODE" "$p"; then fail "an app pod reaches the node's :$p"; fi
 done
 pass "an app pod reaches no Keycloak, Vault, Postgres, LLDAP, Hub, :6443 or :10250"
+
+# ── Postgres on CloudNativePG (plan Task 23) ──
+[ "$(K get ns cnpg-system -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" = restricted ] || fail "cnpg-system isn't PSA restricted"
+K -n cnpg-system get cluster.postgresql.cnpg.io portcullis-pg -o json | jq -e '.spec.instances == 1 and .status.readyInstances == 1 and .spec.priorityClassName == "portcullis-core"' >/dev/null \
+  || fail "the CNPG Cluster portcullis-pg isn't 1 ready instance at portcullis-core"
+K -n cnpg-system get pods -o json | jq -e '[.items[] | select(.status.phase == "Running") | .spec.priorityClassName] | length > 1 and all(. == "portcullis-core")' >/dev/null \
+  || fail "a running pod in cnpg-system isn't portcullis-core (ruling I5)"
+K -n cnpg-system get secrets -o json | jq -e '[.items[].metadata.name] | index("portcullis-pg-superuser") == null' >/dev/null || fail "a superuser Secret exists (enableSuperuserAccess false)"
+SA=system:serviceaccount:cnpg-system:cnpg-cloudnative-pg
+for ns in "$NS" "$APPS"; do
+  for r in "get secrets" "create pods" "create pods/exec"; do
+    # shellcheck disable=SC2086
+    [ "$(K auth can-i $r -n "$ns" --as="$SA" 2>/dev/null || true)" = no ] || fail "the CNPG operator can $r in $ns"
+  done
+done
+[ "$(K auth can-i get secrets -n cnpg-system --as="$SA" 2>/dev/null || true)" = yes ] || fail "the CNPG operator can't read its own namespace's Secrets (the check above proves nothing)"
+K -n "$NS" get deploy lldap -o json | jq -e '[.spec.template.spec.volumes[] | select(.persistentVolumeClaim)] == [] and ([.spec.template.spec.containers[0].env[] | select(.name == "LLDAP_DATABASE_URL") | .valueFrom.secretKeyRef.name] == ["portcullis-pg-lldap"])' >/dev/null \
+  || fail "LLDAP has a PVC or no LLDAP_DATABASE_URL from portcullis-pg-lldap"
+K -n "$NS" get pvc lldap-data >/dev/null 2>&1 && fail "the PVC lldap-data exists (LLDAP is on Postgres)"
+K -n "$NS" get jobs -l portcullis.io/component=lldap-schema -o json | jq -e '.items | length == 1 and .[0].status.succeeded == 1' >/dev/null \
+  || fail "LLDAP's schema Job didn't succeed once"
+PGIP="$(pg_ip)"
+if dial "$NS" e2e-hubside "$PGIP" 5432; then fail "a core pod other than Keycloak / LLDAP reaches Postgres"; fi
+probe_pod "$NS" e2e-kclike '{"portcullis.io/component": "keycloak"}'
+dial "$NS" e2e-kclike "$PGIP" 5432 || fail "a pod labelled as Keycloak doesn't reach Postgres :5432 (to-postgres / portcullis-pg)"
+if dial "$NS" e2e-kclike "$PGIP" 8000; then fail "Keycloak's label reaches the instance manager :8000"; fi
+OPIP="$(K -n cnpg-system get pods -l app.kubernetes.io/name=cloudnative-pg -o jsonpath='{.items[0].status.podIP}')"
+if dial "$NS" e2e-kclike "$OPIP" 9443; then fail "a core pod reaches the CNPG webhook :9443"; fi
+# (Keycloak's label puts the probe behind the keycloak Service: gone at once.)
+K -n "$NS" delete pod e2e-kclike --wait=false >/dev/null
+pass "Postgres on CNPG: cnpg-system restricted, every pod portcullis-core, no superuser Secret, the operator's rights end at cnpg-system, LLDAP on Postgres (no PVC, its schema Job done), only Keycloak / LLDAP reach :5432, nobody in the core namespace reaches :8000 or the webhook"
 
 # ── PVC ownership on the node (K3) ──
 own() { # own <pvc> — uid:gid:mode of its directory on the node
@@ -103,10 +137,16 @@ own() { # own <pvc> — uid:gid:mode of its directory on the node
   path="$(K get pv "$pv" -o jsonpath='{.spec.hostPath.path}{.spec.local.path}')"
   sudo stat -c '%u:%g:%a' "$path"
 }
-[ "$(own postgres-data)" = "70:70:750" ] || fail "postgres-data is $(own postgres-data), not 70:70:750"
+ownpg() { # ownpg — uid:gid:mode of the CNPG primary's PVC directory on the node
+  local pv path
+  pv="$(K -n cnpg-system get pvc -l cnpg.io/cluster=portcullis-pg -o jsonpath='{.items[0].spec.volumeName}')"
+  path="$(K get pv "$pv" -o jsonpath='{.spec.hostPath.path}{.spec.local.path}')"
+  sudo stat -c '%u:%g:%a' "$path"
+}
+[ "$(ownpg)" = "26:26:700" ] || fail "the CNPG instance's PVC is $(ownpg), not 26:26:700 (inheritedMetadata's owner annotations)"
 [ "$(own wg-data)" = "10006:10001:2750" ] || fail "wg-data is $(own wg-data), not 10006:10001:2750"
 [ "$(own vpn-doc)" = "10001:10007:2750" ] || fail "vpn-doc is $(own vpn-doc), not 10001:10007:2750"
-pass "PVC directories are created with their owners: postgres-data 70:70:750, wg-data 10006:10001:2750, vpn-doc 10001:10007:2750"
+pass "PVC directories are created with their owners: the CNPG instance's 26:26:700, wg-data 10006:10001:2750, vpn-doc 10001:10007:2750"
 jq -n '{apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: {name: "e2e-noowner", namespace: "portcullis"},
         spec: {storageClassName: "portcullis-core", accessModes: ["ReadWriteOnce"], resources: {requests: {storage: "1Mi"}}}}' | K create -f - >/dev/null
 N="e2e-noowner-pod" IMG="$ALPINE" jq -n '{apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: "portcullis", labels: {"e2e-k3s": "probe"}},

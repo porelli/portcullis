@@ -9,11 +9,12 @@ set -u
 A=e2e-artifacts
 mkdir -p "$A"
 K() { kubectl --context ci "$@"; }
-for ns in portcullis portcullis-apps portcullis-storage portcullis-edge; do
+for ns in portcullis portcullis-apps portcullis-storage portcullis-edge cnpg-system; do
   K -n "$ns" get pods -o wide > "$A/$ns-pods.txt" 2>&1 || true
   K -n "$ns" get events --sort-by=.lastTimestamp > "$A/$ns-events.txt" 2>&1 || true
   K -n "$ns" get pvc -o wide > "$A/$ns-pvc.txt" 2>&1 || true
-  for d in $(K -n "$ns" get deploy -o name 2>/dev/null); do
+  # cnpg-system: the operator's Deployment and the CNPG instances / Jobs (plan Task 23).
+  for d in $(K -n "$ns" get deploy -o name 2>/dev/null; [ "$ns" != cnpg-system ] || K -n "$ns" get pods -o name 2>/dev/null; [ "$ns" != portcullis ] || K -n "$ns" get jobs -o name 2>/dev/null); do
     K -n "$ns" logs "$d" --all-containers --tail=500 > "$A/$ns-${d#*/}.log" 2>&1 || true
     K -n "$ns" logs "$d" --all-containers --previous --tail=500 > "$A/$ns-${d#*/}.previous.log" 2>/dev/null || rm -f "$A/$ns-${d#*/}.previous.log"
   done

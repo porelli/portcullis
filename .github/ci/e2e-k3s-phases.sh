@@ -13,9 +13,12 @@
 #   vpn      vpn init (built-in on), a device handshake through wg-people
 #            from netns ext, vpn mode admin, then the break-glass vpn mode
 #            apps with the Hub at 0: the core routers' entrypoints move
-#   restore  the Docker phase's backup restored onto k3s: the host's
-#            kubernetes keys kept, the CA chain and rt-person the Docker
-#            phase's, status clean
+#   restore  test_restore_into_cnpg (plan Task 23): a Kubernetes backup
+#            (pg_dump keycloak + lldap from the CNPG primary) restored, LLDAP's
+#            person back and Keycloak signing in; then the Docker phase's
+#            backup restored onto k3s: the host's kubernetes keys kept, the
+#            CA chain the Docker phase's, Keycloak's database in CNPG (signs
+#            in), status clean; its SQLite LLDAP waits for Task 26
 # Output goes through redact (setup links); no secret is printed.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -51,6 +54,43 @@ lldap_token() { # lldap_token <base> — admin's token (retried; the HTTP status
     sleep 2
   done
   rm -f "$out"; echo "FAIL: LLDAP login as admin: HTTP ${code:-none}" >&2; return 1
+}
+
+pf_svc() { # pf_svc <svc> <port> — a port-forward to a core Service (dies with the script); prints the local port
+  local log port
+  log="$(mktemp)"
+  K -n portcullis port-forward --address 127.0.0.1 "svc/$1" ":$2" > "$log" 2>&1 &
+  for _ in $(seq 1 50); do grep -q 'Forwarding from' "$log" && break; sleep 0.2; done
+  port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) .*/\1/p' "$log" | head -n1)"
+  [ -n "$port" ] || fail "no port-forward to $1"
+  printf '%s' "$port"
+}
+
+lldap_gql() { # lldap_gql <base> <query> — LLDAP's GraphQL as admin (the token never printed)
+  local tok
+  tok="$(lldap_token "$1")" || return 1; echo "::add-mask::$tok"
+  jq -n --arg q "$2" '{query: $q}' | curl -sf "$1/api/graphql" -H @<(printf 'Authorization: Bearer %s\n' "$tok") -H 'Content-Type: application/json' -d @-
+}
+
+lldap_has() { # lldap_has <base> <user> <true|false> — the user is (not) in LLDAP
+  local out
+  out="$(lldap_gql "$1" '{ users { id } }')" || return 1
+  [ "$(printf '%s' "$out" | jq --arg u "$2" '[.data.users[].id] | index($u) != null')" = "$3" ]
+}
+
+kc_signin() { # kc_signin — Keycloak's admin signs in (password grant on master, admin-cli) through a port-forward; the password from .env on stdin
+  local pw port code out
+  pw="$(grep '^KEYCLOAK_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$pw"
+  port="$(pf_svc keycloak 8080)"
+  out="$(mktemp)"
+  for _ in $(seq 1 60); do
+    code="$(PW="$pw" jq -rn '"grant_type=password&client_id=admin-cli&username=admin&password=" + (env.PW | @uri)' \
+      | curl -s -o "$out" -w '%{http_code}' --max-time 10 "http://127.0.0.1:$port/realms/master/protocol/openid-connect/token" \
+          -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- || true)"
+    [ "$code" = 200 ] && jq -e '.access_token | length > 0' "$out" >/dev/null 2>&1 && { rm -f "$out"; return 0; }
+    sleep 5
+  done
+  rm -f "$out"; echo "FAIL: Keycloak's admin doesn't sign in (HTTP ${code:-none})"; return 1
 }
 
 # E2E_K3S_SKIP_DOCKER=1 (local iteration, .github/ci/e2e-k3s-local.sh):
@@ -150,18 +190,37 @@ vpn)
   echo "PASS: vpn init (wg-people UDP LB, ETP Local), vpn mode admin parks the hub router, break-glass vpn mode apps with the Hub at 0"
   ;;
 restore)
-  ./portcullis restore --yes "$RUNNER_TEMP/rt-backup" 2>&1 | redact
+  # test_restore_into_cnpg (plan Task 23): a Kubernetes backup (pg_dump of
+  # keycloak and lldap from the CNPG primary, the pod portcullis-pg-rw
+  # selects) restored into the cluster; then the Docker phase's backup.
+  lport="$(pf_svc lldap 17170)"
+  bash .github/ci/lldap-create-person.sh k8s-person "http://127.0.0.1:$lport"
+  ./portcullis backup 2>&1 | redact
+  B="$(find backups -mindepth 1 -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
+  for f in postgres.dump lldap.dump; do [ "$(head -c 5 "$B/$f" 2>/dev/null)" = PGDMP ] || fail "the Kubernetes backup has no custom-format $f"; done
+  [ ! -e "$B/lldap_data.tar.gz" ] || fail "the Kubernetes backup has an lldap_data volume (LLDAP is on Postgres)"
+  ./portcullis backup verify --local "$B" 2>&1 | redact
+  lldap_has "http://127.0.0.1:$lport" k8s-person true || fail "k8s-person isn't in LLDAP before the backup's restore"
+  lldap_gql "http://127.0.0.1:$lport" 'mutation { deleteUser(userId: "k8s-person") { ok } }' >/dev/null
+  lldap_has "http://127.0.0.1:$lport" k8s-person false || fail "k8s-person wasn't deleted before the restore"
+  ./portcullis restore --yes "$B" 2>&1 | redact
+  status_wait 600
+  lport="$(pf_svc lldap 17170)"
+  lldap_has "http://127.0.0.1:$lport" k8s-person true || fail "k8s-person isn't back in LLDAP after the restore (lldap.dump into CNPG)"
+  kc_signin || exit 1
+  echo "PASS: test_restore_into_cnpg: a Kubernetes backup (pg_dump keycloak + lldap) restored into CNPG; LLDAP has k8s-person again, Keycloak signs in"
+  # The Docker phase's backup: Keycloak's dump into CNPG; its LLDAP is
+  # SQLite, whose conversion into Postgres is plan Task 26's restore step
+  # (until then LLDAP starts empty: --allow-empty-lldap).
+  ./portcullis restore --yes --allow-empty-lldap "$RUNNER_TEMP/rt-backup" 2>&1 | redact | tee "$RUNNER_TEMP/rt-restore.log"
+  grep -q "isn't converted into Postgres on Kubernetes yet" "$RUNNER_TEMP/rt-restore.log" || fail "restore didn't say the Docker backup's LLDAP isn't converted"
   grep -qx 'CONTAINER_RUNTIME=kubernetes' .env && grep -qx 'PORTCULLIS_KUBE_CONTEXT=ci' .env || fail "restore didn't keep this host's kubernetes keys"
   status_wait 600
   [ "$(sha256sum certs/ca-chain.crt | cut -d' ' -f1)" = "$(cat "$RUNNER_TEMP/rt-ca.sha256")" ] || fail "the CA chain isn't the Docker phase's"
-  pf_log="$(mktemp)"
-  K -n portcullis port-forward --address 127.0.0.1 svc/lldap :17170 > "$pf_log" 2>&1 &
-  for i in $(seq 1 50); do grep -q 'Forwarding from' "$pf_log" && break; sleep 0.2; done
-  port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) .*/\1/p' "$pf_log" | head -n1)"
-  tok="$(lldap_token "http://127.0.0.1:$port")" || exit 1; echo "::add-mask::$tok"
-  jq -n '{query: "{ user(userId: \"rt-person\") { id } }"}' | curl -sf "http://127.0.0.1:$port/api/graphql" -H @<(printf 'Authorization: Bearer %s\n' "$tok") \
-    -H 'Content-Type: application/json' -d @- | jq -e '.data.user.id == "rt-person"' >/dev/null || fail "rt-person isn't in the restored LLDAP"
-  echo "PASS: Docker → Kubernetes restore: host keys kept, status clean, the CA chain and rt-person are the Docker phase's"
+  kc_signin || exit 1
+  lport="$(pf_svc lldap 17170)"
+  lldap_has "http://127.0.0.1:$lport" rt-person false || fail "rt-person is in LLDAP: the SQLite conversion is Task 26's (update this check with it)"
+  echo "PASS: Docker → Kubernetes restore: host keys kept, status clean, the CA chain the Docker phase's, Keycloak's database restored into CNPG (signs in); LLDAP's SQLite waits for Task 26"
   ;;
 *) echo "usage: $0 docker|init|seed|hub|vpn|restore" >&2; exit 2 ;;
 esac
