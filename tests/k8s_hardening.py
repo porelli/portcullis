@@ -367,6 +367,7 @@ def main():
     check_secret_access(docs + storage_docs())
     check_edge(docs)
     check_frontdoor()
+    check_nodeadm()
     check_log_ports()
     check_psa()
     check_priorities()
@@ -395,7 +396,117 @@ def main():
 # can't be stricter than enforce privileged, warn / audit baseline.
 PSA_WANT = {"core": ["restricted"] * 3, "apps": ["privileged", "baseline", "baseline"],
             "storage": ["privileged", "baseline", "baseline"], "edge": ["restricted"] * 3,
-            "ingress": ["privileged", "baseline", "baseline"]}
+            "ingress": ["privileged", "baseline", "baseline"],
+            # nodeadm (contract §20.1): the init container's root read of the
+            # etcd client key (hostPath, read-only).
+            "nodeadm": ["privileged", "baseline", "baseline"]}
+
+
+NODEADM_NS = "portcullis-nodeadm"
+NODEADM_VALUES = {"nodeadm": {"enabled": True, "image": "ghcr.io/porelli/portcullis-nodeadm@sha256:" + "4" * 64}}
+NODEADM_CLUSTER_RULES = [
+    {"apiGroups": [""], "resources": ["nodes"], "verbs": ["get", "list", "watch", "patch", "delete"]},
+    {"apiGroups": [""], "resources": ["pods"], "verbs": ["list", "watch"]},
+    {"apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"]},
+    {"apiGroups": ["postgresql.cnpg.io"], "resources": ["clusters"], "verbs": ["get", "list"]},
+    {"apiGroups": ["longhorn.io"], "resources": ["volumes", "nodes", "replicas"], "verbs": ["get", "list"]},
+    {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["get", "list"]},
+]
+NODEADM_CORE_RULES = [
+    {"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["nodeadm-k3s-token", "frontdoor-control-tls", "nodeadm-state"], "verbs": ["get", "update"]},
+    {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-cluster-addresses"], "verbs": ["update"]},
+    {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-admission-active"], "verbs": ["get"]},
+    {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["portcullis-nodeadm"], "verbs": ["get", "update"]},
+]
+NODEADM_KUBE_SYSTEM_RULES = [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["create"]}]
+NODEADM_LONGHORN_RULES = [{"apiGroups": ["longhorn.io"], "resources": ["nodes"], "verbs": ["get", "patch"]}]
+ADMISSION_RESOURCES = {"validatingadmissionpolicies", "validatingadmissionpolicybindings", "mutatingwebhookconfigurations",
+                       "validatingwebhookconfigurations", "mutatingadmissionpolicies", "mutatingadmissionpolicybindings"}
+
+
+def check_nodeadm():
+    """nodeadm (contract §20.2, ruling R-ADM), rendered with nodeadm.enabled
+    only: one pod in portcullis-nodeadm on a server node; the main
+    container restricted as 10010; only the init container runs as root
+    (every capability dropped, read-only, no escalation) and only it mounts
+    the etcd certificates' hostPath, read-only; its RBAC exactly the
+    contract's (no admission object anywhere, no ConfigMap create, Secrets
+    only by name in the core namespace and create in kube-system)."""
+    if [d for d in K.render() if d.get("metadata", {}).get("namespace") == NODEADM_NS or "nodeadm" in d.get("metadata", {}).get("name", "")]:
+        F.add("nodeadm renders without nodeadm.enabled")
+    for ha in (False, True):
+        vals = dict(NODEADM_VALUES, ha={"enabled": ha})
+        docs = K.render(vals)
+        pods = [p for p in K.pod_specs(docs) if p[0] == "nodeadm"]
+        if len(pods) != 1 or pods[0][1] != NODEADM_NS:
+            F.add(f"nodeadm: {len(pods)} pods (want one in {NODEADM_NS})")
+            return
+        name, ns, labels, spec, ann = pods[0]
+        if spec.get("nodeSelector") != {"node-role.kubernetes.io/control-plane": "true"}:
+            F.add(f"nodeadm: nodeSelector {spec.get('nodeSelector')} (server nodes only)")
+        if spec.get("priorityClassName") != "portcullis-core" or spec.get("serviceAccountName") != "nodeadm":
+            F.add("nodeadm: priority class / ServiceAccount")
+        for k in ("hostNetwork", "hostPID", "hostIPC"):
+            if spec.get(k):
+                F.add(f"nodeadm: {k}")
+        hostpaths = [v for v in spec.get("volumes", []) if "hostPath" in v]
+        if [v["hostPath"]["path"] for v in hostpaths] != ["/var/lib/rancher/k3s/server/tls/etcd"]:
+            F.add(f"nodeadm: hostPath volumes {hostpaths}")
+        for v in spec.get("volumes", []):
+            kinds = set(v) - {"name"}
+            if not kinds <= RESTRICTED_VOLUMES | {"hostPath"}:
+                F.add(f"nodeadm: volume {v['name']} {sorted(kinds)}")
+        inits, mains = spec.get("initContainers", []), spec.get("containers", [])
+        if [c["name"] for c in inits] != ["etcd-certs"] or [c["name"] for c in mains] != ["nodeadm"]:
+            F.add("nodeadm: containers")
+            return
+        for c in inits + mains:
+            sc = c.get("securityContext", {})
+            if sc.get("allowPrivilegeEscalation") is not False or sc.get("privileged") or sc.get("readOnlyRootFilesystem") is not True \
+                    or sc.get("capabilities") != {"drop": ["ALL"]}:
+                F.add(f"nodeadm/{c['name']}: the baseline (no escalation, drop ALL and add nothing, read-only root)")
+            res = c.get("resources", {})
+            if not res.get("limits", {}).get("memory") or res["limits"]["memory"] != res.get("requests", {}).get("memory"):
+                F.add(f"nodeadm/{c['name']}: memory limit != request")
+            if not re.search(r"@sha256:[0-9a-f]{64}$", c["image"]):
+                F.add(f"nodeadm/{c['name']}: image not by digest")
+            for m in c.get("volumeMounts", []):
+                if m["name"] == "host-etcd" and (c["name"] != "etcd-certs" or m.get("readOnly") is not True):
+                    F.add(f"nodeadm/{c['name']}: mounts the etcd hostPath (only the init container, read-only)")
+        msc = mains[0]["securityContext"]
+        if msc.get("runAsUser") != 10010 or msc.get("runAsNonRoot") is not True:
+            F.add(f"nodeadm: runs as {msc.get('runAsUser')} (10010, non-root)")
+        if (spec.get("securityContext", {}).get("seccompProfile") or {}).get("type") != "RuntimeDefault":
+            F.add("nodeadm: seccomp")
+        secrets = {v["secret"]["secretName"] for v in spec.get("volumes", []) if "secret" in v}
+        if secrets != {"nodeadm-enroll"}:
+            F.add(f"nodeadm: mounts {sorted(secrets)}")
+        # RBAC.
+        cr = [d for d in K.by_kind(docs, "ClusterRole") if d["metadata"]["name"] == "portcullis-nodeadm"]
+        if len(cr) != 1 or cr[0]["rules"] != NODEADM_CLUSTER_RULES:
+            F.add(f"nodeadm's ClusterRole must be exactly {NODEADM_CLUSTER_RULES}")
+        roles = {(r["metadata"]["namespace"], r["metadata"]["name"]): r["rules"] for r in K.by_kind(docs, "Role")
+                 if any(s.get("name") == "nodeadm" for b in K.by_kind(docs, "RoleBinding")
+                        if b["roleRef"]["name"] == r["metadata"]["name"] and b["metadata"]["namespace"] == r["metadata"]["namespace"]
+                        for s in b.get("subjects", []))}
+        want = {(K.NS, "portcullis-nodeadm"): NODEADM_CORE_RULES, ("kube-system", "portcullis-nodeadm"): NODEADM_KUBE_SYSTEM_RULES}
+        if ha:
+            want[("longhorn-system", "portcullis-nodeadm")] = NODEADM_LONGHORN_RULES
+        if roles != want:
+            F.add(f"nodeadm's Roles {roles} != {want}")
+        for d in K.by_kind(docs, "ClusterRole") + K.by_kind(docs, "Role"):
+            if "nodeadm" in d["metadata"]["name"]:
+                for r in d["rules"]:
+                    if set(r.get("resources", [])) & ADMISSION_RESOURCES or "*" in r.get("resources", []) + r.get("verbs", []):
+                        F.add(f"{d['kind']} {d['metadata']['name']}: an admission object or a wildcard (ruling R-ADM)")
+                    if "configmaps" in r.get("resources", []) and {"create", "delete", "patch"} & set(r["verbs"]):
+                        F.add(f"{d['kind']} {d['metadata']['name']}: configmaps {r['verbs']} (update the addresses, get the active record only)")
+        got = secret_access(docs).get(f"{NODEADM_NS}/nodeadm", set())
+        if got != {K.NS}:
+            F.add(f"nodeadm reads Secrets in {sorted(got)} (the core namespace's three, by name)")
+        if any(d.get("kind") in ("Secret", "ConfigMap") and d["metadata"]["name"] in ("nodeadm-k3s-token", "nodeadm-state", "portcullis-cluster-addresses")
+               for d in docs):
+            F.add("the chart renders an object nodeadm writes (the CLI creates them, never Helm)")
 
 
 def check_psa():
@@ -403,7 +514,8 @@ def check_psa():
     for role, want in PSA_WANT.items():
         if src.get(role) != want:
             F.add(f"namespaces.json {role}: {src.get(role)} (want {want})")
-    names = {"core": K.NS, "apps": K.APPS_NS, "storage": "portcullis-storage", "edge": K.EDGE_NS, "ingress": "portcullis-ingress"}
+    names = {"core": K.NS, "apps": K.APPS_NS, "storage": "portcullis-storage", "edge": K.EDGE_NS, "ingress": "portcullis-ingress",
+             "nodeadm": NODEADM_NS}
     ns = {d["metadata"]["name"]: d["metadata"].get("labels", {}) for d in K.by_kind(K.render({"renderNamespaces": True}), "Namespace")}
     for role, n in names.items():
         got = [ns.get(n, {}).get(f"pod-security.kubernetes.io/{m}") for m in ("enforce", "warn", "audit")]

@@ -1,0 +1,586 @@
+{{- /* nodeadm (contract §20.1, §20.2; ruling R-ADM): node enrolment and the
+cluster API, the only holder of the k3s server token. Rendered with
+nodeadm.enabled (the CLI sets it on a cluster init installed, where it can
+read the server token). One replica on a server node, in its own namespace
+(PSA privileged, created by the CLI): an init container (root, every
+capability dropped, read-only) copies the server's etcd client certificate
+from the read-only hostPath into an in-memory emptyDir, group-readable for
+nodeadm itself (uid 10010, restricted otherwise). Writes only while it holds
+the Lease portcullis-nodeadm.
+
+Its rights (the security delta of hardening.md):
+  - ClusterRole: nodes get / list / watch / patch / delete; pods list /
+    watch; pods/eviction create; the CNPG, Longhorn and Self Node
+    Remediation status objects get / list; NO admission object at all
+    (R-ADM: the API server applies no policy to them);
+  - Role in kube-system: secrets create (bootstrap tokens only, judged by
+    portcullis-nodeadm-tokens);
+  - Role in the core namespace: secrets get / update on nodeadm-k3s-token,
+    frontdoor-control-tls and nodeadm-state (its own state: the join codes'
+    hashes, which are secret-equivalent, and the enrolled nodes);
+    configmaps update on portcullis-cluster-addresses and get on
+    portcullis-admission-active; leases get / update on portcullis-nodeadm;
+  - HA only, Role in longhorn-system: Longhorn's nodes get / patch (a
+    cooperative removal asks Longhorn to evict the node's replicas).
+The objects it updates (nodeadm-k3s-token, nodeadm-state,
+portcullis-cluster-addresses) are created by the CLI, never by Helm. */ -}}
+{{- if .Values.nodeadm.enabled }}
+{{- $ns := .Release.Namespace }}
+{{- $nns := .Values.ha.nodeadmNamespace }}
+{{- $uid := .Values.uids.nodeadm }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nodeadm
+  namespace: {{ $nns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-nodeadm
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["get", "list"]
+  - apiGroups: ["longhorn.io"]
+    resources: ["volumes", "nodes", "replicas"]
+    verbs: ["get", "list"]
+  - apiGroups: ["self-node-remediation.medik8s.io"]
+    resources: ["selfnoderemediations"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-nodeadm
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: portcullis-nodeadm
+subjects:
+  - kind: ServiceAccount
+    name: nodeadm
+    namespace: {{ $nns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-nodeadm
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-nodeadm
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-nodeadm
+subjects:
+  - kind: ServiceAccount
+    name: nodeadm
+    namespace: {{ $nns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-nodeadm
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["nodeadm-k3s-token", "frontdoor-control-tls", "nodeadm-state"]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["portcullis-cluster-addresses"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["portcullis-admission-active"]
+    verbs: ["get"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["portcullis-nodeadm"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-nodeadm
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-nodeadm
+subjects:
+  - kind: ServiceAccount
+    name: nodeadm
+    namespace: {{ $nns }}
+{{- if .Values.ha.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-nodeadm
+  namespace: {{ .Values.ha.longhornNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: ["longhorn.io"]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-nodeadm
+  namespace: {{ .Values.ha.longhornNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-nodeadm
+subjects:
+  - kind: ServiceAccount
+    name: nodeadm
+    namespace: {{ $nns }}
+{{- end }}
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: portcullis-nodeadm
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodeadm
+  namespace: {{ $nns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/component: nodeadm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      portcullis.io/component: nodeadm
+  template:
+    metadata:
+      labels:
+        portcullis.io/component: nodeadm
+        portcullis.io/net-nodeadm: "true"
+    spec:
+      serviceAccountName: nodeadm
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      priorityClassName: portcullis-core
+      # On a server node only: its etcd client certificate is there.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      securityContext:
+        fsGroup: {{ $uid }}
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Root reads the root-owned 0600 key (it owns it: no capability)
+        # and writes 0440 copies (group = the pod's fsGroup).
+        - name: etcd-certs
+          image: {{ required "nodeadm.image is required (by digest)" .Values.nodeadm.image }}
+          args: ["copy-etcd-certs", "/host-etcd", "/run/portcullis/etcd"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: {{ $uid }}
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: 32Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: host-etcd
+              mountPath: /host-etcd
+              readOnly: true
+            - name: etcd
+              mountPath: /run/portcullis/etcd
+      containers:
+        - name: nodeadm
+          image: {{ .Values.nodeadm.image }}
+          args: ["serve"]
+          securityContext:
+            runAsUser: {{ $uid }}
+            runAsGroup: {{ $uid }}
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PORTCULLIS_DOMAIN
+              value: {{ include "portcullis.domain" . | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: NODEADM_CORE_NAMESPACE
+              value: {{ $ns }}
+            - name: NODEADM_CLUSTER_CIDR
+              value: {{ required "podCIDR is required" .Values.podCIDR }}
+            - name: NODEADM_SERVICE_CIDR
+              value: {{ required "serviceCIDR is required" .Values.serviceCIDR }}
+            - name: NODEADM_PROBE_EGRESS_HOST
+              value: {{ .Values.nodeadm.probeEgressHost | quote }}
+            - name: NODEADM_LONGHORN_NAMESPACE
+              value: {{ .Values.ha.longhornNamespace }}
+            - name: NODEADM_ENROLL_URL
+              value: http://enroll.{{ $ns }}.svc.cluster.local:8444
+            - name: NODEADM_ENROLL_BEARER_FILE
+              value: /run/portcullis/nodeadm/enroll-bearer
+            - name: NODEADM_ETCD_DIR
+              value: /run/portcullis/etcd
+          ports:
+            - name: internal
+              containerPort: 8443
+            - name: public
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9105
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9105
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9105
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: 128Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: etcd
+              mountPath: /run/portcullis/etcd
+              readOnly: true
+            - name: enroll-bearer
+              mountPath: /run/portcullis/nodeadm
+              readOnly: true
+      volumes:
+        - name: host-etcd
+          hostPath:
+            path: /var/lib/rancher/k3s/server/tls/etcd
+            type: Directory
+        - name: etcd
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: enroll-bearer
+          secret:
+            secretName: nodeadm-enroll
+            defaultMode: 288
+            items:
+              - key: bearer
+                path: enroll-bearer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodeadm
+  namespace: {{ $nns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  selector:
+    portcullis.io/component: nodeadm
+  ports:
+    - name: internal
+      port: 8443
+      targetPort: 8443
+    - name: public
+      port: 8080
+      targetPort: 8080
+    - name: metrics
+      port: 9105
+      targetPort: 9105
+---
+# Default deny in nodeadm's namespace, both directions.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ $nns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nodeadm
+  namespace: {{ $nns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: nodeadm
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # The internal API: the Hub and the front door (mTLS decides who may
+    # call what).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: hub
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: frontdoor
+      ports:
+        - protocol: TCP
+          port: 8443
+    # The public /node/ paths: Traefik only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: traefik
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: portcullis-ingress
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- if .Values.monitoring.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: prometheus
+      ports:
+        - protocol: TCP
+          port: 9105
+    {{- end }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # enroll's internal listener (pki_node signing and revocation).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: enroll
+      ports:
+        - protocol: TCP
+          port: 8444
+    # The nodeagents (:7443), etcd (:2379) and the k3s supervisor (:6443,
+    # the token rotation's check) on the node mesh.
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.ha.meshCIDR }}
+      ports:
+        - protocol: TCP
+          port: 7443
+        - protocol: TCP
+          port: 2379
+        - protocol: TCP
+          port: 6443
+    # The API server.
+    {{- range (required "apiEndpoints is required" .Values.apiEndpoints) }}
+    {{- $p := splitList ":" . }}
+    - to:
+        - ipBlock:
+            cidr: {{ index $p 0 }}/32
+      ports:
+        - protocol: TCP
+          port: {{ index $p 1 }}
+    {{- end }}
+---
+# The core namespace's side of nodeadm's flows (its default deny).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nodeadm-to-enroll
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: enroll
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $nns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: nodeadm
+      ports:
+        - protocol: TCP
+          port: 8444
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hub-to-nodeadm
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: hub
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $nns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: nodeadm
+      ports:
+        - protocol: TCP
+          port: 8443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traefik-to-nodeadm
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: traefik
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $nns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: nodeadm
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- if .Values.monitoring.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus-to-nodeadm
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: prometheus
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $nns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: nodeadm
+      ports:
+        - protocol: TCP
+          port: 9105
+{{- end }}
+{{- end }}

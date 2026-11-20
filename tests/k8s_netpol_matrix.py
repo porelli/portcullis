@@ -188,7 +188,49 @@ def check_log_ports():
                 F.add(f"policy {p['metadata']['name']} names a log port without ha.enabled")
 
 
+def check_nodeadm():
+    """nodeadm (contract §20.1 "Network flows"; nodeadm.enabled): only the
+    Hub and the front door reach its :8443, only Traefik its :8080, only
+    Prometheus its :9105; it reaches only enroll :8444, the node mesh's
+    :7443 / :2379 / :6443, the API endpoints and kube-dns."""
+    for ha in (False, True):
+        docs = K.render({"ha": {"enabled": ha}, "nodeadm": {"enabled": True, "image": "ghcr.io/porelli/portcullis-nodeadm@sha256:" + "4" * 64}})
+        pols = K.by_kind(docs, "NetworkPolicy")
+        pods = {}
+        for name, ns, labels, spec, _ in K.pod_specs(docs):
+            ports = [(p["containerPort"], p.get("protocol", "TCP")) for c in spec["containers"] for p in c.get("ports", [])]
+            pods[name] = Peer(name, ns, labels, ports)
+        na = pods.get("nodeadm")
+        if na is None:
+            F.add("nodeadm: no pod")
+            return
+        agent, ext, node = Peer("nodeagent", None, {}, ip=MESH_AGENT), Peer("external", None, {}, ip=EXTERNAL), Peer("node", None, {}, ip=NODE)
+        app = Peer("app", K.APPS_NS, {"portcullis.io/instance": "echo", "portcullis.io/service": "web"})
+        ingress_traefik = Peer("traefik-ds", "portcullis-ingress", {"app.kubernetes.io/name": "traefik"})
+        allowed_in = {8443: {"hub", "frontdoor"}, 8080: {"traefik"}, 9105: {"prometheus"}}
+        rows = []
+        for port, who in allowed_in.items():
+            for name, peer in sorted(pods.items()):
+                if name != "nodeadm":
+                    rows.append((peer, na, port, name in who))
+            rows += [(app, na, port, False), (ext, na, port, False)]
+        rows += [(ingress_traefik, na, 8080, True), (ingress_traefik, na, 8443, False)]
+        rows += [(na, pods["enroll"], 8444, True), (na, agent, 7443, True), (na, agent, 2379, True), (na, agent, 6443, True),
+                 (na, agent, 22, False), (na, ext, 443, False), (na, node, 10250, False), (na, app, 80, False)]
+        for name, peer in sorted(pods.items()):
+            for port, proto in peer.ports:
+                if not (name == "enroll" and port == 8444) and name != "nodeadm":
+                    rows.append((na, peer, port, False))
+        for src, dst, port, want in rows:
+            if (src.name, dst.name) == ("frontdoor", "nodeadm") and not ha:
+                continue  # the front door is HA only
+            got = allowed(pols, src, dst, port, ingress_only=src.ns in (K.APPS_NS, "portcullis-ingress"))
+            if got != want:
+                F.add(f"nodeadm (ha {ha}): {src} → {dst}:{port}: {'allowed' if got else 'denied'}, want {'allowed' if want else 'denied'}")
+
+
 def main():
+    check_nodeadm()
     check_ha()
     check_log_ports()
     check_compose(K.render(), ha=False)

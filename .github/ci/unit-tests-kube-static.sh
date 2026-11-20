@@ -78,13 +78,14 @@ for f in files:
 print(f"{n} CRD schemas")
 PY
 
-echo "::group::helm template → kubeconform (every profile on, every profile off, VPN modes, HA)"
+echo "::group::helm template → kubeconform (every profile on, every profile off, VPN modes, HA, nodeadm)"
 IMGV="$TOOLS/images-values.yaml"
 "$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))' > "$IMGV"
 for combo in "--set renderNamespaces=true" \
              "--set renderNamespaces=true --set wg.enabled=false --set monitoring.enabled=false" \
              "--set entrypoints.web.admin=parked --set entrypoints.ep.admin=vpnsecure" \
-             "--set renderNamespaces=true --set ha.enabled=true"; do
+             "--set renderNamespaces=true --set ha.enabled=true" \
+             "--set renderNamespaces=true --set ha.enabled=true --set nodeadm.enabled=true --set nodeadm.image=ghcr.io/porelli/portcullis-nodeadm@sha256:4444444444444444444444444444444444444444444444444444444444444444"; do
   # shellcheck disable=SC2086  # the combo's flags
   "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" $combo > "$TOOLS/rendered.yaml"
   "$KUBECONFORM" -strict -summary -kubernetes-version "$K8S_VERSION" \

@@ -47,6 +47,8 @@ uids:
   mailProvider: 2000
   nobody: 65534
   grafana: 472
+  # nodeadm (contract §20.1; its own image, no compose service).
+  nodeadm: 10010
 
 # Compose profiles (COMPOSE_PROFILES): the same switches as on Docker.
 monitoring:
@@ -130,6 +132,9 @@ ha:
   # The node mesh pcmesh (§20.11): the nodeagents answer on :7443 there.
   meshCIDR: 10.215.0.0/24
   nodeadmNamespace: portcullis-nodeadm
+  # Longhorn's namespace (Task 24): nodeadm asks it to evict a node's
+  # replicas on a cooperative removal.
+  longhornNamespace: longhorn-system
   # group-gate and mcp-gate in HA (contract §20.10): StatefulSets of this
   # many replicas (at least 1; a PDB from 2), each with its own log, served
   # to the Hub on :8091 / :8092 (wg's status on :8093). 1 while the gates
@@ -139,6 +144,15 @@ ha:
   # group-gate prunes its own opened log to this many days in HA
   # (GATE_OPENED_PRUNE_DAYS; the Hub's default history_days, contract §8.2).
   openedPruneDays: 365
+
+# nodeadm (contract §20.2): node enrolment and the cluster API. The CLI
+# enables it on a cluster init installed (it reads the k3s server token
+# there), with its image by digest; probeEgressHost is the main domain's DNS
+# provider API host (the probes' egress reference, §20.4; no credential).
+nodeadm:
+  enabled: false
+  image: ""
+  probeEgressHost: ""
 
 # Content hashes of every synced ConfigMap / Secret (secrets/kube/applied.json):
 # pods carry portcullis.io/config-hash over the ones they mount, so a
