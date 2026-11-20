@@ -239,7 +239,7 @@ func setupCase(t *testing.T, vs *apiVectors, c apiCase) (*harness, []byte, map[s
 			body = []byte(`{"server_id":"n4","rtt_ms":{"n1":3,"n2":251,"n3":5}}`)
 			hdr = signedHeaders(c4, k4, "n4", c.Request.Path, body, h.s.now())
 		}
-	case "POST /node/v1/renew":
+	case "POST /node/v1/renew", "POST /node/v1/renew/confirm":
 		h.setNow(time.Date(2026, 11, 18, 10, 5, 0, 0, time.UTC))
 		h.putState(t, func(s *nodeadmState) {
 			s.Nodes["n4"] = vecNodeRecord("4e:4f:44:45", true)
@@ -264,8 +264,28 @@ func setupCase(t *testing.T, vs *apiVectors, c apiCase) (*harness, []byte, map[s
 			}
 			nk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 			der, _ := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: cn}}, nk)
-			body, _ = json.Marshal(renewReq{ServerID: "n4", CSR: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))})
-			hdr = signedHeaders(c4, k4, "n4", c.Request.Path, body, h.s.now())
+			csrPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))
+			body, _ = json.Marshal(renewReq{ServerID: "n4", CSR: csrPEM})
+			if c.Route == "POST /node/v1/renew/confirm" {
+				body = []byte(`{"server_id":"n4"}`)
+			}
+			sk, sc := k4, c4
+			if strings.Contains(st, "pending") {
+				// A pending renewal: a test-CA certificate for the new key (or
+				// the vectors' certificate for the same CSR).
+				_, pc := h.ca.sign("n4.cluster.portcullis.internal", &nk.PublicKey, nil)
+				sum := sha256.Sum256([]byte(csrPEM))
+				ren := &renewal{CSRSHA256: hex.EncodeToString(sum[:]), Serial: certSerial(pc), CertPEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pc.Raw})),
+					NotAfter: pc.NotAfter, IssuedAt: h.s.now()}
+				if strings.Contains(st, "this very CSR") {
+					ren.CertPEM, ren.Serial, ren.NotAfter = vs.PKI.NodeCertPEM, "4e:4f:44:45", na
+				}
+				h.putState(t, func(s *nodeadmState) { s.Nodes["n4"].Renewal = ren })
+				if strings.Contains(st, "with n4's pending renewal certificate") {
+					sk, sc = nk, pc
+				}
+			}
+			hdr = signedHeaders(sc, sk, "n4", c.Request.Path, body, h.s.now())
 		}
 	case "POST /v1/nodes/{id}/drain", "DELETE /v1/nodes/{id}?mode=cooperative":
 		if strings.Contains(st, "PDB refuses") {
@@ -365,7 +385,7 @@ func TestAPIVectors(t *testing.T) {
 					}
 				}
 				rec := h.state(t).Nodes["n4"]
-				if !reflect.DeepEqual(got.Flags, joinFlags(rec, "n4", got.ServerURL)) {
+				if !reflect.DeepEqual(got.Flags, joinFlags(rec, "n4", got.ServerURL, "10.42.0.0/16")) {
 					t.Errorf("flags %v", got.Flags)
 				}
 			default:
@@ -435,8 +455,18 @@ func checkCaseEffects(t *testing.T, h *harness, c apiCase) {
 		}
 	case "renew":
 		r := st.Nodes["n4"]
-		if r == nil || r.Serial != "4e:4f:44:45" || len(h.enroll.revoked) != 1 || len(h.enroll.signed) != 1 || h.enroll.signed[0] != "node-cluster:n4.cluster.portcullis.internal" {
+		if r == nil || r.Serial == "4e:4f:44:45" || r.Renewal == nil || r.Renewal.Serial != "4e:4f:44:45" || len(h.enroll.revoked) != 0 ||
+			len(h.enroll.signed) != 1 || h.enroll.signed[0] != "node-cluster:n4.cluster.portcullis.internal" {
 			t.Errorf("renewal: record %+v, revoked %v, signed %v", r, h.enroll.revoked, h.enroll.signed)
+		}
+	case "renew confirm":
+		r := st.Nodes["n4"]
+		if r == nil || r.Renewal != nil || len(h.enroll.revoked) != 1 || r.Serial == h.enroll.revoked[0] {
+			t.Errorf("confirm: record %+v, revoked %v", r, h.enroll.revoked)
+		}
+	case "renew: the same CSR again", "renew: signed with the pending certificate", "renew confirm: with the current certificate":
+		if len(h.enroll.signed) != 0 || len(h.enroll.revoked) != 0 || st.Nodes["n4"].Renewal == nil {
+			t.Errorf("signed %v, revoked %v, renewal %+v", h.enroll.signed, h.enroll.revoked, st.Nodes["n4"].Renewal)
 		}
 	case "renew: not due yet", "renew: a CSR for another name", "renew: a removed node", "renew: no signature":
 		if len(h.enroll.signed) != 0 {

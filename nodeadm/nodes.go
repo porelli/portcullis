@@ -515,6 +515,10 @@ func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses) er
 			rec.Addrs = &a
 		}
 		st.queueRevoke(id, rec.Serial, s.now())
+		if rec.Renewal != nil {
+			st.queueRevoke(id, rec.Renewal.Serial, s.now())
+			rec.Renewal = nil
+		}
 		rec.Removed, rec.Serial = true, ""
 		return nil
 	}); err != nil {

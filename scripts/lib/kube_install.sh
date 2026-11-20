@@ -149,6 +149,7 @@ kube_k3s_server_flags() {
 --node-ip=$ip
 --advertise-address=$ip
 --bind-address=$ip
+--cluster-cidr=$KUBE_CLUSTER_CIDR
 --etcd-arg=listen-client-urls=https://$ip:2379,https://127.0.0.1:2379
 --etcd-arg=heartbeat-interval=200
 --etcd-arg=election-timeout=2000

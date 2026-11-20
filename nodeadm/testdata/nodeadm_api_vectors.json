@@ -2431,7 +2431,7 @@
    "route": "POST /node/v1/renew",
    "client": "none",
    "leader": true,
-   "state": "re-signed by the test: n4 enrolled with a test-CA certificate valid 2026-01-01..2027-01-01 (now 2026-11-18T10:05:00Z: in its last two thirds); enroll answers the vectors' node certificate",
+   "state": "re-signed by the test: n4 enrolled with a test-CA certificate valid 2026-01-01..2027-01-01 (now 2026-11-18T10:05:00Z: in its last two thirds); enroll answers the vectors' node certificate; nothing is revoked: the node confirms the new certificate later",
    "request": {
     "method": "POST",
     "path": "/node/v1/renew",
@@ -2526,6 +2526,113 @@
     "headers": {},
     "body": null,
     "body_text": "{\"server_id\":\"n4\",\"csr\":\"<a CSR the test makes: n4.cluster.portcullis.internal, a new P-256 key>\"}"
+   },
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": "the join request isn't signed by the node"
+    }
+   }
+  },
+  {
+   "name": "renew: the same CSR again",
+   "route": "POST /node/v1/renew",
+   "client": "none",
+   "leader": true,
+   "state": "re-signed by the test: n4's renewal of this very CSR is pending (the vectors' node certificate): answered again, nothing signed",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/renew",
+    "headers": {},
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"csr\":\"<a CSR the test makes: n4.cluster.portcullis.internal, a new P-256 key>\"}"
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Cache-Control": "no-store"
+    },
+    "body": {
+     "certificate": "-----BEGIN CERTIFICATE-----\nMIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0\nY3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4\nMTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJu\nYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQU\nQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30w\nezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMB\nMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40\nLmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBx\nFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbM\nEkXWkAEkHqhpj/snWRZFk2t7\n-----END CERTIFICATE-----\n",
+     "ca": "-----BEGIN CERTIFICATE-----\nMIIBfjCCASOgAwIBAgIBATAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3Vs\nbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDkwMDAwWhcNMzYxMTE1MTAw\nMDAwWjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwWTAT\nBgcqhkjOPQIBBggqhkjOPQMBBwNCAARnvlv7Pq12IVjTn0+gqrE+Ppe9pe/zxQEV\ndl+AQU94/B/S/Dj6zq1rZqmpseBCa5/aMLq5NZJL4FB3v5gKyXGSo0IwQDAOBgNV\nHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUFb7/iN221cqe\n/greMYebnVXHYLQwCgYIKoZIzj0EAwIDSQAwRgIhAKbsBMAucbpFaFLutRZWwcy6\nxRoD2xYsmNVdEWp2ZDA0AiEAlM15LuvtfG0f1enkmcoGB6wSi3TKiNncPQLTVbuS\neyQ=\n-----END CERTIFICATE-----\n",
+     "not_after": "2026-12-18T10:00:00Z"
+    }
+   }
+  },
+  {
+   "name": "renew: signed with the pending certificate",
+   "route": "POST /node/v1/renew",
+   "client": "none",
+   "leader": true,
+   "state": "re-signed by the test with n4's pending renewal certificate",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/renew",
+    "headers": {},
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"csr\":\"<a CSR the test makes: n4.cluster.portcullis.internal, a new P-256 key>\"}"
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "this certificate is a pending renewal: confirm it (POST /node/v1/renew/confirm)"
+    }
+   }
+  },
+  {
+   "name": "renew confirm",
+   "route": "POST /node/v1/renew/confirm",
+   "client": "none",
+   "leader": true,
+   "state": "re-signed by the test with n4's pending renewal certificate: it becomes the recorded one, the previous serial is queued for revocation",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/renew/confirm",
+    "headers": {},
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\"}"
+   },
+   "response": {
+    "status": 204,
+    "headers": {},
+    "body": null
+   }
+  },
+  {
+   "name": "renew confirm: with the current certificate",
+   "route": "POST /node/v1/renew/confirm",
+   "client": "none",
+   "leader": true,
+   "state": "re-signed by the test with n4's current certificate while a renewal is pending",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/renew/confirm",
+    "headers": {},
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\"}"
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "no renewal of this certificate is pending"
+    }
+   }
+  },
+  {
+   "name": "renew confirm: no signature",
+   "route": "POST /node/v1/renew/confirm",
+   "client": "none",
+   "leader": true,
+   "state": "no Portcullis-Node-* headers",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/renew/confirm",
+    "headers": {},
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\"}"
    },
    "response": {
     "status": 403,

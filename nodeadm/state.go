@@ -68,8 +68,11 @@ type nodeRecord struct {
 	// generation no longer holds its mesh address.
 	Removed bool `json:"removed,omitempty"`
 	// TokensStale: a removed node a rotation skipped (it keeps old tokens).
-	TokensStale bool           `json:"tokens_stale,omitempty"`
-	Addrs       *NodeAddresses `json:"addrs,omitempty"`
+	TokensStale bool `json:"tokens_stale,omitempty"`
+	// Renewal: a renewed certificate not yet confirmed (renew.go); until
+	// confirm both it and Serial are valid.
+	Renewal *renewal       `json:"renewal,omitempty"`
+	Addrs   *NodeAddresses `json:"addrs,omitempty"`
 	// TokenIDs: the bootstrap tokens issued to it (a revoke deletes them).
 	TokenIDs []string `json:"token_ids,omitempty"`
 	// Releases: how many times the join material went out (either role).
@@ -91,6 +94,14 @@ type nodeadmState struct {
 	// dropped record never touches it); reconcile retries it until each is
 	// revoked.
 	PendingRevokes map[string]*pendingRevoke `json:"pending_revokes,omitempty"`
+}
+
+type renewal struct {
+	CSRSHA256 string    `json:"csr_sha256"`
+	Serial    string    `json:"serial"`
+	CertPEM   string    `json:"cert_pem"`
+	NotAfter  time.Time `json:"not_after"`
+	IssuedAt  time.Time `json:"issued_at"`
 }
 
 type pendingRevoke struct {

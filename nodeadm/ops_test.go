@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -800,43 +801,133 @@ func TestServerJoinGetsAgentToken(t *testing.T) {
 	}
 }
 
-// TestRenewOnce (Task 9 ruling I4): two renewals with the same current
-// certificate: one wins; the other's new certificate is revoked; the
-// renewed node signs joins with the new certificate only.
-func TestRenewOnce(t *testing.T) {
+// renewHelper: a renew request of node j (a fresh CSR of its key unless
+// csr is given), signed with certificate c / key k.
+func renewHelper(h *harness, id string, c *x509.Certificate, k *ecdsa.PrivateKey, csr string) (string, []byte, map[string]string) {
+	if csr == "" {
+		der, _ := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: id + "." + clusterDomain}}, k)
+		csr = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))
+	}
+	body, _ := json.Marshal(renewReq{ServerID: id, CSR: csr})
+	return csr, body, signedHeaders(c, k, id, "/node/v1/renew", body, h.s.now())
+}
+
+func (h *harness) renewCert(t *testing.T, w *httptest.ResponseRecorder) *x509.Certificate {
+	t.Helper()
+	var ans renewAnswer
+	json.Unmarshal(w.Body.Bytes(), &ans)
+	blk, _ := pem.Decode([]byte(ans.Certificate))
+	if blk == nil {
+		t.Fatalf("no certificate in %d %s", w.Code, w.Body)
+	}
+	c, _ := x509.ParseCertificate(blk.Bytes)
+	return c
+}
+
+func (h *harness) confirm(id string, c *x509.Certificate, k *ecdsa.PrivateKey) int {
+	body := []byte(`{"server_id":"` + id + `"}`)
+	return h.public("POST", "/node/v1/renew/confirm", body, signedHeaders(c, k, id, "/node/v1/renew/confirm", body, h.s.now())).Code
+}
+
+// TestRenewTwoPhase (re-review of renew): the answer revokes nothing and
+// both certificates are valid; a lost answer is retried with the same CSR
+// and gets the same certificate (nothing signed); another CSR supersedes
+// the pending renewal (its certificate queued and revoked); confirm with
+// the new certificate makes it the recorded one and revokes the old.
+func TestRenewTwoPhase(t *testing.T) {
 	h := newHarness(t)
 	j := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
 	if w := h.enrol(t, j, ""); w.Code != 200 {
 		t.Fatalf("enrol: %d", w.Code)
 	}
-	// The enrolment's certificate (test CA, 2026-01-01..2027-01-01) is due.
 	h.enroll.cert = nil
-	mk := func() ([]byte, map[string]string) {
-		der, _ := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "n5." + clusterDomain}}, j.key)
-		body, _ := json.Marshal(renewReq{ServerID: "n5", CSR: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))})
-		return body, signedHeaders(j.cert, j.key, "n5", "/node/v1/renew", body, h.s.now())
+	old := certSerial(j.cert)
+	csr, b, hd := renewHelper(h, "n5", j.cert, j.key, "")
+	w := h.public("POST", "/node/v1/renew", b, hd)
+	if w.Code != 200 {
+		t.Fatalf("renew: %d %s", w.Code, w.Body)
 	}
-	b1, h1 := mk()
-	b2, h2 := mk()
-	w1 := h.public("POST", "/node/v1/renew", b1, h1)
-	w2 := h.public("POST", "/node/v1/renew", b2, h2)
-	if w1.Code != 200 || w2.Code != 403 && w2.Code != 409 {
-		t.Fatalf("renewals: %d %s / %d %s", w1.Code, w1.Body, w2.Code, w2.Body)
+	c1 := h.renewCert(t, w)
+	signed := len(h.enroll.signed)
+	// The answer was lost: the same CSR again, the same certificate.
+	_, b, hd = renewHelper(h, "n5", j.cert, j.key, csr)
+	if w := h.public("POST", "/node/v1/renew", b, hd); w.Code != 200 || certSerial(h.renewCert(t, w)) != certSerial(c1) || len(h.enroll.signed) != signed {
+		t.Fatalf("a retried renew: %d, signed %d → %d", w.Code, signed, len(h.enroll.signed))
 	}
-	var ans struct{ Certificate string }
-	json.Unmarshal(w1.Body.Bytes(), &ans)
-	blk, _ := pem.Decode([]byte(ans.Certificate))
-	nc, _ := x509.ParseCertificate(blk.Bytes)
-	if r := h.state(t).Nodes["n5"]; r.Serial != certSerial(nc) || !slices.Contains(h.enroll.revoked, certSerial(j.cert)) {
-		t.Fatalf("record serial %s, revoked %v", r.Serial, h.enroll.revoked)
+	if len(h.enroll.revoked) != 0 {
+		t.Fatalf("revoked before confirm: %v", h.enroll.revoked)
 	}
-	// The old certificate no longer signs a join; the new one does.
+	// Both certificates are valid until confirm.
+	if w := h.join(t, j, nearRTT); w.Code != 200 {
+		t.Fatalf("a join with the current certificate: %d %s", w.Code, w.Body)
+	}
+	// Another CSR supersedes the pending renewal.
+	_, b, hd = renewHelper(h, "n5", j.cert, j.key, "")
+	w = h.public("POST", "/node/v1/renew", b, hd)
+	c2 := h.renewCert(t, w)
+	if w.Code != 200 || certSerial(c2) == certSerial(c1) || !slices.Contains(h.enroll.revoked, certSerial(c1)) {
+		t.Fatalf("a superseding renew: %d, revoked %v", w.Code, h.enroll.revoked)
+	}
+	// Confirm with the superseded one: refused; with the new one: done.
+	if code := h.confirm("n5", c1, j.key); code != 403 {
+		t.Fatalf("confirm with a superseded certificate: %d", code)
+	}
+	if code := h.confirm("n5", c2, j.key); code != 204 {
+		t.Fatalf("confirm: %d", code)
+	}
+	if code := h.confirm("n5", c2, j.key); code != 204 {
+		t.Fatalf("a retried confirm: %d", code)
+	}
+	r := h.state(t).Nodes["n5"]
+	if r.Serial != certSerial(c2) || r.Renewal != nil || !slices.Contains(h.enroll.revoked, old) {
+		t.Fatalf("after confirm: %+v, revoked %v", r, h.enroll.revoked)
+	}
 	if w := h.join(t, j, nearRTT); w.Code != 403 {
 		t.Fatalf("a join with the renewed-away certificate: %d", w.Code)
 	}
-	j.cert = nc
+}
+
+// TestRenewUnconfirmedExpires: a renewal not confirmed within 24 h goes;
+// its certificate is revoked, the current one stays.
+func TestRenewUnconfirmedExpires(t *testing.T) {
+	h := newHarness(t)
+	j := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
+	h.enrol(t, j, "")
+	h.enroll.cert = nil
+	_, b, hd := renewHelper(h, "n5", j.cert, j.key, "")
+	w := h.public("POST", "/node/v1/renew", b, hd)
+	c1 := h.renewCert(t, w)
+	h.setNow(h.s.now().Add(renewConfirmTTL + time.Minute))
+	h.s.expireRenewals(context.Background(), h.state(t))
+	h.s.dropRemoved(context.Background(), h.state(t))
+	r := h.state(t).Nodes["n5"]
+	if r.Renewal != nil || r.Serial != certSerial(j.cert) || !slices.Contains(h.enroll.revoked, certSerial(c1)) || slices.Contains(h.enroll.revoked, r.Serial) {
+		t.Fatalf("after 24 h: %+v, revoked %v", r, h.enroll.revoked)
+	}
+	if code := h.confirm("n5", c1, j.key); code != 403 {
+		t.Fatalf("confirm after expiry: %d", code)
+	}
+}
+
+// TestCertSkew: a leaf 4 min before its NotBefore still signs; 6 min
+// before, not.
+func TestCertSkew(t *testing.T) {
+	h := newHarness(t)
+	j := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
+	h.enrol(t, j, "")
+	nb := h.s.now().Add(4 * time.Minute)
+	_, c := h.ca.signAt("n5."+clusterDomain, &j.key.PublicKey, nb, nb.Add(720*time.Hour))
+	h.putState(t, func(st *nodeadmState) { st.Nodes["n5"].Serial = certSerial(c) })
+	j.cert = c
 	if w := h.join(t, j, nearRTT); w.Code != 200 {
-		t.Fatalf("a join with the renewed certificate: %d %s", w.Code, w.Body)
+		t.Fatalf("4 min early: %d %s", w.Code, w.Body)
+	}
+	nb = h.s.now().Add(6 * time.Minute)
+	_, c = h.ca.signAt("n5."+clusterDomain, &j.key.PublicKey, nb, nb.Add(720*time.Hour))
+	h.putState(t, func(st *nodeadmState) { st.Nodes["n5"].Serial = certSerial(c) })
+	j.cert = c
+	if w := h.join(t, j, nearRTT); w.Code != 403 {
+		t.Fatalf("6 min early: %d", w.Code)
 	}
 }
 
@@ -854,29 +945,21 @@ func TestPendingRevokesSurviveEnrollOutage(t *testing.T) {
 	}
 	h.enroll.cert = nil
 	h.enroll.revokeFail = errors.New("vault sealed")
-	mk := func() ([]byte, map[string]string) {
-		der, _ := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "n5." + clusterDomain}}, j.key)
-		body, _ := json.Marshal(renewReq{ServerID: "n5", CSR: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))})
-		return body, signedHeaders(j.cert, j.key, "n5", "/node/v1/renew", body, h.s.now())
-	}
 	oldSerial := certSerial(j.cert)
-	b1, h1 := mk()
-	b2, h2 := mk()
-	// The second renewal runs while the first is signing: it signs too, then
-	// loses the compare-and-swap.
-	var w2code int
-	h.enroll.onSign = func() {
-		h.enroll.onSign = nil
-		w2code = h.public("POST", "/node/v1/renew", b2, h2).Code
-	}
-	if w := h.public("POST", "/node/v1/renew", b1, h1); w.Code != 200 && w2code != 200 {
-		t.Fatalf("renewals: %d / %d", w.Code, w2code)
+	// A renewal superseded by another (its certificate queued), the second
+	// confirmed (the old one queued): enroll can't revoke either.
+	_, b, hd := renewHelper(h, "n5", j.cert, j.key, "")
+	c1 := h.renewCert(t, h.public("POST", "/node/v1/renew", b, hd))
+	_, b, hd = renewHelper(h, "n5", j.cert, j.key, "")
+	c2 := h.renewCert(t, h.public("POST", "/node/v1/renew", b, hd))
+	if code := h.confirm("n5", c2, j.key); code != 204 {
+		t.Fatalf("confirm: %d", code)
 	}
 	st := h.state(t)
 	cur := st.Nodes["n5"].Serial
 	pend := pending(st)
-	if len(pend) != 2 || !slices.Contains(pend, oldSerial) || slices.Contains(pend, cur) {
-		t.Fatalf("queued %v (want the old serial and the losing renewal's, not the current %s)", pend, cur)
+	if len(pend) != 2 || !slices.Contains(pend, oldSerial) || !slices.Contains(pend, certSerial(c1)) || cur != certSerial(c2) {
+		t.Fatalf("queued %v (want the old serial and the superseded renewal's), current %s", pend, cur)
 	}
 	if err := h.s.forget(ctx, "n5", nil); err == nil {
 		t.Fatal("forget with enroll unable to revoke didn't report it")

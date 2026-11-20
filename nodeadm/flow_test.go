@@ -342,7 +342,7 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 	want = append(want, "--server="+server, "--node-label=node.longhorn.io/create-default-disk=true")
 	sort.Strings(want)
 	rec := &nodeRecord{Role: "server", Class: "home", Site: "main", MeshIP: ip, Ingress: true, Storage: true}
-	got := joinFlags(rec, "n7", server)
+	got := joinFlags(rec, "n7", server, "10.42.0.0/16")
 	if !slices.Equal(got, want) {
 		t.Fatalf("server flags\n got %q\nwant %q", got, want)
 	}
@@ -361,16 +361,16 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 		}
 	}
 	rec.Role = "agent"
-	if got := joinFlags(rec, "n7", server); !slices.Equal(got, agentWant) {
+	if got := joinFlags(rec, "n7", server, "10.42.0.0/16"); !slices.Equal(got, agentWant) {
 		t.Fatalf("agent flags\n got %q\nwant %q", got, agentWant)
 	}
 	small := &nodeRecord{Role: "agent", Class: "small", Site: "tb", MeshIP: ip}
-	got = joinFlags(small, "pi-1", server)
+	got = joinFlags(small, "pi-1", server, "10.42.0.0/16")
 	if !slices.Contains(got, "--node-taint=portcullis.io/small=true:NoSchedule") || slices.Contains(got, "--node-label=portcullis.io/storage=true") {
 		t.Fatalf("small flags %q", got)
 	}
 	st := &nodeRecord{Role: "agent", Class: "cloud", Site: "edge", MeshIP: ip, Storage: true}
-	if slices.Contains(joinFlags(st, "e1", server), "--node-label=node.longhorn.io/create-default-disk=true") {
+	if slices.Contains(joinFlags(st, "e1", server, "10.42.0.0/16"), "--node-label=node.longhorn.io/create-default-disk=true") {
 		t.Fatal("a storage node outside main gets Longhorn's default disk")
 	}
 }

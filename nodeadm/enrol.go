@@ -462,6 +462,17 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// certSkew: the clock skew allowed on a node certificate's validity.
+const certSkew = 5 * time.Minute
+
+// serialOK: sr is the node's recorded serial or its pending renewal's.
+func (n *nodeRecord) serialOK(sr string) bool {
+	if sr == "" {
+		return false
+	}
+	return sr == n.Serial || (n.Renewal != nil && sr == n.Renewal.Serial)
+}
+
 // normSerial: Vault's form, lowercase colon-separated hex.
 func normSerial(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
@@ -516,7 +527,19 @@ func (s *Server) verifySigned(r *http.Request, body []byte, st *nodeadmState) (s
 	if pool == nil {
 		return "", errUnsigned
 	}
-	if _, err := cert.Verify(x509.VerifyOptions{Roots: pool, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+	// The leaf's validity with certSkew either side (a node's clock may be
+	// off a little); the chain checked at that clamped instant.
+	if now.Before(cert.NotBefore.Add(-certSkew)) || now.After(cert.NotAfter.Add(certSkew)) {
+		return "", errUnsigned
+	}
+	at := now
+	if at.Before(cert.NotBefore) {
+		at = cert.NotBefore
+	}
+	if at.After(cert.NotAfter) {
+		at = cert.NotAfter
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: pool, CurrentTime: at, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
 		return "", errUnsigned
 	}
 	id, ok := strings.CutSuffix(cert.Subject.CommonName, "."+clusterDomain)
@@ -524,7 +547,9 @@ func (s *Server) verifySigned(r *http.Request, body []byte, st *nodeadmState) (s
 		return "", errUnsigned
 	}
 	rec := st.Nodes[id]
-	if rec == nil || rec.Removed || rec.Serial == "" || rec.Serial != certSerial(cert) {
+	// The recorded serial, or a pending renewal's (both valid until the
+	// node confirms the new one).
+	if rec == nil || rec.Removed || !rec.serialOK(certSerial(cert)) {
 		return "", errUnsigned
 	}
 	t, err := time.Parse(time.RFC3339, tm)
@@ -703,7 +728,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	flags := joinFlags(rec, id, serverURL)
+	flags := joinFlags(rec, id, serverURL, s.cfg.ClusterCIDR)
 	s.log.Info("join material issued", "server_id", id, "role", rec.Role, "token_id", tokenID(token))
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, joinAnswer{Role: rec.Role, ServerURL: serverURL, Token: token, AgentToken: agentTok,

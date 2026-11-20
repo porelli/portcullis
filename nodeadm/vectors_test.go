@@ -86,7 +86,7 @@ var apiRoutes = []string{
 	"POST /v1/codes", "GET /v1/cluster", "PUT /v1/nodes/{id}/labels", "POST /v1/nodes/{id}/cordon", "POST /v1/nodes/{id}/uncordon",
 	"POST /v1/nodes/{id}/drain", "DELETE /v1/nodes/{id}?mode=cooperative", "DELETE /v1/nodes/{id}?mode=revoke",
 	"GET /node/join.sh", "GET /node/nodeagent-{arch}", "POST /node/v1/nonce", "POST /node/v1/enrol", "POST /node/v1/join",
-	"POST /node/v1/renew",
+	"POST /node/v1/renew", "POST /node/v1/renew/confirm",
 }
 
 var apiKinds = map[string]int{"quorum_minimum": 409, "replica_minimum": 409, "unknown_node": 404, "proof_invalid": 403, "mesh_pending": 409, "waiting_admission": 409, "not_leader": 503}
@@ -303,6 +303,11 @@ var routeBodies = map[string][2]func() any{
 			Flags       []string `json:"flags"`
 		}{}
 	}},
+	"POST /node/v1/renew/confirm": {func() any {
+		return &struct {
+			ServerID string `json:"server_id"`
+		}{}
+	}, nil},
 	"POST /node/v1/renew": {func() any {
 		return &struct {
 			ServerID string `json:"server_id"`

@@ -210,6 +210,7 @@ func (s *Server) PublicHandler() http.Handler {
 	mux.HandleFunc("POST /node/v1/enrol", s.public(true, s.handleEnrol))
 	mux.HandleFunc("POST /node/v1/join", s.public(true, s.handleJoin))
 	mux.HandleFunc("POST /node/v1/renew", s.public(true, s.handleRenew))
+	mux.HandleFunc("POST /node/v1/renew/confirm", s.public(true, s.handleRenewConfirm))
 	return mux
 }
 

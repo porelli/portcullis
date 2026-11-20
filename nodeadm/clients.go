@@ -238,15 +238,17 @@ func (a agentClient) client(ctx context.Context, id string) (*http.Client, error
 	if err != nil {
 		return nil, err
 	}
-	want := ""
-	if rec := st.Nodes[id]; rec != nil {
-		if rec.Removed {
+	var rec *nodeRecord
+	if r := st.Nodes[id]; r != nil {
+		if r.Removed {
 			return nil, fmt.Errorf("node %s is removed", id)
 		}
-		want = rec.Serial
+		if r.Serial != "" || r.Renewal != nil {
+			rec = r
+		}
 	}
 	verify := func(cs tls.ConnectionState) error {
-		if want != "" && (len(cs.PeerCertificates) == 0 || certSerial(cs.PeerCertificates[0]) != want) {
+		if rec != nil && (len(cs.PeerCertificates) == 0 || !rec.serialOK(certSerial(cs.PeerCertificates[0]))) {
 			return errors.New("the nodeagent's certificate isn't the one nodeadm signed")
 		}
 		return nil

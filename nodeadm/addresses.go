@@ -266,6 +266,7 @@ func (s *Server) reconcile(ctx context.Context) {
 		return
 	}
 	s.annotateJoined(ctx, nodes, st)
+	s.expireRenewals(ctx, st)
 	s.dropRemoved(ctx, st)
 	doc, errs := s.buildAddresses(nodes, st)
 	s.addrMu.Lock()

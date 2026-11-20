@@ -13,7 +13,8 @@ package main
 //     a storage node at main (§20.11);
 //   - --node-taint=portcullis.io/small=true:NoSchedule on class small.
 // A server also gets --agent-token-file (init's; the answer's agent_token
-// goes there, 0600, as the token does).
+// goes there, 0600, as the token does) and --cluster-cidr (the answer's
+// cluster_cidr, init's too).
 // An agent gets the subset k3s agent takes: --server, --token-file,
 // --node-name, --node-ip, the labels and taint, the flannel interface and
 // net-conf, the kubelet args. The token itself is never a flag: the
@@ -46,7 +47,7 @@ func nodeLabels(class, site string, ingress, storage bool) []string {
 }
 
 // joinFlags is the flag list for the node, sorted (as the fixture).
-func joinFlags(rec *nodeRecord, id, serverURL string) []string {
+func joinFlags(rec *nodeRecord, id, serverURL, clusterCIDR string) []string {
 	ip := rec.MeshIP
 	f := []string{
 		"--server=" + serverURL,
@@ -62,6 +63,7 @@ func joinFlags(rec *nodeRecord, id, serverURL string) []string {
 	if rec.Role == "server" {
 		f = append(f,
 			"--agent-token-file="+k3sAgentTokenFile,
+			"--cluster-cidr="+clusterCIDR,
 			"--secrets-encryption",
 			"--disable=traefik",
 			"--write-kubeconfig-mode=0600",
