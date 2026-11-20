@@ -21,7 +21,9 @@
 # the KUBE_K3S_* pins after sourcing (.github/ci/e2e-k3s-install.sh).
 
 # The pins (plan Amendment 1). get.k3s.io is unversioned: the script is
-# taken from the release tag, and the binary is checked on its own.
+# taken from the release tag, and the binary is checked on its own. The
+# script stays at this tag when CI's K3S_LINE swaps the binary: with
+# INSTALL_K3S_SKIP_DOWNLOAD it only writes the unit and the helper scripts.
 KUBE_K3S_VERSION="v1.37.2+k3s1"
 KUBE_K3S_SHA256_AMD64=265b3ee6a3198ef14033c63ef46cbb32370d83795199fb6d1b01f21575eddbda
 KUBE_K3S_SHA256_ARM64=a779ccf1e5e2e33a62f5a29c2f1c0bbf99431e100579d4c10f0aa0742a6aa84b
@@ -39,7 +41,10 @@ KUBE_CLUSTER_CIDR=10.42.0.0/16
 KUBE_K3S_TOKEN_FILE=/etc/rancher/k3s/token
 KUBE_FLANNEL_CONF=/etc/rancher/k3s/flannel-net-conf.json
 KUBE_K3S_YAML=/etc/rancher/k3s/k3s.yaml
-KUBE_MESH_KEY=/etc/pcmesh/private.key
+# The key lives under /etc/wireguard: Ubuntu's AppArmor profile for wg
+# (26.04) lets it read nothing else, so a PostUp `wg set … private-key`
+# from another directory fails.
+KUBE_MESH_KEY=/etc/wireguard/pcmesh.key
 KUBE_MESH_CONF=/etc/wireguard/pcmesh.conf
 # The packages a node needs (wireguard-tools for wg-quick; Longhorn's
 # open-iscsi and nfs-common, spike S2).
@@ -90,8 +95,8 @@ _ki_arch() {
   esac
 }
 
-# _ki_node_class — the class suggestion (spec): small below 4 GB of RAM or
-# on a Raspberry Pi, cloud when the public address is on this host, else
+# _ki_node_class — the class suggestion (contract §20.1): small below
+# 3.5 GiB of RAM or on a Raspberry Pi, cloud when the public address is on this host, else
 # home. PORTCULLIS_NODE_CLASS overrides it.
 _ki_node_class() {
   local kb model pub
@@ -101,8 +106,8 @@ _ki_node_class() {
   fi
   kb="$(awk '/^MemTotal:/ { print $2 }' "$(_ki_p /proc/meminfo)" 2>/dev/null || true)"
   model="$(tr -d '\0' 2>/dev/null < "$(_ki_p /proc/device-tree/model)" || true)"
-  # "4 GB" machines report ~3.7–3.9 GiB.
-  if { [ -n "$kb" ] && [ "$kb" -lt 3500000 ]; } || case "$model" in *"Raspberry Pi"*) true ;; *) false ;; esac; then
+  # Below 3.5 GiB = 3 670 016 KiB (contract §20.1, nodeagent's class.Suggest).
+  if { [ -n "$kb" ] && [ "$kb" -lt 3670016 ]; } || case "$model" in *"Raspberry Pi"*) true ;; *) false ;; esac; then
     echo small; return 0
   fi
   pub="$(_kube_public_ipv4)"
@@ -202,7 +207,8 @@ _ki_node_checks() {
   esac
 }
 
-# _ki_port_busy <port> <tcp|udp> — something listens there.
+# _ki_port_busy <port> <tcp|udp> — something listens there (ss checked
+# present by kube_install_host_checks: without it nothing would look busy).
 _ki_port_busy() {
   local f=-Hlnt
   [ "$2" = tcp ] || f=-Hlnu
@@ -217,10 +223,34 @@ _ki_mesh_taken() {
   } | head -n1
 }
 
+_ki_have() { command -v "$1" >/dev/null 2>&1; }
+
+# _ki_link_up — the pcmesh interface exists.
+_ki_link_up() { ip link show "$KUBE_MESH_IF" >/dev/null 2>&1; }
+
+# _ki_mesh_ours — pcmesh is a half-finished init's: the interface is up
+# with our config (its header) and our key.
+_ki_mesh_ours() {
+  _ki_link_up && _ki_sudo test -s "$(_ki_p "$KUBE_MESH_KEY")" \
+    && _ki_sudo grep -q '^# pcmesh: the Portcullis node mesh' "$(_ki_p "$KUBE_MESH_CONF")" 2>/dev/null
+}
+
+# _ki_k3s_ours — k3s is a half-finished init's: our token file, our
+# flannel net-conf (exactly kube_flannel_conf) and the k3s unit.
+_ki_k3s_ours() {
+  _ki_sudo test -s "$(_ki_p "$KUBE_K3S_TOKEN_FILE")" && _ki_sudo test -f "$(_ki_p /etc/systemd/system/k3s.service)" \
+    && [ "$(_ki_sudo cat "$(_ki_p "$KUBE_FLANNEL_CONF")" 2>/dev/null)" = "$(kube_flannel_conf)" ]
+}
+
+# The teardown of a half-finished install that isn't recognised as ours.
+KUBE_INSTALL_TEARDOWN="if it is a half-finished Portcullis install, remove it first: sudo /usr/local/bin/k3s-uninstall.sh; sudo systemctl disable --now wg-quick@pcmesh; sudo rm -f /etc/wireguard/pcmesh.conf /etc/wireguard/pcmesh.key — otherwise name the existing cluster with --kube-context"
+
 # kube_install_host_checks — "ok|warn|fail<TAB>text" lines before anything
-# is installed (fail = refuse).
+# is installed (fail = refuse). A half-finished init of our own (pcmesh up
+# with our config and key; k3s with our token, net-conf and unit) holds its
+# own ports: the run resumes (_KI_RESUME names what).
 kube_install_host_checks() {
-  local p taken
+  local p taken mine=" " k3sports="6443/tcp 2379/tcp 2380/tcp 10250/tcp $KUBE_FLANNEL_PORT/udp"
   if [ "$(_ki_os)" != Linux ]; then
     _rt_chk fail "init installs k3s on Linux only: on this host, name an existing cluster with --kube-context"; return 0
   fi
@@ -233,11 +263,18 @@ kube_install_host_checks() {
     _rt_chk fail "the kernel has no WireGuard module: the node mesh pcmesh needs it"
   fi
   if command -v helm >/dev/null 2>&1; then _rt_chk ok "helm present"; else _rt_chk fail "helm is missing (init deploys core with it): install helm first"; fi
-  for p in 6443/tcp 2379/tcp 2380/tcp 10250/tcp $KUBE_MESH_PORT/udp $KUBE_FLANNEL_PORT/udp; do
-    if _ki_port_busy "${p%/*}" "${p#*/}"; then
-      _rt_chk fail "port $p is in use: another Kubernetes or WireGuard runs here (name an existing cluster with --kube-context)"
-    fi
-  done
+  if ! _ki_have ss; then
+    _rt_chk fail "ss (iproute2) is missing: the ports can't be checked free"
+  else
+    if _ki_mesh_ours; then mine="$mine$KUBE_MESH_PORT/udp "; _rt_chk ok "$KUBE_MESH_IF is a half-finished init's: resuming"; fi
+    if _ki_k3s_ours; then mine="$mine$k3sports "; _rt_chk ok "k3s is a half-finished init's: resuming"; fi
+    for p in $k3sports $KUBE_MESH_PORT/udp; do
+      case "$mine" in *" $p "*) continue ;; esac
+      if _ki_port_busy "${p%/*}" "${p#*/}"; then
+        _rt_chk fail "port $p is in use: another Kubernetes or WireGuard runs here ($KUBE_INSTALL_TEARDOWN)"
+      fi
+    done
+  fi
   taken="$(_ki_mesh_taken)"
   if [ -n "$taken" ]; then
     _rt_chk fail "the mesh subnet $KUBE_MESH_CIDR is already in use on this host ($taken)"
@@ -261,7 +298,7 @@ _ki_confirm() {
 kube_install_preflight() {
   local lines fails pkgs what
   lines="$(kube_install_host_checks)"
-  printf '%s\n' "$lines" | awk -F'\t' '$1 == "warn" { print "  ! " $2 }' >&2
+  printf '%s\n' "$lines" | awk -F'\t' '$1 == "warn" { print "  ! " $2 } $1 == "ok" && $2 ~ /resuming$/ { print "  > " $2 }' >&2
   fails="$(printf '%s\n' "$lines" | awk -F'\t' '$1 == "fail" { print "  - " $2 }')"
   [ -z "$fails" ] || fail "this host can't become the cluster's first node yet:"$'\n'"$fails"
   pkgs="$(_ki_missing_packages)"
@@ -278,7 +315,7 @@ kube_install_preflight() {
 # ── the mesh ──
 
 # kube_install_mesh — /etc/wireguard/pcmesh.conf (0600) for the first node,
-# its private key generated here into /etc/pcmesh/private.key (0600; never
+# its private key generated here into /etc/wireguard/pcmesh.key (0600; never
 # printed, never in the config: PostUp loads it), wg-quick@pcmesh enabled.
 # An existing config is kept (nodeagent manages the peers).
 kube_install_mesh() {
@@ -297,18 +334,35 @@ MTU = $KUBE_MESH_MTU
 PostUp = wg set %i private-key $KUBE_MESH_KEY
 EOF
   fi
-  _ki_sudo systemctl enable --now "wg-quick@$KUBE_MESH_IF" >/dev/null 2>&1 || fail "wg-quick@$KUBE_MESH_IF didn't start (journalctl -u wg-quick@$KUBE_MESH_IF)"
+  # `enable --now` can answer 0 although the start failed (systemd 255):
+  # is-active decides.
+  _ki_sudo systemctl enable --now "wg-quick@$KUBE_MESH_IF" >/dev/null 2>&1 || true
+  if ! _ki_sudo systemctl is-active --quiet "wg-quick@$KUBE_MESH_IF"; then
+    _ki_journal_tail "wg-quick@$KUBE_MESH_IF" 20
+    fail "wg-quick@$KUBE_MESH_IF didn't start (its last journal lines are above)"
+  fi
   info "Node mesh $KUBE_MESH_IF up: $KUBE_MESH_IP/24, UDP $KUBE_MESH_PORT."
+}
+
+# _ki_journal_tail <unit> <lines> — the unit's last journal lines on stderr
+# (bounded: lines × 300 characters), any line holding the k3s token or the
+# mesh key dropped (neither is logged by wg-quick or k3s; belt and braces).
+_ki_journal_tail() {
+  echo "    last $2 journal lines of $1:" >&2
+  _ki_sudo sh -c 'p=""; for f in "$3" "$4"; do [ -s "$f" ] && p="$p -f $f"; done
+    journalctl -u "$1" -n "$2" --no-pager -o cat 2>&1 | if [ -n "$p" ]; then grep -vF $p; else cat; fi' \
+    _ "$1" "$2" "$(_ki_p "$KUBE_K3S_TOKEN_FILE")" "$(_ki_p "$KUBE_MESH_KEY")" | cut -c1-300 | sed 's/^/    | /' >&2 || true
 }
 
 # ── k3s ──
 
-# _ki_fetch <url> <sha256> <out> — download, refused unless the sha256 matches.
+# _ki_fetch <url> <sha256> <tmpdir/out> — download, refused unless the
+# sha256 matches (a refusal removes the whole download directory).
 _ki_fetch() {
   local got
-  curl -fsSL --retry 3 -o "$3" "$1" || fail "could not download $1"
+  curl -fsSL --retry 3 -o "$3" "$1" || { rm -rf "$(dirname "$3")"; fail "could not download $1"; }
   got="$(_kube_sha "$3")"
-  [ "$got" = "$2" ] || { rm -f "$3"; fail "$1 doesn't match its pinned sha256 (want $2, got $got): nothing was installed"; }
+  [ "$got" = "$2" ] || { rm -rf "$(dirname "$3")"; fail "$1 doesn't match its pinned sha256 (want $2, got $got): nothing was installed"; }
 }
 
 # _ki_token_file — the k3s token: 32 random bytes as hex, generated once into
@@ -324,7 +378,8 @@ _ki_wait_ready() {
     _ki_sudo k3s kubectl get nodes --no-headers 2>/dev/null | awk '$2 == "Ready" { f = 1 } END { exit !f }' && return 0
     sleep 2
   done
-  fail "k3s didn't become Ready within 5 minutes (journalctl -u k3s)"
+  _ki_journal_tail k3s 30
+  fail "k3s didn't become Ready within 5 minutes (its last journal lines are above)"
 }
 
 # _ki_write_kubeconfig — k3s.yaml as $(kube_install_kubeconfig) (0600, the
@@ -366,9 +421,12 @@ kube_install_k3s() {
   kube_flannel_conf | _ki_write "$(_ki_p "$KUBE_FLANNEL_CONF")" 644 || fail "could not write $KUBE_FLANNEL_CONF"
   _ki_sudo mkdir -p "$(_ki_p /usr/local/bin)"
   _ki_sudo install -m 0755 "$tmp/k3s" "$(_ki_p /usr/local/bin/k3s)" || { rm -rf "$tmp"; fail "could not install the k3s binary"; }
+  # k3s binds the mesh address: start it after pcmesh (install.sh reloads systemd).
+  printf '[Unit]\nAfter=wg-quick@%s.service\nRequires=wg-quick@%s.service\n' "$KUBE_MESH_IF" "$KUBE_MESH_IF" \
+    | _ki_write "$(_ki_p /etc/systemd/system/k3s.service.d/10-pcmesh.conf)" 644 || { rm -rf "$tmp"; fail "could not write k3s's pcmesh ordering"; }
   info "Installing k3s $KUBE_K3S_VERSION (embedded etcd on $KUBE_MESH_IF $KUBE_MESH_IP)..."
   _ki_sudo env INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_VERSION="$KUBE_K3S_VERSION" \
-    sh "$tmp/install.sh" server "${flags[@]}" ${1+"$@"} >&2 || { rm -rf "$tmp"; fail "the k3s install script failed (journalctl -u k3s)"; }
+    sh "$tmp/install.sh" server "${flags[@]}" ${1+"$@"} >&2 || { rm -rf "$tmp"; _ki_journal_tail k3s 30; fail "the k3s install script failed (k3s's last journal lines are above)"; }
   rm -rf "$tmp"
   _ki_wait_ready
   _ki_write_kubeconfig
@@ -417,29 +475,42 @@ EOF
 
 # ── the cluster addresses document (contract §20.9) ──
 
-# kube_cluster_addresses — once nodeadm has written the ConfigMap
-# portcullis-cluster-addresses, it is the source of the networks:
-# _K_POD_CIDR = cluster_cidr, _K_SVC_CIDR = service_cidr, _K_API_EP = api
-# (ip:6443, sorted). Absent: return 0, nothing changed. A document that
-# doesn't parse, or a node without a mesh address: return 1 (_K_ERR says
-# why; fail closed).
+# kube_cluster_addresses — after kube_detect_cidrs: once nodeadm has written
+# the ConfigMap portcullis-cluster-addresses, it must agree with the fixed
+# mesh and with the cluster itself, before anything else reads it:
+# mesh_cidr = 10.215.0.0/24, every api / nodes[].mesh entry an IPv4 address
+# in it, api (as ip:6443) = the default/kubernetes EndpointSlice, and
+# cluster_cidr / service_cidr = the detected networks. Absent: return 0.
+# Anything else: return 1, _K_ERR says why (fail closed: no params rewrite).
+# It overrides nothing (.env is compared with the cluster as before).
 kube_cluster_addresses() {
-  local out doc vals pod svc mesh api a
+  local out doc vals pod svc mesh api nodes a ep
   if ! out="$(kube_ctl -n "$(kube_ns)" get configmap portcullis-cluster-addresses -o json 2>&1)"; then
     case "$out" in *NotFound*) return 0 ;; esac
     _K_ERR="the cluster addresses (ConfigMap portcullis-cluster-addresses) can't be read"; return 1
   fi
   doc="$(printf '%s' "$out" | jq -r '.data["addresses.json"] // empty' 2>/dev/null)"
-  vals="$(printf '%s' "$doc" | jq -r 'select(.v == 1 and (.api | type == "array" and length > 0) and (.nodes | type == "object" and length > 0)
-      and ([.nodes[] | (.mesh | type == "string")] | all))
-    | [.cluster_cidr, .service_cidr, .mesh_cidr, (.api | sort | join(" "))] | @tsv' 2>/dev/null)"
-  IFS=$'\t' read -r pod svc mesh api <<< "$vals"
+  vals="$(printf '%s' "$doc" | jq -r 'def ip4: type == "string" and test("^[0-9]{1,3}([.][0-9]{1,3}){3}$");
+    select(.v == 1 and (.mesh_cidr | type == "string") and (.cluster_cidr | type == "string") and (.service_cidr | type == "string")
+      and (.api | type == "array" and length > 0 and all(ip4)) and (.nodes | type == "object" and length > 0)
+      and ([.nodes[] | .mesh | ip4] | all))
+    | [.cluster_cidr, .service_cidr, .mesh_cidr, (.api | join(" ")), ([.nodes[].mesh] | join(" "))] | @tsv' 2>/dev/null)"
   _K_ERR="the cluster addresses (ConfigMap portcullis-cluster-addresses) don't parse: nothing is changed"
-  _kube_cidr_ok "${pod:-x}" && _kube_cidr_ok "${svc:-x}" && _kube_cidr_ok "${mesh:-x}" || return 1
-  for a in $api; do cidr_contains "$mesh" "$a" || return 1; done
-  _K_POD_CIDR="$pod" _K_SVC_CIDR="$svc" _K_API_EP=""
-  for a in $api; do _K_API_EP="$_K_API_EP $a:6443"; done
-  _K_API_EP="${_K_API_EP# }" _K_ERR=""
-  # nodeadm keeps the API servers current; .env's list is init's.
-  export PORTCULLIS_KUBE_API_ENDPOINTS="$_K_API_EP"
+  [ -n "$vals" ] || return 1
+  IFS=$'\t' read -r pod svc mesh api nodes <<< "$vals"
+  if [ "$mesh" != "$KUBE_MESH_CIDR" ]; then
+    _K_ERR="the cluster addresses give the mesh as $mesh, not $KUBE_MESH_CIDR: nothing is changed"; return 1
+  fi
+  for a in $api $nodes; do
+    cidr_contains "$KUBE_MESH_CIDR" "$a" || { _K_ERR="the cluster addresses list $a, which isn't an address in $KUBE_MESH_CIDR: nothing is changed"; return 1; }
+  done
+  ep="$(for a in $api; do echo "$a:6443"; done | LC_ALL=C sort | tr '\n' ' ')"
+  ep="${ep% }"
+  if [ "$ep" != "$_K_API_EP" ]; then
+    _K_ERR="the cluster addresses list the API servers $ep, but the cluster has $_K_API_EP: nothing is changed"; return 1
+  fi
+  if [ "$pod" != "$_K_POD_CIDR" ] || [ "$svc" != "$_K_SVC_CIDR" ]; then
+    _K_ERR="the cluster addresses give pods $pod and services $svc, but the cluster has $_K_POD_CIDR and $_K_SVC_CIDR: nothing is changed"; return 1
+  fi
+  _K_ERR=""
 }

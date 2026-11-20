@@ -666,9 +666,17 @@ Options:
                           and one confirmation, init installs the node mesh
                           pcmesh (10.215.0.1, UDP 51830) and the pinned k3s
                           with embedded etcd on it (context portcullis in
-                          secrets/kube/kubeconfig)
+                          secrets/kube/kubeconfig). The node's class label
+                          is suggested from its RAM (small below 3.5 GiB)
+                          and PORTCULLIS_PUBLIC_IPV4 (cloud when that
+                          address is on the host); PORTCULLIS_NODE_CLASS=
+                          small|home|cloud sets it. A half-finished install
+                          of init's own is resumed by running init again
   --env-only              only write/complete .env, then stop (refused
-                          without --runtime when no engine answers)
+                          without --runtime when no engine answers; with
+                          --runtime kubernetes and no --kube-context it
+                          still installs pcmesh and k3s first: .env holds
+                          the cluster's networks)
   --skip-dns              do not create DNS records
   --no-config-repo        do not create the config/ git repo
 

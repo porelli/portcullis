@@ -80,14 +80,16 @@ kube_detect_cidrs() {
   local nodes out
   _K_POD_CIDR="" _K_SVC_CIDR="" _K_API_EP="" _K_ERR=""
   nodes="$(kube_ctl get nodes -o json 2>/dev/null)" || { _K_ERR="kubectl get nodes failed"; return 1; }
-  # k3s (node-args on a node): the cluster CIDR, --cluster-cidr or k3s's
-  # 10.42.0.0/16, holds every node's range; another distribution: one node.
-  _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '[.items[].metadata.annotations["k3s.io/node-args"] // empty][0] // empty | fromjson
+  # k3s (a server's node-args): the cluster CIDR, --cluster-cidr or k3s's
+  # 10.42.0.0/16; another distribution: the node's spec.podCIDRs.
+  _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '[.items[].metadata.annotations["k3s.io/node-args"] // empty | fromjson | select(.[0] == "server")][0] // empty
     | . as $a | ([range(0; length) | select($a[.] | startswith("--cluster-cidr")) | if $a[.] | contains("=") then ($a[.] | sub("^--cluster-cidr="; "")) else $a[. + 1] end][0] // "10.42.0.0/16" | gsub(","; " "))' 2>/dev/null || true)"
   case "$(printf '%s' "$nodes" | jq -r '.items | length' 2>/dev/null)" in
     0|"") _K_ERR="the cluster has no node"; return 1 ;;
     1) [ -n "$_K_POD_CIDR" ] || _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '.items[0].spec | (.podCIDRs // [.podCIDR // empty]) | join(" ")' 2>/dev/null || true)" ;;
-    *) [ -n "$_K_POD_CIDR" ] || { _K_ERR="the cluster has more than one node and isn't k3s (no k3s.io/node-args): its cluster CIDR can't be read"; return 1; } ;;
+    # The node checks read one node (flags, pids cap, AppArmor): fail closed
+    # until nodeadm's per-node checks exist.
+    *) _K_ERR="the cluster has more than one node: multi-node clusters are added with ./portcullis node add (not yet available)"; return 1 ;;
   esac
   [ -n "$_K_POD_CIDR" ] || { _K_ERR="the node has no spec.podCIDRs"; return 1; }
   # A Service no cluster can allocate: the API server names the range.
@@ -254,7 +256,7 @@ kube_host_checks() {
     esac
   fi
   _kube_apparmor_check "$nodes"
-  [ ! -s "$(kube_install_kubeconfig)" ] || _ki_node_checks
+  [ "${PORTCULLIS_KUBE_CONTEXT:-}" != "$(kube_install_context)" ] || [ ! -s "$(kube_install_kubeconfig)" ] || _ki_node_checks
   cfg="$(kube_ctl get --raw "/api/v1/nodes/$(printf '%s' "$nodes" | jq -r '.items[0].metadata.name // "?"' 2>/dev/null)/proxy/configz" 2>/dev/null || true)"
   pids="$(printf '%s' "$cfg" | jq -r '.kubeletconfig.podPidsLimit // empty' 2>/dev/null || true)"
   if [ "$pids" = 1024 ]; then
@@ -262,7 +264,7 @@ kube_host_checks() {
   else
     _rt_chk fail "kubelet podPidsLimit is ${pids:-unset}, not 1024: reinstall k3s with --kubelet-arg=pod-max-pids=1024 (the only per-pod pids cap)"
   fi
-  if kube_detect_cidrs; then
+  if kube_detect_cidrs && kube_cluster_addresses; then
     if _kube_ipv6_in "$_K_POD_CIDR $_K_SVC_CIDR"; then
       _rt_chk fail "dual-stack or IPv6 cluster (pods $_K_POD_CIDR, services $_K_SVC_CIDR): Portcullis supports IPv4 single-stack only"
     elif [ "${_K_POD_CIDR// /}" != "$_K_POD_CIDR" ] || [ "${_K_SVC_CIDR// /}" != "$_K_SVC_CIDR" ]; then

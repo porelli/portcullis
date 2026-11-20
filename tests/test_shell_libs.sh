@@ -4474,31 +4474,48 @@ echo 'error: something else entirely' > "$KS/kube/svc-dryrun.err"
 OUT="$(kt 'kube_detect_cidrs')"
 case "$OUT" in *"rc=1") t_pass "kube_detect_cidrs: an unparsable dry-run answer → refused" ;; *) t_fail "kube unparsable svc cidr: $OUT" ;; esac
 # ── HA Task 17: init installs k3s on pcmesh (scripts/lib/kube_install.sh) ──
-# kube_detect_cidrs on more than one node: k3s's cluster CIDR (its
-# --cluster-cidr node arg, else 10.42.0.0/16), never one node's range.
+# kube_detect_cidrs: more than one node is refused (fail closed: the node
+# checks read one node) until nodeadm's per-node checks exist (Task 21).
 k_fixtures
-jq '.items[0].metadata.annotations["k3s.io/node-args"] = "[\"server\",\"--cluster-init\"]" | .items = [.items[0], (.items[0] | .metadata.name = "n2" | .spec.podCIDRs = ["10.42.1.0/24"]), (.items[0] | .metadata.name = "n3" | .spec.podCIDRs = ["10.42.2.0/24"])]' "$KS/kube/nodes.json" > "$KS/kube/n3.json" && mv "$KS/kube/n3.json" "$KS/kube/nodes.json"
-expect_eq "kube_detect_cidrs: three nodes accepted, cluster CIDR 10.42.0.0/16" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR"')" "10.42.0.0/16
-rc=0"
-jq '.items |= map(.metadata.annotations = {})' "$KS/kube/nodes.json" > "$KS/kube/n3.json" && mv "$KS/kube/n3.json" "$KS/kube/nodes.json"
+jq '.items = [.items[0], (.items[0] | .metadata.name = "n2" | .spec.podCIDRs = ["10.42.1.0/24"]), (.items[0] | .metadata.name = "n3" | .spec.podCIDRs = ["10.42.2.0/24"])]' "$KS/kube/nodes.json" > "$KS/kube/n3.json" && mv "$KS/kube/n3.json" "$KS/kube/nodes.json"
 OUT="$(kt 'kube_detect_cidrs || { echo "$_K_ERR"; exit 1; }')"
-case "$OUT" in *"more than one node and isn't k3s"*"rc=1") t_pass "kube_detect_cidrs: several nodes without k3s node-args → refused (no cluster CIDR to read)" ;; *) t_fail "kube detect multi non-k3s: $OUT" ;; esac
+case "$OUT" in *"multi-node clusters are added with ./portcullis node add (not yet available)"*"rc=1") t_pass "kube_detect_cidrs: three nodes → refused (multi-node waits for node add)" ;; *) t_fail "kube detect multi: $OUT" ;; esac
+echo '{"kubeletconfig":{"podPidsLimit":0}}' > "$KS/kube/configz.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	can't read the cluster's networks: the cluster has more than one node: multi-node"*) t_pass "kube_host_checks: a 3-node cluster (one node without the pids cap) → refused" ;; *) t_fail "kube host multi: $OUT" ;; esac
 k_fixtures
 expect_eq "kube_detect_cidrs: k3s's --cluster-cidr node arg is the pod CIDR" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR"')" "10.42.0.0/24
 rc=0"
-# The cluster addresses document (contract §20.9): once it exists it is the
-# networks' source; one that doesn't parse refuses (fail closed).
-printf '%s' '{"data":{"addresses.json":"{\"v\":1,\"mesh_cidr\":\"10.215.0.0/24\",\"cluster_cidr\":\"10.42.0.0/24\",\"service_cidr\":\"10.43.0.0/16\",\"api\":[\"10.215.0.2\",\"10.215.0.1\"],\"nodes\":{\"n1\":{\"mesh\":\"10.215.0.1\"},\"n2\":{\"mesh\":\"10.215.0.2\"}}}"}}' > "$KS/kube/cluster-addresses.json"
-expect_eq "kube_runtime_check reads portcullis-cluster-addresses: the API servers from it, the CIDRs still = .env" \
-  "$(kt 'kube_forward_core() { :; }; kube_runtime_check && echo "$PORTCULLIS_KUBE_API_ENDPOINTS"')" "10.215.0.1:6443 10.215.0.2:6443
+jq '.items[0].metadata.annotations["k3s.io/node-args"] = "[\"agent\",\"--cluster-cidr\",\"10.99.0.0/16\"]"' "$KS/kube/nodes.json" > "$KS/kube/n1.json" && mv "$KS/kube/n1.json" "$KS/kube/nodes.json"
+expect_eq "kube_detect_cidrs: only a server's node-args name the cluster CIDR (an agent's are ignored)" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR"')" "10.42.0.0/24
 rc=0"
-printf '%s' '{"data":{"addresses.json":"{\"v\":1,\"cluster_cidr\":\"10.42.0.0/24\",\"service_cidr\":\"10.43.0.0/16\",\"api\":[\"10.215.0.1\"],\"nodes\":{\"n1\":{\"lan\":[]}}}"}}' > "$KS/kube/cluster-addresses.json"
-OUT="$(kt 'kube_forward_core() { :; }; kube_runtime_check')"
-case "$OUT" in *"portcullis-cluster-addresses) don't parse"*"rc=1") t_pass "kube_runtime_check: an unparseable cluster addresses document (no mesh address) → refused" ;; *) t_fail "cluster addresses bad: $OUT" ;; esac
-printf '%s' '{"data":{"addresses.json":"{\"v\":1,\"mesh_cidr\":\"10.215.0.0/24\",\"cluster_cidr\":\"10.99.0.0/16\",\"service_cidr\":\"10.43.0.0/16\",\"api\":[\"10.215.0.1\"],\"nodes\":{\"n1\":{\"mesh\":\"10.215.0.1\"}}}"}}' > "$KS/kube/cluster-addresses.json"
-OUT="$(kt 'kube_forward_core() { :; }; kube_runtime_check')"
-case "$OUT" in *"PORTCULLIS_POD_CIDR=10.42.0.0/24 in .env, but the cluster has 10.99.0.0/16"*"rc=1") t_pass "kube_runtime_check: the document's cluster CIDR ≠ .env → refused naming both" ;; *) t_fail "cluster addresses cidr: $OUT" ;; esac
+# The cluster addresses document (contract §20.9): checked against the
+# fixed mesh and the cluster itself; it overrides nothing.
+k_fixtures
+echo '{"items":[{"ports":[{"port":6443}],"endpoints":[{"addresses":["10.215.0.1"]},{"addresses":["10.215.0.10"]}]}]}' > "$KS/kube/eps.json"
+ca() { # ca <addresses.json> → the ConfigMap
+  jq -n --arg d "$1" '{data: {"addresses.json": $d}}' > "$KS/kube/cluster-addresses.json"; }
+CA_OK='{"v":1,"mesh_cidr":"10.215.0.0/24","cluster_cidr":"10.42.0.0/24","service_cidr":"10.43.0.0/16","api":["10.215.0.10","10.215.0.1"],"nodes":{"n1":{"mesh":"10.215.0.1"},"n2":{"mesh":"10.215.0.10"}}}'
+car() { kt "PORTCULLIS_KUBE_API_ENDPOINTS='10.215.0.10:6443 10.215.0.1:6443'; kube_forward_core() { :; }; kube_runtime_check && echo \"\$PORTCULLIS_KUBE_API_ENDPOINTS\""; }
+ca "$CA_OK"
+expect_eq "kube_runtime_check: a cluster addresses document matching the mesh and the cluster → ok, nothing overridden" "$(car)" "10.215.0.10:6443 10.215.0.1:6443
+rc=0"
+ca "$(jq -c '.mesh_cidr = "0.0.0.0/0"' <<< "$CA_OK")"
+case "$(car)" in *"give the mesh as 0.0.0.0/0, not 10.215.0.0/24"*"rc=1") t_pass "kube_cluster_addresses: a mesh_cidr other than 10.215.0.0/24 → refused" ;; *) t_fail "ca mesh: $(car)" ;; esac
+ca "$(jq -c '.api = ["10.215.0.1","192.0.2.7"]' <<< "$CA_OK")"
+case "$(car)" in *"list 192.0.2.7, which isn't an address in 10.215.0.0/24"*"rc=1") t_pass "kube_cluster_addresses: an API address outside the mesh → refused" ;; *) t_fail "ca api out: $(car)" ;; esac
+ca "$(jq -c '.nodes.n2.mesh = "10.215.0.300"' <<< "$CA_OK")"
+case "$(car)" in *"list 10.215.0.300, which isn't an address"*"rc=1") t_pass "kube_cluster_addresses: a node's mesh address that isn't an IPv4 address in the mesh → refused" ;; *) t_fail "ca node mesh: $(car)" ;; esac
+ca "$(jq -c '.nodes.n2 = {"lan":[]}' <<< "$CA_OK")"
+case "$(car)" in *"portcullis-cluster-addresses) don't parse"*"rc=1") t_pass "kube_cluster_addresses: a node without a mesh address → refused" ;; *) t_fail "ca no mesh: $(car)" ;; esac
+ca "$(jq -c '.api = ["10.215.0.1"]' <<< "$CA_OK")"
+case "$(car)" in *"list the API servers 10.215.0.1:6443, but the cluster has 10.215.0.10:6443 10.215.0.1:6443"*"rc=1") t_pass "kube_cluster_addresses: an api list ≠ the cluster's EndpointSlice → refused naming both" ;; *) t_fail "ca api diff: $(car)" ;; esac
+ca "$(jq -c '.cluster_cidr = "10.99.0.0/16"' <<< "$CA_OK")"
+case "$(car)" in *"give pods 10.99.0.0/16 and services 10.43.0.0/16, but the cluster has 10.42.0.0/24"*"rc=1") t_pass "kube_cluster_addresses: a cluster CIDR ≠ the cluster's → refused" ;; *) t_fail "ca cidr: $(car)" ;; esac
+OUT="$(kt "PORTCULLIS_KUBE_API_ENDPOINTS='10.215.0.10:6443 10.215.0.1:6443'; kube_host_checks")"
+case "$OUT" in *"fail	can't read the cluster's networks: the cluster addresses give pods 10.99.0.0/16"*) t_pass "kube_host_checks: a mismatched cluster addresses document → fail" ;; *) t_fail "ca host: $OUT" ;; esac
 rm -f "$KS/kube/cluster-addresses.json"
+k_fixtures
 
 # The installer sandbox: every host path under KUBE_INSTALL_PREFIX, a fake
 # curl serving the pinned downloads, a fake installer recording its argv,
@@ -4539,8 +4556,9 @@ OUT="$(kik "KUBE_K3S_SCRIPT_SHA256=$(printf '0%.0s' $(seq 64)); kube_install_k3s
 case "$OUT" in *"install.sh doesn't match its pinned sha256"*"nothing was installed"*"rc=1") t_pass "kube_install_k3s: refuses a script whose sha256 differs (rc=1)" ;; *) t_fail "ki sha: $OUT" ;; esac
 expect_eq "kube_install_k3s: a refused script → nothing executed, no binary, no token, no flannel conf" \
   "$(ls "$KI/argv" "$KI/root/usr/local/bin/k3s" "$KI/root/etc/rancher/k3s/token" "$KI/root/etc/rancher/k3s/flannel-net-conf.json" 2>/dev/null | wc -l | tr -d ' ')" 0
-ki_reset; printf 'X\n' > "$KI/dl/k3s.other"
-OUT="$(kik "KUBE_K3S_SHA256_AMD64=$(printf 'a%.0s' $(seq 64)); kube_install_k3s")"
+ki_reset; mkdir -p "$KI/tmp"
+OUT="$(kik "export TMPDIR='$KI/tmp'; KUBE_K3S_SHA256_AMD64=$(printf 'a%.0s' $(seq 64)); kube_install_k3s")"
+expect_eq "kube_install_k3s: a refused download leaves no temp directory" "$(ls -A "$KI/tmp" | wc -l | tr -d ' ')" 0
 case "$OUT" in *"k3s doesn't match its pinned sha256"*"rc=1") t_pass "kube_install_k3s: refuses a binary whose sha256 differs" ;; *) t_fail "ki bin sha: $OUT" ;; esac
 expect_eq "kube_install_k3s: a refused binary → the installer never ran" "$(test -e "$KI/argv" && echo ran || echo no)" no
 ki_reset
@@ -4556,6 +4574,8 @@ expect_eq "kube_install_k3s: token never on argv (argv, environment, stdin, outp
 expect_eq "kube_install_k3s: an existing token file is kept, 0600" "$(cat "$KI/root/etc/rancher/k3s/token"):$(file_mode "$KI/root/etc/rancher/k3s/token")" "FIXTURE-K3S-TOKEN-7f3a9c:600"
 expect_eq "kube_install_k3s: flannel's net-conf = tests/fixtures/k3s-flannel-net-conf.json (WireGuard on 51840, the cluster network)" \
   "$(diff "$KI/root/etc/rancher/k3s/flannel-net-conf.json" "$HERE/fixtures/k3s-flannel-net-conf.json" >/dev/null && echo same):$(jq -r '.Backend.ListenPort' "$KI/root/etc/rancher/k3s/flannel-net-conf.json")" "same:51840"
+expect_eq "kube_install_k3s: k3s starts after pcmesh (a 10-pcmesh.conf drop-in)" \
+  "$(grep -cxE '\[Unit\]|After=wg-quick@pcmesh\.service|Requires=wg-quick@pcmesh\.service' "$KI/root/etc/systemd/system/k3s.service.d/10-pcmesh.conf")" 3
 expect_eq "kube_install_k3s: the pinned binary installed 0755" "$(cat "$KI/root/usr/local/bin/k3s"):$(file_mode "$KI/root/usr/local/bin/k3s")" "K3S-BINARY:755"
 KCF="$PORTCULLIS_ROOT/secrets/kube/kubeconfig"
 expect_eq "kube_install_k3s: the kubeconfig at secrets/kube/kubeconfig (0600), context portcullis, server https://10.215.0.1:6443" \
@@ -4569,8 +4589,13 @@ rm -f "$KCF"
 ki_reset
 OUT="$(kik '_ki_cluster_answers() { return 0; }; kube_install_k3s')"
 case "$OUT" in *"already answers"*"rc=0") [ -e "$KI/argv" ] && t_fail "ki answers: ran" || t_pass "kube_install_k3s: a cluster answering on init's context → not installed again" ;; *) t_fail "ki answers: $OUT" ;; esac
-# The class suggestion: small below 4 GB or on a Pi (no storage label),
-# cloud when the public address is local, else home.
+# The class suggestion: small below 3.5 GiB (3 670 016 KiB) or on a Pi (no
+# storage label), cloud when the public address is local, else home.
+ki_reset; printf 'MemTotal:        3600000 kB\n' > "$KI/root/proc/meminfo"
+expect_eq "kube_k3s_server_flags: 3 600 000 KiB (below 3.5 GiB) → small" "$(kik 'kube_k3s_server_flags | grep class=')" "--node-label=portcullis.io/class=small
+rc=0"
+ki_reset; printf 'MemTotal:        3700000 kB\n' > "$KI/root/proc/meminfo"
+expect_eq "kube_k3s_server_flags: 3 700 000 KiB (above 3.5 GiB) → home, storage on" "$(kik 'kube_k3s_server_flags | grep -E "class=|storage=" | tr "\n" " "')" "--node-label=portcullis.io/class=home --node-label=portcullis.io/storage=true rc=0"
 ki_reset; printf 'MemTotal:        2000000 kB\n' > "$KI/root/proc/meminfo"
 expect_eq "kube_k3s_server_flags: 2 GB → class small, no storage label" "$(kik 'kube_k3s_server_flags | grep -E "class=|storage="')" "--node-label=portcullis.io/class=small
 rc=0"
@@ -4585,12 +4610,17 @@ rc=0"
 # in the config (PostUp loads it), wg-quick@pcmesh enabled.
 ki_reset
 OUT="$(kik 'kube_install_mesh')"
-MK="$KI/root/etc/pcmesh/private.key" MC="$KI/root/etc/wireguard/pcmesh.conf"
+MK="$KI/root/etc/wireguard/pcmesh.key" MC="$KI/root/etc/wireguard/pcmesh.conf"
 expect_eq "kube_install_mesh: private key mode 0600 (dir 0700) and never printed" \
   "$(cat "$MK"):$(file_mode "$MK"):$(file_mode "$(dirname "$MK")"):$(printf '%s' "$OUT" | grep -c PRIVKEY-FIXTURE || true)" "PRIVKEY-FIXTURE-k3Jq9zZ0aWc=:600:700:0"
 expect_eq "kube_install_mesh: pcmesh.conf 0600, 10.215.0.1/24 on UDP 51830, MTU 1420, the key by PostUp only" \
-  "$(file_mode "$MC"):$(grep -cxE 'Address = 10\.215\.0\.1/24|ListenPort = 51830|MTU = 1420|PostUp = wg set %i private-key /etc/pcmesh/private\.key' "$MC"):$(grep -c 'PRIVKEY-FIXTURE\|PrivateKey' "$MC" || true)" "600:4:0"
-expect_eq "kube_install_mesh: wg-quick@pcmesh enabled, wg only asked for genkey" "$(cat "$KI/systemctl-calls"):$(cat "$KI/wg-calls")" "enable --now wg-quick@pcmesh:genkey"
+  "$(file_mode "$MC"):$(grep -cxE 'Address = 10\.215\.0\.1/24|ListenPort = 51830|MTU = 1420|PostUp = wg set %i private-key /etc/wireguard/pcmesh\.key' "$MC"):$(grep -c 'PRIVKEY-FIXTURE\|PrivateKey' "$MC" || true)" "600:4:0"
+expect_eq "kube_install_mesh: wg-quick@pcmesh enabled and checked active, wg only asked for genkey" "$(tr '\n' ' ' < "$KI/systemctl-calls"):$(cat "$KI/wg-calls")" "enable --now wg-quick@pcmesh is-active --quiet wg-quick@pcmesh :genkey"
+printf '#!/bin/sh\necho "-- journal for $*"\necho "[#] wg set pcmesh private-key /etc/wireguard/pcmesh.key"\necho "PRIVKEY-FIXTURE-k3Jq9zZ0aWc= leaked line"\necho "Unable to read: Permission denied"\n' > "$KI/bin/journalctl"; chmod +x "$KI/bin/journalctl"
+OUT="$(kik 'systemctl() { [ "$1" = enable ]; }; kube_install_mesh')"
+case "$OUT" in *"last 20 journal lines of wg-quick@pcmesh"*"| -- journal for -u wg-quick@pcmesh -n 20"*"| Unable to read: Permission denied"*"didn't start (its last journal lines are above)"*"rc=1") t_pass "kube_install_mesh: enable --now answering 0 but the unit not active → its journal tail printed, then refused" ;; *) t_fail "ki mesh journal: $OUT" ;; esac
+expect_eq "kube_install_mesh: the journal tail drops any line holding the mesh key" "$(printf '%s' "$OUT" | grep -c PRIVKEY-FIXTURE || true)" 0
+rm -f "$KI/bin/journalctl"
 OUT="$(kik 'kube_install_mesh')"
 expect_eq "kube_install_mesh: a re-run keeps the key and the config" "$(cat "$MK"):$(cat "$KI/wg-calls")" "PRIVKEY-FIXTURE-k3Jq9zZ0aWc=:genkey"
 
@@ -4598,7 +4628,7 @@ expect_eq "kube_install_mesh: a re-run keeps the key and the config" "$(cat "$MK
 # packages to install (wireguard-tools here is installed).
 ki_reset; mkdir -p "$KI/root/sys/module/wireguard"
 kip() { kik "KUBE_INSTALL_OS=Linux; INIT_INTERACTIVE=true
-  _ki_pkg_installed() { [ \"\$1\" = wireguard-tools ]; }; _ki_port_busy() { return 1; }; _ki_mesh_taken() { :; }; _ki_fs_type() { echo ext4; }
+  _ki_pkg_installed() { [ \"\$1\" = wireguard-tools ]; }; _ki_port_busy() { return 1; }; _ki_mesh_taken() { :; }; _ki_fs_type() { echo ext4; }; _ki_link_up() { return 1; }; _ki_k3s_ours() { return 1; }
   confirm() { echo \"CONFIRM \$1\" >> '$KI/log'; $1; }
   _ki_sudo() { echo \"SUDO \$*\" >> '$KI/log'; }
   $2"; }
@@ -4613,12 +4643,34 @@ OUT="$(kip 'return 1' 'kube_install_preflight')"
 case "$OUT" in *"nothing was installed"*"rc=1") [ "$(grep -c '^SUDO' "$KI/log" || true)" = 0 ] && t_pass "kube_install_preflight: the confirmation declined → refused, nothing installed" || t_fail "ki decline installed" ;; *) t_fail "ki decline: $OUT" ;; esac
 rm -f "$KI/log"
 OUT="$(kip 'return 0' '_ki_port_busy() { [ "$1" = 6443 ]; }; kube_install_preflight')"
-case "$OUT" in *"port 6443/tcp is in use"*"rc=1") [ ! -e "$KI/log" ] && t_pass "kube_install_preflight: a failed host check (6443 in use) → refused before the confirmation" || t_fail "ki port: asked" ;; *) t_fail "ki port: $OUT" ;; esac
+case "$OUT" in *"port 6443/tcp is in use"*"sudo /usr/local/bin/k3s-uninstall.sh; sudo systemctl disable --now wg-quick@pcmesh; sudo rm -f /etc/wireguard/pcmesh.conf /etc/wireguard/pcmesh.key"*"rc=1") [ ! -e "$KI/log" ] && t_pass "kube_install_preflight: a failed host check (6443 in use) → refused before the confirmation" || t_fail "ki port: asked" ;; *) t_fail "ki port: $OUT" ;; esac
 OUT="$(kip 'return 0' '_ki_mesh_taken() { echo 10.215.0.7; }; kube_install_host_checks')"
 case "$OUT" in *"fail	the mesh subnet 10.215.0.0/24 is already in use on this host (10.215.0.7)"*) t_pass "kube_install_host_checks: the mesh subnet taken → fail" ;; *) t_fail "ki mesh taken: $OUT" ;; esac
 OUT="$(kip 'return 0' 'mkdir -p "$KUBE_INSTALL_PREFIX/dev" && : > "$KUBE_INSTALL_PREFIX/dev/watchdog"; _ki_fs_type() { echo zfs; }; _ki_pkg_installed() { return 0; }; _ki_node_checks')"
 case "$OUT" in *"ok	open-iscsi installed"*"ok	nfs-common installed"*"ok	watchdog device /dev/watchdog"*"warn	/var/lib is on ZFS"*) t_pass "_ki_node_checks: packages, the watchdog and ZFS reported" ;; *) t_fail "ki node checks: $OUT" ;; esac
-expect_eq "kube_host_checks runs the node checks on an init-installed node" "$(sed -n '/^kube_host_checks() {/,/^}/p' "$HERE"/../scripts/lib/kube.sh | grep -c '_ki_node_checks')" 1
+OUT="$(kip 'return 0' '_ki_have() { [ "$1" != ss ]; }; kube_install_host_checks')"
+case "$OUT" in *"fail	ss (iproute2) is missing: the ports can't be checked free"*) t_pass "kube_install_host_checks: no ss → fail (never every port free)" ;; *) t_fail "ki no ss: $OUT" ;; esac
+# A half-finished init of our own resumes (I3): pcmesh up with our config
+# and key holds 51830; k3s with our token, net-conf and unit holds its ports.
+kir() { kik "KUBE_INSTALL_OS=Linux; INIT_INTERACTIVE=false; _ki_pkg_installed() { return 0; }; _ki_mesh_taken() { :; }; _ki_fs_type() { echo ext4; }; _ki_link_up() { return 0; }
+  $1"; }
+ki_reset; mkdir -p "$KI/root/sys/module/wireguard"
+kik 'kube_install_mesh' >/dev/null
+OUT="$(kir '_ki_port_busy() { [ "$1" = 51830 ]; }; kube_install_preflight; echo resumed')"
+case "$OUT" in *"pcmesh is a half-finished init's: resuming"*"resumed"*"rc=0") t_pass "kube_install_preflight: mesh up (ours), k3s failed → the re-run resumes" ;; *) t_fail "ki resume mesh: $OUT" ;; esac
+kik 'kube_install_k3s' >/dev/null; rm -f "$PORTCULLIS_ROOT/secrets/kube/kubeconfig" "$KI/argv"
+mkdir -p "$KI/root/etc/systemd/system"; : > "$KI/root/etc/systemd/system/k3s.service"
+TOK="$(cat "$KI/root/etc/rancher/k3s/token")"
+OUT="$(kir '_ki_port_busy() { return 0; }; kube_install_preflight && kube_install_mesh && kube_install_k3s')"
+case "$OUT" in *"k3s is a half-finished init's: resuming"*"rc=0") t_pass "kube_install_preflight: k3s not Ready (ours, every port held) → the re-run resumes" ;; *) t_fail "ki resume k3s: $OUT" ;; esac
+expect_eq "kube_install_k3s: the resumed run keeps the token and runs the installer again" "$([ "$(cat "$KI/root/etc/rancher/k3s/token")" = "$TOK" ] && echo kept):$(head -n1 "$KI/argv" 2>/dev/null)" "kept:server"
+rm -f "$PORTCULLIS_ROOT/secrets/kube/kubeconfig"
+echo '{"Network":"10.99.0.0/16"}' > "$KI/root/etc/rancher/k3s/flannel-net-conf.json"
+OUT="$(kir '_ki_port_busy() { [ "$1" = 6443 ]; }; kube_install_preflight')"
+case "$OUT" in *"port 6443/tcp is in use"*"k3s-uninstall.sh"*"rc=1") t_pass "kube_install_preflight: k3s that isn't ours (another net-conf) → refused with the teardown" ;; *) t_fail "ki not ours: $OUT" ;; esac
+expect_eq "kube_host_checks runs the node checks only on init's own context" "$(sed -n '/^kube_host_checks() {/,/^}/p' "$HERE"/../scripts/lib/kube.sh | grep -c '"${PORTCULLIS_KUBE_CONTEXT:-}" != "$(kube_install_context)" ] || \[ ! -s "$(kube_install_kubeconfig)" \] || _ki_node_checks')" 1
+OUT="$(kt "mkdir -p '$PORTCULLIS_ROOT/secrets/kube' && echo x > '$PORTCULLIS_ROOT/secrets/kube/kubeconfig'; KUBE_LOCAL_ADDRS=; kube_host_checks | grep -c 'watchdog' ; rm -f '$PORTCULLIS_ROOT/secrets/kube/kubeconfig'")"
+expect_eq "kube_host_checks: another context (ci) with init's kubeconfig present → no node checks" "$(printf '%s\n' "$OUT" | head -n1)" 0
 # kube_install_run: the order is preflight → mesh → k3s, and the context.
 OUT="$(kik 'kube_install_preflight() { echo pre; }; kube_install_mesh() { echo mesh; }; kube_install_k3s() { echo k3s; }; kube_install_run; echo "ctx=$PORTCULLIS_KUBE_CONTEXT"; _K_POD_CIDR=10.42.0.0/16 _K_SVC_CIDR=10.43.0.0/16 _K_API_EP=10.215.0.1:6443; kube_env_keys portcullis | grep K3S')"
 expect_eq "kube_install_run: preflight, mesh, k3s in that order; context portcullis; PORTCULLIS_K3S_VERSION written" "$(printf '%s\n' "$OUT" | tr '\n' ' ')" "pre mesh k3s ctx=portcullis PORTCULLIS_K3S_VERSION=v1.37.2+k3s1 rc=0 "
