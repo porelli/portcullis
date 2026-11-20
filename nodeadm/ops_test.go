@@ -149,18 +149,22 @@ func TestRevokeResumesAtEachStep(t *testing.T) {
 			if !slices.Equal(h.agents.etcdRm, []string{"n1:n2:10.215.0.2"}) {
 				t.Fatalf("etcd removals %v", h.agents.etcdRm)
 			}
-			// Every survivor applied once, with the final tokens.
-			applied := map[string]int{}
+			// Every survivor applied, its last apply with the final tokens
+			// (a server target: two rounds).
+			applied, last := map[string]int{}, map[string]string{}
 			for i, r := range h.agents.rotations {
 				if strings.HasPrefix(r, "apply") {
 					applied[r]++
-					want := srv
-					if strings.HasPrefix(r, "apply-agent") || strings.HasSuffix(r, ":n4") {
-						want = agt
-					}
-					if h.agents.tokens[i] != want {
-						t.Fatalf("%s carried a stale token", r)
-					}
+					last[r] = h.agents.tokens[i]
+				}
+			}
+			for r, tok := range last {
+				want := srv
+				if strings.HasPrefix(r, "apply-agent") || strings.HasSuffix(r, ":n4") {
+					want = agt
+				}
+				if tok != want {
+					t.Fatalf("%s's last apply carried a stale token", r)
 				}
 			}
 			for _, r := range []string{"apply:n1", "apply-agent:n1", "apply:n3", "apply-agent:n3", "apply:n4"} {
@@ -213,8 +217,13 @@ func TestRevokeStopsOnLeaseLoss(t *testing.T) {
 	h.putState(t, func(st *nodeadmState) {
 		st.Nodes["n3"] = &nodeRecord{Role: "server", Serial: "56:78", MeshIP: "10.215.0.3"}
 	})
+	var once sync.Once
 	h.agents.onRotate = func(id, step, tok string) {
-		if step == "rotate" && h.leader.on.Load() {
+		lost := false
+		if step == "rotate" {
+			once.Do(func() { lost = true })
+		}
+		if lost {
 			h.leader.on.Store(false)
 			time.Sleep(400 * time.Millisecond) // the fence notices
 		}
@@ -223,7 +232,7 @@ func TestRevokeStopsOnLeaseLoss(t *testing.T) {
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n3?mode=revoke", nil); w.Code < 500 {
 		t.Fatalf("a revoke losing the Lease: %d", w.Code)
 	}
-	if op := h.state(t).Ops["n3"]; op == nil || op.NewServer == "" {
+	if op := h.state(t).Ops["n3"]; op == nil || (op.NewServer == "" && !op.ServerRotated) {
 		t.Fatalf("the op or its new token isn't recorded: %+v", op)
 	}
 	h.leader.on.Store(true)
@@ -664,7 +673,7 @@ func TestRevokeParksSecurityDone(t *testing.T) {
 	h.setReady(t, "n3", false)
 	h.agents.onRotate = h.bootFollows
 	w := h.internal(clientHub, "DELETE", "/v1/nodes/n5?mode=revoke", nil)
-	if w.Code != 409 || !strings.Contains(w.Body.String(), `"kind":"quorum_minimum"`) || !strings.Contains(w.Body.String(), "certificate revoked") {
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"kind":"quorum_minimum"`) || !strings.Contains(w.Body.String(), "security steps done") {
 		t.Fatalf("revoke without quorum: %d %s", w.Code, w.Body)
 	}
 	st := h.state(t)
@@ -713,5 +722,50 @@ func TestRevokeParksSecurityDone(t *testing.T) {
 		if !slices.Contains(h.agents.rotations, r) {
 			t.Fatalf("%s not applied after the resume: %v", r, h.agents.rotations)
 		}
+	}
+}
+
+// TestRevokeStepsVersion (fix round 6): an op recorded under another step
+// list restarts from marked (the security steps run again) and finishes
+// with both rotations; done refuses without the recorded rotations.
+func TestRevokeStepsVersion(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.agents.onRotate = h.bootFollows
+	h.kube.CoreV1().Secrets(bootstrapNS).Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-abc123", Namespace: bootstrapNS}}, metav1.CreateOptions{})
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["n3"] = &nodeRecord{Role: "server", Serial: "56:78", MeshIP: "10.215.0.3"}
+		// An old op past its (old) etcd step, claiming nothing was rotated.
+		st.Ops["n3"] = &revokeOp{Node: "n3", Role: "server", Mesh: "10.215.0.3", Serial: "56:78", TokenIDs: []string{"abc123"},
+			Step: "deferred_applied", StepsVersion: 2, Started: vecNow}
+	})
+	h.resume(t, "n3")
+	if !strings.Contains(h.logs.String(), "restarted from marked") {
+		t.Fatal("the old op wasn't restarted")
+	}
+	if r := h.state(t).Nodes["n3"]; r == nil || !r.Removed || r.Serial != "" || !slices.Contains(h.enroll.revoked, "56:78") {
+		t.Fatalf("the security steps didn't run again: %+v %v", r, h.enroll.revoked)
+	}
+	if _, err := h.kube.CoreV1().Secrets(bootstrapNS).Get(ctx, "bootstrap-token-abc123", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatal("its bootstrap token wasn't deleted")
+	}
+	n := 0
+	for _, r := range h.agents.rotations {
+		if r == "rotate:n1" {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("server rotations %d (want 2): %v", n, h.agents.rotations)
+	}
+	// done without the recorded rotations: refused.
+	op := &revokeOp{Node: "n9", Role: "server", Step: "applied2", StepsVersion: revokeStepsVersion, ServerRotated: true, AgentRotated: true}
+	h.putState(t, func(st *nodeadmState) { st.Ops["n9"] = op })
+	if err := h.s.revokeStep(ctx, op); err == nil || !strings.Contains(err.Error(), "required token rotation") {
+		t.Fatalf("done without the second rotation: %v", err)
+	}
+	op.Role = "agent"
+	if err := h.s.revokeStep(ctx, op); err != nil {
+		t.Fatalf("an agent's done after one rotation: %v", err)
 	}
 }

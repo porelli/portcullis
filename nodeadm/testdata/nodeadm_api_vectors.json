@@ -1533,7 +1533,7 @@
     "status": 409,
     "headers": {},
     "body": {
-     "error": "removing n3 would leave etcd 1 healthy of 3 members: parked (certificate revoked, bootstrap tokens deleted, k3s tokens rotated; Node and etcd member kept until quorum)",
+     "error": "removing n3 would leave etcd 1 healthy of 3 members: parked; security steps done; the server stays an etcd member until quorum returns; a compromised server needs rotate-ca",
      "kind": "quorum_minimum"
     }
    }

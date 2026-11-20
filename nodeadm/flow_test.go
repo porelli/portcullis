@@ -564,8 +564,18 @@ func TestRevokeRotatesServerToken(t *testing.T) {
 	if !slices.Equal(h.agents.etcdRm, []string{"n1:n2:10.215.0.2"}) || !slices.Equal(h.enroll.revoked, []string{"12:34"}) {
 		t.Fatalf("etcd %v, revoked %v", h.agents.etcdRm, h.enroll.revoked)
 	}
-	if want := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n3", "apply-agent:n3", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
+	// Rotated twice (a server target, fix round 6): the second round, after
+	// its etcd member is gone, carries the tokens finally in effect.
+	round := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n3", "apply-agent:n3", "apply:n4"}
+	if want := append(append([]string{}, round...), round...); !slices.Equal(h.agents.rotations, want) {
 		t.Fatalf("rotations %v", h.agents.rotations)
+	}
+	first := append([]string{}, h.agents.tokens[:len(round)]...)
+	h.agents.rotations, h.agents.tokens = h.agents.rotations[len(round):], h.agents.tokens[len(round):]
+	for _, tok := range first {
+		if tok == testServerToken || tok == testAgentToken || slices.Contains(h.agents.tokens, tok) {
+			t.Fatal("the first round carried an old or the final token")
+		}
 	}
 	// Both tokens are new; no call to an agent ever carries a server token
 	// (old or new): agents get the new agent token, the servers the new

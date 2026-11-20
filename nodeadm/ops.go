@@ -20,8 +20,17 @@ package main
 //	                 removed                          } revokeQuorum)
 //	etcd_removed     (a server) its etcd member removed through a surviving
 //	                 server's nodeagent;
-//	deferred_applied the survivors that weren't Ready get the tokens;
-//	done             the op's tokens dropped.
+//	server_rotated2  (a server) both tokens rotated again, the same way:
+//	agent_rotated2   until its member is gone the revoked server could read
+//	                 the datastore (the first rotation's bootstrap data too);
+//	applied2         every survivor applied (the ones down so far too);
+//	done             refused unless every required rotation is recorded;
+//	                 the op's tokens dropped.
+//
+// While parked before node_deleted, a server target is NOT fully cut off:
+// its joins are refused and the tokens rotated, but it stays an etcd
+// member until quorum returns; a compromised server also holds the etcd
+// peer certificates and the cluster CA, so recovery needs rotate-ca.
 //
 // A resumed rotation first asks the supervisor which token it accepts: the
 // new one means the rotate already took effect (promote it), the old one
@@ -53,18 +62,36 @@ type revokeOp struct {
 	NewServer string         `json:"new_server,omitempty"`
 	NewAgent  string         `json:"new_agent,omitempty"`
 	Applied   []string       `json:"applied,omitempty"`
-	Skipped   []string       `json:"skipped,omitempty"` // removed nodes the rotation didn't touch (N6)
-	Started   time.Time      `json:"started"`
-	LastError string         `json:"last_error,omitempty"`
-	LastKind  string         `json:"last_kind,omitempty"` // an error kind (quorum_minimum) for the answer
+	Applied2  []string       `json:"applied2,omitempty"`
+	// StepsVersion: the step list the op was recorded under.
+	StepsVersion int `json:"steps_version"`
+	// The rotations proven in effect (done refuses without them).
+	ServerRotated  bool      `json:"server_rotated,omitempty"`
+	AgentRotated   bool      `json:"agent_rotated,omitempty"`
+	ServerRotated2 bool      `json:"server_rotated2,omitempty"`
+	AgentRotated2  bool      `json:"agent_rotated2,omitempty"`
+	Skipped        []string  `json:"skipped,omitempty"` // removed nodes the rotation didn't touch (N6)
+	Started        time.Time `json:"started"`
+	LastError      string    `json:"last_error,omitempty"`
+	LastKind       string    `json:"last_kind,omitempty"` // an error kind (quorum_minimum) for the answer
 }
 
-// Security first (fix round 5): the tokens are rotated and applied to the
-// Ready survivors before the quorum-gated Node / etcd steps, so a revoke
-// parked on quorum has already cut the node off; the survivors that were
-// down get the tokens last (deferred_applied).
+// Security first (fix rounds 5, 6): the tokens are rotated and applied to
+// the Ready survivors before the quorum-gated Node / etcd steps, which
+// blocks the node's supervisor joins at once. A server target is NOT fully
+// cut off while it stays an etcd member: it can read the datastore,
+// including the rotated token's bootstrap data. So for a server both
+// tokens are rotated AGAIN after etcd_removed (server_rotated2,
+// agent_rotated2) and applied to every survivor (applied2): the tokens
+// finally in effect never were in a datastore it could reach. An agent
+// needs the first rotation only (its *2 steps do nothing); applied2 then
+// gives the tokens to the survivors that were down.
 var revokeSteps = []string{"created", "marked", "tokens_deleted", "server_rotated", "agent_rotated", "applied",
-	"node_deleted", "published", "etcd_removed", "deferred_applied", "done"}
+	"node_deleted", "published", "etcd_removed", "server_rotated2", "agent_rotated2", "applied2", "done"}
+
+// revokeStepsVersion: an op recorded under another step list restarts from
+// marked (every step is idempotent; fail closed, fix round 6).
+const revokeStepsVersion = 3
 
 func stepIndex(s string) int { return slices.Index(revokeSteps, s) }
 
@@ -107,7 +134,7 @@ func (s *Server) revoke(ctx context.Context, id string) error {
 		} else if err != nil {
 			return err
 		}
-		op := &revokeOp{Node: id, Step: "created", Started: s.now()}
+		op := &revokeOp{Node: id, Step: "created", Started: s.now(), StepsVersion: revokeStepsVersion}
 		if n != nil {
 			cn := toClusterNode(n)
 			cn.Addresses = s.cleanAddrs(cn.Addresses)
@@ -189,7 +216,7 @@ func (s *Server) revokeQuorum(ctx context.Context, target string) error {
 	}
 	if h*2 <= v {
 		return errKind(http.StatusConflict, "quorum_minimum",
-			"removing %s would leave etcd %d healthy of %d members: parked (certificate revoked, bootstrap tokens deleted, k3s tokens rotated; Node and etcd member kept until quorum)", target, h, v)
+			"removing %s would leave etcd %d healthy of %d members: parked; security steps done; the server stays an etcd member until quorum returns; a compromised server needs rotate-ca", target, h, v)
 	}
 	return nil
 }
@@ -282,6 +309,21 @@ func (s *Server) runRevoke(ctx context.Context, id string) error {
 		if err != nil {
 			return err
 		}
+		if op.StepsVersion != revokeStepsVersion || stepIndex(op.Step) < 0 {
+			// Another step list: from marked again, the rotation flags and
+			// the applied lists cleared; a persisted new token is kept (it
+			// may be in effect: rotateOne proves which one is).
+			from := op.StepsVersion
+			if err := s.opStep(ctx, id, func(o *revokeOp) {
+				o.Step, o.StepsVersion = "created", revokeStepsVersion
+				o.ServerRotated, o.AgentRotated, o.ServerRotated2, o.AgentRotated2 = false, false, false, false
+				o.Applied, o.Applied2 = nil, nil
+			}); err != nil {
+				return err
+			}
+			s.log.Warn("revocation recorded under another step list: restarted from marked", "node", id, "steps_version", from)
+			continue
+		}
 		if err := s.revokeStep(ctx, op); err != nil {
 			return err
 		}
@@ -331,23 +373,45 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 				return err
 			}
 		}
-	case "server_rotated":
+	case "server_rotated", "server_rotated2":
+		if next == "server_rotated2" && op.Role != "server" {
+			break
+		}
 		if err := s.rotateOne(ctx, op, false); err != nil {
 			return err
 		}
-	case "agent_rotated":
+		// Proven and promoted: the next rotation makes a new token.
+		op.NewServer = ""
+		if next == "server_rotated" {
+			op.ServerRotated = true
+		} else {
+			op.ServerRotated2 = true
+		}
+	case "agent_rotated", "agent_rotated2":
+		if next == "agent_rotated2" && op.Role != "server" {
+			break
+		}
 		if err := s.rotateOne(ctx, op, true); err != nil {
 			return err
 		}
+		op.NewAgent = ""
+		if next == "agent_rotated" {
+			op.AgentRotated = true
+		} else {
+			op.AgentRotated2 = true
+		}
 	case "applied":
-		if err := s.applyTokens(ctx, op, false); err != nil {
+		if err := s.applyTokens(ctx, op, false, &op.Applied); err != nil {
 			return err
 		}
-	case "deferred_applied":
-		if err := s.applyTokens(ctx, op, true); err != nil {
+	case "applied2":
+		if err := s.applyTokens(ctx, op, true, &op.Applied2); err != nil {
 			return err
 		}
 	case "done":
+		if !op.ServerRotated || !op.AgentRotated || (op.Role == "server" && (!op.ServerRotated2 || !op.AgentRotated2)) {
+			return fmt.Errorf("the revocation of %s can't finish: a required token rotation isn't recorded", id)
+		}
 		op.NewServer, op.NewAgent = "", ""
 		if len(op.Skipped) > 0 {
 			skipped := op.Skipped
@@ -364,7 +428,10 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 		}
 	}
 	op.Step = next
-	if err := s.opStep(ctx, id, func(o *revokeOp) { o.Step, o.NewServer, o.NewAgent = next, op.NewServer, op.NewAgent }); err != nil {
+	if err := s.opStep(ctx, id, func(o *revokeOp) {
+		o.Step, o.NewServer, o.NewAgent = next, op.NewServer, op.NewAgent
+		o.ServerRotated, o.AgentRotated, o.ServerRotated2, o.AgentRotated2 = op.ServerRotated, op.AgentRotated, op.ServerRotated2, op.AgentRotated2
+	}); err != nil {
 		return err
 	}
 	s.log.Info("revocation step done", "node", id, "step", next)
@@ -522,7 +589,7 @@ func (s *Server) rotateOne(ctx context.Context, op *revokeOp, agent bool) error 
 // applyTokens: final false applies the Ready survivors and leaves the
 // others for later; final true applies every survivor not applied yet,
 // waiting (the op retries) while one isn't Ready.
-func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool) error {
+func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool, applied *[]string) error {
 	servers, agents, err := s.survivors(ctx, op.Node)
 	if err != nil {
 		return err
@@ -542,7 +609,7 @@ func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool) erro
 		return nil
 	}
 	for _, n := range append(servers, agents...) {
-		if slices.Contains(op.Applied, n.Name) {
+		if slices.Contains(*applied, n.Name) {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -568,11 +635,15 @@ func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool) erro
 		if err := s.waitReady(ctx, n.Name); err != nil {
 			return err
 		}
-		op.Applied = append(op.Applied, n.Name)
-		name := n.Name
+		*applied = append(*applied, n.Name)
+		name, second := n.Name, applied == &op.Applied2
 		if err := s.opStep(ctx, op.Node, func(o *revokeOp) {
-			if !slices.Contains(o.Applied, name) {
-				o.Applied = append(o.Applied, name)
+			l := &o.Applied
+			if second {
+				l = &o.Applied2
+			}
+			if !slices.Contains(*l, name) {
+				*l = append(*l, name)
 			}
 		}); err != nil {
 			return err

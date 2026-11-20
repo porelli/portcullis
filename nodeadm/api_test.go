@@ -430,7 +430,10 @@ func checkCaseEffects(t *testing.T, h *harness, c apiCase) {
 		if !slices.Equal(h.agents.etcdRm, []string{"n1:n3:10.215.0.3"}) {
 			t.Errorf("etcd removed %v", h.agents.etcdRm)
 		}
-		if want := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n2", "apply-agent:n2", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
+		// A server target: rotated twice (before the quorum-gated steps and
+		// after its etcd member is gone, fix round 6).
+		round := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n2", "apply-agent:n2", "apply:n4"}
+		if want := append(append([]string{}, round...), round...); !slices.Equal(h.agents.rotations, want) {
 			t.Errorf("rotations %v, want %v", h.agents.rotations, want)
 		}
 		tok, _ := h.s.serverToken(ctx)
