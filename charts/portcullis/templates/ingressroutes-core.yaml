@@ -46,9 +46,11 @@ core Service's cluster DNS name. k8s_parity.py compares these with compose. */ -
 {{- $routers = append $routers (dict "name" "grafana-metrics" "ep" $ep.web.admin "rule" $sub.metrics "mw" (list "rate-limit@file" "client-headers@file" "portcullis-auth@file" "portcullis-groups@file" "security-headers@file") "svc" "grafana" "port" 3000) -}}
 {{- $routers = append $routers (dict "name" "grafana-metrics-vpn" "ep" "vpnsecure" "rule" $sub.metrics "mw" (list "rate-limit@file" "client-headers@file" "portcullis-auth@file" "portcullis-groups-vpn@file" "security-headers@file") "svc" "grafana" "port" 3000) -}}
 {{- end -}}
-{{- /* HA (plan Amendment 2): the Keycloak and Hub routers retry the
-backend (core-retry@file, last: only the backend call is retried). */ -}}
-{{- $retry := list "keycloak" "hub" -}}
+{{- /* HA (plan Amendment 2): the Keycloak routers retry the backend
+(core-retry@file, last: only the backend call is retried). Not the Hub's
+(review M6): it is one replica, so a retry only replays its admin POSTs
+while it is down. */ -}}
+{{- $retry := list "keycloak" -}}
 {{- range $r := $routers }}
 {{- $mw := $r.mw }}
 {{- if and $.Values.ha.enabled (has $r.svc $retry) }}{{ $mw = append $mw "core-retry@file" }}{{ end }}

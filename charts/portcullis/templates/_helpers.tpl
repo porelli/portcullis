@@ -84,7 +84,9 @@ NEW (HA, Task 19; contract §20.1, spec §6 "Placement"):
     a PodDisruptionBudget minAvailable 1 (portcullis.pdb) and the spread;
   - spread (ScheduleAnyway | DoNotSchedule): topologySpreadConstraints on
     kubernetes.io/hostname, maxSkew 1 (the stateless gates ScheduleAnyway,
-    quorum and data pieces DoNotSchedule); default ScheduleAnyway for a
+    quorum and data pieces DoNotSchedule, with nodeTaintsPolicy Honor);
+    default DoNotSchedule for a StatefulSet with per-replica claims (review
+    I1: node-local, pinned where it first lands), ScheduleAnyway for another
     replicated workload, none for one replica;
   - priorityClass (default portcullis-core: ruling I5, every core pod);
   - with ha.enabled, the not-ready / unreachable tolerations at 30 s on
@@ -111,6 +113,10 @@ per-pod names.
 {{- $n := int ($s.replicas | default 1) }}
 {{- if $sts }}{{ $n = int $sts.replicas }}{{ end }}
 {{- $spread := $s.spread | default "" }}
+{{- /* Review I1: a StatefulSet whose replicas each have a node-local PVC
+(portcullis-core) is pinned where it first lands, so it never co-locates:
+DoNotSchedule. */}}
+{{- if and (not $spread) $sts $sts.claims }}{{ $spread = "DoNotSchedule" }}{{ end }}
 {{- if and (not $spread) (or $sts (gt $n 1)) }}{{ $spread = "ScheduleAnyway" }}{{ end }}
 {{- $img := include "portcullis.image" (list $root ($s.image | default $s.name)) }}
 {{- $pin := "" }}{{- if $s.pin }}{{- $pin = include "portcullis.sitePin" (dict "root" $root "s" $s) | trim }}{{- end }}
@@ -237,6 +243,11 @@ spec:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: {{ $spread }}
+          {{- if eq $spread "DoNotSchedule" }}
+          {{- /* A node this pod can't run on (the small taint) is no empty
+          domain: without Honor, 3 replicas on 2 eligible nodes stay Pending. */}}
+          nodeTaintsPolicy: Honor
+          {{- end }}
           labelSelector:
             matchLabels:
               portcullis.io/component: {{ $s.name }}
@@ -330,13 +341,16 @@ spec:
 portcullis.memRequest <root> <service> <limit> — the memory request (user
 ruling 2026-11-19, plan Amendment 2): the measured peak
 (values memoryPeakMi) × 1.25, rounded up to 16 Mi, never above the limit;
-a service with no measurement requests its limit. The limit stays
-compose's mem_limit.
+a service with no measurement requests its limit; values memoryRequestMi
+(a reviewed figure) wins over both. The limit stays compose's mem_limit.
 */}}
 {{- define "portcullis.memRequest" -}}
 {{- $root := index . 0 -}}{{- $lim := index . 2 -}}
 {{- $peak := index ($root.Values.memoryPeakMi | default dict) (index . 1) -}}
-{{- if $peak -}}
+{{- $fixed := index ($root.Values.memoryRequestMi | default dict) (index . 1) -}}
+{{- if $fixed -}}
+{{- int $fixed }}Mi
+{{- else if $peak -}}
 {{- $limMi := 0 -}}
 {{- if hasSuffix "Gi" $lim }}{{ $limMi = mul (int (trimSuffix "Gi" $lim)) 1024 }}{{ else if hasSuffix "Mi" $lim }}{{ $limMi = int (trimSuffix "Mi" $lim) }}{{ else }}{{ fail (printf "memory %q: Mi or Gi only" $lim) }}{{ end -}}
 {{- $req := mul (int (ceil (divf (mulf (float64 $peak) 1.25) 16.0))) 16 -}}

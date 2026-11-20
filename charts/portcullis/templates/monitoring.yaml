@@ -51,6 +51,9 @@ the headless alertmanager-peers), so it survives any one node. */ -}}
 {{- $_ = set $am "args" (concat (list "--config.file=/etc/portcullis/alertmanager.yml" "--storage.path=/alertmanager" "--cluster.listen-address=0.0.0.0:9094" "--cluster.advertise-address=$(POD_IP):9094") $peers) }}
 {{- $_ = set $am "env" (list (dict "name" "POD_IP" "valueFrom" (dict "fieldRef" (dict "fieldPath" "status.podIP")))) }}
 {{- $_ = set $am "ports" (concat $am.ports (list (dict "name" "cluster" "port" 9094) (dict "name" "cluster-udp" "port" 9094 "protocol" "UDP"))) }}
+{{- /* Review M1: port-bound, so its gossip (unauthenticated: a peer could
+push silences) admits the other Alertmanager alone (alertmanager-ingress). */ -}}
+{{- $_ = set $am "extraLabels" (dict "portcullis.io/ingress" "bound") }}
 {{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $am) }}
 ---
@@ -71,6 +74,41 @@ spec:
     - name: cluster
       port: 9094
       targetPort: 9094
+---
+# HA: Alertmanager is port-bound (review M1): its API 9093 for its compose
+# networks' members as before, the gossip 9094 for the other replica only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alertmanager-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: alertmanager
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/net-monitoring: "true"
+        - podSelector:
+            matchLabels:
+              portcullis.io/net-alerting: "true"
+      ports:
+        - protocol: TCP
+          port: 9093
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: alertmanager
+      ports:
+        - protocol: TCP
+          port: 9094
+        - protocol: UDP
+          port: 9094
 {{- else }}
 {{ include "portcullis.pvc" (list . "alertmanager-data" $n $n "0750") }}
 {{- end }}

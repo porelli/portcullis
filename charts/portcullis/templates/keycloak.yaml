@@ -3,6 +3,11 @@ proxy headers trusted from the pod CIDR, the second layer); internal
 clients use keycloak-internal:8081 (Traefik's kcinternal). Not read-only:
 `start` re-augments (as on Docker). /hub-data is its published documents
 (projected, read-only: portcullis.published, contract §4 / §8.1).
+Memory (review I2): the heap is capped at 768 Mi (JAVA_OPTS_KC_HEAP, the
+image's own heap knob; Keycloak's default is 70 % of the limit, so its
+working set only grows towards the limit), the request 1024 Mi
+(values memoryRequestMi; the 2 Gi limit stays), to be re-measured on the
+VMs (Task 33).
 HA (spec §6, plan Amendment 2): a StatefulSet of 2 replicas, 3 from 3
 non-small nodes at the primary site (ha.nonSmallNodesAtPrimary, P33), a
 PDB, spread; one embedded Infinispan cluster (Keycloak's default ispn
@@ -32,7 +37,8 @@ health check, traefik-file-middlewares.yaml), no volume of its own. */ -}}
     (dict "name" "KC_BOOTSTRAP_ADMIN_USERNAME" "value" .Values.keycloak.admin)
     (dict "name" "KC_BOOTSTRAP_ADMIN_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "KEYCLOAK_ADMIN_PASSWORD")))
     (dict "name" "PORTCULLIS_SIGNIN_URL" "value" (printf "https://people.%s/signin" $d))
-    (dict "name" "PORTCULLIS_PORTAL_URL" "value" (printf "https://%s/" $d)))
+    (dict "name" "PORTCULLIS_PORTAL_URL" "value" (printf "https://%s/" $d))
+    (dict "name" "JAVA_OPTS_KC_HEAP" "value" "-XX:InitialRAMPercentage=10 -Xmx768m"))
   "mounts" (list
     (dict "name" "realm" "mountPath" "/opt/keycloak/data/import" "readOnly" true)
     (dict "name" "theme" "mountPath" "/opt/keycloak/themes/portcullis" "readOnly" true)
@@ -48,6 +54,9 @@ health check, traefik-file-middlewares.yaml), no volume of its own. */ -}}
 {{- include "portcullis.published" (dict "root" . "s" $s) }}
 {{- if .Values.ha.enabled }}
 {{- $_ := set $s "statefulSet" (dict "replicas" (include "portcullis.keycloakReplicas" . | int) "serviceName" "keycloak-pods") }}
+{{- /* Review M2: two Keycloaks on one node are one failure from no sign-in;
+a replacement waits Pending for its own node rather than co-locate. */ -}}
+{{- $_ = set $s "spread" "DoNotSchedule" }}
 {{- $_ = set $s "ports" (concat $s.ports (list (dict "name" "jgroups" "port" 7800) (dict "name" "jgroups-fd" "port" 57800))) }}
 {{- $_ = set $s "env" (concat $s.env (list
   (dict "name" "POD_IP" "valueFrom" (dict "fieldRef" (dict "fieldPath" "status.podIP")))

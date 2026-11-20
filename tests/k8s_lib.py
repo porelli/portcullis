@@ -140,7 +140,11 @@ def mem_request(name, limit):
     measured peak (values.yaml memoryPeakMi) × 1.25 rounded up to 16 Mi, at
     most the limit; a service without a measurement requests its limit."""
     import math
-    peaks = yaml.safe_load((CHART / "values.yaml").read_text()).get("memoryPeakMi") or {}
+    vals = yaml.safe_load((CHART / "values.yaml").read_text())
+    peaks = vals.get("memoryPeakMi") or {}
+    fixed = vals.get("memoryRequestMi") or {}
+    if name in fixed:  # a reviewed request (Keycloak: review I2)
+        return int(fixed[name]) * 1024 ** 2
     if name not in peaks:
         return mem_bytes(limit)
     req = math.ceil(peaks[name] * 1.25 / 16) * 16 * 1024 ** 2

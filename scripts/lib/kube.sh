@@ -1587,11 +1587,13 @@ kube_traefik_peer() {
   if kube_ha_on; then echo "$KUBE_INGRESS_NS:app.kubernetes.io/name=traefik"; else echo "$(kube_ns):portcullis.io/component=traefik"; fi
 }
 
-# kube_nonsmall_at_primary — the Ready-or-not nodes labelled
-# portcullis.io/site=main without class small (preflight P33: Keycloak's 3rd
-# replica needs one there); 0 when the nodes can't be read (2 replicas).
+# kube_nonsmall_at_primary — the Ready nodes labelled portcullis.io/site=main
+# with class home or cloud (preflight P33: Keycloak's 3rd replica needs one
+# there; review M8: an unlabelled or NotReady node never counts); 0 when the
+# nodes can't be read (2 replicas).
 kube_nonsmall_at_primary() {
-  kube_ctl get nodes -l 'portcullis.io/site=main,portcullis.io/class!=small' -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null || echo 0
+  kube_ctl get nodes -l 'portcullis.io/site=main,portcullis.io/class in (home,cloud)' -o json 2>/dev/null \
+    | jq -r '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length' 2>/dev/null || echo 0
 }
 
 # kube_render_values — secrets/kube/values.yaml from .env, the resolved

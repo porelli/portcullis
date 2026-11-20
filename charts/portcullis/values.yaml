@@ -177,6 +177,12 @@ memoryPeakMi:
   sessions: 12
   lldap: 9.1
   domains: 8.8
+# Reviewed requests that replace the formula (Mi). Keycloak (review I2):
+# its measured peak isn't a bound (the JVM heap grows to a share of the
+# limit), so its heap is capped at 768 Mi (keycloak.yaml JAVA_OPTS_KC_HEAP)
+# and the request is 1024 Mi; re-measure on the VMs (Task 33).
+memoryRequestMi:
+  keycloak: 1024
 
 # nodeadm (contract §20.2): node enrolment and the cluster API. The CLI
 # enables it on a cluster init installed (it reads the k3s server token

@@ -13193,5 +13193,553 @@
   "want": "deny",
   "reason_contains": "only the Traefik DaemonSet's pod shape may run in portcullis-ingress",
   "ha": true
+ },
+ {
+  "name": "ha: non-HA params: a routed port from Traefik in the core namespace",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "rt",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/service": "web"
+     }
+    },
+    "policyTypes": [
+     "Ingress"
+    ],
+    "ingress": [
+     {
+      "from": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "portcullis.io/component": "traefik"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 8080,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "allow",
+  "reason_contains": "",
+  "ha": true
+ },
+ {
+  "name": "ha: non-HA params: an MCP companion port from mcp-gate",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "mcp",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/service": "mcp"
+     }
+    },
+    "policyTypes": [
+     "Ingress"
+    ],
+    "ingress": [
+     {
+      "from": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "portcullis.io/component": "mcp-gate"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 8000,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "allow",
+  "reason_contains": "",
+  "ha": true
+ },
+ {
+  "name": "ha: non-HA params: a wired VPN gateway to its wg edge port",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "gw",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/vpn-slot": "3"
+     }
+    },
+    "policyTypes": [
+     "Egress"
+    ],
+    "egress": [
+     {
+      "to": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "portcullis.io/component": "wg"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 9004,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "allow",
+  "reason_contains": "",
+  "ha": true
+ },
+ {
+  "name": "ha: non-HA params: Traefik's HA peer (portcullis-ingress) isn't Traefik",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "rt",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/service": "web"
+     }
+    },
+    "policyTypes": [
+     "Ingress"
+    ],
+    "ingress": [
+     {
+      "from": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis-ingress"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "app.kubernetes.io/name": "traefik"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 8080,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "deny",
+  "reason_contains": "an ingress peer that isn't the same instance, Traefik or mcp-gate",
+  "ha": true
+ },
+ {
+  "name": "ha: HA params: a routed port from the Traefik DaemonSet in portcullis-ingress",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "rt",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/service": "web"
+     }
+    },
+    "policyTypes": [
+     "Ingress"
+    ],
+    "ingress": [
+     {
+      "from": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis-ingress"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "app.kubernetes.io/name": "traefik"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 8080,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "allow",
+  "reason_contains": "",
+  "ha": true,
+  "params": {
+   "traefik": "portcullis-ingress:app.kubernetes.io/name=traefik"
+  }
+ },
+ {
+  "name": "ha: HA params: the core-namespace Traefik peer is refused",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "rt",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/service": "web"
+     }
+    },
+    "policyTypes": [
+     "Ingress"
+    ],
+    "ingress": [
+     {
+      "from": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "portcullis.io/component": "traefik"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 8080,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "deny",
+  "reason_contains": "an ingress peer that isn't the same instance, Traefik or mcp-gate",
+  "ha": true,
+  "params": {
+   "traefik": "portcullis-ingress:app.kubernetes.io/name=traefik"
+  }
+ },
+ {
+  "name": "ha: HA params: an MCP companion port from mcp-gate in the core namespace",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "mcp",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/service": "mcp"
+     }
+    },
+    "policyTypes": [
+     "Ingress"
+    ],
+    "ingress": [
+     {
+      "from": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "portcullis.io/component": "mcp-gate"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 8000,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "allow",
+  "reason_contains": "",
+  "ha": true,
+  "params": {
+   "traefik": "portcullis-ingress:app.kubernetes.io/name=traefik"
+  }
+ },
+ {
+  "name": "ha: HA params: mcp-gate's peer in Traefik's namespace is refused",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "mcp",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/service": "mcp"
+     }
+    },
+    "policyTypes": [
+     "Ingress"
+    ],
+    "ingress": [
+     {
+      "from": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis-ingress"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "portcullis.io/component": "mcp-gate"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 8000,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "deny",
+  "reason_contains": "an ingress peer that isn't the same instance, Traefik or mcp-gate",
+  "ha": true,
+  "params": {
+   "traefik": "portcullis-ingress:app.kubernetes.io/name=traefik"
+  }
+ },
+ {
+  "name": "ha: HA params: a wired VPN gateway to wg in the core namespace",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "gw",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/vpn-slot": "3"
+     }
+    },
+    "policyTypes": [
+     "Egress"
+    ],
+    "egress": [
+     {
+      "to": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "portcullis.io/component": "wg"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 9004,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "allow",
+  "reason_contains": "",
+  "ha": true,
+  "params": {
+   "traefik": "portcullis-ingress:app.kubernetes.io/name=traefik"
+  }
+ },
+ {
+  "name": "ha: HA params: a gateway's wg peer in Traefik's namespace is refused",
+  "object": {
+   "apiVersion": "networking.k8s.io/v1",
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "gw",
+    "namespace": "portcullis-apps",
+    "labels": {
+     "portcullis.io/instance": "app"
+    }
+   },
+   "spec": {
+    "podSelector": {
+     "matchLabels": {
+      "portcullis.io/instance": "app",
+      "portcullis.io/vpn-slot": "3"
+     }
+    },
+    "policyTypes": [
+     "Egress"
+    ],
+    "egress": [
+     {
+      "to": [
+       {
+        "namespaceSelector": {
+         "matchLabels": {
+          "kubernetes.io/metadata.name": "portcullis-ingress"
+         }
+        },
+        "podSelector": {
+         "matchLabels": {
+          "portcullis.io/component": "wg"
+         }
+        }
+       }
+      ],
+      "ports": [
+       {
+        "port": 9004,
+        "protocol": "TCP"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "as": "hub",
+  "want": "deny",
+  "reason_contains": "an egress peer outside the Hub's shapes",
+  "ha": true,
+  "params": {
+   "traefik": "portcullis-ingress:app.kubernetes.io/name=traefik"
+  }
  }
 ]

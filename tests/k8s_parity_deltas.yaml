@@ -48,6 +48,7 @@ env-missing:
   - {service: wg, item: WG_LINK_CA, reason: "multiple servers: Docker/Podman primaries only (contract §17.1; Servers is off on Kubernetes)"}
 
 env-extra:
+  - {service: keycloak, item: JAVA_OPTS_KC_HEAP, reason: "Task 19 review I2: the heap capped at 768 Mi on Kubernetes so the 1024 Mi request bounds it (Docker keeps the image's default share of mem_limit); re-measured in Task 33"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD, reason: "spec §5: the kubernetesCRD provider"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES, reason: "spec §5: exactly the core and the apps namespace"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE, reason: "spec §5: false (routes name edge-local or @file objects)"}

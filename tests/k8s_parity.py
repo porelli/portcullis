@@ -504,10 +504,11 @@ def check_ha():
     "ha: wg-people externalTrafficPolicy Cluster" (Local without HA); the
     Traefik DaemonSet has the Deployment's environment minus the ACME
     resolver and the DNS credentials (no ACME in HA), hostPort 80 / 443 on
-    web / websecure; the Keycloak and Hub routers (and kcinternal) end with
-    core-retry@file in HA only, no other router has it; traefik-dynamic's
-    core-retry is 3 attempts, the Keycloak and Hub services have the passive
-    health check and the fast dial, Keycloak's servers its replicas by name;
+    web / websecure; the Keycloak routers (and kcinternal) end with
+    core-retry@file in HA only, no other router has it (not the single Hub:
+    review M6); traefik-dynamic's core-retry is 3 attempts, the Keycloak
+    services alone have the passive health check and the fast dial,
+    Keycloak's servers its replicas by name;
     router portcullis-node (nodeadm on, both modes) is the main domain's
     exact /node/ paths with rate-limit@file to the edge Service
     portcullis-node:8080."""
@@ -526,7 +527,7 @@ def check_ha():
     hp = {p["name"]: p.get("hostPort") for p in he["ports"]}
     if hp != {"web": 80, "websecure": 443, "kcinternal": None, "vpnsecure": None, "ping": None, "metrics": None}:
         F.add(f"ha: traefik hostPorts {hp} (web 80, websecure 443 only)")
-    retry_svcs = ("keycloak", "hub")
+    retry_svcs = ("keycloak",)  # not the single Hub (review M6)
     for label, docs in (("ha: ", ha), ("", plain)):
         for ir in K.by_kind(docs, "IngressRoute"):
             r = ir["spec"]["routes"][0]
@@ -544,7 +545,7 @@ def check_ha():
     kc = 3 if vals["ha"].get("nonSmallNodesAtPrimary", 0) >= 3 else 2
     for name, s in http["services"].items():
         lb = s["loadBalancer"]
-        hc = name.startswith("core-keycloak-") or name.startswith("core-hub-")
+        hc = name.startswith("core-keycloak-")
         if hc != ("passiveHealthCheck" in lb) or hc != (lb.get("serversTransport") == "core-fast"):
             F.add(f"ha: service {name}: passive health check / core-fast {'missing' if hc else 'unexpected'}")
         if name == "core-keycloak-8080" and [x["url"] for x in lb["servers"]] != [f"http://keycloak-{i}.keycloak-pods.{K.NS}.svc.cluster.local:8080" for i in range(kc)]:

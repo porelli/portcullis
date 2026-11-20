@@ -9,11 +9,12 @@ Middlewares (portcullis-auth-console, portal paths, directory-redirect) are
 CRDs of the edge namespace; hub-proxy-secret and hub-cli-proxy-secret (they carry the secrets) are applied by the CLI
 from stdin, never rendered.
 HA (plan Amendment 2: a lost node's endpoints stay for ~40-50 s): the
-Keycloak and Hub routers end with core-retry (3 attempts), and their
-services fail fast (core-fast: a 3 s dial) with a passive health check (a
-server failing 3 times in 10 s is out for 10 s). Keycloak's servers are its
-replicas by name (keycloak-<i>.keycloak-pods, ready pods only), so a dead
-one is passed over; the Hub has one replica behind its Service. In HA the
+Keycloak routers end with core-retry (3 attempts), and its service fails
+fast (core-fast: a 3 s dial) with a passive health check (a server failing
+3 times in 10 s is out for 10 s); its servers are its replicas by name
+(keycloak-<i>.keycloak-pods, ready pods only), so a dead one is passed
+over. Not the Hub (review M6): one replica, where a passive check would
+only answer 503 for 10 s after it is back and a retry replay its POSTs. In HA the
 ConfigMap lives in Traefik's own namespace (a pod mounts only its own). */ -}}
 {{- $ns := .Release.Namespace -}}
 {{- $edge := .Values.edgeNamespace -}}
@@ -115,7 +116,7 @@ data:
             servers:
               - url: http://mcp-gate.{{ $ns }}.svc.cluster.local:8080
         {{- range $c := $core }}
-        {{- $ha := and $.Values.ha.enabled (has (index $c 0) (list "keycloak" "hub")) }}
+        {{- $ha := and $.Values.ha.enabled (eq (index $c 0) "keycloak") }}
         core-{{ index $c 0 }}-{{ index $c 1 }}:
           loadBalancer:
             {{- if $ha }}

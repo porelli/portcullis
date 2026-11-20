@@ -5223,6 +5223,9 @@ OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on; kube_nonsmall_at_primary() { echo 
 expect_eq "kube_render_values: PORTCULLIS_HA=on → ha.enabled, the non-small nodes at main (Keycloak ×3)" "$(printf '%s\n' "$OUT" | head -n1)" '{"enabled":true,"nonSmallNodesAtPrimary":3}'
 OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on; kube_nonsmall_at_primary() { echo oops; }; _K_IMAGES='{}'; kube_render_values; jq -c .ha.nonSmallNodesAtPrimary \"$K15/secrets/kube/values.yaml\"")"
 expect_eq "kube_render_values: an unreadable node count → 0 (Keycloak ×2)" "$(printf '%s\n' "$OUT" | head -n1)" "0"
+OUT="$(kt "kube_ctl() { printf '%s' '{\"items\":[{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}]}},{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"False\"}]}},{\"status\":{}}]}'; echo \"\$*\" > '$WORK/nsp-args'; }; kube_nonsmall_at_primary")"
+expect_eq "kube_nonsmall_at_primary: Ready home / cloud nodes at main only (review M8)" "$(printf '%s\n' "$OUT" | head -n1 | sed 's/rc=0//'):$(cat "$WORK/nsp-args")" \
+  "1:get nodes -l portcullis.io/site=main,portcullis.io/class in (home,cloud) -o json"
 OUT="$(kt "for v in hub_data hub_secrets lldap_data domains_data wg_data traefik_acme; do kube_pvc_name \$v; done | tr '\n' ' '; export PORTCULLIS_HA=on; for v in hub_data hub_secrets lldap_data domains_data wg_data prometheus_data; do kube_pvc_name \$v; done | tr '\n' ' '; echo")"
 expect_eq "kube_pvc_name: hub_data is hub-state; in HA the replicated ones are <name>-r (the chart's portcullis.pvcName)" "$(printf '%s\n' "$OUT" | head -n1)" \
   "hub-state hub-secrets lldap-data domains-data wg-data traefik-acme hub-state-r hub-secrets-r lldap-data domains-data-r wg-data-r prometheus-data "

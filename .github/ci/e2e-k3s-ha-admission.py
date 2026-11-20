@@ -15,8 +15,14 @@ ${NOW+<n>m} to now + n minutes. An op update / delete judges its existing
 object: fetched when it exists (and then never deleted: k3s's own
 kube-system Secrets; the judged delete is a dry run), else created as the
 CLI first (a Pod never scheduled, owned by the live DaemonSet traefik or
-one made for the run) and deleted afterwards; a subresource is sent as one. Every vector prints PASS
-or FAIL; the run fails at the end when any did.
+one made for the run) and deleted afterwards; a subresource is sent as one.
+A case with "params" (only a create of an apps NetworkPolicy, Task 19
+review C1: the HA `traefik` peer) is judged under the live params with those
+keys replaced: its own ConfigMap portcullis-admission-params-e2e-<n> and a
+binding portcullis-apps-guard-netpol-e2e-<n> of portcullis-apps-netpol on a
+namespace portcullis-apps-e2e-<n>, where the object is sent (the live apps
+bindings don't select it); all three are deleted afterwards. Every vector
+prints PASS or FAIL; the run fails at the end when any did.
   python3 .github/ci/e2e-k3s-ha-admission.py [<context>]   (default ci)
 """
 import datetime
@@ -25,6 +31,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 
 CTX = sys.argv[1] if len(sys.argv) > 1 else "ci"
@@ -78,6 +85,47 @@ if created_sa and k(["-n", "portcullis-ingress", "create", "serviceaccount", "tr
 vectors = json.loads((ROOT / "tests" / "admission_vectors.json").read_text())
 NEVER = {"portcullis.io/e2e-never": "true"}  # no node matches: nothing runs
 results = []  # (name, ok, why)
+override_sets = []  # each distinct "params" override (sorted JSON); its index = <n>
+
+
+def override_ns(over):
+    """The namespace judged under the live params with <over> (made once:
+    the namespace, the params ConfigMap, the netpol binding)."""
+    key = json.dumps(over, sort_keys=True)
+    if key in override_sets:
+        return f"portcullis-apps-e2e-{override_sets.index(key)}"
+    n = len(override_sets)
+    override_sets.append(key)
+    ns, cm, b = f"portcullis-apps-e2e-{n}", f"portcullis-admission-params-e2e-{n}", f"portcullis-apps-guard-netpol-e2e-{n}"
+    objs = [{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}},
+            {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": cm, "namespace": ref["namespace"]}, "data": dict(params, **over)},
+            {"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicyBinding", "metadata": {"name": b},
+             "spec": {"policyName": "portcullis-apps-netpol", "validationActions": ["Deny"],
+                      "paramRef": {"name": cm, "namespace": ref["namespace"], "parameterNotFoundAction": "Deny"},
+                      "matchResources": {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": ns}}}}}]
+    for o in objs:
+        rc, out = k(["create", "-f", "-"], json.dumps(o))
+        if rc != 0:
+            raise RuntimeError(f"can't create {o['kind']} {o['metadata']['name']}: {out[:300]}")
+    # A new binding takes effect asynchronously: wait until a shape every
+    # params refuse (an ingress peer from the whole internet) is refused by it.
+    probe = {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+             "metadata": {"name": "e2e-wait", "namespace": ns, "labels": {"portcullis.io/instance": "app"}},
+             "spec": {"podSelector": {"matchLabels": {"portcullis.io/instance": "app", "portcullis.io/service": "web"}},
+                      "policyTypes": ["Ingress"], "ingress": [{"from": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]}]}}
+    for _ in range(60):
+        rc, out = k([f"--as={IDS['hub']}", "--as-group=system:masters", "create", "--dry-run=server", "-f", "-"], json.dumps(probe))
+        if rc != 0 and f"binding '{b}'" in out:
+            return ns
+        time.sleep(1)
+    raise RuntimeError(f"the binding {b} never took effect")
+
+
+def drop_overrides():
+    for n in range(len(override_sets)):
+        k(["delete", "validatingadmissionpolicybinding", f"portcullis-apps-guard-netpol-e2e-{n}", "--ignore-not-found"])
+        k(["-n", ref["namespace"], "delete", "configmap", f"portcullis-admission-params-e2e-{n}", "--ignore-not-found"])
+        k(["delete", "namespace", f"portcullis-apps-e2e-{n}", "--ignore-not-found", "--wait=false"])
 
 
 def owner_daemonset():
@@ -105,6 +153,10 @@ def run(v, owner):
     raw = re.sub(r"\$\{NOW\+([0-9]+)m\}", lambda m: (datetime.datetime.now(datetime.timezone.utc)
                  + datetime.timedelta(minutes=int(m.group(1)))).strftime("%Y-%m-%dT%H:%M:%SZ"), raw)
     o = json.loads(raw)
+    if v.get("params"):
+        if o.get("kind") != "NetworkPolicy" or o["metadata"].get("namespace") != "portcullis-apps" or v.get("existing") or v.get("op"):
+            return None, "a params case must be a create of an apps NetworkPolicy"
+        o["metadata"]["namespace"] = override_ns(v["params"])
     who = [] if v["as"] == "cli" else [f"--as={IDS[v['as']]}", "--as-group=system:masters"]
     if v.get("op") in ("exec", "attach", "portforward"):
         md = o["metadata"]
@@ -194,6 +246,7 @@ try:
         print(f"{'PASS' if good else 'FAIL'}: {name}{'' if good else ': ' + why}", flush=True)
 finally:
     drop_made_ds()
+    drop_overrides()
     if created_sa:
         k(["-n", "portcullis-ingress", "delete", "serviceaccount", "traefik", "--ignore-not-found"])
 bad = [r for r in results if not r[1]]

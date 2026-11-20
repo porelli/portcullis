@@ -307,10 +307,16 @@ def gate_shape_problems(docs, vals=None):
         if not replicated and name in pdbs:
             out.append(f"{name}: a PodDisruptionBudget with {n} replica(s) blocks every drain")
         spread = tpl.get("topologySpreadConstraints") or []
-        if replicated and not any(c.get("topologyKey") == "kubernetes.io/hostname" and c.get("whenUnsatisfiable") == "ScheduleAnyway"
-                                  and c.get("maxSkew") == 1 and c.get("labelSelector", {}).get("matchLabels") == {"portcullis.io/component": name}
-                                  for c in spread):
-            out.append(f"{name}: no spread over the nodes (hostname, maxSkew 1, ScheduleAnyway)")
+        # Review I1 / M2: the node-local data replicas and Keycloak never
+        # co-locate (DoNotSchedule, a tainted node no empty domain); the
+        # stateless Deployments ScheduleAnyway.
+        hard = name in DO_NOT_SCHEDULE
+        want_sp = {"maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule" if hard else "ScheduleAnyway",
+                   "labelSelector": {"matchLabels": {"portcullis.io/component": name}}}
+        if hard:
+            want_sp["nodeTaintsPolicy"] = "Honor"
+        if replicated and spread != [want_sp]:
+            out.append(f"{name}: spread {spread} (want {want_sp})")
         if replicated and kind == "Deployment" and sp.get("strategy", {}).get("rollingUpdate", {}).get("maxUnavailable") != 0:
             out.append(f"{name}: a rollout may take every replica down (RollingUpdate maxUnavailable 0)")
         if kind != "StatefulSet":
@@ -327,7 +333,7 @@ def gate_shape_problems(docs, vals=None):
             out.append(f"{name}: its PVCs must be kept (Retain)")
         if sp.get("podManagementPolicy") != "Parallel":
             out.append(f"{name}: podManagementPolicy {sp.get('podManagementPolicy')} (want Parallel)")
-        if name in ("group-gate", "mcp-gate", "keycloak") and sp["template"]["metadata"]["labels"].get("portcullis.io/ingress") != "bound":
+        if name in ("group-gate", "mcp-gate", "keycloak", "alertmanager") and sp["template"]["metadata"]["labels"].get("portcullis.io/ingress") != "bound":
             out.append(f"{name}: not port-bound (portcullis.io/ingress: bound)")
         heads = {"keycloak": "keycloak-pods", "alertmanager": "alertmanager-peers"}
         if name in heads:
@@ -338,6 +344,9 @@ def gate_shape_problems(docs, vals=None):
         if wn > 1 and not any(d.get("kind") == wk and d["metadata"]["name"] == name for d in docs):
             out.append(f"{name}: no {wk}")
     return out
+
+
+DO_NOT_SCHEDULE = {"group-gate", "mcp-gate", "alertmanager", "keycloak"}
 
 
 HA_TOLERATIONS = [{"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 30},

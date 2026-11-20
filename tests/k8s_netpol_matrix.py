@@ -217,7 +217,9 @@ def check_nodeadm():
                 if name != "nodeadm":
                     rows.append((peer, na, port, name in who))
             rows += [(app, na, port, False), (ext, na, port, False)]
-        rows += [(ingress_traefik, na, 8080, True), (ingress_traefik, na, 8443, False)]
+        # The ingress namespace's Traefik only in HA (review M4: the
+        # core-namespace peer only without HA).
+        rows += [(ingress_traefik, na, 8080, ha), (ingress_traefik, na, 8443, False)]
         rows += [(na, pods["enroll"], 8444, True), (na, agent, 7443, True), (na, agent, 2379, False), (na, agent, 6443, True),
                  (na, agent, 22, False), (na, ext, 443, False), (na, node, 10250, False), (na, app, 80, False)]
         for name, peer in sorted(pods.items()):
@@ -236,7 +238,9 @@ def check_ha_flows():
     """Task 19's HA flows (plan Amendments 2, 3; preflight P39), on the CI HA
     values: Keycloak ↔ Keycloak on 7800 / 57800 (Infinispan) and nothing
     else reaches those ports (every other core pod, an app pod, Traefik, the
-    internet); Alertmanager ↔ Alertmanager on 9094, no app pod; the Hub
+    internet); Alertmanager ↔ Alertmanager on 9094 TCP / UDP and no other
+    core pod or app pod (review M1); Traefik's 8081 / 8444 / 8082 from no
+    app pod nor the internet (M3); the Hub
     alone of the core pods (the front door and nodeadm aside, their own
     flows) reaches the nodeagents' :7443 on the mesh, and no other mesh
     port; Traefik in portcullis-ingress reaches nodeadm :8080 and no
@@ -263,6 +267,14 @@ def check_ha_flows():
             (pods["hub"], agent, 7443, "TCP", True), (pods["hub"], agent, 7444, "TCP", False), (pods["hub"], agent, 10250, "TCP", False),
             (tr, nodeadm, 8080, "TCP", True), (tr, ext, 443, "TCP", False), (tr, ext, 80, "TCP", False),
             (ext, tr, 8000, "TCP", True), (ext, tr, 8443, "TCP", True), (ext, tr, 8080, "TCP", False), (app, tr, 8080, "TCP", False)]
+    # Review M3: Traefik's internal entrypoints from an app pod and the
+    # internet (core pods: check_compose).
+    for port in (8081, 8444, 8082):
+        rows += [(app, tr, port, "TCP", False), (ext, tr, port, "TCP", False)]
+    # Review M1: the gossip port from every other core pod.
+    for name, peer in sorted(pods.items()):
+        if name != "alertmanager":
+            rows += [(peer, am, 9094, "TCP", False), (peer, am, 9094, "UDP", False)]
     for name, peer in sorted(pods.items()):
         if name not in ("keycloak",):
             rows += [(peer, kc, 7800, "TCP", False), (peer, kc, 57800, "TCP", False)]
@@ -317,6 +329,8 @@ def check_compose(docs, ha):
         bound["group-gate"] = {8080: "any", 8091: {"hub"}}
         bound["mcp-gate"] = {8080: "any", 8092: {"hub"}}
         bound["wg"][8093] = {"hub"}
+        # Review M1: Alertmanager's gossip, its peer alone.
+        bound["alertmanager"] = {9093: "any", 9094: {"alertmanager"}}
     for src in sorted(nets):
         for dst in sorted(nets):
             if src == dst:

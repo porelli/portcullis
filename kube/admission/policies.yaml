@@ -1120,8 +1120,14 @@ spec:
       expression: "params.data.nodeAddresses.split(' ').filter(a, a != '')"
     - name: apiAddrs
       expression: "params.data.apiAddresses.split(' ').filter(a, a != '')"
-    - name: coreNs
+    # Each peer's own namespace (Task 19 review C1): in HA Traefik is in
+    # portcullis-ingress while mcp-gate and wg stay in the core namespace.
+    - name: traefikNs
       expression: "params.data.traefik.split(':')[0]"
+    - name: mcpNs
+      expression: "params.data.mcpGate.split(':')[0]"
+    - name: wgNs
+      expression: "params.data.wg.split(':')[0]"
     - name: traefikSel
       expression: "{params.data.traefik.split(':')[1].split('=')[0]: params.data.traefik.split(':')[1].split('=')[1]}"
     - name: mcpSel
@@ -1185,9 +1191,9 @@ spec:
             (!has(p.namespaceSelector) && !has(p.ipBlock) && has(p.podSelector) && has(p.podSelector.matchLabels)
               && 'portcullis.io/instance' in p.podSelector.matchLabels && p.podSelector.matchLabels['portcullis.io/instance'] == variables.inst)
             || (!has(p.ipBlock) && has(p.namespaceSelector) && has(p.namespaceSelector.matchLabels)
-              && p.namespaceSelector.matchLabels == {'kubernetes.io/metadata.name': variables.coreNs}
               && has(p.podSelector) && has(p.podSelector.matchLabels)
-              && (p.podSelector.matchLabels == variables.traefikSel || p.podSelector.matchLabels == variables.mcpSel))))
+              && ((p.namespaceSelector.matchLabels == {'kubernetes.io/metadata.name': variables.traefikNs} && p.podSelector.matchLabels == variables.traefikSel)
+                  || (p.namespaceSelector.matchLabels == {'kubernetes.io/metadata.name': variables.mcpNs} && p.podSelector.matchLabels == variables.mcpSel)))))
         )
       message: "an ingress peer that isn't the same instance, Traefik or mcp-gate"
     - expression: |-
@@ -1200,7 +1206,7 @@ spec:
               && has(p.podSelector) && has(p.podSelector.matchLabels) && p.podSelector.matchLabels == variables.dnsSel
               && has(r.ports) && size(r.ports) > 0 && r.ports.all(x, has(x.port) && x.port == 53 && !has(x.endPort)))
             || (!has(p.ipBlock) && has(p.namespaceSelector) && has(p.namespaceSelector.matchLabels)
-              && p.namespaceSelector.matchLabels == {'kubernetes.io/metadata.name': variables.coreNs}
+              && p.namespaceSelector.matchLabels == {'kubernetes.io/metadata.name': variables.wgNs}
               && has(p.podSelector) && has(p.podSelector.matchLabels) && p.podSelector.matchLabels == variables.wgSel
               && variables.slot != '' && has(r.ports) && size(r.ports) == 1 && has(r.ports[0].port) && !has(r.ports[0].endPort) && string(r.ports[0].port) == string(9001 + int(variables.slot)))
             || (has(p.ipBlock) && !has(p.namespaceSelector) && !has(p.podSelector)

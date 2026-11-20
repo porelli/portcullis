@@ -17,7 +17,7 @@ data:
   nodeAddresses: "<PORTCULLIS_KUBE_NODE_ADDRESSES, each /32>"
   apiAddresses: "<PORTCULLIS_KUBE_API_ENDPOINTS' addresses, each /32>"
   kubeDNS: "kube-system:k8s-app=kube-dns"
-  traefik: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=traefik"
+  traefik: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=traefik; in HA portcullis-ingress:app.kubernetes.io/name=traefik (kube_traefik_peer). The netpol policy takes each peer's namespace from its own key>"
   mcpGate: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=mcp-gate"
   wg: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=wg"
   fileMiddlewares: "<traefik/dynamic/middlewares.yml's six + the K15 seven, each @file, + group-gate@file forward-auth-ext@file mcp-gate@file>"

@@ -374,18 +374,21 @@ spec:
           port: 8443
     # The public /node/ paths: Traefik only.
     - from:
+        {{- if .Values.ha.enabled }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.ingressNamespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+        {{- else }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ $ns }}
           podSelector:
             matchLabels:
               portcullis.io/component: traefik
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: portcullis-ingress
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: traefik
+        {{- end }}
       ports:
         - protocol: TCP
           port: 8080
