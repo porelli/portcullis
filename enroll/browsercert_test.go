@@ -71,7 +71,12 @@ func newFakeCA(t *testing.T, cn string, parent *fakeCA) *fakeCA {
 // leaf issues a client certificate for cn with pub's key.
 func (ca *fakeCA) leaf(t *testing.T, cn string, pub *ecdsa.PublicKey, notBefore, notAfter time.Time) *x509.Certificate {
 	t.Helper()
-	tmpl := &x509.Certificate{SerialNumber: nextSerial(), Subject: pkix.Name{CommonName: cn},
+	return ca.leafDNS(t, cn, nil, pub, notBefore, notAfter)
+}
+
+func (ca *fakeCA) leafDNS(t *testing.T, cn string, dns []string, pub *ecdsa.PublicKey, notBefore, notAfter time.Time) *x509.Certificate {
+	t.Helper()
+	tmpl := &x509.Certificate{SerialNumber: nextSerial(), Subject: pkix.Name{CommonName: cn}, DNSNames: dns,
 		NotBefore: notBefore, NotAfter: notAfter,
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, pub, ca.key)
@@ -288,8 +293,14 @@ func (fp *fakePKI) sign(w http.ResponseWriter, r *http.Request, mount string, ca
 	fp.signs = append(fp.signs, body)
 	delay, swap := fp.signDelay, fp.swapKey
 	fp.mu.Unlock()
-	for k := range body {
-		if k != "csr" && k != "common_name" && k != "ttl" {
+	// enroll.hcl: node-nodeadm alone takes its one alt_names value and
+	// exclude_cn_from_sans "true".
+	nodeadmRole := strings.HasSuffix(r.URL.Path, "/sign/node-nodeadm")
+	for k, v := range body {
+		ok := k == "csr" || k == "common_name" || k == "ttl" ||
+			(nodeadmRole && k == "alt_names" && v == "nodeadm.portcullis-nodeadm.svc") ||
+			(nodeadmRole && k == "exclude_cn_from_sans" && v == "true")
+		if !ok {
 			vaultAnswer(w, 403, map[string]any{"errors": []string{"permission denied: " + k}})
 			return
 		}
@@ -313,7 +324,11 @@ func (fp *fakePKI) sign(w http.ResponseWriter, r *http.Request, mount string, ca
 		k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		pub = &k.PublicKey
 	}
-	c := ca.leaf(fp.t, cn, pub, time.Now().Add(-time.Minute), time.Now().Add(ttl))
+	var dns []string
+	if alt, _ := body["alt_names"].(string); alt != "" {
+		dns = []string{alt}
+	}
+	c := ca.leafDNS(fp.t, cn, dns, pub, time.Now().Add(-time.Minute), time.Now().Add(ttl))
 	s := fp.add(mount, c, false)
 	vaultAnswer(w, 200, map[string]any{"data": map[string]any{
 		"certificate": pemCert(c), "issuing_ca": pemCert(ca.cert),

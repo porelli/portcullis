@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"log"
 	"net"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -251,5 +252,85 @@ func TestNodeRevoke(t *testing.T) {
 	}
 	if w := postAction(s, "/internal/nodes/sign", nodeSignBody(roleNodeControl, "hub.control", makeNodeCSR(t, csrOpts{cn: "hub.control"}))); w.Code != 503 {
 		t.Errorf("unwired sign: %d", w.Code)
+	}
+}
+
+const testNodeadmSecret = "fedcba9876543210fedcba9876543210-nodeadm"
+
+func postNodeadm(s *inviteService, path, body string) *httptest.ResponseRecorder {
+	return do(s.apiHandler(false), "POST", path, body, map[string]string{
+		"Authorization": "Bearer " + testNodeadmSecret, "Content-Type": "application/json",
+	})
+}
+
+// TestNodeadmBearer (contract §17.5, HA): nodeadm's own bearer signs
+// node-cluster, node-frontdoor and node-nodeadm (its one SAN
+// nodeadm.portcullis-nodeadm.svc) and nothing else; the invites' bearer
+// signs none of the three; nodeadm revokes only those certificates; it
+// reaches no other route.
+func TestNodeadmBearer(t *testing.T) {
+	fp, s := nodePKI(t)
+	s.nodeadmSecret = testNodeadmSecret
+	sign := func(post func(*inviteService, string, string) *httptest.ResponseRecorder, role, cn string) (int, *x509.Certificate, string) {
+		w := post(s, "/internal/nodes/sign", nodeSignBody(role, cn, makeNodeCSR(t, csrOpts{cn: cn})))
+		var out map[string]string
+		json.Unmarshal(w.Body.Bytes(), &out)
+		var leaf *x509.Certificate
+		if b, _ := pem.Decode([]byte(out["certificate"])); b != nil {
+			leaf, _ = x509.ParseCertificate(b.Bytes)
+		}
+		return w.Code, leaf, out["serial"]
+	}
+	code, leaf, clusterSerial := sign(postNodeadm, roleNodeCluster, "n4.cluster.portcullis.internal")
+	if code != 201 || leaf.Subject.CommonName != "n4.cluster.portcullis.internal" {
+		t.Fatalf("node-cluster: %d", code)
+	}
+	if code, _, _ := sign(postNodeadm, roleNodeFrontdoor, frontdoorCN); code != 201 {
+		t.Fatalf("node-frontdoor: %d", code)
+	}
+	code, leaf, _ = sign(postNodeadm, roleNodeNodeadm, nodeadmCN)
+	if code != 201 || len(leaf.DNSNames) != 1 || leaf.DNSNames[0] != nodeadmSAN {
+		t.Fatalf("node-nodeadm: %d %v", code, leaf)
+	}
+	for _, c := range []struct {
+		post     func(*inviteService, string, string) *httptest.ResponseRecorder
+		role, cn string
+		want     int
+	}{
+		{postNodeadm, roleNodeWorker, "w1.node.portcullis.internal", 403},
+		{postNodeadm, roleNodeControl, "hub.control", 403},
+		{postNodeadm, "node-link", "link.control", 403},
+		{postNodeadm, roleNodeCluster, "n4.node.portcullis.internal", 400},
+		{postNodeadm, roleNodeCluster, "N4.cluster.portcullis.internal", 400},
+		{postNodeadm, roleNodeFrontdoor, "hub.control", 400},
+		{postNodeadm, roleNodeNodeadm, "frontdoor.control", 400},
+		{postAction, roleNodeCluster, "n4.cluster.portcullis.internal", 403},
+		{postAction, roleNodeFrontdoor, frontdoorCN, 403},
+		{postAction, roleNodeNodeadm, nodeadmCN, 403},
+	} {
+		if code, _, _ := sign(c.post, c.role, c.cn); code != c.want {
+			t.Errorf("%s %s: %d, want %d", c.role, c.cn, code, c.want)
+		}
+	}
+	// Revocation: its own certificates only.
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	_, worker := fp.issue(mountNode, "w1.node.portcullis.internal", &k.PublicKey, fp.cas[mountNode].cert.NotAfter, false)
+	rev := func(serial string) int {
+		b, _ := json.Marshal(map[string]string{"serial": serial})
+		return postNodeadm(s, "/internal/nodes/revoke", string(b)).Code
+	}
+	if code := rev(worker); code != 403 || fp.certs[mountNode][worker].revoked {
+		t.Fatalf("nodeadm revoked a worker certificate: %d", code)
+	}
+	if code := rev(clusterSerial); code != 204 {
+		t.Fatalf("revoke node-cluster: %d", code)
+	}
+	// No other route; a bearer equal to the invites' one is no nodeadm bearer.
+	if w := postNodeadm(s, "/internal/invites", `{"username":"alice","ttl":"1h"}`); w.Code != 401 {
+		t.Errorf("nodeadm's bearer on the invites: %d", w.Code)
+	}
+	s.nodeadmSecret = testAPISecret
+	if code, _, _ := sign(postAction, roleNodeCluster, "n5.cluster.portcullis.internal"); code != 403 {
+		t.Errorf("the invites' bearer as nodeadm's: %d", code)
 	}
 }

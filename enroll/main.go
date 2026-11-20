@@ -541,6 +541,12 @@ func main() {
 	inv.revoke = cfg.revokeCert
 	inv.ssh = &cfg
 	inv.sshUserExists = func(u string) error { _, err := cfg.existingUser(u); return err }
+	// nodeadm's bearer (Kubernetes only; absent on Docker / Podman).
+	if ns, err := readInviteSecret(secretDir + "/nodeadm-api-secret"); err == nil {
+		inv.nodeadmSecret = ns
+	} else if !os.IsNotExist(err) {
+		log.Printf("WARNING: nodeadm's node signing disabled: %v", err)
+	}
 	inv.signNode = cfg.signNodeCert
 	inv.revokeNode = cfg.revokeNodeCert
 	mux := publicMux(srv, inv)

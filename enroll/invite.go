@@ -139,7 +139,10 @@ type inviteService struct {
 	domain       string
 	clientSecret string // Keycloak ⇄ enroll OIDC client secret
 	apiSecret    string // Hub ⇄ enroll invite API bearer secret
-	lookupUser   func(string) (*User, error)
+	// nodeadmSecret (HA, §17.5): nodeadm's own bearer; it signs and revokes
+	// only nodeadm's three pki_node roles (nodes.go), nothing else.
+	nodeadmSecret string
+	lookupUser    func(string) (*User, error)
 	// userGroups lists the LLDAP groups of a user; protectedGroups are the
 	// groups whose members only the server may invite (lldap_admin & co.).
 	userGroups      func(string) ([]string, error)
@@ -164,8 +167,8 @@ type inviteService struct {
 	ssh           sshBackend
 	sshUserExists func(string) error
 	// Node certificates (nodes.go, contract §17); nil = 503.
-	signNode   func(ctx context.Context, role, cn, csrPEM string) (*nodeCertResult, error)
-	revokeNode func(ctx context.Context, serial string) error
+	signNode   func(ctx context.Context, role, cn, csrPEM string, nodeadm bool) (*nodeCertResult, error)
+	revokeNode func(ctx context.Context, serial string, nodeadm bool) error
 	now        func() time.Time
 
 	mu          sync.Mutex

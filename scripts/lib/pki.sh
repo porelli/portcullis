@@ -170,11 +170,20 @@ _pki_write_node_role() {
 #   node-control hub.control (the Hub), client only, 30 d
 #   node-link    link.control (wg's link role), client only, 90 d — signed
 #                by the CLI with the root token, never by enroll
+# HA (contract §17.5), signed by enroll for nodeadm's own bearer only:
+#   node-cluster   <server id>.cluster.portcullis.internal (a cluster node's
+#                  nodeagent and its signed join request), client + server, 30 d
+#   node-frontdoor frontdoor.control (the front door's client), client only, 30 d
+#   node-nodeadm   nodeadm.control, its one SAN nodeadm.portcullis-nodeadm.svc
+#                  (nodeadm's serving and client certificate), client + server, 30 d
 _pki_write_node_roles() {
   info "Writing the node roles on pki_node..."
   _pki_write_node_role node-worker node.portcullis.internal true false true 720h
   _pki_write_node_role node-control hub.control false true false 720h
   _pki_write_node_role node-link link.control false true false 2160h
+  _pki_write_node_role node-cluster cluster.portcullis.internal true false true 720h
+  _pki_write_node_role node-frontdoor frontdoor.control false true false 720h
+  _pki_write_node_role node-nodeadm nodeadm.control,nodeadm.portcullis-nodeadm.svc false true true 720h
 }
 
 # _pki_ensure_node_ca <domain> <certs> <have_node> — create pki_node when it

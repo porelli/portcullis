@@ -304,16 +304,20 @@ type signedCert struct {
 // signOn has mount sign csrPEM with role, for exactly common_name = user
 // and ttl. It never passes SANs (alt_names, ip_sans, uri_sans, other_sans:
 // enroll's Vault policy denies them). The answer must be one certificate
-// whose CN is user.
-func (cfg *Config) signOn(ctx context.Context, mount, role, user, csrPEM, ttl string) (*signedCert, error) {
+// whose CN is user. extra adds request parameters: only the HA
+// node-nodeadm role's fixed alt_names / exclude_cn_from_sans (nodes.go),
+// which enroll's policy pins to their one value.
+func (cfg *Config) signOn(ctx context.Context, mount, role, user, csrPEM, ttl string, extra ...map[string]interface{}) (*signedCert, error) {
 	var secret *vault.Secret
+	params := map[string]interface{}{"csr": csrPEM, "common_name": user, "ttl": ttl}
+	for _, e := range extra {
+		for k, v := range e {
+			params[k] = v
+		}
+	}
 	err := cfg.vault.do(func(vc *vault.Client) error {
 		var err error
-		secret, err = vc.Logical().WriteWithContext(ctx, mount+"/sign/"+role, map[string]interface{}{
-			"csr":         csrPEM,
-			"common_name": user,
-			"ttl":         ttl,
-		})
+		secret, err = vc.Logical().WriteWithContext(ctx, mount+"/sign/"+role, params)
 		return err
 	})
 	if err != nil {

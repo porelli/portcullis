@@ -13,6 +13,7 @@
 #   - revoke on both mounts and rotate that mount's CRL
 #     (POST /internal/certificates/revoke)
 #   - multiple servers (contract §17): sign node-worker and node-control
+#     (HA: node-cluster, node-frontdoor and node-nodeadm, nodeadm's bearer only)
 #     CSRs on pki_node (POST /internal/nodes/sign), revoke there and rotate
 #     its CRL (POST /internal/nodes/revoke), and read the CA and the issued
 #     certificates there (the answer's CA, the revoke lookup). Never
@@ -92,6 +93,40 @@ path "pki_node/sign/node-control" {
     "ip_sans"    = []
     "uri_sans"   = []
     "other_sans" = []
+  }
+}
+
+# HA (contract §17.5): nodeadm's three roles, signed only for nodeadm's own
+# bearer (enroll checks it): node-cluster and node-frontdoor take no SAN;
+# node-nodeadm only its one serving name, with the CN left out of the SANs.
+path "pki_node/sign/node-cluster" {
+  capabilities = ["update"]
+  denied_parameters = {
+    "alt_names"  = []
+    "ip_sans"    = []
+    "uri_sans"   = []
+    "other_sans" = []
+  }
+}
+
+path "pki_node/sign/node-frontdoor" {
+  capabilities = ["update"]
+  denied_parameters = {
+    "alt_names"  = []
+    "ip_sans"    = []
+    "uri_sans"   = []
+    "other_sans" = []
+  }
+}
+
+path "pki_node/sign/node-nodeadm" {
+  capabilities = ["update"]
+  allowed_parameters = {
+    "csr"                  = []
+    "common_name"          = ["nodeadm.control"]
+    "ttl"                  = []
+    "alt_names"            = ["nodeadm.portcullis-nodeadm.svc"]
+    "exclude_cn_from_sans" = ["true"]
   }
 }
 
