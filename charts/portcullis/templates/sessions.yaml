@@ -1,6 +1,6 @@
 {{- /* sessions (compose: sessions): Valkey, memory only. */ -}}
 {{- $s := dict
-  "name" "sessions" "uid" .Values.uids.sessions "gid" .Values.uids.sessionsGroup
+  "name" "sessions" "uid" .Values.uids.sessions "gid" .Values.uids.sessionsGroup "pin" true
   "memory" "128Mi" "nets" (list "portcullis-sessions")
   "hashes" (list "secrets-sessions")
   "args" (list "valkey-server" "/etc/valkey/valkey.conf")

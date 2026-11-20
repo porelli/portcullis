@@ -1,14 +1,27 @@
 {{- /* Traefik's Services (K-P26): only 80 → 8000 and 443 → 8443 are on the
 LoadBalancer (ServiceLB publishes every port of one on the node); kcinternal,
-vpnsecure and metrics are ClusterIPs. Fixed ClusterIPs in the static band. */ -}}
+vpnsecure and metrics are ClusterIPs. Fixed ClusterIPs in the static band.
+HA (plan Amendment 3): Traefik's DaemonSet has hostPort 80 / 443 on the
+ingress nodes and no LoadBalancer (ServiceLB serves only wg-people and the
+apps' ports:); its Services live in its namespace (a Service selects only
+its own namespace's pods): traefik (a ClusterIP at the same fixed address,
+the hairpin to auth.<domain>), keycloak-internal, traefik-vpn (fixed) and
+traefik-metrics; the core namespace keeps keycloak-internal and
+traefik-metrics as ExternalName names of them, so the core pods' short
+names don't change (no app can create a Service in the core namespace). */ -}}
+{{- $tns := ternary .Values.ingressNamespace .Release.Namespace .Values.ha.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
   name: traefik
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ $tns }}
 spec:
+  {{- if not .Values.ha.enabled }}
   type: LoadBalancer
   externalTrafficPolicy: Local
+  {{- else }}
+  type: ClusterIP
+  {{- end }}
   clusterIP: {{ required "traefikServiceIP is required" .Values.traefikServiceIP }}
   selector:
     portcullis.io/component: traefik
@@ -26,7 +39,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: keycloak-internal
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ $tns }}
 spec:
   type: ClusterIP
   selector:
@@ -41,7 +54,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: traefik-vpn
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ $tns }}
 spec:
   type: ClusterIP
   clusterIP: {{ required "traefikVPNServiceIP is required" .Values.traefikVPNServiceIP }}
@@ -57,7 +70,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: traefik-metrics
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ $tns }}
 spec:
   type: ClusterIP
   selector:
@@ -66,3 +79,19 @@ spec:
     - name: metrics
       port: 8082
       targetPort: 8082
+{{- if .Values.ha.enabled }}
+{{- range $n := list "keycloak-internal" "traefik-metrics" }}
+---
+# HA: the core namespace's name for Traefik's {{ $n }} (its namespace's).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $n }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  type: ExternalName
+  externalName: {{ $n }}.{{ $.Values.ingressNamespace }}.svc.cluster.local
+{{- end }}
+{{- end }}

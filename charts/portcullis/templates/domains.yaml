@@ -4,7 +4,7 @@ behind the portcullis-domains policy (the Hub and domains only).
 DOMAINS_MAIL_HOSTNAME: always "" (mail.<domain>): mail isn't available on
 Kubernetes (contract §19.12). */ -}}
 {{- $s := dict
-  "name" "domains" "uid" .Values.uids.domains "gid" .Values.uids.domains "groups" (list .Values.uids.hub)
+  "name" "domains" "uid" .Values.uids.domains "gid" .Values.uids.domains "pin" true "groups" (list .Values.uids.hub)
   "memory" "256Mi" "nets" (list "portcullis-domains" "portcullis-certs" "domains-egress") "egress" true
   "hashes" (list "secrets-domains" "secrets-domains-certs-endpoint" "domains-env")
   "health" (dict "test" (list "domains" "healthcheck") "interval" 10 "timeout" 5 "retries" 3)
@@ -24,13 +24,18 @@ Kubernetes (contract §19.12). */ -}}
     (dict "name" "data" "mountPath" "/data")
     (dict "name" "secrets" "mountPath" "/run/portcullis/domains" "readOnly" true))
   "volumes" (list
-    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "domains-data"))
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" (include "portcullis.pvcName" (list . "domains-data"))))
     (dict "name" "secrets" "projected" (dict "defaultMode" 288 "sources" (list
       (dict "secret" (dict "name" "secrets-domains" "items" (list (dict "key" "api-secret" "path" "api-secret") (dict "key" "age.key" "path" "age.key"))))
       (dict "secret" (dict "name" "secrets-domains-certs-endpoint" "items" (list
         (dict "key" "ca.crt" "path" "certs-endpoint/ca.crt") (dict "key" "server.crt" "path" "certs-endpoint/server.crt") (dict "key" "server.key" "path" "certs-endpoint/server.key"))))))))
   "fsGroup" .Values.uids.domains
 -}}
+{{- if .Values.ha.enabled }}
+{{- /* HA (contract §20.1 "HA mode", §12.4): the added domains' address sets
+follow frontdoor-status. */ -}}
+{{- $_ := set $s "env" (append $s.env (dict "name" "PORTCULLIS_HA" "value" "on")) }}
+{{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
 {{ include "portcullis.pvc" (list . "domains-data" .Values.uids.domains .Values.uids.domains "0750") }}

@@ -8,12 +8,16 @@ age / wg / vault Secrets) or the apps namespace (the instances' Secrets),
 nothing cluster-scoped, no nodes (the Ingress / Gateway providers are off).
 The provider's informers need every resource listed (Traefik 3.7 lists
 ConfigMaps too): one it can't list keeps it from loading any route.
-k8s_hardening.py checks every ServiceAccount's Secret access. */ -}}
+k8s_hardening.py checks every ServiceAccount's Secret access. In HA the
+ServiceAccount lives in Traefik's own namespace (portcullis-ingress), still
+with this one Role in the edge namespace and nothing in its own (contract
+§6). */ -}}
+{{- $sans := ternary .Values.ingressNamespace .Release.Namespace .Values.ha.enabled }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: traefik
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ $sans }}
 automountServiceAccountToken: false
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -44,4 +48,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: traefik
-    namespace: {{ .Release.Namespace }}
+    namespace: {{ $sans }}

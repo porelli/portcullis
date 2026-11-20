@@ -2,10 +2,17 @@
 proxy headers trusted from the pod CIDR, the second layer); internal
 clients use keycloak-internal:8081 (Traefik's kcinternal). Not read-only:
 `start` re-augments (as on Docker). /hub-data is its published documents
-(projected, read-only: portcullis.published, contract §4 / §8.1). */ -}}
+(projected, read-only: portcullis.published, contract §4 / §8.1).
+HA (spec §6, plan Amendment 2): a StatefulSet of 2 replicas, 3 from 3
+non-small nodes at the primary site (ha.nonSmallNodesAtPrimary, P33), a
+PDB, spread; one embedded Infinispan cluster (Keycloak's default ispn
+cache over JDBC_PING) on 7800 / 57800 between Keycloak pods only, bound
+to the pod's address. A StatefulSet for the stable names Traefik's
+Keycloak servers use (keycloak-<i>.keycloak-pods: the retry and passive
+health check, traefik-file-middlewares.yaml), no volume of its own. */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $s := dict
-  "name" "keycloak" "uid" .Values.uids.keycloak "gid" 0 "readOnly" false
+  "name" "keycloak" "uid" .Values.uids.keycloak "gid" 0 "readOnly" false "pin" true
   "memory" "2Gi" "nets" (list "portcullis" "portcullis-auth" "portcullis-mcp") "egress" true
   "extraLabels" (dict "portcullis.io/ingress" "bound")
   "hashes" (list "portcullis-env" "config-keycloak-realm" "config-keycloak-theme" "certs-truststore")
@@ -39,6 +46,13 @@ clients use keycloak-internal:8081 (Traefik's kcinternal). Not read-only:
     (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
 -}}
 {{- include "portcullis.published" (dict "root" . "s" $s) }}
+{{- if .Values.ha.enabled }}
+{{- $_ := set $s "statefulSet" (dict "replicas" (include "portcullis.keycloakReplicas" . | int) "serviceName" "keycloak-pods") }}
+{{- $_ = set $s "ports" (concat $s.ports (list (dict "name" "jgroups" "port" 7800) (dict "name" "jgroups-fd" "port" 57800))) }}
+{{- $_ = set $s "env" (concat $s.env (list
+  (dict "name" "POD_IP" "valueFrom" (dict "fieldRef" (dict "fieldPath" "status.podIP")))
+  (dict "name" "JAVA_OPTS_APPEND" "value" "-Djgroups.bind.address=$(POD_IP)"))) }}
+{{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
 apiVersion: v1
@@ -56,3 +70,21 @@ spec:
     - name: management
       port: 9000
       targetPort: 9000
+{{- if .Values.ha.enabled }}
+---
+# HA: the replicas' own names (keycloak-<i>.keycloak-pods), ready pods
+# only: Traefik's Keycloak servers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-pods
+  namespace: {{ .Release.Namespace }}
+spec:
+  clusterIP: None
+  selector:
+    portcullis.io/component: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+{{- end }}

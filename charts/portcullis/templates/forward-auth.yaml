@@ -1,8 +1,10 @@
 {{- /* forward-auth (compose: forward-auth): oauth2-proxy, no healthcheck (distroless).
+In HA ha.gateReplicas replicas (its sessions are in Valkey), a PDB, spread.
 auth.<domain> resolves to the traefik Service (hostAliases, as host-gateway). */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $s := dict
   "name" "forward-auth" "image" "forward-auth" "uid" .Values.uids.oauth2proxy "gid" .Values.uids.oauth2proxy
+  "replicas" (ternary (int .Values.ha.gateReplicas) 1 .Values.ha.enabled) "pin" true
   "memory" "256Mi" "nets" (list "portcullis" "portcullis-sessions") "egress" true
   "hashes" (list "portcullis-env" "certs" "config-oauth2-proxy")
   "args" (list "--alpha-config=/etc/oauth2-proxy/alpha.yaml")

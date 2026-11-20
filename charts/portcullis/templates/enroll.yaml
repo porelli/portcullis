@@ -1,6 +1,9 @@
-{{- /* enroll (compose: enroll): setup links, certificate API. */ -}}
+{{- /* enroll (compose: enroll): setup links, certificate API. One replica
+in HA too: its invites, redemptions, sign-in codes and IdP signing key
+live in its memory (enroll/invite.go), so a second replica would refuse
+links the first made (a Task 19 concern: shared state first). */ -}}
 {{- $s := dict
-  "name" "enroll" "uid" .Values.uids.enroll "gid" .Values.uids.enroll
+  "name" "enroll" "uid" .Values.uids.enroll "gid" .Values.uids.enroll "pin" true
   "memory" "128Mi" "nets" (list "portcullis") "egress" true
   "hashes" (list "portcullis-env" "secrets-enroll" "config-group-gate")
   "health" (dict "test" (list "wget" "-q" "-O" "/dev/null" "http://127.0.0.1:8443/healthz") "interval" 10 "timeout" 3 "retries" 3)

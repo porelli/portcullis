@@ -24,6 +24,7 @@ spec:
         - podSelector:
             matchLabels:
               portcullis.io/net-portcullis: "true"
+        {{- include "portcullis.traefikPeer" $ | nindent 8 }}
       ports:
         - protocol: TCP
           port: 8080
@@ -58,6 +59,7 @@ spec:
         - podSelector:
             matchLabels:
               portcullis.io/net-portcullis-proxy: "true"
+        {{- include "portcullis.traefikPeer" $ | nindent 8 }}
       ports:
         - protocol: TCP
           port: 8080

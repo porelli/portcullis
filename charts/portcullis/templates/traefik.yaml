@@ -12,7 +12,20 @@ chart's traefik-dynamic (K15 core names, strip-forwarded), projected into
 one directory. Every untrusted entrypoint runs strip-client-forwarded@file
 first and deletes header aliases. web → https://<host>:443 (the redirect's
 `to` is the public port: websecure's own :8443 sits behind 443; Traefik's
-redirection has no port field, and a set one fails its env decoding). */ -}}
+redirection has no port field, and a set one fails its env decoding).
+HA (plan Amendment 3, contract §20.1, §6 "ingress pods"): a DaemonSet on
+the portcullis.io/ingress nodes, in its own namespace portcullis-ingress,
+in the pod network with hostPort 80 → 8000 and 443 → 8443 (the client's
+real address kept; no LoadBalancer for Traefik), non-root with every
+capability dropped. Exactly the pod shape portcullis-ingress-pods admits:
+the image by digest, no command / args / envFrom, the ping exec probes
+only, environment names from its allowlist, volumes emptyDir / ConfigMap /
+Secret / projected only. No ACME resolver and no traefik-acme volume
+(spec §11.2: several replicas can't share one ACME account; the
+certificates come from the domains HTTP provider), so no DNS credential
+and no portcullis-env either, and no internet egress. The core Services
+it reads by short name (domains) resolve through the core namespace's
+search domain. */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $s := dict
   "name" "traefik" "uid" .Values.uids.traefik "gid" .Values.uids.traefik
@@ -110,6 +123,28 @@ redirection has no port field, and a set one fails its env decoding). */ -}}
     (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
   "fsGroup" .Values.uids.traefik
 -}}
+{{- if .Values.ha.enabled }}
+{{- $acme := list "TRAEFIK_CERTIFICATESRESOLVERS_" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_" "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_" }}
+{{- $creds := list "CF_API_EMAIL" "GCE_PROJECT" "CF_DNS_API_TOKEN" "PORKBUN_API_KEY" "PORKBUN_SECRET_API_KEY" "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "AWS_HOSTED_ZONE_ID" "DO_AUTH_TOKEN" "HETZNER_API_KEY" "HETZNER_API_TOKEN" }}
+{{- $env := list }}
+{{- range $s.env }}{{- $e := . }}{{- $drop := has $e.name $creds }}{{- range $acme }}{{- if hasPrefix . $e.name }}{{- $drop = true }}{{- end }}{{- end }}{{- if not $drop }}{{- $env = append $env $e }}{{- end }}{{- end }}
+{{- $ports := list }}
+{{- range $s.ports }}{{- $p := deepCopy . }}{{- if eq $p.name "web" }}{{- $_ := set $p "hostPort" 80 }}{{- else if eq $p.name "websecure" }}{{- $_ := set $p "hostPort" 443 }}{{- end }}{{- $ports = append $ports $p }}{{- end }}
+{{- $m := list }}{{- range $s.mounts }}{{- if ne .name "acme" }}{{- $m = append $m . }}{{- end }}{{- end }}
+{{- $v := list }}{{- range $s.volumes }}{{- if ne .name "acme" }}{{- $v = append $v . }}{{- end }}{{- end }}
+{{- $_ := set $s "env" $env }}
+{{- $_ = set $s "ports" $ports }}
+{{- $_ = set $s "mounts" $m }}
+{{- $_ = set $s "volumes" $v }}
+{{- $_ = set $s "egress" false }}
+{{- $_ = set $s "namespace" .Values.ingressNamespace }}
+{{- $_ = set $s "daemonSet" (dict "nodeSelector" (dict "portcullis.io/ingress" "true")) }}
+{{- $_ = set $s "extraLabels" (dict "portcullis.io/ingress" "bound" "app.kubernetes.io/name" "traefik") }}
+{{- $_ = set $s "dnsSearches" (list (printf "%s.svc.cluster.local" .Release.Namespace)) }}
+{{- $_ = set $s "hashes" (list "config-traefik-dynamic" "certs" "secrets-certs" "secrets-domains-certs-endpoint") }}
+{{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+{{- if not .Values.ha.enabled }}
 ---
 {{ include "portcullis.pvc" (list . "traefik-acme" .Values.uids.traefik .Values.uids.traefik "0700") }}
+{{- end }}

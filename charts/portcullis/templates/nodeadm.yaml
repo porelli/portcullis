@@ -494,6 +494,15 @@ spec:
       ports:
         - protocol: TCP
           port: 8443
+    # The nodeagents' API on the node mesh (contract §20.4: mesh pushes,
+    # probes targets, uninstall; mTLS hub.control; preflight P39).
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.ha.meshCIDR }}
+      ports:
+        - protocol: TCP
+          port: 7443
+{{- if not .Values.ha.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -518,6 +527,7 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+{{- end }}
 {{- if .Values.monitoring.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -544,4 +554,55 @@ spec:
         - protocol: TCP
           port: 9105
 {{- end }}
+---
+# The public join paths (contract §20.2, Task 21 review I5): router
+# portcullis-node on the main domain's exact /node/ paths, rate-limit@file,
+# above every app route (10000 + 300, over people-cli's 200) and over the
+# apex's core-vpn-required / portal routers; websecure and vpnsecure (a
+# joining machine is outside the VPN), authaware@file (the apex's TLS
+# option: Traefik picks one per host). Its backend is a pinned ExternalName
+# Service in the edge namespace (Traefik's only watched one: the
+# app-backend pattern of §5, owner=core so portcullis-edge-routes refuses
+# the Hub any change to it) to nodeadm's plain-HTTP :8080, which admits
+# only Traefik pods (above).
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: portcullis-node
+  namespace: {{ .Values.edgeNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
+spec:
+  entryPoints: ["websecure", "vpnsecure"]
+  routes:
+    - match: {{ include "portcullis.nodeRule" . | quote }}
+      kind: Rule
+      priority: 10300
+      middlewares:
+        - name: rate-limit@file
+      services:
+        - name: portcullis-node
+          kind: Service
+          port: 8080
+  tls:
+    options:
+      name: authaware@file
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portcullis-node
+  namespace: {{ .Values.edgeNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
+spec:
+  type: ExternalName
+  externalName: nodeadm.{{ $nns }}.svc.cluster.local
+  ports:
+    - name: tcp-8080
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
 {{- end }}

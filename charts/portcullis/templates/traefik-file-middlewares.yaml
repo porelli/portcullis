@@ -7,7 +7,14 @@ IngressRoutes live in the edge namespace, which holds no Service of
 theirs). Projected next to the synced traefik/dynamic/*.yml. The core-only
 Middlewares (portcullis-auth-console, portal paths, directory-redirect) are
 CRDs of the edge namespace; hub-proxy-secret and hub-cli-proxy-secret (they carry the secrets) are applied by the CLI
-from stdin, never rendered. */ -}}
+from stdin, never rendered.
+HA (plan Amendment 2: a lost node's endpoints stay for ~40-50 s): the
+Keycloak and Hub routers end with core-retry (3 attempts), and their
+services fail fast (core-fast: a 3 s dial) with a passive health check (a
+server failing 3 times in 10 s is out for 10 s). Keycloak's servers are its
+replicas by name (keycloak-<i>.keycloak-pods, ready pods only), so a dead
+one is passed over; the Hub has one replica behind its Service. In HA the
+ConfigMap lives in Traefik's own namespace (a pod mounts only its own). */ -}}
 {{- $ns := .Release.Namespace -}}
 {{- $edge := .Values.edgeNamespace -}}
 {{- $core := list (list "lldap" 17170) (list "keycloak" 8080) (list "forward-auth" 4180) (list "group-gate" 8080) (list "hub" 8888) (list "hub" 8889) (list "hub" 8891) (list "enroll" 8443) (list "mcp-gate" 8080) -}}
@@ -18,7 +25,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: traefik-dynamic
-  namespace: {{ $ns }}
+  namespace: {{ ternary .Values.ingressNamespace $ns .Values.ha.enabled }}
   labels:
     app.kubernetes.io/managed-by: portcullis
 data:
@@ -82,6 +89,18 @@ data:
               X-Forwarded-Tls-Client-Cert-Info: ""
               Forwarded: ""
               X-Real-Ip: ""
+        {{- if .Values.ha.enabled }}
+        core-retry:
+          retry:
+            attempts: 3
+            initialInterval: 100ms
+        {{- end }}
+      {{- if .Values.ha.enabled }}
+      serversTransports:
+        core-fast:
+          forwardingTimeouts:
+            dialTimeout: 3s
+      {{- end }}
       services:
         group-gate:
           loadBalancer:
@@ -96,10 +115,23 @@ data:
             servers:
               - url: http://mcp-gate.{{ $ns }}.svc.cluster.local:8080
         {{- range $c := $core }}
+        {{- $ha := and $.Values.ha.enabled (has (index $c 0) (list "keycloak" "hub")) }}
         core-{{ index $c 0 }}-{{ index $c 1 }}:
           loadBalancer:
+            {{- if $ha }}
+            serversTransport: core-fast
+            passiveHealthCheck:
+              failureWindow: 10s
+              maxFailedAttempts: 3
+            {{- end }}
             servers:
+              {{- if and $ha (eq (index $c 0) "keycloak") }}
+              {{- range $i := until (include "portcullis.keycloakReplicas" $ | int) }}
+              - url: http://keycloak-{{ $i }}.keycloak-pods.{{ $ns }}.svc.cluster.local:{{ index $c 1 }}
+              {{- end }}
+              {{- else }}
               - url: http://{{ index $c 0 }}.{{ $ns }}.svc.cluster.local:{{ index $c 1 }}
+              {{- end }}
         {{- end }}
 ---
 apiVersion: traefik.io/v1alpha1

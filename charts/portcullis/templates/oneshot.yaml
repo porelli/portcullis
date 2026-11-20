@@ -88,5 +88,5 @@ spec:
   volumes:
     - name: data
       persistentVolumeClaim:
-        claimName: hub-data
+        claimName: {{ include "portcullis.pvcName" (list . "hub-state") }}
 {{- end }}

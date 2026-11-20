@@ -7,7 +7,7 @@
 #   init     .env for kubernetes (context ci, K1 local images), the CI TLS
 #            certificate, ./portcullis init --runtime kubernetes
 #   seed     the Hub's template source (tests/e2e/apps echo, folder-writer,
-#            alias-echo, mcp-echo) into hub-data, the
+#            alias-echo, mcp-echo) into hub-state, the
 #            fixer's /srv/e2e-k3s, an issued YubiKey certificate's serial
 #   hub      tests/e2e/e2e_k3s.py through a port-forward to the Hub
 #   vpn      vpn init (built-in on), a device handshake through wg-people
@@ -100,7 +100,7 @@ seed)
       securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, seccompProfile: {type: "RuntimeDefault"}},
       containers: [{name: "c", image: env.IMG, command: ["sleep", "600"], resources: {limits: {memory: "64Mi"}, requests: {memory: "64Mi"}},
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},
-        volumeMounts: [{name: "d", mountPath: "/data"}]}], volumes: [{name: "d", persistentVolumeClaim: {claimName: "hub-data"}}]}}' | K create -f - >/dev/null
+        volumeMounts: [{name: "d", mountPath: "/data"}]}], volumes: [{name: "d", persistentVolumeClaim: {claimName: "hub-state"}}]}}' | K create -f - >/dev/null
   K -n portcullis wait --for=condition=Ready "pod/$pod" --timeout=180s >/dev/null
   # The CI templates (mcp-echo: an AI companion with numeric users).
   tar -cf - -C tests/e2e/apps echo folder-writer alias-echo mcp-echo | K -n portcullis exec -i "$pod" -- sh -c 'mkdir -p /data/repos/ci && tar -C /data/repos/ci -xf - &&

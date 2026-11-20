@@ -20,6 +20,7 @@ import subprocess
 import sys
 
 import k8s_lib as K
+yaml = K.yaml
 
 F = K.Failures("k8s_parity")
 D = K.deltas()
@@ -131,8 +132,11 @@ def check_services(comp, docs):
         # memory
         lim = c.get("resources", {}).get("limits", {}).get("memory")
         req = c.get("resources", {}).get("requests", {}).get("memory")
-        if "mem_limit" in svc and (lim is None or K.mem_bytes(lim) != K.mem_bytes(svc["mem_limit"]) or lim != req):
-            F.add(f"{name}: memory limit {lim} / request {req} != compose mem_limit {svc['mem_limit']}")
+        # The limit is compose's mem_limit; the request the measured peak
+        # × 1.25 (values memoryPeakMi, plan Amendment 2), never above it.
+        if "mem_limit" in svc and (lim is None or K.mem_bytes(lim) != K.mem_bytes(svc["mem_limit"])
+                                   or req is None or K.mem_bytes(req) != K.mem_request(name, lim)):
+            F.add(f"{name}: memory limit {lim} / request {req} != compose mem_limit {svc['mem_limit']} / request {K.mem_request(name, lim) if lim else '?'}")
         # environment keys
         ck = env_keys(svc)
         kk = {e["name"] for e in c.get("env", [])}
@@ -332,7 +336,7 @@ def check_routers(comp):
                 F.add(f"router {rname}: service {gs} != compose {svc}")
             if ir["spec"].get("tls", {}).get("options", {}).get("name") != r.get("tls.options"):
                 F.add(f"router {rname}: tls options {ir['spec'].get('tls')} != compose {r.get('tls.options')}")
-        for extra in sorted(set(irs) - set(cr) - {"kcinternal"}):
+        for extra in sorted(set(irs) - set(cr) - {"kcinternal", "portcullis-node"}):
             F.add(f"IngressRoute {extra}: no compose router")
 
 
@@ -490,6 +494,84 @@ def check_published():
             F.add(f"published_problems misses {what} (mutation test)")
 
 
+NODE_PATHS = ["/node/join.sh", "/node/nodeagent-amd64", "/node/nodeagent-arm64", "/node/v1/nonce", "/node/v1/enrol",
+              "/node/v1/join", "/node/v1/renew", "/node/v1/renew/confirm"]
+ACME_ENV = re.compile(r"^(TRAEFIK_CERTIFICATESRESOLVERS_|TRAEFIK_ENTRYPOINTS_(WEBSECURE|VPNSECURE)_HTTP_TLS_|CF_|GCE_|PORKBUN_|AWS_|DO_|HETZNER_)")
+
+
+def check_ha():
+    """Task 19, HA against the plain chart (compose's form on Kubernetes):
+    "ha: wg-people externalTrafficPolicy Cluster" (Local without HA); the
+    Traefik DaemonSet has the Deployment's environment minus the ACME
+    resolver and the DNS credentials (no ACME in HA), hostPort 80 / 443 on
+    web / websecure; the Keycloak and Hub routers (and kcinternal) end with
+    core-retry@file in HA only, no other router has it; traefik-dynamic's
+    core-retry is 3 attempts, the Keycloak and Hub services have the passive
+    health check and the fast dial, Keycloak's servers its replicas by name;
+    router portcullis-node (nodeadm on, both modes) is the main domain's
+    exact /node/ paths with rate-limit@file to the edge Service
+    portcullis-node:8080."""
+    vals = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    ha, plain = K.render(vals), K.render()
+    svc = lambda docs, n: next(s for s in K.by_kind(docs, "Service") if s["metadata"]["name"] == n)
+    if svc(ha, "wg-people")["spec"].get("externalTrafficPolicy") != "Cluster":
+        F.add("ha: wg-people externalTrafficPolicy Cluster (contract §16.1: a handshake through any ingress node)")
+    if svc(plain, "wg-people")["spec"].get("externalTrafficPolicy") != "Local":
+        F.add("wg-people externalTrafficPolicy Local without HA")
+    tr = lambda docs, k: next(d for d in docs if d.get("kind") == k and d["metadata"]["name"] == "traefik")["spec"]["template"]["spec"]["containers"][0]
+    ce, he = tr(plain, "Deployment"), tr(ha, "DaemonSet")
+    want = {e["name"]: e for e in ce["env"] if not ACME_ENV.match(e["name"])}
+    if {e["name"]: e for e in he["env"]} != want:
+        F.add(f"ha: traefik's environment differs from the Deployment's beyond the ACME resolver: {sorted(set(e['name'] for e in he['env']) ^ set(want))}")
+    hp = {p["name"]: p.get("hostPort") for p in he["ports"]}
+    if hp != {"web": 80, "websecure": 443, "kcinternal": None, "vpnsecure": None, "ping": None, "metrics": None}:
+        F.add(f"ha: traefik hostPorts {hp} (web 80, websecure 443 only)")
+    retry_svcs = ("keycloak", "hub")
+    for label, docs in (("ha: ", ha), ("", plain)):
+        for ir in K.by_kind(docs, "IngressRoute"):
+            r = ir["spec"]["routes"][0]
+            mws = [m["name"] for m in r.get("middlewares", [])]
+            svcname = r["services"][0]["name"]
+            want_retry = bool(label) and (ir["metadata"]["name"] == "kcinternal" or any(svcname.startswith(f"core-{s}-") for s in retry_svcs))
+            if ("core-retry@file" in mws) != want_retry or (want_retry and mws[-1] != "core-retry@file"):
+                F.add(f"{label}router {ir['metadata']['name']}: middlewares {mws} ({'last core-retry@file' if want_retry else 'no core-retry@file'})")
+    dyn = next(c for c in ha if c.get("kind") == "ConfigMap" and c["metadata"]["name"] == "traefik-dynamic")
+    if dyn["metadata"]["namespace"] != K.INGRESS_NS:
+        F.add(f"ha: traefik-dynamic in {dyn['metadata']['namespace']} (Traefik's namespace)")
+    http = yaml.safe_load(dyn["data"]["kubernetes.yml"])["http"]
+    if http["middlewares"].get("core-retry", {}).get("retry", {}).get("attempts") != 3:
+        F.add("ha: core-retry must be retry attempts 3")
+    kc = 3 if vals["ha"].get("nonSmallNodesAtPrimary", 0) >= 3 else 2
+    for name, s in http["services"].items():
+        lb = s["loadBalancer"]
+        hc = name.startswith("core-keycloak-") or name.startswith("core-hub-")
+        if hc != ("passiveHealthCheck" in lb) or hc != (lb.get("serversTransport") == "core-fast"):
+            F.add(f"ha: service {name}: passive health check / core-fast {'missing' if hc else 'unexpected'}")
+        if name == "core-keycloak-8080" and [x["url"] for x in lb["servers"]] != [f"http://keycloak-{i}.keycloak-pods.{K.NS}.svc.cluster.local:8080" for i in range(kc)]:
+            F.add(f"ha: core-keycloak-8080 servers {lb['servers']} (Keycloak's {kc} replicas by name)")
+    if http.get("serversTransports", {}).get("core-fast", {}).get("forwardingTimeouts", {}).get("dialTimeout") != "3s":
+        F.add("ha: serversTransport core-fast (dialTimeout 3s)")
+    yp = yaml.safe_load(next(c for c in plain if c.get("kind") == "ConfigMap" and c["metadata"]["name"] == "traefik-dynamic")["data"]["kubernetes.yml"])["http"]
+    if "core-retry" in yp["middlewares"] or "serversTransports" in yp or any("passiveHealthCheck" in s["loadBalancer"] for s in yp["services"].values()):
+        F.add("retry / passive health checks without ha.enabled")
+    want_rule = f"Host(`{K.domain()}`) && (" + " || ".join(f"Path(`{p}`)" for p in NODE_PATHS) + ")"
+    for label, docs in (("ha: ", ha), ("", K.render({"nodeadm": vals["nodeadm"]}))):
+        irs = [d for d in K.by_kind(docs, "IngressRoute") if d["metadata"]["name"] == "portcullis-node"]
+        if len(irs) != 1:
+            F.add(f"{label}router portcullis-node: {len(irs)} rendered")
+            continue
+        r = irs[0]["spec"]["routes"][0]
+        if r["match"] != want_rule or [m["name"] for m in r.get("middlewares", [])] != ["rate-limit@file"] \
+                or r["services"] != [{"name": "portcullis-node", "kind": "Service", "port": 8080}] \
+                or irs[0]["spec"]["entryPoints"] != ["websecure", "vpnsecure"] or irs[0]["spec"]["tls"] != {"options": {"name": "authaware@file"}}:
+            F.add(f"{label}router portcullis-node: {irs[0]['spec']} (want {want_rule}, rate-limit@file, portcullis-node:8080)")
+        es = [s for s in K.by_kind(docs, "Service") if s["metadata"]["name"] == "portcullis-node"]
+        if len(es) != 1 or es[0]["metadata"]["namespace"] != K.EDGE_NS or es[0]["spec"].get("externalName") != "nodeadm.portcullis-nodeadm.svc.cluster.local":
+            F.add(f"{label}the edge Service portcullis-node must be ExternalName nodeadm.portcullis-nodeadm.svc.cluster.local")
+    if [d for d in K.by_kind(plain, "IngressRoute") if d["metadata"]["name"] == "portcullis-node"]:
+        F.add("router portcullis-node without nodeadm.enabled")
+
+
 def main():
     comp = K.compose()
     docs = K.render()
@@ -500,6 +582,7 @@ def main():
     check_routers(comp)
     check_traefik(comp, docs)
     check_published()
+    check_ha()
     for kind, items in D.items():
         for e in items:
             if (kind, e.get("service"), str(e.get("item"))) not in USED:

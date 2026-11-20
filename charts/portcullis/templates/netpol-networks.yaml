@@ -5,13 +5,14 @@ ingress of the port-bound pods (portcullis.io/ingress: bound: traefik,
 keycloak, grafana, wg), which admit exactly one peer set per port (below).
 The VPN networks are port-bound rules only (netpol-wg-edge.yaml).
 portcullis.io/egress (a member of a non-internal network): the internet, not
-the pod / service networks, link-local or the nodes — the nodes only on
+the pod / service networks, link-local, the node mesh or the nodes — the nodes only on
 80 / 443 (the hairpin to auth.<domain>). */ -}}
 {{- $ns := .Release.Namespace -}}
 {{- /* Fail closed: without the node and API addresses the internet rule
 would let every egress pod reach the nodes and the kube API. */ -}}
 {{- if not (required "nodeAddresses is required (PORTCULLIS_KUBE_NODE_ADDRESSES)" .Values.nodeAddresses) }}{{ fail "nodeAddresses is empty: refusing to render the egress policy without the node addresses" }}{{ end -}}
 {{- if not (required "apiEndpoints is required (PORTCULLIS_KUBE_API_ENDPOINTS)" .Values.apiEndpoints) }}{{ fail "apiEndpoints is empty: refusing to render the egress policy without the kube API addresses" }}{{ end -}}
+{{- $tnets := include "portcullis.traefikNets" . | fromJsonArray -}}
 {{- $nets := list "portcullis" "portcullis-proxy" "portcullis-auth" "monitoring" "alerting" "portcullis-domains" "portcullis-certs" "domains-egress" "portcullis-mcp" "portcullis-sessions" "wg-egress" -}}
 {{- range $n := $nets }}
 ---
@@ -35,6 +36,9 @@ spec:
         - podSelector:
             matchLabels:
               portcullis.io/net-{{ $n }}: "true"
+        {{- if and $.Values.ha.enabled (has $n $tnets) }}
+        {{- include "portcullis.traefikPeer" $ | nindent 8 }}
+        {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -53,6 +57,9 @@ spec:
         - podSelector:
             matchLabels:
               portcullis.io/net-{{ $n }}: "true"
+        {{- if and $.Values.ha.enabled (has $n $tnets) }}
+        {{- include "portcullis.traefikPeer" $ | nindent 8 }}
+        {{- end }}
 {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -75,6 +82,10 @@ spec:
               - {{ required "podCIDR is required" .Values.podCIDR }}
               - {{ required "serviceCIDR is required" .Values.serviceCIDR }}
               - 169.254.0.0/16
+              {{- /* The node mesh (pcmesh, §20.11): every node's nodeagent
+              :7443, kubelet and etcd listen there; only the Hub, nodeadm
+              and the front door reach it, by their own policies. */}}
+              - {{ .Values.ha.meshCIDR }}
               {{- range .Values.nodeAddresses }}
               - {{ . }}/32
               {{- end }}
@@ -122,6 +133,7 @@ spec:
         - protocol: TCP
           port: {{ index $p 1 }}
     {{- end }}
+{{- if not .Values.ha.enabled }}
 ---
 # Traefik → the apps' routed ports (the apps' own policies admit exactly
 # those, contract §5).
@@ -142,6 +154,7 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ .Values.appsNamespace }}
+{{- end }}
 ---
 # mcp-gate → the apps' MCP companions only (pods the Hub labels
 # portcullis.io/mcp-companion: "true"); their own policies admit mcp-gate
@@ -166,6 +179,7 @@ spec:
           podSelector:
             matchLabels:
               portcullis.io/mcp-companion: "true"
+{{- if not .Values.ha.enabled }}
 ---
 # Traefik: web / websecure from anywhere (and every pod of both namespaces);
 # kcinternal from the five internal Keycloak clients only; vpnsecure from
@@ -220,6 +234,7 @@ spec:
       ports:
         - protocol: TCP
           port: 8082
+{{- end }}
 ---
 # Keycloak: 8080 from Traefik only (its proxy headers are trusted from the
 # pod CIDR: this is what makes that safe); 9000 (metrics) from Prometheus.
@@ -237,9 +252,7 @@ spec:
   policyTypes: ["Ingress"]
   ingress:
     - from:
-        - podSelector:
-            matchLabels:
-              portcullis.io/component: traefik
+        {{- include "portcullis.traefikPeer" . | nindent 8 }}
       ports:
         - protocol: TCP
           port: 8080
@@ -250,6 +263,43 @@ spec:
       ports:
         - protocol: TCP
           port: 9000
+    {{- if .Values.ha.enabled }}
+    # HA (plan Amendment 2): the Infinispan cluster, Keycloak pods only.
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: keycloak
+      ports:
+        - protocol: TCP
+          port: 7800
+        - protocol: TCP
+          port: 57800
+    {{- end }}
+{{- if .Values.ha.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-cluster
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: keycloak
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: keycloak
+      ports:
+        - protocol: TCP
+          port: 7800
+        - protocol: TCP
+          port: 57800
+{{- end }}
 {{- if .Values.monitoring.enabled }}
 ---
 # Grafana trusts X-Forwarded-User from the pod CIDR (GF_AUTH_PROXY_WHITELIST):
@@ -268,9 +318,7 @@ spec:
   policyTypes: ["Ingress"]
   ingress:
     - from:
-        - podSelector:
-            matchLabels:
-              portcullis.io/component: traefik
+        {{- include "portcullis.traefikPeer" . | nindent 8 }}
       ports:
         - protocol: TCP
           port: 3000

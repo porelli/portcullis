@@ -66,10 +66,11 @@ startupProbe:
 {{- end }}
 
 {{/*
-portcullis.deployment (dict "root" . "s" <spec>) — the Deployment of one core
+portcullis.deployment (dict "root" . "s" <spec>) — the workload of one core
 service. Spec keys: name, uid, gid, groups ([gid]), readOnly (default true),
-caps ([cap] added after drop ALL), memory, health (probes dict), env (list of
-EnvVar), envFrom, args, command, ports ([{name, port, protocol}]), mounts
+caps ([cap] added after drop ALL), memory (the limit; the request is
+portcullis.memRequest's), health (probes dict), env (list of EnvVar),
+envFrom, args, command, ports ([{name, port, protocol, hostPort}]), mounts
 ([VolumeMount]), volumes ([Volume]), nets ([compose network]), egress
 (bool), token (bool: the ServiceAccount token, Traefik and the Hub only),
 serviceAccount, hostAliases, dnsSearches (dnsConfig.searches), hashes ([object names]), grace (seconds),
@@ -77,38 +78,72 @@ extraLabels (map), fsGroup, initContainers ([Container], as given), httpReady ({
 httpGet for an image without a compose healthcheck — distroless —, so helm
 --wait and status see a crash loop; readiness only, never liveness;
 k8s_parity's delta kind kube-probe).
-statefulSet ({replicas, claims: [{name, uid, gid, mode, size?}]}): a
-StatefulSet instead (HA's per-replica logs, contract §20.10): `replicas`
-pods, each with its own PVC per claim (portcullis-core, the K3 owner
+NEW (HA, Task 19; contract §20.1, spec §6 "Placement"):
+  - replicas (default 1): one replica is a Deployment with Recreate; more
+    is RollingUpdate (maxUnavailable 0, maxSurge 1: one stays up) and gets
+    a PodDisruptionBudget minAvailable 1 (portcullis.pdb) and the spread;
+  - spread (ScheduleAnyway | DoNotSchedule): topologySpreadConstraints on
+    kubernetes.io/hostname, maxSkew 1 (the stateless gates ScheduleAnyway,
+    quorum and data pieces DoNotSchedule); default ScheduleAnyway for a
+    replicated workload, none for one replica;
+  - priorityClass (default portcullis-core: ruling I5, every core pod);
+  - with ha.enabled, the not-ready / unreachable tolerations at 30 s on
+    every pod (contract §3.4: the cluster's default is 300 s);
+  - pin (bool): the primary-site pin hook, portcullis.sitePin (Task 20
+    renders it; empty until then);
+  - namespace (default the release's), daemonSet ({nodeSelector}): a
+    DaemonSet instead (Traefik on the ingress nodes in HA), RollingUpdate
+    maxUnavailable 1 (its hostPorts can't surge).
+statefulSet ({replicas, serviceName?, claims: [{name, uid, gid, mode, size?, storageClass?}]}): a
+StatefulSet instead (HA's per-replica logs, contract §20.10; Keycloak's and
+Alertmanager's stable pod names in HA): `replicas` pods, each with its own
+PVC per claim (portcullis-core unless the claim says, the K3 owner
 annotations, kept when scaled down or deleted), spread over the nodes, a
-claim mounted by its name like a volume.
+claim mounted by its name like a volume; serviceName (default the
+component's ClusterIP Service: no per-pod DNS) a headless Service for
+per-pod names.
 */}}
 {{- define "portcullis.deployment" -}}
 {{- $root := .root -}}{{- $s := .s -}}
 {{- $ro := true -}}{{- if hasKey $s "readOnly" -}}{{- $ro = $s.readOnly -}}{{- end }}
 {{- $sts := $s.statefulSet }}
+{{- $ds := $s.daemonSet }}
+{{- $n := int ($s.replicas | default 1) }}
+{{- if $sts }}{{ $n = int $sts.replicas }}{{ end }}
+{{- $spread := $s.spread | default "" }}
+{{- if and (not $spread) (or $sts (gt $n 1)) }}{{ $spread = "ScheduleAnyway" }}{{ end }}
+{{- $img := include "portcullis.image" (list $root ($s.image | default $s.name)) }}
+{{- $pin := "" }}{{- if $s.pin }}{{- $pin = include "portcullis.sitePin" (dict "root" $root "s" $s) | trim }}{{- end }}
 apiVersion: apps/v1
-kind: {{ ternary "StatefulSet" "Deployment" (not (empty $sts)) }}
+kind: {{ ternary "DaemonSet" (ternary "StatefulSet" "Deployment" (not (empty $sts))) (not (empty $ds)) }}
 metadata:
   name: {{ $s.name }}
-  namespace: {{ include "portcullis.ns" $root }}
+  namespace: {{ $s.namespace | default (include "portcullis.ns" $root) }}
   labels:
     app.kubernetes.io/managed-by: portcullis
     portcullis.io/component: {{ $s.name }}
 spec:
-  {{- if $sts }}
+  {{- if $ds }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  {{- else if $sts }}
   replicas: {{ $sts.replicas }}
   {{- /* The ClusterIP Service, not a headless one: no per-pod DNS names (the
-  Hub finds the replicas by listing pods, contract §20.10). */}}
-  serviceName: {{ $s.name }}
+  Hub finds the replicas by listing pods, contract §20.10), unless the spec
+  names its headless Service (Keycloak's servers, Alertmanager's peers). */}}
+  serviceName: {{ $sts.serviceName | default $s.name }}
   podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Retain
     whenScaled: Retain
+  {{- with $sts.claims }}
   volumeClaimTemplates:
-    {{- range $sts.claims }}
+    {{- range . }}
     - metadata:
         name: {{ .name }}
         labels:
@@ -119,16 +154,24 @@ spec:
           portcullis.io/gid: {{ .gid | quote }}
           portcullis.io/mode: {{ .mode | quote }}
       spec:
-        storageClassName: portcullis-core
+        storageClassName: {{ .storageClass | default "portcullis-core" }}
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
             storage: {{ .size | default "1Gi" }}
     {{- end }}
+  {{- end }}
   {{- else }}
-  replicas: 1
+  replicas: {{ $n }}
   strategy:
+    {{- if gt $n 1 }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- else }}
     type: Recreate
+    {{- end }}
   {{- end }}
   selector:
     matchLabels:
@@ -154,8 +197,9 @@ spec:
       {{- end }}
       automountServiceAccountToken: {{ $s.token | default false }}
       enableServiceLinks: false
-      {{- /* NEW (HA): every core pod (templates/priorityclasses.yaml). */}}
-      priorityClassName: portcullis-core
+      {{- /* NEW (HA): every core pod names its class (kube/priorityclasses.yaml;
+      ruling I5): portcullis-core, or portcullis-critical where the plan says. */}}
+      priorityClassName: {{ $s.priorityClass | default "portcullis-core" }}
       {{- with $s.grace }}
       terminationGracePeriodSeconds: {{ . }}
       {{- end }}
@@ -167,11 +211,32 @@ spec:
       dnsConfig:
         searches: {{ toJson . }}
       {{- end }}
-      {{- if $sts }}
+      {{- with $ds }}
+      nodeSelector:
+        {{- toYaml .nodeSelector | nindent 8 }}
+      {{- end }}
+      {{- with $pin }}
+      affinity:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- if $root.Values.ha.enabled }}
+      {{- /* HA (contract §3.4, §20.1): a pod on a lost node is evicted after
+      30 s, not the cluster's 300 s. */}}
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      {{- end }}
+      {{- if $spread }}
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: {{ $spread }}
           labelSelector:
             matchLabels:
               portcullis.io/component: {{ $s.name }}
@@ -195,8 +260,8 @@ spec:
       {{- end }}
       containers:
         - name: {{ $s.name }}
-          image: {{ include "portcullis.image" (list $root ($s.image | default $s.name)) }}
-          imagePullPolicy: {{ ternary "Never" "IfNotPresent" (hasPrefix "localhost/" (include "portcullis.image" (list $root ($s.image | default $s.name)))) }}
+          image: {{ $img }}
+          imagePullPolicy: {{ ternary "Never" "IfNotPresent" (hasPrefix "localhost/" $img) }}
           {{- with $s.command }}
           command: {{ toJson . }}
           {{- end }}
@@ -209,6 +274,9 @@ spec:
             - name: {{ .name }}
               containerPort: {{ .port }}
               protocol: {{ .protocol | default "TCP" }}
+              {{- with .hostPort }}
+              hostPort: {{ . }}
+              {{- end }}
             {{- end }}
           {{- end }}
           {{- with $s.env }}
@@ -223,7 +291,7 @@ spec:
             limits:
               memory: {{ $s.memory }}
             requests:
-              memory: {{ $s.memory }}
+              memory: {{ include "portcullis.memRequest" (list $root $s.name $s.memory) }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: {{ $ro }}
@@ -252,19 +320,55 @@ spec:
       volumes:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- if and (not $ds) (ge $n 2) }}
+---
+{{ include "portcullis.pdb" (list $root $s.name) }}
+{{- end }}
+{{- end }}
+
+{{/*
+portcullis.memRequest <root> <service> <limit> — the memory request (user
+ruling 2026-11-19, plan Amendment 2): the measured peak
+(values memoryPeakMi) × 1.25, rounded up to 16 Mi, never above the limit;
+a service with no measurement requests its limit. The limit stays
+compose's mem_limit.
+*/}}
+{{- define "portcullis.memRequest" -}}
+{{- $root := index . 0 -}}{{- $lim := index . 2 -}}
+{{- $peak := index ($root.Values.memoryPeakMi | default dict) (index . 1) -}}
+{{- if $peak -}}
+{{- $limMi := 0 -}}
+{{- if hasSuffix "Gi" $lim }}{{ $limMi = mul (int (trimSuffix "Gi" $lim)) 1024 }}{{ else if hasSuffix "Mi" $lim }}{{ $limMi = int (trimSuffix "Mi" $lim) }}{{ else }}{{ fail (printf "memory %q: Mi or Gi only" $lim) }}{{ end -}}
+{{- $req := mul (int (ceil (divf (mulf (float64 $peak) 1.25) 16.0))) 16 -}}
+{{- min $req $limMi }}Mi
+{{- else -}}
+{{- $lim -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+portcullis.sitePin (dict "root" . "s" <spec>) — the primary-site pin (plan
+Task 20: a required node affinity term portcullis.io/site In
+[<ha.primarySite>], merged with the class term). A hook only until Task 20:
+it renders nothing, so `pin: true` on a spec changes nothing yet.
+*/}}
+{{- define "portcullis.sitePin" -}}
 {{- end }}
 
 {{/*
 portcullis.pvc <root> <name> <uid> <gid> <mode> [size] — a core PVC
 (StorageClass portcullis-core, kept on uninstall, K3 owner annotations: the
-provisioner creates the directory with them; no seed container ever).
+provisioner creates the directory with them; no seed container ever). The
+name is portcullis.pvcName's: in HA a replicated one is <name>-r on
+portcullis-core-replicated (contract §20.1 "Core volumes").
 */}}
 {{- define "portcullis.pvc" -}}
 {{- $root := index . 0 -}}
+{{- $name := include "portcullis.pvcName" (list $root (index . 1)) -}}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ index . 1 }}
+  name: {{ $name }}
   namespace: {{ include "portcullis.ns" $root }}
   labels:
     app.kubernetes.io/managed-by: portcullis
@@ -274,11 +378,28 @@ metadata:
     portcullis.io/gid: {{ index . 3 | quote }}
     portcullis.io/mode: {{ index . 4 | quote }}
 spec:
-  storageClassName: portcullis-core
+  storageClassName: {{ ternary "portcullis-core-replicated" "portcullis-core" (ne $name (index . 1)) }}
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:
       storage: {{ if gt (len .) 5 }}{{ index . 5 }}{{ else }}1Gi{{ end }}
+{{- end }}
+
+{{/*
+portcullis.pvcName <root> <name> — a core PVC's name (contract §20.1 "Core
+volumes", preflight P35): hub-state, hub-secrets, hub-backups, domains-data
+and wg-data are on the replicated tier in HA, as <name>-r (a PVC's class
+is immutable: `ha enable` copies each X into X-r); every other PVC keeps
+its name (prometheus-data stays local: Prometheus' history is rebuildable).
+The CLI's kube_pvc_name follows the same list.
+*/}}
+{{- define "portcullis.pvcName" -}}
+{{- $n := index . 1 -}}
+{{- if and (index . 0).Values.ha.enabled (has $n (list "hub-state" "hub-secrets" "hub-backups" "domains-data" "wg-data")) -}}
+{{- $n }}-r
+{{- else -}}
+{{- $n -}}
+{{- end -}}
 {{- end }}
 
 {{/* portcullis.items <list of {key, path}> — ConfigMap items for a nested tree. */}}
@@ -416,4 +537,50 @@ the old hub plus the new temporary copy (plus one left by a killed copy)
 is ~231 MB, so 256Mi (128Mi got the pod evicted). */ -}}
 {{- $_ = set $s "volumes" (append $vols (dict "name" "portcullis-bin" "emptyDir" (dict "sizeLimit" "256Mi"))) -}}
 {{- $_ = set $s "mounts" (append $mounts (dict "name" "portcullis-bin" "mountPath" "/portcullis-bin" "readOnly" true)) -}}
+{{- end }}
+
+{{/*
+portcullis.keycloakReplicas — Keycloak's replicas in HA (spec §6): 3 when
+the primary site has 3 non-small nodes or more (ha.nonSmallNodesAtPrimary,
+preflight P33: Keycloak is pinned there), else 2.
+*/}}
+{{- define "portcullis.keycloakReplicas" -}}
+{{- ternary 3 2 (ge (int .Values.ha.nonSmallNodesAtPrimary) 3) -}}
+{{- end }}
+
+{{/*
+portcullis.traefikPeer — Traefik as a NetworkPolicy peer of a core-namespace
+policy, one list item: its pods in the core namespace, or in HA (plan
+Amendment 3, contract §20.1 "Network flows") the DaemonSet's pods in
+portcullis-ingress by namespace and app.kubernetes.io/name.
+*/}}
+{{- define "portcullis.traefikPeer" -}}
+{{- if .Values.ha.enabled -}}
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ .Values.ingressNamespace }}
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+{{- else -}}
+- podSelector:
+    matchLabels:
+      portcullis.io/component: traefik
+{{- end -}}
+{{- end }}
+
+{{/* portcullis.traefikNets — Traefik's compose networks with a Kubernetes form (traefik.yaml's nets, the VPN ones excepted). */}}
+{{- define "portcullis.traefikNets" -}}
+{{- toJson (list "portcullis" "portcullis-proxy" "portcullis-auth" "portcullis-certs") -}}
+{{- end }}
+
+{{/*
+portcullis.nodeRule — router portcullis-node's rule: the main domain's
+public nodeadm paths exactly (contract §20.2's GET / POST /node/… routes;
+nodeadm answers 404 for any other /node/<file> anyway).
+*/}}
+{{- define "portcullis.nodeRule" -}}
+{{- $paths := list "/node/join.sh" "/node/nodeagent-amd64" "/node/nodeagent-arm64" "/node/v1/nonce" "/node/v1/enrol" "/node/v1/join" "/node/v1/renew" "/node/v1/renew/confirm" -}}
+{{- $p := list -}}{{- range $paths }}{{- $p = append $p (printf "Path(`%s`)" .) -}}{{- end -}}
+Host(`{{ include "portcullis.domain" . }}`) && ({{ join " || " $p }})
 {{- end }}

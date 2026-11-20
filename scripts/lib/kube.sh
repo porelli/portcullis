@@ -43,6 +43,9 @@ kube_ns() { echo "${PORTCULLIS_NAMESPACE:-portcullis}"; }
 kube_apps_ns() { echo "${PORTCULLIS_APPS_NAMESPACE:-portcullis-apps}"; }
 
 _rt_is_kube() { [ "${CONTAINER_RUNTIME:-}" = kubernetes ]; }
+# kube_ha_on — the chart's HA mode (contract §20.1 "HA mode"): .env
+# PORTCULLIS_HA exactly on (written by `ha enable`; absent = off).
+kube_ha_on() { [ "${PORTCULLIS_HA:-}" = on ]; }
 
 # kube_ctl <kubectl args> — kubectl on PORTCULLIS_KUBE_CONTEXT, always
 # with --context (a wrong current context can't hit another cluster).
@@ -721,7 +724,10 @@ _kube_acme_clear() {
   _kube_helper_done "$pod"
   return "$rc"
 }
-_kube_traefik_exists() { kube_ctl -n "$(kube_ns)" get deploy traefik >/dev/null 2>&1; }
+_kube_traefik_exists() {
+  if kube_ha_on; then kube_ctl -n "$KUBE_INGRESS_NS" get daemonset traefik >/dev/null 2>&1; return; fi
+  kube_ctl -n "$(kube_ns)" get deploy traefik >/dev/null 2>&1
+}
 
 # kube_revocation_bump — cert revoke / sync: the certs-revocation ConfigMap
 # synced now, then group-gate's pod annotation portcullis.io/rev bumped so
@@ -926,7 +932,7 @@ kube_admission_params() {
     nodeAddresses "$nodes" \
     apiAddresses "$api" \
     kubeDNS "kube-system:k8s-app=kube-dns" \
-    traefik "$ns:portcullis.io/component=traefik" \
+    traefik "$(kube_traefik_peer)" \
     mcpGate "$ns:portcullis.io/component=mcp-gate" \
     wg "$ns:portcullis.io/component=wg" \
     fileMiddlewares "$KUBE_FILE_NAMES" \
@@ -1489,6 +1495,29 @@ _kube_put() {
   fi
 }
 
+# _kube_sync_ingress <scratch file> — HA (plan Amendment 3): the objects
+# Traefik's DaemonSet mounts, put into its namespace (a pod mounts only its
+# own namespace's): config-traefik-dynamic, certs and secrets-certs as
+# staged, and of secrets-domains-certs-endpoint only Traefik's client side
+# (ca.crt, client.crt, client.key; never the domains server's key). Never
+# portcullis-env: Traefik has no DNS credential in HA (no ACME resolver).
+# Put every run (a replace with equal data changes nothing in the pods).
+_kube_sync_ingress() {
+  local want="$1" item kind name dir ins="$KUBE_INGRESS_NS"
+  for item in "${_K_STAGED[@]}"; do
+    IFS='|' read -r kind name dir <<< "$item"
+    case "$name" in
+      config-traefik-dynamic|certs) kube_ctl create configmap "$name" -n "$ins" --from-file="$dir" --dry-run=client -o json ;;
+      secrets-certs) kube_ctl create secret generic "$name" -n "$ins" --from-file="$dir" --dry-run=client -o json ;;
+      secrets-domains-certs-endpoint)
+        kube_ctl create secret generic "$name" -n "$ins" --from-file=ca.crt="$dir/ca.crt" \
+          --from-file=client.crt="$dir/client.crt" --from-file=client.key="$dir/client.key" --dry-run=client -o json ;;
+      *) continue ;;
+    esac > "$want" || return 1
+    _kube_put "$want" || return 1
+  done
+}
+
 # kube_sync_secrets [--full] — stage everything and put each object whose
 # LIVE content (data + binaryData, read with kubectl get) differs from the
 # staged one, or that is missing: no local cache decides (a restore, a reset
@@ -1531,6 +1560,9 @@ kube_sync_secrets() {
     fi
     _kube_put "$want" || { rm -rf "$_K_STAGE"; fail "could not sync $kind $name"; }
   done
+  if kube_ha_on; then
+    _kube_sync_ingress "$want" || { rm -rf "$_K_STAGE"; fail "could not sync Traefik's ConfigMaps and Secrets into $KUBE_INGRESS_NS"; }
+  fi
   [ -n "${HUB_PROXY_SECRET:-}" ] || { rm -rf "$_K_STAGE"; fail "HUB_PROXY_SECRET is not set in .env"; }
   NS="$KUBE_EDGE_NS" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "Middleware",
       metadata: {name: "hub-proxy-secret", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/owner": "core"}},
@@ -1547,6 +1579,20 @@ kube_sync_secrets() {
 }
 
 # ── values (no secret ever) ──
+
+# kube_traefik_peer — the admission params' Traefik peer selector (contract
+# §6 "params"): its core-namespace pods, or in HA the DaemonSet's pods in
+# portcullis-ingress (plan Amendment 3; the chart's portcullis.traefikPeer).
+kube_traefik_peer() {
+  if kube_ha_on; then echo "$KUBE_INGRESS_NS:app.kubernetes.io/name=traefik"; else echo "$(kube_ns):portcullis.io/component=traefik"; fi
+}
+
+# kube_nonsmall_at_primary — the Ready-or-not nodes labelled
+# portcullis.io/site=main without class small (preflight P33: Keycloak's 3rd
+# replica needs one there); 0 when the nodes can't be read (2 replicas).
+kube_nonsmall_at_primary() {
+  kube_ctl get nodes -l 'portcullis.io/site=main,portcullis.io/class!=small' -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null || echo 0
+}
 
 # kube_render_values — secrets/kube/values.yaml from .env, the resolved
 # images, the synced objects' hashes and nested items (JSON, which Helm
@@ -1570,8 +1616,11 @@ kube_render_values() {
   local mon=false wg=false
   case ",${COMPOSE_PROFILES:-}," in *,monitoring,*) mon=true ;; esac
   case ",${COMPOSE_PROFILES:-}," in *,wg,*) wg=true ;; esac
+  local ha=false nsp=0
+  if kube_ha_on; then ha=true; nsp="$(kube_nonsmall_at_primary)"; fi
+  [[ "$nsp" =~ ^[0-9]+$ ]] || nsp=0
   jq -n --argjson images "$_K_IMAGES" --argjson hashes "${_K_HASHES:-{\}}" --argjson items "${_K_ITEMS:-{\}}" \
-    --argjson mon "$mon" --argjson wg "$wg" \
+    --argjson mon "$mon" --argjson wg "$wg" --argjson ha "$ha" --argjson nsp "$nsp" \
     --arg domain "$PORTCULLIS_DOMAIN" --arg pod "$PORTCULLIS_POD_CIDR" --arg svc "$PORTCULLIS_SERVICE_CIDR" \
     --arg api "$PORTCULLIS_KUBE_API_ENDPOINTS" --arg nodes "${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}" \
     --arg tip "$PORTCULLIS_TRAEFIK_SERVICE_IP" --arg tvip "$PORTCULLIS_TRAEFIK_VPN_SERVICE_IP" --arg weip "$PORTCULLIS_WG_EDGE_SERVICE_IP" \
@@ -1606,7 +1655,8 @@ kube_render_values() {
      keycloak: {admin: $kca}, lldap: {baseDN: $bdn},
      hub: {bindRoots: $roots, invitesProtectedGroups: $ipg, portalDisplayName: $pdn, clientCertTTL: $ttl,
            certExpiryWarnDays: $warn, impersonationMaxMinutes: $imp, selfImage: $images.hub, appsNamespace: $apps},
-     alerting: {smtpFrom: $smtp}, appsNamespace: $apps}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
+     alerting: {smtpFrom: $smtp}, appsNamespace: $apps,
+     ha: {enabled: $ha, nonSmallNodesAtPrimary: $nsp}}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
     || fail "could not write $f"
   kube_nodeadm_values "$f"
 }
@@ -1805,9 +1855,18 @@ _kube_forward() {
 
 # ── backup / restore on kubernetes (Task 15; spec §9) ─────
 
-# The PVC of a compose volume key (lldap_data → lldap-data) and its owner
-# on Kubernetes (BACKUP_FILE_VOLUMES' owners; traefik_acme: Traefik's 65532).
-kube_pvc_name() { echo "${1//_/-}"; }
+# The PVC of a compose volume key (lldap_data → lldap-data; hub_data is the
+# Hub's hub-state, contract §20.1 "Core volumes") and its owner on
+# Kubernetes (BACKUP_FILE_VOLUMES' owners; traefik_acme: Traefik's 65532).
+# In HA the replicated ones are <name>-r (the chart's portcullis.pvcName).
+kube_pvc_name() {
+  local n="${1//_/-}"
+  [ "$n" != hub-data ] || n="hub-state"
+  case "$n" in
+    hub-state|hub-secrets|hub-backups|domains-data|wg-data) ! kube_ha_on || n="$n-r" ;;
+  esac
+  echo "$n"
+}
 kube_volume_owner() {
   case "$1" in
     traefik_acme) echo "65532:65532" ;;

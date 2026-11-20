@@ -3,12 +3,13 @@ volume (map.conf, revocation/, ca/: compose's four binds, no nested
 mounts); its revocation list updates in place. Its VPN mode comes from its own env
 (vpn.mode / vpn.publicEnrol): break-glass `vpn mode apps` with the Hub at 0.
 /hub-data and /vpn-doc are its published documents (projected, read-only:
-portcullis.published, contract §4), never the Hub's PVC.
+portcullis.published, contract §4), never the Hub's PVC: so no
+supplemental group (the projected files are 0444; hub and vpn-doc's groups
+were for the shared volumes, review M6).
 HA (contract §20.10): a StatefulSet, one opened log per replica, served to
 the Hub on :8091 and pruned by the gate itself (portcullis.haGate). */ -}}
 {{- $s := dict
-  "name" "group-gate" "uid" .Values.uids.groupGate "gid" .Values.uids.groupGate
-  "groups" (list .Values.uids.hub .Values.uids.vpnDoc)
+  "name" "group-gate" "uid" .Values.uids.groupGate "gid" .Values.uids.groupGate "pin" true
   "memory" "128Mi" "nets" (list "portcullis") "egress" true
   "hashes" (list "config-group-gate" "certs" "certs-revocation")
   "health" (dict "test" (list "sh" "-c" "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)\"") "interval" 10 "timeout" 5 "retries" 3)
@@ -51,11 +52,7 @@ the Hub on :8091 and pruned by the gate itself (portcullis.haGate). */ -}}
 {{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
-{{- if .Values.ha.enabled }}
-{{- if ge (int .Values.ha.gateReplicas) 2 }}
-{{ include "portcullis.pdb" (list . "group-gate") }}
-{{- end }}
-{{- else }}
+{{- if not .Values.ha.enabled }}
 {{ include "portcullis.pvc" (list . "group-gate-data" .Values.uids.groupGate .Values.uids.hub "0750") }}
 {{- end }}
 ---

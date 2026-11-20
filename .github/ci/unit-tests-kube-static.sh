@@ -44,6 +44,7 @@ export HELM
 
 echo "::group::helm lint"
 "$HELM" lint charts/portcullis -f tests/k8s-ci-values.yaml -f <("$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))')
+"$HELM" lint charts/portcullis -f tests/k8s-ci-values.yaml -f tests/k8s-ci-values-ha.yaml -f <("$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))')
 echo "::endgroup::"
 
 # The Traefik CRDs as JSON schemas (strict: unknown fields refused).
@@ -78,14 +79,16 @@ for f in files:
 print(f"{n} CRD schemas")
 PY
 
-echo "::group::helm template → kubeconform (every profile on, every profile off, VPN modes, HA, nodeadm)"
+echo "::group::helm template → kubeconform (every profile on, every profile off, VPN modes, HA, nodeadm, the HA CI values)"
 IMGV="$TOOLS/images-values.yaml"
 "$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))' > "$IMGV"
 for combo in "--set renderNamespaces=true" \
              "--set renderNamespaces=true --set wg.enabled=false --set monitoring.enabled=false" \
              "--set entrypoints.web.admin=parked --set entrypoints.ep.admin=vpnsecure" \
              "--set renderNamespaces=true --set ha.enabled=true" \
-             "--set renderNamespaces=true --set ha.enabled=true --set nodeadm.enabled=true --set nodeadm.image=ghcr.io/porelli/portcullis-nodeadm@sha256:4444444444444444444444444444444444444444444444444444444444444444"; do
+             "--set renderNamespaces=true --set ha.enabled=true --set nodeadm.enabled=true --set nodeadm.image=ghcr.io/porelli/portcullis-nodeadm@sha256:4444444444444444444444444444444444444444444444444444444444444444" \
+             "--set renderNamespaces=true -f tests/k8s-ci-values-ha.yaml" \
+             "-f tests/k8s-ci-values-ha.yaml --set ha.nonSmallNodesAtPrimary=3 --set ha.gateReplicas=3 --set wg.enabled=false --set monitoring.enabled=false"; do
   # shellcheck disable=SC2086  # the combo's flags
   "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" $combo > "$TOOLS/rendered.yaml"
   "$KUBECONFORM" -strict -summary -kubernetes-version "$K8S_VERSION" \
@@ -127,9 +130,9 @@ done
   | "$PY" -c 'import sys, yaml
 p = [d for d in yaml.safe_load_all(sys.stdin) if d and d["metadata"]["name"] == "egress-internet"][0]
 ex = p["spec"]["egress"][0]["to"][0]["ipBlock"]["except"]
-want = {"10.42.0.0/24", "10.43.0.0/16", "169.254.0.0/16", "10.1.0.4/32", "198.51.100.1/32", "10.9.8.7/32"}
+want = {"10.42.0.0/24", "10.43.0.0/16", "169.254.0.0/16", "10.215.0.0/24", "10.1.0.4/32", "198.51.100.1/32", "10.9.8.7/32"}
 sys.exit(0 if set(ex) == want else "FAIL: egress-internet except %s != %s" % (sorted(ex), sorted(want)))'
-echo "PASS: the egress policy refuses an empty nodeAddresses / apiEndpoints and excludes every API endpoint"
+echo "PASS: the egress policy refuses an empty nodeAddresses / apiEndpoints and excludes every API endpoint and the node mesh"
 
 "$PY" tests/k8s_parity.py
 "$PY" tests/k8s_netpol_matrix.py

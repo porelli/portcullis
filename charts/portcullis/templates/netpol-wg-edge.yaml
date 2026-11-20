@@ -75,9 +75,7 @@ spec:
   policyTypes: ["Egress"]
   egress:
     - to:
-        - podSelector:
-            matchLabels:
-              portcullis.io/component: traefik
+        {{- include "portcullis.traefikPeer" . | nindent 8 }}
       ports:
         - protocol: TCP
           port: 8444

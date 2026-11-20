@@ -124,11 +124,19 @@ hub:
 alerting:
   smtpFrom: ""
 
-# High availability (PORTCULLIS_HA=on, contract §20; Task 19 adds the rest
-# of the HA mode). The front door (templates/frontdoor.yaml) renders only
-# with it.
+# High availability (PORTCULLIS_HA=on → ha.enabled, written by
+# kube_render_values; contract §20). The front door (templates/frontdoor.yaml)
+# renders only with it. In HA: the gates and Keycloak are replicated with a
+# PodDisruptionBudget and spread over the nodes, Alertmanager is 2 meshed
+# replicas, every core pod tolerates a lost node for 30 s, the replicated
+# volumes are <name>-r on portcullis-core-replicated, and Traefik is a
+# DaemonSet on the ingress nodes in its own namespace (ingressNamespace).
 ha:
   enabled: false
+  # The non-small nodes at the primary site (kube_render_values counts
+  # them from the nodes' labels; preflight P33: every pinned set is bounded
+  # by main): Keycloak runs 3 replicas from 3 of them, else 2.
+  nonSmallNodesAtPrimary: 0
   # The node mesh pcmesh (§20.11): the nodeagents answer on :7443 there.
   meshCIDR: 10.215.0.0/24
   nodeadmNamespace: portcullis-nodeadm
@@ -136,14 +144,39 @@ ha:
   # replicas on a cooperative removal.
   longhornNamespace: longhorn-system
   # group-gate and mcp-gate in HA (contract §20.10): StatefulSets of this
-  # many replicas (at least 1; a PDB from 2), each with its own log, served
-  # to the Hub on :8091 / :8092 (wg's status on :8093). 1 while the gates
-  # still mount the single-node hub-data / vpn-doc (Task 19 makes it 2):
-  # their replicas would all be pinned to that node (k8s_hardening).
-  gateReplicas: 1
+  # many replicas (1-16; a PDB from 2), each with its own log, served to
+  # the Hub on :8091 / :8092 (wg's status on :8093); the Hub reads
+  # HUB_GATE_REPLICAS = this. forward-auth and forward-auth-ext run as many
+  # (no state of their own: the sessions are in Valkey).
+  gateReplicas: 2
   # group-gate prunes its own opened log to this many days in HA
   # (GATE_OPENED_PRUNE_DAYS; the Hub's default history_days, contract §8.2).
   openedPruneDays: 365
+
+# The measured memory peaks, MiB (user ruling 2026-11-19, plan Amendment 2):
+# the higher of the test server's `docker stats` (spike-cluster.md, "H7")
+# and the k3d cluster's `kubectl top` working set under load
+# (spike-components.md, "Memory"). portcullis.memRequest makes the
+# request peak × 1.25 rounded up to 16 Mi (never above the limit, which
+# stays compose's mem_limit); a service with no measurement (the
+# monitoring profile, the front door, nodeadm) requests its limit. Requests
+# are what the scheduler and N−1 count: a node can then hold more than its
+# limits add up to (the OOM risk the docs state).
+memoryPeakMi:
+  keycloak: 773
+  hub: 96.9
+  vault: 92
+  traefik: 74
+  postgres: 303
+  group-gate: 47.3
+  forward-auth: 18
+  wg: 18.1
+  enroll: 16.1
+  mcp-gate: 10.7
+  forward-auth-ext: 9.5
+  sessions: 12
+  lldap: 9.1
+  domains: 8.8
 
 # nodeadm (contract §20.2): node enrolment and the cluster API. The CLI
 # enables it on a cluster init installed (it reads the k3s server token

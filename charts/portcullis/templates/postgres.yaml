@@ -1,6 +1,6 @@
 {{- /* postgres (compose: postgres). */ -}}
 {{- $s := dict
-  "name" "postgres" "uid" .Values.uids.postgres "gid" .Values.uids.postgres
+  "name" "postgres" "uid" .Values.uids.postgres "gid" .Values.uids.postgres "pin" true
   "memory" "1Gi" "nets" (list "portcullis") "egress" true
   "hashes" (list "portcullis-env")
   "health" (dict "test" (list "sh" "-c" "pg_isready -U keycloak") "interval" 5 "timeout" 5 "retries" 10 "startPeriod" 300)

@@ -1,6 +1,6 @@
 {{- /* lldap (compose: lldap). */ -}}
 {{- $s := dict
-  "name" "lldap" "uid" .Values.uids.lldap "gid" .Values.uids.lldap
+  "name" "lldap" "uid" .Values.uids.lldap "gid" .Values.uids.lldap "pin" true
   "memory" "256Mi" "nets" (list "portcullis") "egress" true
   "hashes" (list "portcullis-env")
   "health" (dict "test" (list "/app/lldap" "healthcheck" "--config-file" "/data/lldap_config.toml") "interval" 5 "timeout" 3 "retries" 5)

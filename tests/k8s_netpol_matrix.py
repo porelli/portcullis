@@ -99,7 +99,8 @@ def allowed(policies, src, dst, port, proto="TCP", ingress_only=False):
         sel = [p for p in policies if p["metadata"]["namespace"] == pod.ns and direction in p["spec"].get("policyTypes", [])
                and sel_match(p["spec"]["podSelector"], pod.labels)]
         if not sel:
-            return pod.ns not in (K.NS, K.APPS_NS)  # both namespaces are default-deny
+            # The core, apps, ingress (HA) and nodeadm namespaces are default-deny.
+            return pod.ns not in (K.NS, K.APPS_NS, K.INGRESS_NS, "portcullis-nodeadm")
         for p in sel:
             for rule in p["spec"].get(field) or []:
                 peers = rule.get(peers_key)
@@ -118,7 +119,7 @@ MESH_AGENT = "10.215.0.2"
 
 
 def check_ha():
-    docs = K.render({"ha": {"enabled": True}})
+    docs = K.render(K.yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text()))
     pols = K.by_kind(docs, "NetworkPolicy")
     pods = {}
     for name, ns, labels, spec, _ in K.pod_specs(docs):
@@ -144,7 +145,8 @@ def check_ha():
         if name == "frontdoor":
             continue
         for port, proto in peer.ports:
-            rows.append((fd, peer, port, False))
+            if not (name == "nodeadm" and port == 8443):  # its own flow, above
+                rows.append((fd, peer, port, False))
         for port in (8090, 9106):
             if not (name == "prometheus" and port == 9106):
                 rows.append((peer, fd, port, False))
@@ -230,7 +232,53 @@ def check_nodeadm():
                 F.add(f"nodeadm (ha {ha}): {src} → {dst}:{port}: {'allowed' if got else 'denied'}, want {'allowed' if want else 'denied'}")
 
 
+def check_ha_flows():
+    """Task 19's HA flows (plan Amendments 2, 3; preflight P39), on the CI HA
+    values: Keycloak ↔ Keycloak on 7800 / 57800 (Infinispan) and nothing
+    else reaches those ports (every other core pod, an app pod, Traefik, the
+    internet); Alertmanager ↔ Alertmanager on 9094, no app pod; the Hub
+    alone of the core pods (the front door and nodeadm aside, their own
+    flows) reaches the nodeagents' :7443 on the mesh, and no other mesh
+    port; Traefik in portcullis-ingress reaches nodeadm :8080 and no
+    internet, the world reaches its 8000 / 8443 and not its ping 8080; a pod
+    of portcullis-ingress without Traefik's name label reaches no core
+    pod."""
+    vals = K.yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    docs = K.render(vals)
+    pols = K.by_kind(docs, "NetworkPolicy")
+    pods = {}
+    for name, ns, labels, spec, _ in K.pod_specs(docs):
+        ports = [(p["containerPort"], p.get("protocol", "TCP")) for c in spec["containers"] for p in c.get("ports", [])]
+        pods[name] = Peer(name, ns, labels, ports)
+    kc, am, tr = pods["keycloak"], pods["alertmanager"], pods["traefik"]
+    kc2, am2 = Peer("keycloak-1", kc.ns, kc.labels), Peer("alertmanager-1", am.ns, am.labels)
+    app = Peer("app", K.APPS_NS, {"portcullis.io/instance": "echo", "portcullis.io/service": "web"})
+    ext, agent = Peer("external", None, {}, ip=EXTERNAL), Peer("nodeagent", None, {}, ip=MESH_AGENT)
+    stray = Peer("stray-ingress", K.INGRESS_NS, {"portcullis.io/component": "traefik"})
+    nodeadm = Peer("nodeadm", "portcullis-nodeadm", {"portcullis.io/component": "nodeadm"})
+    rows = [(kc, kc2, 7800, "TCP", True), (kc, kc2, 57800, "TCP", True), (kc2, kc, 7800, "TCP", True),
+            (am, am2, 9094, "TCP", True), (am, am2, 9094, "UDP", True),
+            (app, kc, 7800, "TCP", False), (app, kc, 57800, "TCP", False), (app, am, 9094, "TCP", False),
+            (ext, kc, 7800, "TCP", False), (tr, kc, 7800, "TCP", False),
+            (pods["hub"], agent, 7443, "TCP", True), (pods["hub"], agent, 7444, "TCP", False), (pods["hub"], agent, 10250, "TCP", False),
+            (tr, nodeadm, 8080, "TCP", True), (tr, ext, 443, "TCP", False), (tr, ext, 80, "TCP", False),
+            (ext, tr, 8000, "TCP", True), (ext, tr, 8443, "TCP", True), (ext, tr, 8080, "TCP", False), (app, tr, 8080, "TCP", False)]
+    for name, peer in sorted(pods.items()):
+        if name not in ("keycloak",):
+            rows += [(peer, kc, 7800, "TCP", False), (peer, kc, 57800, "TCP", False)]
+        if name not in ("hub", "frontdoor", "nodeadm"):
+            rows.append((peer, agent, 7443, "TCP", False))
+        for port, proto in peer.ports:
+            if peer.ns == K.NS:
+                rows.append((stray, peer, port, proto, False))
+    for src, dst, port, proto, want in rows:
+        got = allowed(pols, src, dst, port, proto, ingress_only=src.ns == K.APPS_NS)
+        if got != want:
+            F.add(f"ha flows: {src} → {dst}:{port}/{proto}: {'allowed' if got else 'denied'}, want {'allowed' if want else 'denied'}")
+
+
 def main():
+    check_ha_flows()
     check_nodeadm()
     check_ha()
     check_log_ports()

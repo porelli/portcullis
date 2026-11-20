@@ -1,0 +1,150 @@
+{{- /* HA only (plan Amendment 3, contract §20.1 "Network flows"): Traefik's
+own namespace portcullis-ingress, default-deny both ways plus Traefik's
+flows, the same as its core-namespace policies without HA
+(netpol-networks.yaml): web / websecure (its hostPorts 80 / 443) from
+anywhere and from every pod of the core and apps namespaces; kcinternal
+from the five internal Keycloak clients; vpnsecure from wg; metrics from
+Prometheus; nothing on its ping port. It reaches the core members of its
+compose networks (their side: the traefikPeer of each core policy), the
+apps namespace (the apps' own policies admit their routed ports), nodeadm's
+public :8080 (the /node/ paths), the kube API and kube-dns; no internet
+(no ACME resolver in HA). */ -}}
+{{- if .Values.ha.enabled }}
+{{- $ns := .Release.Namespace }}
+{{- $ins := .Values.ingressNamespace }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ $ins }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kube-dns
+  namespace: {{ $ins }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traefik
+  namespace: {{ $ins }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.appsNamespace }}
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 8443
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchExpressions:
+              - key: portcullis.io/component
+                operator: In
+                values: ["hub", "enroll", "forward-auth", "forward-auth-ext", "mcp-gate"]
+      ports:
+        - protocol: TCP
+          port: 8081
+    {{- if .Values.wg.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: wg
+      ports:
+        - protocol: TCP
+          port: 8444
+    {{- end }}
+    {{- if .Values.monitoring.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: prometheus
+      ports:
+        - protocol: TCP
+          port: 8082
+    {{- end }}
+  egress:
+    {{- range $n := include "portcullis.traefikNets" . | fromJsonArray }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              portcullis.io/net-{{ $n }}: "true"
+    {{- end }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.appsNamespace }}
+    {{- if .Values.nodeadm.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.ha.nodeadmNamespace }}
+          podSelector:
+            matchLabels:
+              portcullis.io/component: nodeadm
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+    {{- range (required "apiEndpoints is required" .Values.apiEndpoints) }}
+    {{- $p := splitList ":" . }}
+    - to:
+        - ipBlock:
+            cidr: {{ index $p 0 }}/32
+      ports:
+        - protocol: TCP
+          port: {{ index $p 1 }}
+    {{- end }}
+{{- end }}

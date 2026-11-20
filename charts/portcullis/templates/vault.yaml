@@ -1,6 +1,6 @@
 {{- /* vault (compose: vault): raft in the PVC, auto-unseal from secrets/vault-unseal. */ -}}
 {{- $s := dict
-  "name" "vault" "uid" .Values.uids.vault "gid" .Values.uids.vaultGroup
+  "name" "vault" "uid" .Values.uids.vault "gid" .Values.uids.vaultGroup "pin" true
   "memory" "512Mi" "nets" (list "portcullis") "egress" true
   "hashes" (list "config-vault" "secrets-vault-unseal")
   "command" (list "/bin/sh" "/vault/portcullis/entrypoint.sh")

@@ -5216,6 +5216,21 @@ OUT="$(kt "$K15_ENV; _K_IMAGES='{\"hub\":\"ghcr.io/porelli/portcullis-hub@sha256
 expect_eq "kube_render_values: .env → values (the networks, the ClusterIPs, the six classes, the pools, the Hub's digest)" "$(printf '%s\n' "$OUT" | head -n1)" \
   "[\"k.example.org\",\"10.42.0.0/24\",\"[\\\"10.1.0.4:6443\\\"]\",\"[\\\"10.1.0.4\\\",\\\"198.51.100.1\\\"]\",\"10.43.0.20\",\"websecure\",\"10.42.0.0/24 10.43.0.0/16\",\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"]"
 expect_eq "kube_render_values: no secret in values.yaml (0600)" "$(grep -cE 'PG-SECRET|HUB-PROXY|KC-SECRET' "$K15/secrets/kube/values.yaml" || true):$(file_mode "$K15/secrets/kube/values.yaml")" "0:600"
+# HA (Task 19): ha.enabled from PORTCULLIS_HA=on, the non-small nodes at main.
+OUT="$(kt "$K15_ENV; _K_IMAGES='{}'; kube_render_values; jq -c .ha \"$K15/secrets/kube/values.yaml\"")"
+expect_eq "kube_render_values: ha off without PORTCULLIS_HA=on" "$(printf '%s\n' "$OUT" | head -n1)" '{"enabled":false,"nonSmallNodesAtPrimary":0}'
+OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on; kube_nonsmall_at_primary() { echo 3; }; _K_IMAGES='{}'; kube_render_values; jq -c .ha \"$K15/secrets/kube/values.yaml\"")"
+expect_eq "kube_render_values: PORTCULLIS_HA=on → ha.enabled, the non-small nodes at main (Keycloak ×3)" "$(printf '%s\n' "$OUT" | head -n1)" '{"enabled":true,"nonSmallNodesAtPrimary":3}'
+OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on; kube_nonsmall_at_primary() { echo oops; }; _K_IMAGES='{}'; kube_render_values; jq -c .ha.nonSmallNodesAtPrimary \"$K15/secrets/kube/values.yaml\"")"
+expect_eq "kube_render_values: an unreadable node count → 0 (Keycloak ×2)" "$(printf '%s\n' "$OUT" | head -n1)" "0"
+OUT="$(kt "for v in hub_data hub_secrets lldap_data domains_data wg_data traefik_acme; do kube_pvc_name \$v; done | tr '\n' ' '; export PORTCULLIS_HA=on; for v in hub_data hub_secrets lldap_data domains_data wg_data prometheus_data; do kube_pvc_name \$v; done | tr '\n' ' '; echo")"
+expect_eq "kube_pvc_name: hub_data is hub-state; in HA the replicated ones are <name>-r (the chart's portcullis.pvcName)" "$(printf '%s\n' "$OUT" | head -n1)" \
+  "hub-state hub-secrets lldap-data domains-data wg-data traefik-acme hub-state-r hub-secrets-r lldap-data domains-data-r wg-data-r prometheus-data "
+OUT="$(kt "kube_traefik_peer; PORTCULLIS_HA=on kube_traefik_peer")"
+expect_eq "kube_traefik_peer: the admission params' Traefik peer, its DaemonSet's pods in portcullis-ingress in HA" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" \
+  "portcullis:portcullis.io/component=traefik portcullis-ingress:app.kubernetes.io/name=traefik "
+expect_eq "_kube_sync_ingress: Traefik's objects into portcullis-ingress, the endpoint Secret's client side only, never portcullis-env" \
+  "$(declare -f _kube_sync_ingress | grep -c 'portcullis-env\|server.key'):$(declare -f _kube_sync_ingress | grep -c 'client.key=')" "0:1"
 OUT="$(kt "$K15_ENV; unset PORTCULLIS_WG_EDGE_SERVICE_IP; _K_IMAGES='{}'; kube_render_values")"
 case "$OUT" in *"PORTCULLIS_WG_EDGE_SERVICE_IP is not set in .env (required by the chart)"*"rc=1") t_pass "kube_render_values: a required key missing → refused naming it" ;; *) t_fail "values missing key: $OUT" ;; esac
 # rt_up: K1 local builds first; helm failure → health report, applied.json unchanged

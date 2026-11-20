@@ -3,7 +3,7 @@
 portcullis.io/component, its net labels, automountServiceAccountToken false
 (but traefik and hub), drop ALL, no privilege escalation, a read-only root
 (but keycloak, as on Docker), RuntimeDefault seccomp, runAsNonRoot,
-memory limit = request, portcullis.io/config-hash; and no workload in the
+the memory request portcullis.memRequest's (≤ the limit), portcullis.io/config-hash; and no workload in the
 core namespace that PSA `restricted` would refuse. Also: no randAlphaNum /
 randAscii / genPrivateKey anywhere in the chart, every image by digest.
 Secret access (least privilege): every ServiceAccount's get / list / watch
@@ -12,10 +12,15 @@ exactly SECRET_READERS (Traefik only the edge namespace, which renders no
 Secret; the Hub only the apps namespace; nobody the core one, which holds
 portcullis-env, the age / wg / vault Secrets); Traefik watches only the edge
 namespace, and every core IngressRoute / Middleware lives there.
-HA (contract §20.10): the baseline on every HA pod; group-gate and mcp-gate
-StatefulSets with a data PVC per replica, spread, a PDB from 2 replicas and
-never more than 1 while they mount hub-data / vpn-doc; the log ports and
-the gate's own pruning only in HA, no shared gate / wg data mount.
+HA (contract §20.10, plan Task 19): the baseline on every HA pod; the HA
+shape (tests/k8s-ci-values-ha.yaml): the gates ×ha.gateReplicas (group-gate
+and mcp-gate StatefulSets with a data PVC per replica), Keycloak ×2/3 and
+Alertmanager ×2 StatefulSets, a PDB from 2 replicas, spread, no replicated
+pod (nor the Hub) on a node-local PVC, the 30 s tolerations, the replicated
+volumes <name>-r, Traefik a DaemonSet in portcullis-ingress with hostPort
+80 / 443 only there; the log ports and the gate's own pruning only in HA, no
+shared gate / wg data mount. Memory: request = the measured peak × 1.25
+(values memoryPeakMi), at most the limit.
 
   python3 tests/k8s_hardening.py
 """
@@ -34,6 +39,11 @@ WRITABLE_ROOT_OK = {"keycloak"}  # compose: not read_only (`start` re-augments)
 # ServiceAccount (namespace/name) → the namespaces whose Secrets it may read.
 SECRET_READERS = {
     f"{K.NS}/traefik": {K.EDGE_NS},
+    f"{K.NS}/portcullis-hub": {K.APPS_NS},
+}
+# HA (plan Amendment 3): Traefik's ServiceAccount lives in its own namespace.
+SECRET_READERS_HA = {
+    f"{K.INGRESS_NS}/traefik": {K.EDGE_NS},
     f"{K.NS}/portcullis-hub": {K.APPS_NS},
 }
 # By-name Secret grants that don't make a ServiceAccount a reader of the
@@ -101,10 +111,17 @@ def check_pod(name, ns, labels, spec, ann):
             F.add(f"{cn}: runs as root")
         res = c.get("resources", {})
         lim, req = res.get("limits", {}).get("memory"), res.get("requests", {}).get("memory")
-        if not lim or lim != req:
-            F.add(f"{cn}: memory limit {lim} != request {req}")
+        # A service's own container: the request is portcullis.memRequest's
+        # (the measured peak × 1.25, never above the limit); init containers
+        # request their limit.
+        want = K.mem_request(name, lim) if lim and c in spec.get("containers", []) else (K.mem_bytes(lim) if lim else None)
+        if not lim or not req or K.mem_bytes(req) != want or K.mem_bytes(req) > K.mem_bytes(lim):
+            F.add(f"{cn}: memory request {req} (limit {lim}; want {want} bytes: the measured peak × 1.25, at most the limit)")
         for p in c.get("ports", []):
-            if p.get("hostPort"):
+            # Only Traefik's DaemonSet in portcullis-ingress (HA, plan
+            # Amendment 3): 80 → 8000 and 443 → 8443.
+            ok = (name, ns, p.get("hostPort"), p.get("containerPort")) in {("traefik", K.INGRESS_NS, 80, 8000), ("traefik", K.INGRESS_NS, 443, 8443)}
+            if p.get("hostPort") and not ok:
                 F.add(f"{cn}: hostPort {p['hostPort']}")
         if not re.search(r"@sha256:[0-9a-f]{64}$", c["image"]):
             F.add(f"{cn}: image {c['image']} not by digest")
@@ -148,10 +165,11 @@ def check_frontdoor():
             F.add(f"{name}: mounts the front door's Secrets")
         if name == "frontdoor" and secrets != {"frontdoor-env", "frontdoor-control-tls"}:
             F.add(f"frontdoor: mounts {sorted(secrets)}")
-    check_secret_access(docs + storage_docs())
+    check_secret_access(docs + storage_docs(), ha=True)
 
 
-PUB_PVCS = {"hub-data", "vpn-doc"}  # the Hub's own: no reader mounts them (contract §4)
+# The Hub's own: no reader mounts them (contract §4, §20.1 "Core volumes").
+PUB_PVCS = {"hub-state", "hub-state-r", "vpn-doc"}
 
 
 def check_hub_core():
@@ -162,8 +180,8 @@ def check_hub_core():
     the Hub's Lease portcullis-hub is rendered once with no spec; the Hub
     has POD_NAME from metadata.name; HUB_GATE_REPLICAS = ha.gateReplicas
     in HA only (with the log ports); and no pod but the Hub (and its
-    one-shot) mounts hub-data or vpn-doc ("ha: no pod but hub mounts
-    hub-state": hub-data until Task 19 renames it)."""
+    one-shot) mounts hub-state(-r) or vpn-doc ("ha: no pod but hub mounts
+    hub-state")."""
     want = yaml.safe_load((K.CHART / "files" / "hub-role-core.yaml").read_text())
     for label, extra in (("", None), ("ha: ", {"ha": {"enabled": True}}), ("ha: ", {"ha": {"enabled": True, "gateReplicas": 2}})):
         docs = K.render(extra)
@@ -187,7 +205,7 @@ def check_hub_core():
         if env.get("POD_NAME", {}).get("valueFrom") != {"fieldRef": {"fieldPath": "metadata.name"}}:
             F.add(f"{label}the Hub needs POD_NAME from the downward API (metadata.name): its Lease identity")
         ha = bool(extra)
-        gr = str((extra or {}).get("ha", {}).get("gateReplicas", 1))
+        gr = str((extra or {}).get("ha", {}).get("gateReplicas", K.values()["ha"]["gateReplicas"]))
         if ha and env.get("HUB_GATE_REPLICAS", {}).get("value") != gr:
             F.add(f"{label}the Hub's HUB_GATE_REPLICAS {env.get('HUB_GATE_REPLICAS')} != ha.gateReplicas {gr}")
         if not ha and "HUB_GATE_REPLICAS" in env:
@@ -229,39 +247,78 @@ LOG_PORTS = {"group-gate": ("GATE_LOG_PORT", "8091", 8091), "mcp-gate": ("MCP_GA
              "wg": ("WG_STATUS_LISTEN", "$(WG_POD_IP):8093", 8093)}
 
 
-SINGLE_NODE_PVCS = {"hub-data", "vpn-doc"}
+def local_pvcs(docs):
+    """The node-local PVCs (StorageClass portcullis-core): a pod mounting one
+    is pinned to that node."""
+    return {c["metadata"]["name"] for c in K.by_kind(docs, "PersistentVolumeClaim") if c["spec"].get("storageClassName") == "portcullis-core"}
 
 
-def gate_pod_specs(docs):
-    return {n: sp for n, _, _, sp, _ in K.pod_specs(docs) if n in ("group-gate", "mcp-gate")}
+def mounts_local(spec, local):
+    return {(v.get("persistentVolumeClaim") or {}).get("claimName") for v in spec.get("volumes", [])} & local
 
 
-def gate_mounts_shared(spec):
-    return {(v.get("persistentVolumeClaim") or {}).get("claimName") for v in spec.get("volumes", [])} & SINGLE_NODE_PVCS
+# HA (spec §6, plan Task 19): the replicated workloads, their kind and
+# their replicas from the CI HA values (tests/k8s-ci-values-ha.yaml); every
+# other core workload is one replica. Keycloak 3 from 3 non-small nodes at
+# the primary site (P33), else 2; enroll stays 1 (its invites live in its
+# memory: a Task 19 concern).
+def ha_replicas(vals):
+    g = int(vals["ha"].get("gateReplicas", K.values()["ha"]["gateReplicas"]))
+    kc = 3 if int(vals["ha"].get("nonSmallNodesAtPrimary", 0)) >= 3 else 2
+    return {"group-gate": ("StatefulSet", g), "mcp-gate": ("StatefulSet", g), "forward-auth": ("Deployment", g),
+            "forward-auth-ext": ("Deployment", g), "keycloak": ("StatefulSet", kc), "alertmanager": ("StatefulSet", 2)}
 
 
-def gate_shape_problems(docs):
-    """The HA gates' shape: StatefulSets of at least 1 replica, more than
-    1 only once no gate pod mounts a single-node PVC (hub-data, vpn-doc:
-    every replica would be pinned to that node, and its own PVC would keep
-    it there), one data PVC per replica (portcullis-core, the owner
-    annotations, Retain), Parallel, spread over the nodes, port-bound,
-    a PDB minAvailable 1 exactly when there are 2 or more."""
+def gate_shape_problems(docs, vals=None):
+    """The HA shape: the replicated workloads exactly (kind, replicas), every
+    other one 1 replica (Traefik a DaemonSet on the ingress nodes); a PDB
+    minAvailable 1 exactly for those of 2 or more; each spread over the
+    nodes (hostname, maxSkew 1, ScheduleAnyway for the stateless pieces); no
+    replicated pod mounts a node-local PVC (every replica would be pinned to
+    that node); the gates' StatefulSets with a data PVC per replica
+    (portcullis-core, the owner annotations, Retain), Parallel, port-bound;
+    Alertmanager's too, its peers named through a headless Service; the
+    Hub mounts no node-local PVC at all (it moves on a node loss)."""
+    vals = vals or {"ha": {}}
     out = []
-    sts = {d["metadata"]["name"]: d for d in K.by_kind(docs, "StatefulSet")}
-    if sorted(sts) != ["group-gate", "mcp-gate"]:
-        out.append(f"StatefulSets {sorted(sts)} (want group-gate, mcp-gate)")
+    want = ha_replicas(vals)
     pdbs = {d["spec"]["selector"]["matchLabels"].get("portcullis.io/component"): d["spec"] for d in K.by_kind(docs, "PodDisruptionBudget")}
-    for name, d in sts.items():
-        sp = d["spec"]
+    local = local_pvcs(docs)
+    for d in docs:
+        if d.get("kind") not in ("Deployment", "StatefulSet", "DaemonSet"):
+            continue
+        name, kind, sp = d["metadata"]["name"], d["kind"], d["spec"]
+        tpl = sp["template"]["spec"]
+        if name == "traefik":
+            if kind != "DaemonSet" or d["metadata"]["namespace"] != K.INGRESS_NS or tpl.get("nodeSelector") != {"portcullis.io/ingress": "true"}:
+                out.append("traefik: a DaemonSet in portcullis-ingress on the portcullis.io/ingress nodes")
+            continue
+        wk, wn = want.get(name, ("Deployment", 1))
         n = sp.get("replicas")
+        if (kind, n) != (wk, wn):
+            out.append(f"{name}: {kind} of {n} (want a {wk} of {wn})")
+        if isinstance(n, int) and n > 1 and mounts_local(tpl, local):
+            out.append(f"{name}: {n} replicas pinned to one node by {sorted(mounts_local(tpl, local))}")
+        if name == "hub" and mounts_local(tpl, local):
+            out.append(f"hub: mounts node-local {sorted(mounts_local(tpl, local))} (it would be pinned to that node)")
+        replicated = isinstance(n, int) and n >= 2
+        if replicated and (pdbs.get(name) is None or pdbs[name].get("minAvailable") != 1):
+            out.append(f"{name}: no PodDisruptionBudget minAvailable 1")
+        if not replicated and name in pdbs:
+            out.append(f"{name}: a PodDisruptionBudget with {n} replica(s) blocks every drain")
+        spread = tpl.get("topologySpreadConstraints") or []
+        if replicated and not any(c.get("topologyKey") == "kubernetes.io/hostname" and c.get("whenUnsatisfiable") == "ScheduleAnyway"
+                                  and c.get("maxSkew") == 1 and c.get("labelSelector", {}).get("matchLabels") == {"portcullis.io/component": name}
+                                  for c in spread):
+            out.append(f"{name}: no spread over the nodes (hostname, maxSkew 1, ScheduleAnyway)")
+        if replicated and kind == "Deployment" and sp.get("strategy", {}).get("rollingUpdate", {}).get("maxUnavailable") != 0:
+            out.append(f"{name}: a rollout may take every replica down (RollingUpdate maxUnavailable 0)")
+        if kind != "StatefulSet":
+            continue
         claims = sp.get("volumeClaimTemplates") or []
-        if not isinstance(n, int) or n < 1:
-            out.append(f"{name}: replicas {n}")
-        elif n > 1 and gate_mounts_shared(sp["template"]["spec"]):
-            out.append(f"{name}: {n} replicas pinned to one node by {sorted(gate_mounts_shared(sp['template']['spec']))}")
-        if [c["metadata"]["name"] for c in claims] != ["data"]:
-            out.append(f"{name}: one data PVC per replica, got {[c['metadata']['name'] for c in claims]}")
+        want_claims = ["data"] if name in ("group-gate", "mcp-gate", "alertmanager") else []
+        if [c["metadata"]["name"] for c in claims] != want_claims:
+            out.append(f"{name}: per-replica PVCs {[c['metadata']['name'] for c in claims]} (want {want_claims})")
         for c in claims:
             a = c["metadata"].get("annotations", {})
             if c["spec"].get("storageClassName") != "portcullis-core" or not {"portcullis.io/uid", "portcullis.io/gid", "portcullis.io/mode"} <= set(a):
@@ -270,19 +327,75 @@ def gate_shape_problems(docs):
             out.append(f"{name}: its PVCs must be kept (Retain)")
         if sp.get("podManagementPolicy") != "Parallel":
             out.append(f"{name}: podManagementPolicy {sp.get('podManagementPolicy')} (want Parallel)")
-        spread = sp["template"]["spec"].get("topologySpreadConstraints") or []
-        if not any(c.get("topologyKey") == "kubernetes.io/hostname" and c.get("whenUnsatisfiable") == "ScheduleAnyway"
-                   and c.get("maxSkew") == 1 and c.get("labelSelector", {}).get("matchLabels") == {"portcullis.io/component": name}
-                   for c in spread):
-            out.append(f"{name}: no spread over the nodes (hostname, maxSkew 1, ScheduleAnyway)")
-        if sp["template"]["metadata"]["labels"].get("portcullis.io/ingress") != "bound":
+        if name in ("group-gate", "mcp-gate", "keycloak") and sp["template"]["metadata"]["labels"].get("portcullis.io/ingress") != "bound":
             out.append(f"{name}: not port-bound (portcullis.io/ingress: bound)")
-        want_pdb = isinstance(n, int) and n >= 2
-        if want_pdb and (pdbs.get(name) is None or pdbs[name].get("minAvailable") != 1):
-            out.append(f"{name}: no PodDisruptionBudget minAvailable 1")
-        if not want_pdb and name in pdbs:
-            out.append(f"{name}: a PodDisruptionBudget with {n} replica(s) blocks every drain")
+        heads = {"keycloak": "keycloak-pods", "alertmanager": "alertmanager-peers"}
+        if name in heads:
+            svc = [s for s in K.by_kind(docs, "Service") if s["metadata"]["name"] == heads[name]]
+            if sp.get("serviceName") != heads[name] or len(svc) != 1 or svc[0]["spec"].get("clusterIP") != "None":
+                out.append(f"{name}: its pods' names need the headless Service {heads[name]}")
+    for name, (wk, wn) in want.items():
+        if wn > 1 and not any(d.get("kind") == wk and d["metadata"]["name"] == name for d in docs):
+            out.append(f"{name}: no {wk}")
     return out
+
+
+HA_TOLERATIONS = [{"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 30},
+                  {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 30}]
+
+
+def check_ha_shape():
+    """Task 19: the HA render with tests/k8s-ci-values-ha.yaml (and its
+    variants: 3 non-small nodes at main, gateReplicas 3) has the replica
+    counts, PDBs, spread and classes; every HA pod tolerates a lost node for
+    30 s (contract §3.4), none without HA (nodeadm keeps its own); the
+    replicated volumes are <name>-r on portcullis-core-replicated in HA,
+    portcullis-core without; the Traefik DaemonSet in portcullis-ingress;
+    no LoadBalancer for Traefik in HA, wg-people Cluster in HA and Local
+    without."""
+    base = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    for label, vals in (("ha", base), ("ha 3 nodes", {"ha": dict(base["ha"], nonSmallNodesAtPrimary=3)}),
+                        ("ha gates 3", {"ha": dict(base["ha"], gateReplicas=3)})):
+        docs = K.render(vals)
+        for p in gate_shape_problems(docs, vals):
+            F.add(f"{label}: {p}")
+        for name, ns, labels, spec, ann in K.pod_specs(docs):
+            if name == "nodeadm":
+                continue
+            if spec.get("tolerations") != HA_TOLERATIONS:
+                F.add(f"{label}: {name}: tolerations {spec.get('tolerations')} (want not-ready / unreachable at 30 s)")
+        pvcs = {c["metadata"]["name"]: c["spec"].get("storageClassName") for c in K.by_kind(docs, "PersistentVolumeClaim")}
+        for n in ("hub-state", "hub-secrets", "hub-backups", "domains-data", "wg-data"):
+            if pvcs.get(n + "-r") != "portcullis-core-replicated" or n in pvcs:
+                F.add(f"{label}: {n}-r must be on portcullis-core-replicated (and no {n}): {pvcs.get(n + '-r')}")
+        if "traefik-acme" in pvcs or "vpn-doc" in pvcs:
+            F.add(f"{label}: traefik-acme / vpn-doc rendered in HA")
+        for s in K.by_kind(docs, "Service"):
+            if s["metadata"]["name"] == "traefik" and (s["spec"].get("type") == "LoadBalancer" or s["metadata"]["namespace"] != K.INGRESS_NS):
+                F.add(f"{label}: the traefik Service must be a ClusterIP in {K.INGRESS_NS} (hostPorts, no ServiceLB)")
+            if s["metadata"]["name"] == "wg-people" and s["spec"].get("externalTrafficPolicy") != "Cluster":
+                F.add(f"{label}: wg-people externalTrafficPolicy {s['spec'].get('externalTrafficPolicy')} (want Cluster)")
+    plain = K.render()
+    for name, ns, labels, spec, ann in K.pod_specs(plain):
+        if spec.get("tolerations"):
+            F.add(f"{name}: tolerations without ha.enabled")
+    pvcs = {c["metadata"]["name"]: c["spec"].get("storageClassName") for c in K.by_kind(plain, "PersistentVolumeClaim")}
+    for n in ("hub-state", "hub-secrets", "hub-backups", "domains-data", "wg-data"):
+        if pvcs.get(n) != "portcullis-core":
+            F.add(f"{n} must be on portcullis-core without HA: {pvcs.get(n)}")
+    if [d for d in plain if d.get("kind") in ("StatefulSet", "DaemonSet", "PodDisruptionBudget")]:
+        F.add("StatefulSets / DaemonSets / PDBs without ha.enabled")
+    for s in K.by_kind(plain, "Service"):
+        if s["metadata"]["name"] == "wg-people" and s["spec"].get("externalTrafficPolicy") != "Local":
+            F.add("wg-people externalTrafficPolicy must stay Local without HA")
+    # The pinning rule bites: a replicated pod on a node-local PVC.
+    import copy as _c
+    docs = K.render(base)
+    bad = _c.deepcopy(docs)
+    ff = next(d for d in bad if d.get("kind") == "Deployment" and d["metadata"]["name"] == "forward-auth")
+    ff["spec"]["template"]["spec"].setdefault("volumes", []).append({"name": "x", "persistentVolumeClaim": {"claimName": "lldap-data"}})
+    if not any("pinned" in p for p in gate_shape_problems(bad, base)):
+        F.add("gate_shape_problems misses a replicated pod on a node-local PVC (mutation test)")
 
 
 def check_log_ports():
@@ -310,16 +423,6 @@ def check_log_ports():
         F.add("group-gate prunes its own log (GATE_OPENED_PRUNE_DAYS=365) in HA only")
     if he.get("hub", {}).get("HUB_GATE_LOG_SOURCES") != "http" or "HUB_GATE_LOG_SOURCES" in pe.get("hub", {}):
         F.add("the Hub reads the gates over HTTP (HUB_GATE_LOG_SOURCES=http) in HA only")
-    for p in gate_shape_problems(ha):
-        F.add(f"ha: {p}")
-    if K.by_kind(plain, "StatefulSet"):
-        F.add("StatefulSets without ha.enabled")
-    # The pinning rule bites: 2 replicas while a gate still mounts a
-    # single-node PVC must fail (until Task 19 removes those mounts).
-    two = K.render({"ha": {"enabled": True, "gateReplicas": 2}})
-    pinned = any(gate_mounts_shared(sp) for sp in gate_pod_specs(two).values())
-    if pinned != any("pinned" in p for p in gate_shape_problems(two)):
-        F.add("ha: the gate pinning check doesn't follow the hub-data / vpn-doc mounts")
     for n in (0, 17):
         try:
             K.render({"ha": {"enabled": True, "gateReplicas": n}})
@@ -449,10 +552,12 @@ def main():
                     F.add(f"Traefik's Role in {r['metadata']['namespace']}: {rule['verbs']} (read-only)")
     check_secret_access(docs + storage_docs())
     check_edge(docs)
+    check_edge(K.render(yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())))
     check_frontdoor()
     check_hub_core()
     check_nodeadm()
     check_log_ports()
+    check_ha_shape()
     check_psa()
     check_priorities()
     check_classes(docs + K.render({"ha": {"enabled": True}}))
@@ -865,14 +970,16 @@ def secret_access(docs):
     return out
 
 
-def check_secret_access(docs):
+def check_secret_access(docs, ha=False):
     got = secret_access(docs)
-    for sa in sorted(set(got) | set(SECRET_READERS)):
-        if got.get(sa, set()) != SECRET_READERS.get(sa, set()):
-            F.add(f"Secret access of {sa}: {sorted(got.get(sa, set()))} (want {sorted(SECRET_READERS.get(sa, set()))})")
+    want = SECRET_READERS_HA if ha else SECRET_READERS
+    for sa in sorted(set(got) | set(want)):
+        if got.get(sa, set()) != want.get(sa, set()):
+            F.add(f"{'ha: ' if ha else ''}Secret access of {sa}: {sorted(got.get(sa, set()))} (want {sorted(want.get(sa, set()))})")
     # portcullis-env lives in the core namespace: Traefik may never read it.
-    if K.NS in got.get(f"{K.NS}/traefik", set()) or "*" in got.get(f"{K.NS}/traefik", set()):
-        F.add("Traefik's ServiceAccount can read portcullis-env (Secrets of the core namespace)")
+    for sa in (f"{K.NS}/traefik", f"{K.INGRESS_NS}/traefik"):
+        if K.NS in got.get(sa, set()) or "*" in got.get(sa, set()):
+            F.add("Traefik's ServiceAccount can read portcullis-env (Secrets of the core namespace)")
 
 
 def check_edge(docs):
@@ -911,7 +1018,8 @@ def check_edge(docs):
     params = yaml.safe_load((K.ROOT / "kube" / "admission" / "params.yaml").read_text())["data"]
     if sorted(params["edgeCoreMiddlewares"].split()) != want:
         F.add(f"kube/admission/params.yaml edgeCoreMiddlewares {params['edgeCoreMiddlewares']!r} != the core edge Middlewares {want}")
-    env = {e["name"]: e.get("value") for e in K.deployments(docs)["traefik"]["spec"]["template"]["spec"]["containers"][0]["env"]}
+    tr = next(d for d in docs if d.get("kind") in ("Deployment", "DaemonSet") and d["metadata"]["name"] == "traefik")
+    env = {e["name"]: e.get("value") for e in tr["spec"]["template"]["spec"]["containers"][0]["env"]}
     if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES") != K.EDGE_NS:
         F.add(f"traefik: kubernetesCRD namespaces {env.get('TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES')!r} (want {K.EDGE_NS} only)")
     if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_DISABLECLUSTERSCOPERESOURCES") != "true":
@@ -920,14 +1028,21 @@ def check_edge(docs):
         F.add("traefik: allowExternalNameServices must be true (the apps' backends are the Hub's pinned ExternalName Services in the edge namespace)")
     if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE") != "false":
         F.add("traefik: allowCrossNamespace must be false (every route names edge-local or @file objects)")
-    # Core's own objects are never ExternalName (only the Hub's pinned ones
-    # in the edge namespace, admitted by portcullis-edge-routes), and the
-    # chart puts no Service in the edge namespace at all.
+    # Core's own objects are never ExternalName but these, each pinned (the
+    # Hub's in the edge namespace are admitted by portcullis-edge-routes),
+    # and the chart's only Service in the edge namespace is portcullis-node
+    # (nodeadm's public paths, contract §20.2; owner=core, which the policy
+    # refuses the Hub any change to).
+    pinned = {(K.EDGE_NS, "portcullis-node"): "nodeadm.portcullis-nodeadm.svc.cluster.local",
+              (K.NS, "keycloak-internal"): f"keycloak-internal.{K.INGRESS_NS}.svc.cluster.local",
+              (K.NS, "traefik-metrics"): f"traefik-metrics.{K.INGRESS_NS}.svc.cluster.local"}
     for s in K.by_kind(docs, "Service"):
-        if s["spec"].get("type") == "ExternalName":
-            F.add(f"service {s['metadata']['name']}: ExternalName (core's Services never are)")
-        if s["metadata"].get("namespace") == K.EDGE_NS:
-            F.add(f"service {s['metadata']['name']}: in {K.EDGE_NS} (only the Hub's ExternalName Services live there)")
+        key = (s["metadata"].get("namespace"), s["metadata"]["name"])
+        if s["spec"].get("type") == "ExternalName" and pinned.get(key) != s["spec"].get("externalName"):
+            F.add(f"service {s['metadata']['name']}: ExternalName {s['spec'].get('externalName')} (core's are only {pinned})")
+        if key[0] == K.EDGE_NS and (key not in pinned or s["spec"].get("type") != "ExternalName"
+                                   or (s["metadata"].get("labels") or {}).get("portcullis.io/owner") != "core"):
+            F.add(f"service {s['metadata']['name']}: in {K.EDGE_NS} (only the Hub's ExternalName Services and core's pinned portcullis-node live there)")
 
 
 if __name__ == "__main__":

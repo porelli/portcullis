@@ -1,5 +1,8 @@
 {{- /* The monitoring profile (compose profile monitoring → monitoring.enabled):
-prometheus, alertmanager, blackbox, textfile-exporter, grafana. */ -}}
+prometheus, alertmanager, blackbox, textfile-exporter, grafana. In HA
+(spec §6, §12) Alertmanager is 2 meshed replicas (a StatefulSet, each its
+own data PVC, gossiping on 9094 with the other only, peers by name through
+the headless alertmanager-peers), so it survives any one node. */ -}}
 {{- if .Values.monitoring.enabled }}
 {{- $d := include "portcullis.domain" . -}}
 {{- $n := .Values.uids.nobody -}}
@@ -39,9 +42,38 @@ prometheus, alertmanager, blackbox, textfile-exporter, grafana. */ -}}
     (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "alertmanager-data")))
   "fsGroup" $n
 }}
+{{- if .Values.ha.enabled }}
+{{- $peers := list }}
+{{- range $i := until 2 }}{{- $peers = append $peers (printf "--cluster.peer=alertmanager-%d.alertmanager-peers.%s.svc.cluster.local:9094" $i $.Release.Namespace) }}{{- end }}
+{{- $vols := list }}{{- range $am.volumes }}{{- if ne .name "data" }}{{- $vols = append $vols . }}{{- end }}{{- end }}
+{{- $_ := set $am "volumes" $vols }}
+{{- $_ = set $am "statefulSet" (dict "replicas" 2 "serviceName" "alertmanager-peers" "claims" (list (dict "name" "data" "uid" $n "gid" $n "mode" "0750"))) }}
+{{- $_ = set $am "args" (concat (list "--config.file=/etc/portcullis/alertmanager.yml" "--storage.path=/alertmanager" "--cluster.listen-address=0.0.0.0:9094" "--cluster.advertise-address=$(POD_IP):9094") $peers) }}
+{{- $_ = set $am "env" (list (dict "name" "POD_IP" "valueFrom" (dict "fieldRef" (dict "fieldPath" "status.podIP")))) }}
+{{- $_ = set $am "ports" (concat $am.ports (list (dict "name" "cluster" "port" 9094) (dict "name" "cluster-udp" "port" 9094 "protocol" "UDP"))) }}
+{{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $am) }}
 ---
+{{- if .Values.ha.enabled }}
+# HA: the Alertmanager peers' names (alertmanager-<i>.alertmanager-peers),
+# not-ready pods too (the mesh forms before readiness).
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager-peers
+  namespace: {{ .Release.Namespace }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    portcullis.io/component: alertmanager
+  ports:
+    - name: cluster
+      port: 9094
+      targetPort: 9094
+{{- else }}
 {{ include "portcullis.pvc" (list . "alertmanager-data" $n $n "0750") }}
+{{- end }}
 ---
 {{- $bb := dict
   "name" "blackbox" "uid" $n "gid" $n

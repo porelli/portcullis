@@ -16,6 +16,7 @@ NS = "portcullis"
 APPS_NS = "portcullis-apps"
 EDGE_NS = "portcullis-edge"
 STORAGE_NS = "portcullis-storage"
+INGRESS_NS = "portcullis-ingress"
 # Compose services with no Kubernetes form (the Roles replace the socket
 # proxies; the mail slot is Docker / Podman only, contract §19.12).
 ABSENT = {"socket-proxy-traefik", "socket-proxy-hub", "mail-cert"}
@@ -81,7 +82,7 @@ def pod_specs(docs):
     """(name, namespace, labels, pod spec, annotations) of every pod the chart renders."""
     out = []
     for d in docs:
-        if d.get("kind") in ("Deployment", "StatefulSet"):
+        if d.get("kind") in ("Deployment", "StatefulSet", "DaemonSet"):
             t = d["spec"]["template"]
             out.append((d["metadata"]["name"], d["metadata"]["namespace"], t["metadata"].get("labels", {}), t["spec"], t["metadata"].get("annotations", {})))
         elif d.get("kind") == "Pod":
@@ -131,3 +132,21 @@ class Failures:
 def domain(docs=None):
     """The CI values' domain (tests/k8s-ci-values.yaml)."""
     return yaml.safe_load((ROOT / "tests" / "k8s-ci-values.yaml").read_text())["domain"]
+
+
+def mem_request(name, limit):
+    """The memory request the chart must render for a core service
+    (portcullis.memRequest, user ruling 2026-11-19 / plan Amendment 2): the
+    measured peak (values.yaml memoryPeakMi) × 1.25 rounded up to 16 Mi, at
+    most the limit; a service without a measurement requests its limit."""
+    import math
+    peaks = yaml.safe_load((CHART / "values.yaml").read_text()).get("memoryPeakMi") or {}
+    if name not in peaks:
+        return mem_bytes(limit)
+    req = math.ceil(peaks[name] * 1.25 / 16) * 16 * 1024 ** 2
+    return min(req, mem_bytes(limit))
+
+
+def values():
+    """charts/portcullis/values.yaml (the chart's defaults)."""
+    return yaml.safe_load((CHART / "values.yaml").read_text())

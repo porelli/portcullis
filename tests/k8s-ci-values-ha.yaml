@@ -1,0 +1,11 @@
+# The HA render of the static checks (tests/k8s_hardening.py check_ha_shape,
+# k8s_netpol_matrix.py), on top of tests/k8s-ci-values.yaml: what
+# kube_render_values writes with PORTCULLIS_HA=on on the test cluster's
+# layout (two non-small nodes at main, plan Task 3), nodeadm on.
+ha:
+  enabled: true
+  nonSmallNodesAtPrimary: 2
+  gateReplicas: 2
+nodeadm:
+  enabled: true
+  image: ghcr.io/porelli/portcullis-nodeadm@sha256:4444444444444444444444444444444444444444444444444444444444444444
