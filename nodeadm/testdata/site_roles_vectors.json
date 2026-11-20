@@ -1229,6 +1229,39 @@
   "want_error": "no mesh answer from n3: the node can't join"
  },
  {
+  "name": "a negative RTT is no answer",
+  "cluster": [
+   {
+    "id": "n1",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n2",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   },
+   {
+    "id": "n3",
+    "site": "main",
+    "role": "server",
+    "healthy": true
+   }
+  ],
+  "new": {
+   "site": "main",
+   "rtt_ms": {
+    "n1": 2,
+    "n2": 2,
+    "n3": -1
+   },
+   "override": ""
+  },
+  "want_error": "no mesh answer from n3: the node can't join"
+ },
+ {
   "name": "an unhealthy server needs no RTT answer",
   "cluster": [
    {

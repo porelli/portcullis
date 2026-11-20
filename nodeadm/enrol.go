@@ -793,8 +793,10 @@ func checkRTT(role string, servers []string, rtt map[string]int) error {
 	sort.Strings(servers)
 	worst := -1
 	for _, sv := range servers {
+		// A negative figure is no answer (the Hub's CheckRTT drops it too);
+		// a non-finite or fractional one never decodes into an int (400).
 		v, ok := rtt[sv]
-		if !ok {
+		if !ok || v < 0 {
 			return fmt.Errorf("no mesh answer from %s: the node can't join", sv)
 		}
 		worst = max(worst, v)
