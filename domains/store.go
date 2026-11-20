@@ -245,5 +245,26 @@ func redact(msg string, creds map[string]string) string {
 			msg = strings.ReplaceAll(msg, v[:len(v)/2], "[redacted]")
 		}
 	}
+	// A basic-auth header (base64 of user:password) built from a key and
+	// its value, or from two values.
+	var pairs []string
+	for k, v := range creds {
+		if len(v) < 4 {
+			continue
+		}
+		pairs = append(pairs, k+":"+v)
+		for _, w := range creds {
+			if len(w) >= 4 {
+				pairs = append(pairs, v+":"+w)
+			}
+		}
+	}
+	for _, pr := range pairs {
+		b := []byte(pr)
+		for _, form := range []string{base64.StdEncoding.EncodeToString(b), base64.RawStdEncoding.EncodeToString(b),
+			base64.URLEncoding.EncodeToString(b), base64.RawURLEncoding.EncodeToString(b)} {
+			msg = strings.ReplaceAll(msg, form, "[redacted]")
+		}
+	}
 	return msg
 }

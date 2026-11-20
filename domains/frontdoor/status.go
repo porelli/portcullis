@@ -37,12 +37,15 @@ type PendingStatus struct {
 	Since time.Time `json:"since"`
 }
 
-// ProbeStatus is one node's judgement (ok, judged by readiness only)
-// and whether it was a blind prober.
+// ProbeStatus is one node's judgement and whether it was a blind
+// prober. Verdict is healthy, unhealthy, undecided (a tie: not failed,
+// so ok) or none (not an ingress node: no address of its own to judge);
+// ok = healthy or undecided.
 type ProbeStatus struct {
-	OK           bool `json:"ok"`
-	InternalOnly bool `json:"internal_only"`
-	Blind        bool `json:"blind"`
+	OK           bool   `json:"ok"`
+	Verdict      string `json:"verdict"`
+	InternalOnly bool   `json:"internal_only"`
+	Blind        bool   `json:"blind"`
 }
 
 // SiteStatus: any ingress node of the site healthy, and its ingress
@@ -72,9 +75,10 @@ func BuildStatus(leading bool, names []string, published map[string][]string, tt
 	}
 	for _, id := range sortedKeys(c.Nodes) {
 		n := c.Nodes[id]
-		ps := ProbeStatus{Blind: v.BlindProbers[id]}
+		ps := ProbeStatus{Blind: v.BlindProbers[id], Verdict: "none"}
 		if j, ok := v.Judgements[id]; ok {
-			ps.OK, ps.InternalOnly = j.Verdict == Healthy, j.InternalOnly
+			ps.Verdict = map[Verdict]string{Healthy: "healthy", Unhealthy: "unhealthy", Undecided: "undecided"}[j.Verdict]
+			ps.OK, ps.InternalOnly = j.Verdict != Unhealthy, j.InternalOnly
 		}
 		st.Probes[id] = ps
 		s := st.Sites[n.Site]
@@ -121,6 +125,35 @@ func (s ConfigMapSink) Write(ctx context.Context, doc []byte) error {
 	cm.Data["status.json"] = string(doc)
 	_, err = cms.Update(ctx, cm, metav1.UpdateOptions{})
 	return err
+}
+
+// LastChanges reads each name's last written change from the status an
+// earlier front door left (Engine.Seed): a new leader keeps the one
+// change per name per 60 s.
+func (s ConfigMapSink) LastChanges(ctx context.Context) (map[string]time.Time, error) {
+	cm, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, StatusConfigMap, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return ParseLastChanges(cm.Data["status.json"])
+}
+
+// ParseLastChanges is names.*.last_change of a status document ("" = none).
+func ParseLastChanges(doc string) (map[string]time.Time, error) {
+	out := map[string]time.Time{}
+	if doc == "" {
+		return out, nil
+	}
+	var st Status
+	if err := json.Unmarshal([]byte(doc), &st); err != nil {
+		return nil, err
+	}
+	for n, ns := range st.Names {
+		if ns.LastChange != nil {
+			out[n] = *ns.LastChange
+		}
+	}
+	return out, nil
 }
 
 // Metrics are the front door's Prometheus series (§20.8).

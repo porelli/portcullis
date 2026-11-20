@@ -26,6 +26,8 @@ type Cluster struct {
 	Nodes map[string]Node
 	Ready map[string]bool
 	Mesh  map[string]string
+	// Warnings: the public addresses left out (not truly public).
+	Warnings []string
 }
 
 // Source gives one round's inputs.
@@ -42,15 +44,15 @@ const (
 	labelIngress = "portcullis.io/ingress"
 	defaultSite  = "main"
 	maxBody      = 8 << 20
-	// probeMaxAge: an older round is stale (the nodeagent probes every
-	// 10 s).
-	probeMaxAge = 30 * time.Second
+	// SnapshotFresh: an older nodeadm snapshot is refused.
+	SnapshotFresh = 20 * time.Second
 )
 
 // snapshot is the part of GET /v1/cluster (§20.2) the front door reads.
 type snapshot struct {
-	V     int `json:"v"`
-	Nodes []struct {
+	V       int       `json:"v"`
+	TakenAt time.Time `json:"taken_at"`
+	Nodes   []struct {
 		Name         string            `json:"name"`
 		Ready        bool              `json:"ready"`
 		TraefikReady bool              `json:"traefik_ready"`
@@ -63,15 +65,20 @@ type snapshot struct {
 }
 
 // ParseSnapshot turns nodeadm's snapshot into a Cluster. A snapshot of
-// another version, a node without a name, or a malformed address is
-// refused whole (fail closed: no round).
-func ParseSnapshot(b []byte) (Cluster, error) {
+// another version, taken more than 20 s from now, with a node without a
+// name or twice, or a malformed address is refused whole (fail closed:
+// no round); a well-formed address that isn't truly public (policy) is
+// left out of the node's public addresses, with a warning.
+func ParseSnapshot(b []byte, now time.Time, policy AddrPolicy) (Cluster, error) {
 	var s snapshot
 	if err := json.Unmarshal(b, &s); err != nil {
 		return Cluster{}, fmt.Errorf("nodeadm's snapshot: %w", err)
 	}
 	if s.V != 1 {
 		return Cluster{}, fmt.Errorf("nodeadm's snapshot: version %d", s.V)
+	}
+	if d := now.Sub(s.TakenAt); d > SnapshotFresh || d < -SnapshotFresh {
+		return Cluster{}, fmt.Errorf("nodeadm's snapshot was taken at %s, %s from now", s.TakenAt.Format(time.RFC3339), d.Round(time.Second))
 	}
 	c := Cluster{Nodes: map[string]Node{}, Ready: map[string]bool{}, Mesh: map[string]string{}}
 	for _, n := range s.Nodes {
@@ -88,8 +95,12 @@ func ParseSnapshot(b []byte) (Cluster, error) {
 		var pub []string
 		for _, a := range n.Addresses.Public {
 			ip, err := netip.ParseAddr(a)
-			if err != nil || AddrType(a) == "" || !ip.IsGlobalUnicast() {
+			if err != nil || AddrType(a) == "" {
 				return Cluster{}, fmt.Errorf("nodeadm's snapshot: node %s: public address %q", n.Name, a)
+			}
+			if err := policy.Check(ip.String()); err != nil {
+				c.Warnings = append(c.Warnings, fmt.Sprintf("node %s: %v: never published", n.Name, err))
+				continue
 			}
 			pub = append(pub, ip.String())
 		}
@@ -112,8 +123,10 @@ type MTLSSource struct {
 	NodeadmURL string
 	// TLSDir holds tls.crt, tls.key and ca.crt.
 	TLSDir string
-	// Timeout bounds each request (5 s when zero).
+	// Timeout bounds each request (3 s when zero).
 	Timeout time.Duration
+	// Policy: which public addresses may be published.
+	Policy AddrPolicy
 }
 
 const nodeadmServerName = "nodeadm.portcullis-nodeadm.svc"
@@ -133,7 +146,7 @@ func (s MTLSSource) client(serverName string) (*http.Client, error) {
 	}
 	to := s.Timeout
 	if to == 0 {
-		to = 5 * time.Second
+		to = 3 * time.Second
 	}
 	return &http.Client{Timeout: to, Transport: &http.Transport{
 		Proxy:           nil,
@@ -176,7 +189,7 @@ func (s MTLSSource) Cluster(ctx context.Context) (Cluster, error) {
 	if err != nil {
 		return Cluster{}, fmt.Errorf("nodeadm: %w", err)
 	}
-	return ParseSnapshot(b)
+	return ParseSnapshot(b, time.Now(), s.Policy)
 }
 
 // Probes asks every node's nodeagent at once.
@@ -221,7 +234,7 @@ func (s MTLSSource) probe(ctx context.Context, id, mesh, site string, now time.T
 
 // NewestRound picks a nodeagent's newest probe round from its
 // GET /v1/probes answer: it must be that prober's, at its site, and at
-// most 30 s old; anything else is refused (the prober has no round).
+// most 15 s old; anything else is refused (the prober has no round).
 func NewestRound(b []byte, id, site string, now time.Time) (ProbeRound, error) {
 	var a struct {
 		Rounds []ProbeRound `json:"rounds"`
@@ -243,7 +256,7 @@ func NewestRound(b []byte, id, site string, now time.Time) (ProbeRound, error) {
 		return ProbeRound{}, fmt.Errorf("probes: a round of %q", r.Prober)
 	case r.Site != site:
 		return ProbeRound{}, fmt.Errorf("probes: the prober says site %q, nodeadm %q", r.Site, site)
-	case now.Sub(r.T) > probeMaxAge || r.T.After(now.Add(probeMaxAge)):
+	case now.Sub(r.T) > ProbeFresh || r.T.After(now.Add(ProbeFresh)):
 		return ProbeRound{}, fmt.Errorf("probes: the newest round (%s) is stale", r.T.Format(time.RFC3339))
 	}
 	return r, nil

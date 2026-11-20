@@ -53,3 +53,7 @@ func startTestProvider(logger *log.Logger) error {
 	logger.Printf("WARNING: test build — provider \"fake\" enabled, fake DNS on %s (never use this image in production)", srv.Addr)
 	return nil
 }
+
+// testProviderBuild: the test build (CI's fake zone) publishes the
+// documentation ranges (frontdoor.AddrPolicy).
+const testProviderBuild = true

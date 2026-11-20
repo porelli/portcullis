@@ -30,7 +30,7 @@ const (
 type Fence struct {
 	client               kubernetes.Interface
 	namespace, identity  string
-	clock                clock.Clock
+	clock                clock.WithDelayedExecution
 	mu                   sync.Mutex
 	renewed              time.Time
 	lost                 bool
@@ -38,13 +38,58 @@ type Fence struct {
 	lostCh               chan struct{}
 	lostOnce             sync.Once
 	leaseD, renewD, retr time.Duration
+	writers              map[int]context.CancelFunc
+	nextWriter           int
+}
+
+// WriteMargin bounds a provider write: it starts only with at least this
+// much fence time left and runs at most this long, ending no later than
+// the last renewal + LeaseDuration − WriteMargin (the RenewDeadline), well
+// before another front door may take the Lease.
+const WriteMargin = 5 * time.Second
+
+// WriteContext is the context one provider write runs under: cancelled
+// when the fence stands by (Lease lost) and at its deadline, min(5 s,
+// renewed + LeaseDuration − 5 s). Without 5 s of fence time left it
+// refuses (ErrStandingBy).
+func (f *Fence) WriteContext(parent context.Context) (context.Context, context.CancelFunc, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lost || f.renewed.IsZero() {
+		return nil, nil, ErrStandingBy
+	}
+	now := f.clock.Now()
+	if now.Sub(f.renewed) >= f.renewD {
+		f.loseLocked()
+		return nil, nil, ErrStandingBy
+	}
+	left := f.renewed.Add(f.leaseD - WriteMargin).Sub(now)
+	if left < WriteMargin {
+		return nil, nil, ErrStandingBy
+	}
+	ctx, cancel := context.WithCancel(parent)
+	timer := f.clock.AfterFunc(min(WriteMargin, left), cancel)
+	id := f.nextWriter
+	f.nextWriter++
+	f.writers[id] = cancel
+	return ctx, func() {
+		timer.Stop()
+		cancel()
+		f.mu.Lock()
+		delete(f.writers, id)
+		f.mu.Unlock()
+	}, nil
 }
 
 // NewFence is a fence on the Lease portcullis-frontdoor in namespace,
 // held as identity (the pod name).
 func NewFence(client kubernetes.Interface, namespace, identity string) *Fence {
-	return &Fence{client: client, namespace: namespace, identity: identity, clock: clock.RealClock{},
-		lostCh: make(chan struct{}), leaseD: LeaseDuration, renewD: RenewDeadline, retr: RetryPeriod}
+	return newFence(client, namespace, identity, clock.RealClock{}, LeaseDuration, RenewDeadline, RetryPeriod)
+}
+
+func newFence(client kubernetes.Interface, namespace, identity string, c clock.WithDelayedExecution, leaseD, renewD, retry time.Duration) *Fence {
+	return &Fence{client: client, namespace: namespace, identity: identity, clock: c,
+		lostCh: make(chan struct{}), leaseD: leaseD, renewD: renewD, retr: retry, writers: map[int]context.CancelFunc{}}
 }
 
 // Leading reports whether the front door may write now.
@@ -67,6 +112,11 @@ func (f *Fence) Lost() <-chan struct{} { return f.lostCh }
 
 func (f *Fence) loseLocked() {
 	f.lost = true
+	// Writes in flight stop at once.
+	for id, cancel := range f.writers {
+		cancel()
+		delete(f.writers, id)
+	}
 	if f.cancel != nil {
 		f.cancel()
 	}
@@ -97,11 +147,7 @@ func (f *Fence) Run(ctx context.Context) error {
 		}
 	}()
 	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock: &fenceLock{LeaseLock: &resourcelock.LeaseLock{
-			LeaseMeta:  metav1.ObjectMeta{Namespace: f.namespace, Name: LeaseName},
-			Client:     f.client.CoordinationV1(),
-			LockConfig: resourcelock.ResourceLockConfig{Identity: f.identity},
-		}, f: f},
+		Lock:            f.newLock(),
 		LeaseDuration:   f.leaseD,
 		RenewDeadline:   f.renewD,
 		RetryPeriod:     f.retr,
@@ -117,6 +163,15 @@ func (f *Fence) Run(ctx context.Context) error {
 	}
 	le.Run(ctx)
 	return nil
+}
+
+// newLock is the Lease lock timing this fence's renewals.
+func (f *Fence) newLock() *fenceLock {
+	return &fenceLock{LeaseLock: &resourcelock.LeaseLock{
+		LeaseMeta:  metav1.ObjectMeta{Namespace: f.namespace, Name: LeaseName},
+		Client:     f.client.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{Identity: f.identity},
+	}, f: f}
 }
 
 func (f *Fence) renewedAt(start time.Time) {

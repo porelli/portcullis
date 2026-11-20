@@ -2,6 +2,7 @@ package frontdoor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -17,7 +18,6 @@ type Runner struct {
 	Engine  *Engine
 	Writer  *Writer
 	Source  Source
-	Leading func() bool
 	Status  StatusSink
 	Metrics *Metrics
 	Log     *log.Logger
@@ -30,6 +30,10 @@ type Runner struct {
 	lastPub map[string][]string
 }
 
+// ClusterTimeout bounds the snapshot and the probes of a round (each
+// probe has its own 3 s).
+const ClusterTimeout = 5 * time.Second
+
 func (r *Runner) logf(format string, args ...any) {
 	if r.Log == nil {
 		return
@@ -41,51 +45,67 @@ func (r *Runner) logf(format string, args ...any) {
 	r.Log.Print(msg)
 }
 
-// Step runs one round at now and returns the changes it applied.
+func (r *Runner) leading() bool { return r.Writer.Fence != nil && r.Writer.Fence.Leading() }
+
+// Step runs one round at now and returns the changes it applied. The
+// reads have their own budgets; each write runs under the fence's write
+// context (Writer.Apply).
 func (r *Runner) Step(ctx context.Context, now time.Time) []Change {
-	rctx, cancel := context.WithTimeout(ctx, Round-time.Second)
+	cctx, cancel := context.WithTimeout(ctx, ClusterTimeout)
 	defer cancel()
-	c, err := r.Source.Cluster(rctx)
+	c, err := r.Source.Cluster(cctx)
 	if err != nil {
-		// Fail closed: no snapshot, no decision.
-		r.logf("frontdoor: no cluster snapshot, nothing changes this round: %v", err)
-		r.writeStatus(rctx, r.lastPub, Cluster{}, r.Engine.View())
+		// Fail closed: no snapshot, no decision (and the next round isn't
+		// consecutive with the last one: Engine.Step sees the gap).
+		r.logf("frontdoor: no cluster snapshot, nothing changes this round: %v%s", err, deadline(cctx))
+		r.writeStatus(ctx, r.lastPub, Cluster{}, r.Engine.View())
 		return nil
 	}
-	probes, errs := r.Source.Probes(rctx, c, now)
+	for _, w := range c.Warnings {
+		r.logf("frontdoor: %s", w)
+	}
+	probes, errs := r.Source.Probes(cctx, c, now)
 	for _, e := range errs {
 		r.logf("frontdoor: probes: %v", e)
 	}
-	pub, err := r.Writer.Published(rctx)
+	pub, err := r.Writer.Published(ctx)
 	if err != nil {
 		r.logf("frontdoor: reading the address set, nothing changes this round: %v", err)
-		r.writeStatus(rctx, r.lastPub, c, r.Engine.View())
+		r.writeStatus(ctx, r.lastPub, c, r.Engine.View())
 		return nil
 	}
-	lead := r.Leading != nil && r.Leading()
-	changes := r.Engine.Step(now, Inputs{Lease: lead, Nodes: c.Nodes, Ready: c.Ready, Probes: probes, Published: pub})
+	changes := r.Engine.Step(now, Inputs{Lease: r.leading(), Nodes: c.Nodes, Ready: c.Ready, Probes: probes, Published: pub})
 	var done []Change
 	for _, ch := range changes {
-		if r.Leading == nil || !r.Leading() {
+		if !r.leading() {
 			r.logf("frontdoor: standing by: %s %s %s not written", ch.Op, ch.Name, ch.Value)
 			break
 		}
-		if err := r.Writer.Apply(rctx, ch); err != nil {
+		if err := r.Writer.Apply(ctx, ch); err != nil {
 			// Retried after the 60 s rate limit: the next rounds read the
 			// set again.
 			r.logf("frontdoor: %s %s %s: %v", ch.Op, ch.Name, ch.Value, err)
 			continue
 		}
 		r.logf("frontdoor: %s %s %s", ch.Op, ch.Name, ch.Value)
+		r.Engine.Applied(ch.Name, now)
 		pub[ch.Name] = applyTo(pub[ch.Name], ch)
 		done = append(done, ch)
 	}
 	r.lastPub = pub
-	r.writeStatus(rctx, pub, c, r.Engine.View())
+	r.writeStatus(ctx, pub, c, r.Engine.View())
 	if r.Metrics != nil {
 		r.Metrics.Update(now, pub, c, r.Engine.View())
 	}
 	return done
+}
+
+// deadline names a read cut off by its budget.
+func deadline(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Sprintf(" (the %s read budget ran out)", ClusterTimeout)
+	}
+	return ""
 }
 
 func applyTo(set []string, c Change) []string {
@@ -105,8 +125,10 @@ func (r *Runner) writeStatus(ctx context.Context, pub map[string][]string, c Clu
 	if r.Status == nil {
 		return
 	}
-	lead := r.Leading != nil && r.Leading()
-	b, err := marshalStatus(BuildStatus(lead, r.Writer.Names(), pub, r.Writer.TTL, c, v))
+	sctx, cancel := context.WithTimeout(ctx, ReadTimeout)
+	defer cancel()
+	ctx = sctx
+	b, err := marshalStatus(BuildStatus(r.leading(), r.Writer.Names(), pub, r.Writer.TTL, c, v))
 	if err == nil {
 		err = r.Status.Write(ctx, b)
 	}

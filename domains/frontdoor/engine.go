@@ -105,13 +105,11 @@ func Blind(r ProbeRound) bool { return !r.ReachedAny && !r.EgressOK }
 // counts; in-cluster networking answers same-site probes.
 func Eligible(proberSite, targetSite string) bool { return proberSite != targetSite }
 
-// The rules' switches, only ever changed by the tests that prove the
-// vectors pin each rule.
-var (
-	blindRule = true
-	spanRule  = true
-	tieReadds = false
-)
+// rules switches a rule off, only in the tests that prove the vectors
+// pin each rule (the zero value is the contract's).
+type rules struct {
+	noBlind, noSpan, tieReadds, noFresh, noGapReset, keepOrphans, oneOwner, verdictFailStatic bool
+}
 
 // Judgement is a node's verdict in a round and how it was reached.
 type Judgement struct {
@@ -119,15 +117,21 @@ type Judgement struct {
 	// InternalOnly: no eligible non-blind prober had a result for it, so
 	// readiness alone decided.
 	InternalOnly bool
+	// Eligible and Failing count the eligible non-blind results.
+	Eligible, Failing int
 }
 
 // Judge is node id's verdict from its readiness and the probe rounds.
 func Judge(id string, n Node, ready bool, probes []ProbeRound) Judgement {
+	return judge(rules{}, id, n, ready, probes)
+}
+
+func judge(r rules, id string, n Node, ready bool, probes []ProbeRound) Judgement {
 	elig, failing := 0, 0
 	sites, failSites := map[string]bool{}, map[string]bool{}
 	for _, p := range probes {
 		res, ok := p.Results[id]
-		if !ok || !Eligible(p.Site, n.Site) || (blindRule && Blind(p)) {
+		if !ok || !Eligible(p.Site, n.Site) || (!r.noBlind && Blind(p)) {
 			continue
 		}
 		elig++
@@ -137,21 +141,29 @@ func Judge(id string, n Node, ready bool, probes []ProbeRound) Judgement {
 			failSites[p.Site] = true
 		}
 	}
-	j := Judgement{InternalOnly: elig == 0}
+	j := Judgement{InternalOnly: elig == 0, Eligible: elig, Failing: failing}
 	switch {
 	case !ready:
 		j.Verdict = Unhealthy
 	case elig == 0:
 		j.Verdict = Healthy
-	case 2*failing > elig && (!spanRule || len(sites) < 2 || len(failSites) >= 2):
+	case 2*failing > elig && (r.noSpan || len(sites) < 2 || len(failSites) >= 2):
 		j.Verdict = Unhealthy
-	case 2*(elig-failing) > elig || (tieReadds && 2*failing == elig):
+	case 2*(elig-failing) > elig || (r.tieReadds && 2*failing == elig):
 		j.Verdict = Healthy
 	default:
 		j.Verdict = Undecided
 	}
 	return j
 }
+
+// ProbeFresh: a probe round older than this isn't an observation (the
+// nodeagents probe every 10 s).
+const ProbeFresh = 15 * time.Second
+
+// maxGap: rounds further apart than this aren't consecutive; every count
+// starts again.
+const maxGap = Round * 3 / 2
 
 // nodeState is a node's hysteresis.
 type nodeState struct {
@@ -163,15 +175,42 @@ type nodeState struct {
 // Engine decides the changes, round by round. Not safe for concurrent
 // use.
 type Engine struct {
-	names []string
-	nodes map[string]*nodeState
-	last  map[string]time.Time
-	view  View
+	names     []string
+	rules     rules
+	nodes     map[string]*nodeState
+	attempted map[string]time.Time // the last change emitted per name
+	applied   map[string]time.Time // the last change written per name
+	seen      map[string]time.Time // the newest probe round counted per prober
+	lastStep  time.Time
+	view      View
 }
 
 // NewEngine decides the address sets of names (<d> and *.<d>).
-func NewEngine(names []string) *Engine {
-	return &Engine{names: append([]string(nil), names...), nodes: map[string]*nodeState{}, last: map[string]time.Time{}}
+func NewEngine(names []string) *Engine { return newEngine(names, rules{}) }
+
+func newEngine(names []string, r rules) *Engine {
+	return &Engine{names: append([]string(nil), names...), rules: r, nodes: map[string]*nodeState{},
+		attempted: map[string]time.Time{}, applied: map[string]time.Time{}, seen: map[string]time.Time{}}
+}
+
+// Seed takes the last written change per name from an earlier front door
+// (frontdoor-status), so a new leader keeps the one change per 60 s.
+func (e *Engine) Seed(last map[string]time.Time) {
+	for n, t := range last {
+		if t.After(e.applied[n]) {
+			e.applied[n] = t
+		}
+	}
+}
+
+// Applied records that a change of name was written at t.
+func (e *Engine) Applied(name string, t time.Time) {
+	if t.After(e.applied[name]) {
+		e.applied[name] = t
+	}
+	if e.view.LastChange != nil {
+		e.view.LastChange[name] = e.applied[name]
+	}
 }
 
 // Pending is a change waiting for its hysteresis (or for the rate limit,
@@ -184,32 +223,48 @@ type Pending struct {
 
 // View is what the last Step saw, for frontdoor-status and the metrics.
 type View struct {
-	At           time.Time
-	FailStatic   bool
-	Judgements   map[string]Judgement
+	At         time.Time
+	FailStatic bool
+	Judgements map[string]Judgement
+	// BlindProbers are the probers whose (counted) round was blind.
 	BlindProbers map[string]bool
 	// UnhealthySince is when each unhealthy ingress node's streak began.
 	UnhealthySince map[string]time.Time
 	Pending        map[string]*Pending
-	LastChange     map[string]time.Time
+	// LastChange is the last change written per name.
+	LastChange map[string]time.Time
 }
 
 // View returns the last Step's view.
 func (e *Engine) View() View { return e.view }
 
 // Step judges every ingress node at now and returns the changes due:
-// at most one per name per 60 s, never the last address of a name, none
-// when every ingress node is unhealthy (fail static) and none without
-// the Lease (the hysteresis still runs).
+// at most one per name per 60 s, never the last address of a type of a
+// name, none when every ingress node is unhealthy or every counted probe
+// failed (fail static), and none without the Lease (the hysteresis still
+// runs). Only consecutive rounds (at most 15 s apart) and each prober's
+// fresh rounds, each counted once, are observations.
 func (e *Engine) Step(now time.Time, in Inputs) []Change {
 	v := View{At: now, Judgements: map[string]Judgement{}, BlindProbers: map[string]bool{},
 		UnhealthySince: map[string]time.Time{}, Pending: map[string]*Pending{}, LastChange: map[string]time.Time{}}
+	if !e.rules.noGapReset && !e.lastStep.IsZero() && now.Sub(e.lastStep) > maxGap {
+		// A gap (a round that couldn't read the cluster or the provider):
+		// the rounds before it aren't consecutive with this one.
+		e.nodes = map[string]*nodeState{}
+	}
+	e.lastStep = now
+	var probes []ProbeRound
 	for _, p := range in.Probes {
+		if last, ok := e.seen[p.Prober]; !e.rules.noFresh && ((ok && !p.T.After(last)) || now.Sub(p.T) > ProbeFresh || p.T.Sub(now) > ProbeFresh) {
+			continue // a round already counted, or stale
+		}
+		e.seen[p.Prober] = p.T
+		probes = append(probes, p)
 		if Blind(p) {
 			v.BlindProbers[p.Prober] = true
 		}
 	}
-	owner := map[string]string{}
+	owners := map[string][]string{}
 	anyOK := false
 	for _, id := range sortedKeys(in.Nodes) {
 		n := in.Nodes[id]
@@ -217,9 +272,9 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 			continue
 		}
 		for _, a := range n.Public {
-			owner[a] = id
+			owners[a] = append(owners[a], id)
 		}
-		j := Judge(id, n, in.Ready[id], in.Probes)
+		j := judge(e.rules, id, n, in.Ready[id], probes)
 		v.Judgements[id] = j
 		anyOK = anyOK || j.Verdict != Unhealthy
 	}
@@ -228,14 +283,17 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 			delete(e.nodes, id)
 		}
 	}
-	if !anyOK {
-		// Fail static: every ingress node fails (every probe failing
-		// included): nothing changes, nothing counts towards a removal,
-		// and nothing has been passing.
+	// Fail static: every ingress node fails, or every counted prober
+	// failed every target it probes (every probe failing; a node no
+	// prober probes yet can't make such a round count): nothing changes
+	// and every count starts again.
+	reached := false
+	for _, p := range probes {
+		reached = reached || p.ReachedAny
+	}
+	if !anyOK || (!e.rules.verdictFailStatic && len(probes) > 0 && !reached) {
 		v.FailStatic = true
-		for _, s := range e.nodes {
-			s.healthySince = time.Time{}
-		}
+		e.nodes = map[string]*nodeState{}
 	}
 	for id, j := range v.Judgements {
 		s := e.nodes[id]
@@ -243,26 +301,33 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 			s = &nodeState{}
 			e.nodes[id] = s
 		}
-		if !v.FailStatic {
-			if j.Verdict == Unhealthy {
-				if s.streak == 0 {
-					s.unhealthySince = now
-				}
-				s.streak++
-			} else {
-				s.streak, s.unhealthySince = 0, time.Time{}
+		if v.FailStatic {
+			continue
+		}
+		if j.Verdict == Unhealthy {
+			if s.streak == 0 {
+				s.unhealthySince = now
 			}
-			if j.Verdict == Healthy {
-				if s.healthySince.IsZero() {
-					s.healthySince = now
-				}
-			} else {
-				s.healthySince = time.Time{}
+			s.streak++
+		} else {
+			s.streak, s.unhealthySince = 0, time.Time{}
+		}
+		if j.Verdict == Healthy {
+			if s.healthySince.IsZero() {
+				s.healthySince = now
 			}
+		} else {
+			s.healthySince = time.Time{}
 		}
 		if s.streak > 0 {
 			v.UnhealthySince[id] = s.unhealthySince
 		}
+	}
+	type cand struct {
+		value  string
+		since  time.Time
+		due    bool
+		orphan bool
 	}
 	var out []Change
 	for _, name := range e.names {
@@ -270,66 +335,102 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 		for _, a := range in.Published[name] {
 			pub[a] = true
 		}
-		// Removals: published addresses of ingress nodes unhealthy for 3
-		// rounds, the longest-unhealthy first. Additions: ingress nodes'
-		// addresses healthy for 2 min, the longest-healthy first.
-		type cand struct {
-			value string
-			since time.Time
-			due   bool
-		}
+		// Removals: an address no ingress node owns (a removed node; not a
+		// health judgement: due at once, after the unhealthy ones), and
+		// addresses every owner of which has been unhealthy for 3 rounds.
+		// Additions: addresses an owner of which has been healthy for 2 min.
 		var rm, add []cand
 		for a := range pub {
-			id, ok := owner[a]
-			if !ok {
-				continue // not an ingress node's address: left alone
+			ids := owners[a]
+			if len(ids) > 1 && e.rules.oneOwner {
+				ids = ids[len(ids)-1:]
 			}
-			if s := e.nodes[id]; s.streak > 0 {
-				rm = append(rm, cand{a, s.unhealthySince, s.streak >= RemoveRounds})
-			}
-		}
-		for _, id := range sortedKeys(in.Nodes) {
-			n := in.Nodes[id]
-			s := e.nodes[id]
-			if !n.Ingress || s == nil || s.healthySince.IsZero() {
+			if len(ids) == 0 {
+				if e.rules.keepOrphans {
+					continue
+				}
+				rm = append(rm, cand{value: a, since: now, due: true, orphan: true})
 				continue
 			}
-			for _, a := range n.Public {
-				if !pub[a] {
-					add = append(add, cand{a, s.healthySince, now.Sub(s.healthySince) >= AddAfter})
+			c := cand{value: a, due: true}
+			all := true
+			for _, id := range ids {
+				s := e.nodes[id]
+				if s.streak == 0 {
+					all = false
+					break
 				}
+				if s.unhealthySince.After(c.since) {
+					c.since = s.unhealthySince
+				}
+				c.due = c.due && s.streak >= RemoveRounds
+			}
+			if all {
+				rm = append(rm, c)
 			}
 		}
-		order := func(cs []cand) {
-			sort.Slice(cs, func(i, j int) bool {
-				if !cs[i].since.Equal(cs[j].since) {
-					return cs[i].since.Before(cs[j].since)
+		for _, a := range sortedKeys(owners) {
+			if pub[a] {
+				continue
+			}
+			var since time.Time
+			for _, id := range owners[a] {
+				if s := e.nodes[id]; !s.healthySince.IsZero() && (since.IsZero() || s.healthySince.Before(since)) {
+					since = s.healthySince
 				}
-				return cs[i].value < cs[j].value
-			})
+			}
+			if !since.IsZero() {
+				add = append(add, cand{value: a, since: since, due: now.Sub(since) >= AddAfter})
+			}
 		}
-		order(rm)
-		order(add)
+		sort.Slice(rm, func(i, j int) bool {
+			a, b := rm[i], rm[j]
+			if a.due != b.due {
+				return a.due
+			}
+			if a.orphan != b.orphan {
+				return !a.orphan
+			}
+			if !a.since.Equal(b.since) {
+				return a.since.Before(b.since)
+			}
+			return a.value < b.value
+		})
+		sort.Slice(add, func(i, j int) bool {
+			if !add[i].since.Equal(add[j].since) {
+				return add[i].since.Before(add[j].since)
+			}
+			return add[i].value < add[j].value
+		})
 		if len(rm) > 0 {
 			v.Pending[name] = &Pending{Op: "remove", Value: rm[0].value, Since: rm[0].since}
 		} else if len(add) > 0 {
 			v.Pending[name] = &Pending{Op: "add", Value: add[0].value, Since: add[0].since}
 		}
-		if l, ok := e.last[name]; ok {
+		if l, ok := e.applied[name]; ok {
 			v.LastChange[name] = l
 		}
 		if v.FailStatic || !in.Lease {
 			continue
 		}
-		if l, ok := e.last[name]; ok && now.Sub(l) < ChangeEvery {
+		last := e.applied[name]
+		if a := e.attempted[name]; a.After(last) {
+			last = a
+		}
+		if !last.IsZero() && now.Sub(last) < ChangeEvery {
 			continue
 		}
 		var c *Change
 		// A removal first (a dead address hurts more than a missing
-		// healthy one), but never the last address: then an addition.
-		if len(rm) > 0 && rm[0].due && len(pub) > 1 {
-			c = &Change{T: now, Name: name, Op: "remove", Value: rm[0].value}
-		} else {
+		// healthy one), but never the last address of its type: then an
+		// addition.
+		for _, r := range rm {
+			if r.due && sameType(pub, r.value) > 1 {
+				c = &Change{T: now, Name: name, Op: "remove", Value: r.value}
+				break
+			}
+		}
+		if c == nil {
 			for _, a := range add {
 				if a.due {
 					c = &Change{T: now, Name: name, Op: "add", Value: a.value}
@@ -341,13 +442,23 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 			continue
 		}
 		c.Type = AddrType(c.Value)
-		e.last[name] = now
-		v.LastChange[name] = now
+		e.attempted[name] = now
 		v.Pending[name] = nil
 		out = append(out, *c)
 	}
 	e.view = v
 	return out
+}
+
+// sameType counts the published values of value's record type.
+func sameType(pub map[string]bool, value string) int {
+	n, t := 0, AddrType(value)
+	for a := range pub {
+		if AddrType(a) == t {
+			n++
+		}
+	}
+	return n
 }
 
 // AddrType is the record type of an address: A, AAAA, or "" when it

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,19 @@ type Provider interface {
 // ErrStandingBy: without the Lease nothing is written (§20.5).
 var ErrStandingBy = errors.New("the front door is standing by: another front door holds the Lease")
 
+// ErrCutOff: a write stopped at its fence deadline or when the Lease was
+// lost; whatever the provider did is read again next round.
+var ErrCutOff = errors.New("the write was cut off (its fence deadline, or the Lease lost)")
+
+// WriteFence is the write side of the Lease fence (Fence).
+type WriteFence interface {
+	Leading() bool
+	WriteContext(context.Context) (context.Context, context.CancelFunc, error)
+}
+
+// ReadTimeout bounds one provider read.
+const ReadTimeout = 5 * time.Second
+
 // Writer writes the main domain's address set: append first, then delete
 // only the exact stale value (by record ID where the provider needs it),
 // never leaving a name without an address.
@@ -34,8 +48,10 @@ type Writer struct {
 	Domain, Zone string
 	P            Provider
 	TTL          time.Duration
-	// Leading is the write fence: false refuses every write.
-	Leading func() bool
+	// Fence gates and bounds every write.
+	Fence WriteFence
+	// Policy: only public addresses are ever appended.
+	Policy AddrPolicy
 }
 
 // Names are the address set's names.
@@ -64,9 +80,11 @@ func (w *Writer) abs(rel string) string {
 	return strings.ToLower(strings.TrimSuffix(libdns.AbsoluteName(rel, w.Zone), "."))
 }
 
-// Published reads the address set of each name (A and AAAA values)
-// from the provider.
+// Published reads the address set of each name (its distinct A and AAAA
+// values) from the provider.
 func (w *Writer) Published(ctx context.Context) (map[string][]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, ReadTimeout)
+	defer cancel()
 	recs, err := w.P.GetRecords(ctx, w.Zone)
 	if err != nil {
 		return nil, err
@@ -88,7 +106,9 @@ func (w *Writer) Published(ctx context.Context) (map[string][]string, error) {
 		if err != nil {
 			continue
 		}
-		out[name] = append(out[name], ip.String())
+		if !slices.Contains(out[name], ip.String()) {
+			out[name] = append(out[name], ip.String())
+		}
 	}
 	for n := range out {
 		sort.Strings(out[n])
@@ -97,12 +117,13 @@ func (w *Writer) Published(ctx context.Context) (map[string][]string, error) {
 }
 
 // Apply writes one change: an add appends the value (nothing when it is
-// already there); a remove re-reads the name's set first and refuses to
-// delete the last address, then deletes exactly that value (no TTL: the
-// provider may store another, Porkbun 600 s). Every check comes before
-// the provider is called.
+// already there; only a public address); a remove re-reads the name's set
+// first and refuses to delete the last address of its type, then deletes
+// exactly that value (no TTL: the provider may store another, Porkbun
+// 600 s). Every check comes before the provider is called, and every
+// provider write runs under the fence's write context.
 func (w *Writer) Apply(ctx context.Context, c Change) error {
-	if w.Leading == nil || !w.Leading() {
+	if w.Fence == nil || !w.Fence.Leading() {
 		return ErrStandingBy
 	}
 	typ := AddrType(c.Value)
@@ -115,42 +136,46 @@ func (w *Writer) Apply(ctx context.Context, c Change) error {
 	if c.Op != "add" && c.Op != "remove" {
 		return fmt.Errorf("refusing the change %q", c.Op)
 	}
+	if c.Op == "add" {
+		if err := w.Policy.Check(c.Value); err != nil {
+			return fmt.Errorf("refusing to publish %s at %s: %w", c.Value, c.Name, err)
+		}
+	}
 	ip := netip.MustParseAddr(c.Value)
 	name := strings.ToLower(strings.TrimSuffix(c.Name, "."))
 	pub, err := w.Published(ctx)
 	if err != nil {
 		return fmt.Errorf("reading %s before the change: %w", name, err)
 	}
-	have := false
+	have, others := false, 0
 	for _, a := range pub[name] {
-		have = have || a == ip.String()
+		if a == ip.String() {
+			have = true
+		} else if AddrType(a) == typ {
+			others++
+		}
 	}
-	switch c.Op {
-	case "add":
-		if have {
-			return nil
-		}
-		if !w.Leading() {
-			return ErrStandingBy
-		}
-		_, err := w.P.AppendRecords(ctx, w.Zone, []libdns.Record{libdns.Address{Name: w.rel(name), TTL: w.TTL, IP: ip}})
-		if err != nil {
-			return fmt.Errorf("adding %s to %s: %w", ip, name, err)
-		}
-		return nil
-	default:
-		if !have {
-			return nil
-		}
-		if len(pub[name]) < 2 {
-			return fmt.Errorf("refusing to remove %s: it is the last address of %s", ip, name)
-		}
-		if !w.Leading() {
-			return ErrStandingBy
-		}
-		if _, err := w.P.DeleteRecords(ctx, w.Zone, []libdns.Record{libdns.Address{Name: w.rel(name), IP: ip}}); err != nil {
-			return fmt.Errorf("removing %s from %s: %w", ip, name, err)
-		}
+	if c.Op == "add" && have || c.Op == "remove" && !have {
 		return nil
 	}
+	if c.Op == "remove" && others == 0 {
+		return fmt.Errorf("refusing to remove %s: it is the last %s address of %s", ip, typ, name)
+	}
+	wctx, done, err := w.Fence.WriteContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+	if c.Op == "add" {
+		_, err = w.P.AppendRecords(wctx, w.Zone, []libdns.Record{libdns.Address{Name: w.rel(name), TTL: w.TTL, IP: ip}})
+	} else {
+		_, err = w.P.DeleteRecords(wctx, w.Zone, []libdns.Record{libdns.Address{Name: w.rel(name), IP: ip}})
+	}
+	if err != nil {
+		if wctx.Err() != nil {
+			return fmt.Errorf("%s %s at %s: %w: %v", c.Op, ip, name, ErrCutOff, err)
+		}
+		return fmt.Errorf("%s %s at %s: %w", c.Op, ip, name, err)
+	}
+	return nil
 }

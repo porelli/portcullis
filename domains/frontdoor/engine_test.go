@@ -70,8 +70,10 @@ func (v vector) nodes() map[string]Node {
 // replay runs the engine over v's rounds, applying every change to the
 // published sets as a provider would; it returns the changes and the
 // last round's view.
-func replay(v vector) ([]Change, map[string][]string, View) {
-	e := NewEngine(v.Names)
+func replay(v vector) ([]Change, map[string][]string, View) { return replayRules(v, rules{}) }
+
+func replayRules(v vector, r rules) ([]Change, map[string][]string, View) {
+	e := newEngine(v.Names, r)
 	pub := map[string][]string{}
 	for n, as := range v.Initial {
 		pub[n] = append([]string(nil), as...)
@@ -81,6 +83,7 @@ func replay(v vector) ([]Change, map[string][]string, View) {
 		cs := e.Step(r.T, Inputs{Lease: v.Lease, Nodes: v.nodes(), Ready: r.Ready, Probes: r.Probes, Published: clone(pub)})
 		for _, c := range cs {
 			pub[c.Name] = applyChange(pub[c.Name], c)
+			e.Applied(c.Name, c.T)
 		}
 		all = append(all, cs...)
 	}
@@ -175,17 +178,20 @@ func TestFrontdoorVectors(t *testing.T) {
 // lowest id first).
 func TestFrontdoorVectorsPinTheRules(t *testing.T) {
 	vs := loadVectors(t)
-	for name, mutate := range map[string]func(){
-		"no blind rule":    func() { blindRule = false },
-		"no two-site span": func() { spanRule = false },
-		"tie re-adds":      func() { tieReadds = true },
+	for name, r := range map[string]rules{
+		"no blind rule":              {noBlind: true},
+		"no two-site span":           {noSpan: true},
+		"tie re-adds":                {tieReadds: true},
+		"probe rounds counted again": {noFresh: true},
+		"gaps not restarting":        {noGapReset: true},
+		"orphans kept":               {keepOrphans: true},
+		"one owner per address":      {oneOwner: true},
+		"fail static on verdicts":    {verdictFailStatic: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			mutate()
-			defer func() { blindRule, spanRule, tieReadds = true, true, false }()
 			failed := 0
 			for _, v := range vs {
-				got, _, _ := replay(v)
+				got, _, _ := replayRules(v, r)
 				if len(got) != len(v.Want.Changes) {
 					failed++
 					continue

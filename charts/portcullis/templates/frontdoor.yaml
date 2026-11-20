@@ -25,7 +25,8 @@ a network of one (no generic net policy selects it). */ -}}
     (dict "name" "POD_NAMESPACE" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.namespace")))
     (dict "name" "FRONTDOOR_NODEADM_URL" "value" (printf "https://nodeadm.%s.svc:8443" .Values.ha.nodeadmNamespace))
     (dict "name" "FRONTDOOR_CREDENTIALS_FILE" "value" "/run/portcullis/frontdoor/credentials.json")
-    (dict "name" "FRONTDOOR_TLS_DIR" "value" "/run/portcullis/frontdoor-tls"))
+    (dict "name" "FRONTDOOR_TLS_DIR" "value" "/run/portcullis/frontdoor-tls")
+    (dict "name" "FRONTDOOR_EXCLUDED_CIDRS" "value" (printf "%s %s %s" .Values.ha.meshCIDR (required "podCIDR is required" .Values.podCIDR) (required "serviceCIDR is required" .Values.serviceCIDR))))
   "mounts" (list
     (dict "name" "credentials" "mountPath" "/run/portcullis/frontdoor" "readOnly" true)
     (dict "name" "control-tls" "mountPath" "/run/portcullis/frontdoor-tls" "readOnly" true))

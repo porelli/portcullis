@@ -18,6 +18,12 @@ Constraints and K7, which replace a network for one port:
 Synthetic peers: an app pod, VPN gateway pods (slots 0, 1 and 46) in the
 apps namespace, an external address and a node address.
 
+HA (ha.enabled, contract §20.1 "Network flows", §20.8): the front door
+reaches exactly nodeadm :8443, the nodeagents :7443 on the node mesh, the
+public internet on 443 and the API endpoints; only Prometheus reaches it
+(:9106); every other core pod, an app pod and the internet are denied both
+ways.
+
   python3 tests/k8s_netpol_matrix.py
 """
 import ipaddress
@@ -103,7 +109,50 @@ def allowed(policies, src, dst, port, proto="TCP", ingress_only=False):
     return (ingress_only or side(src, dst, "Egress", "egress", "to")) and side(dst, src, "Ingress", "ingress", "from")
 
 
+MESH_AGENT = "10.215.0.2"
+
+
+def check_ha():
+    docs = K.render({"ha": {"enabled": True}})
+    pols = K.by_kind(docs, "NetworkPolicy")
+    pods = {}
+    for name, ns, labels, spec, _ in K.pod_specs(docs):
+        ports = [(p["containerPort"], p.get("protocol", "TCP")) for c in spec["containers"] for p in c.get("ports", [])]
+        pods[name] = Peer(name, ns, labels, ports)
+    fd = pods.get("frontdoor")
+    if fd is None:
+        F.add("ha: no frontdoor pod")
+        return
+    nodeadm = Peer("nodeadm", "portcullis-nodeadm", {"portcullis.io/component": "nodeadm"})
+    agent, ext, node = Peer("nodeagent", None, {}, ip=MESH_AGENT), Peer("external", None, {}, ip=EXTERNAL), Peer("node", None, {}, ip=NODE)
+    app = Peer("app", K.APPS_NS, {"portcullis.io/instance": "echo", "portcullis.io/service": "web"})
+    api = [(e.split(":")[0], int(e.split(":")[1])) for e in K.yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values.yaml").read_text())["apiEndpoints"]]
+    rows = [(fd, nodeadm, 8443, True), (fd, agent, 7443, True), (fd, ext, 443, True)]
+    rows += [(fd, Peer("api", None, {}, ip=ip), port, True) for ip, port in api]
+    rows += [(pods["prometheus"], fd, 9106, True)]
+    # Denials: the other ports and peers of each flow.
+    rows += [(fd, nodeadm, 8080, False), (fd, nodeadm, 9105, False), (fd, agent, 443, False), (fd, agent, 7444, False),
+             (fd, ext, 80, False), (fd, ext, 7443, False), (fd, node, 443, False), (fd, node, 10250, False),
+             (fd, Peer("pod-cidr", None, {}, ip="10.42.0.9"), 443, False), (fd, Peer("svc-cidr", None, {}, ip="10.43.0.10"), 443, False),
+             (fd, Peer("link-local", None, {}, ip="169.254.169.254"), 443, False)]
+    for name, peer in sorted(pods.items()):
+        if name == "frontdoor":
+            continue
+        for port, proto in peer.ports:
+            rows.append((fd, peer, port, False))
+        for port in (8090, 9106):
+            if not (name == "prometheus" and port == 9106):
+                rows.append((peer, fd, port, False))
+    for port in (8090, 9106):
+        rows += [(app, fd, port, False), (ext, fd, port, False)]
+    for src, dst, port, want in rows:
+        got = allowed(pols, src, dst, port, ingress_only=src is app)
+        if got != want:
+            F.add(f"ha: {src} → {dst}:{port}: {'allowed' if got else 'denied'}, want {'allowed' if want else 'denied'}")
+
+
 def main():
+    check_ha()
     comp = K.compose()
     docs = K.render()
     pols = K.by_kind(docs, "NetworkPolicy")

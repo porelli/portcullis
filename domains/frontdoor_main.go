@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -69,14 +70,33 @@ func providerMinTTL(provider string) time.Duration {
 	return 0
 }
 
+// frontdoorPolicy is the addresses the front door may publish: public
+// only, never the node mesh, pod or service CIDRs (FRONTDOOR_EXCLUDED_CIDRS,
+// required); the documentation ranges only in the testprovider build.
+func frontdoorPolicy(excluded string) (frontdoor.AddrPolicy, error) {
+	pol := frontdoor.AddrPolicy{AllowDocumentation: testProviderBuild}
+	for _, f := range strings.FieldsFunc(excluded, func(r rune) bool { return r == ',' || r == ' ' }) {
+		p, err := netip.ParsePrefix(f)
+		if err != nil {
+			return pol, fmt.Errorf("FRONTDOOR_EXCLUDED_CIDRS: %q is not a CIDR", f)
+		}
+		pol.Excluded = append(pol.Excluded, p.Masked())
+	}
+	if len(pol.Excluded) == 0 {
+		return pol, errors.New("FRONTDOOR_EXCLUDED_CIDRS (the node mesh, pod and service CIDRs) is required")
+	}
+	return pol, nil
+}
+
 // newFrontdoorWriter builds the main domain's writer from the
 // credentials (the service's provider behind redacting) and the
-// redaction of every message the front door logs.
-func newFrontdoorWriter(domain string, c frontdoorCreds, leading func() bool, findZone func(string) (string, error)) (*frontdoor.Writer, func(string) string, error) {
+// redaction of every message the front door logs. Its Fence is set by
+// the caller (nil: every write refused).
+func newFrontdoorWriter(domain string, c frontdoorCreds, policy frontdoor.AddrPolicy, findZone func(string) (string, error)) (*frontdoor.Writer, func(string) string, error) {
 	clean := func(s string) string { return redact(s, c.Credentials) }
 	p, err := buildProvider(&Domain{Name: domain, Provider: c.Provider, Credentials: c.Credentials})
 	if err != nil {
-		return nil, clean, err
+		return nil, clean, errors.New(clean(err.Error()))
 	}
 	inner, cleanErr := unwrap(p)
 	var zone string
@@ -89,7 +109,7 @@ func newFrontdoorWriter(domain string, c frontdoorCreds, leading func() bool, fi
 	if err != nil {
 		return nil, clean, fmt.Errorf("finding the DNS zone of %s: %s", domain, clean(err.Error()))
 	}
-	return &frontdoor.Writer{Domain: domain, Zone: dns.Fqdn(zone), P: p, TTL: frontdoor.TTL(providerMinTTL(c.Provider)), Leading: leading}, clean, nil
+	return &frontdoor.Writer{Domain: domain, Zone: dns.Fqdn(zone), P: p, TTL: frontdoor.TTL(providerMinTTL(c.Provider)), Policy: policy}, clean, nil
 }
 
 // runFrontdoor is `domains frontdoor`.
@@ -110,9 +130,19 @@ func runFrontdoor(stderr io.Writer) int {
 		logger.Print("refusing to start: POD_NAME and POD_NAMESPACE are required (the Lease identity)")
 		return exitFailure
 	}
+	policy, err := frontdoorPolicy(os.Getenv("FRONTDOOR_EXCLUDED_CIDRS"))
+	if err != nil {
+		logger.Printf("refusing to start: %v", err)
+		return exitFailure
+	}
 	creds, err := loadFrontdoorCreds(env("FRONTDOOR_CREDENTIALS_FILE", "/run/portcullis/frontdoor/credentials.json"))
 	if err != nil {
 		logger.Printf("refusing to start: %v", err)
+		return exitFailure
+	}
+	w, clean, err := newFrontdoorWriter(domain, creds, policy, legoZoneFinder)
+	if err != nil {
+		logger.Printf("refusing to start: %s", clean(err.Error()))
 		return exitFailure
 	}
 	cfg, err := rest.InClusterConfig()
@@ -126,21 +156,27 @@ func runFrontdoor(stderr io.Writer) int {
 		return exitFailure
 	}
 	fence := frontdoor.NewFence(kc, ns, pod)
-	w, clean, err := newFrontdoorWriter(domain, creds, fence.Leading, legoZoneFinder)
-	if err != nil {
-		logger.Printf("refusing to start: %s", clean(err.Error()))
-		return exitFailure
-	}
+	w.Fence = fence
 	metrics := frontdoor.NewMetrics()
+	sink := frontdoor.ConfigMapSink{Client: kc, Namespace: ns}
 	r := &frontdoor.Runner{
-		Engine: frontdoor.NewEngine(w.Names()), Writer: w, Leading: fence.Leading,
+		Engine: frontdoor.NewEngine(w.Names()), Writer: w,
 		Source: frontdoor.MTLSSource{NodeadmURL: env("FRONTDOOR_NODEADM_URL", "https://nodeadm.portcullis-nodeadm.svc:8443"),
-			TLSDir: env("FRONTDOOR_TLS_DIR", "/run/portcullis/frontdoor-tls")},
-		Status: frontdoor.ConfigMapSink{Client: kc, Namespace: ns}, Metrics: metrics, Log: logger, Redact: clean,
+			TLSDir: env("FRONTDOOR_TLS_DIR", "/run/portcullis/frontdoor-tls"), Policy: policy},
+		Status: sink, Metrics: metrics, Log: logger, Redact: clean,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	// The last change an earlier front door wrote: one change per name
+	// per 60 s across leaders.
+	sctx, scancel := context.WithTimeout(ctx, frontdoor.ReadTimeout)
+	if last, err := sink.LastChanges(sctx); err != nil {
+		logger.Printf("frontdoor: reading %s: %v", frontdoor.StatusConfigMap, err)
+	} else {
+		r.Engine.Seed(last)
+	}
+	scancel()
 	health := http.NewServeMux()
 	health.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) {
 		rw.Header().Set("Content-Type", "application/json")
@@ -167,14 +203,20 @@ func runFrontdoor(stderr io.Writer) int {
 		}
 	}()
 	logger.Printf("frontdoor: %s (zone %s, TTL %s), Lease %s/%s as %s", domain, w.Zone, w.TTL, ns, frontdoor.LeaseName, pod)
-	go r.Run(ctx)
+	rctx, rcancel := context.WithCancel(ctx)
+	ran := make(chan struct{})
+	go func() { defer close(ran); r.Run(rctx) }()
 	select {
 	case <-ctx.Done():
+		rcancel()
+		<-ran
 		return 0
 	case <-fenceDone:
-		// Standing by is final in this process: one last status round
-		// (no write: the fence is closed), then exit so a fresh pod
-		// campaigns again.
+		// Standing by is final in this process: stop the loop (the engine
+		// isn't shared), one last status round (no write: the fence is
+		// closed), then exit so a fresh pod campaigns again.
+		rcancel()
+		<-ran
 		r.Step(context.Background(), time.Now().UTC())
 		logger.Print("frontdoor: standing by (the Lease was lost): exiting")
 		return exitFailure
