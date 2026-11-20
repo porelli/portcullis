@@ -1,10 +1,12 @@
 # portcullis-nodeadm-tokens (NEW, HA; contract §6 "nodeadm tokens", §20.2):
-# nodeadm's Role in kube-system is `secrets create`, which RBAC can't narrow
-# by type or content. Bound by portcullis-nodeadm-guard-tokens (bindings.yaml)
-# to kube-system, it judges only nodeadmServiceAccount's Secret creates and
-# updates (kube-system's other Secrets are written by k3s and the cluster's
-# controllers, which this policy must not block): a bootstrap token Secret
-# only, expiring within 15 minutes of its creation (an admission policy has
+# nodeadm's Role in kube-system is `secrets create` and `delete`, which RBAC
+# can't narrow by type, name or content. Bound by
+# portcullis-nodeadm-guard-tokens (bindings.yaml) to kube-system, it judges
+# only nodeadmServiceAccount's Secret creates, updates and deletes
+# (kube-system's other Secrets are written by k3s and the cluster's
+# controllers, which this policy must not block): a delete only of a
+# bootstrap token Secret `bootstrap-token-<6 [a-z0-9]>`; a bootstrap token
+# Secret only, expiring within 15 minutes of its creation (an admission policy has
 # no clock: metadata.creationTimestamp is the API server's now on a create),
 # usable for authentication only ("true" = dHJ1ZQ==), carrying exactly the k3s
 # node-token group (c3lzdGVtOmJvb3RzdHJhcHBlcnM6azNzOmRlZmF1bHQtbm9kZS10b2tlbg==).
@@ -28,6 +30,7 @@ spec:
       operations:
       - CREATE
       - UPDATE
+      - DELETE
       resources:
       - secrets
   # nodeadm's own writes only: k3s's and the controllers' kube-system Secrets
@@ -76,29 +79,39 @@ spec:
       + variables.bound.substring(11, 13) + variables.bound.substring(14, 16) + variables.bound.substring(17, 19))
   validations:
   - expression: >-
-      !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      request.operation == 'DELETE' || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
       || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
     messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
   - expression: |-
-      !variables.nodeadm || (
+      !variables.nodeadm || request.operation == 'DELETE' || (
         has(object.type) && object.type == 'bootstrap.kubernetes.io/token'
       )
     message: nodeadm may create only bootstrap token Secrets in kube-system
   - expression: |-
-      !variables.nodeadm || (
+      !variables.nodeadm || request.operation == 'DELETE' || (
         variables.expNum >= 0 && variables.expNum <= variables.boundNum
       )
     message: bootstrap tokens must expire within 15 minutes
   - expression: |-
-      !variables.nodeadm || (
+      !variables.nodeadm || request.operation == 'DELETE' || (
         size(variables.data) <= 32
         && variables.data.all(k, !k.startsWith('usage-bootstrap-') || k == 'usage-bootstrap-authentication')
         && 'usage-bootstrap-authentication' in variables.data && string(variables.data['usage-bootstrap-authentication']) == 'dHJ1ZQ=='
       )
     message: bootstrap tokens may be used for authentication only
   - expression: |-
-      !variables.nodeadm || (
+      !variables.nodeadm || request.operation == 'DELETE' || (
         'auth-extra-groups' in variables.data
         && string(variables.data['auth-extra-groups']) == 'c3lzdGVtOmJvb3RzdHJhcHBlcnM6azNzOmRlZmF1bHQtbm9kZS10b2tlbg=='
       )
     message: bootstrap tokens may carry only the group system:bootstrappers:k3s:default-node-token
+  # Delete (Task 18 security ruling: nodeadm's Role has secrets delete, to
+  # remove a used or expired token): only a bootstrap token Secret named
+  # bootstrap-token-<6 [a-z0-9]>, judged on the old object; never k3s's
+  # serving certificate, node passwords or any other kube-system Secret.
+  - expression: |-
+      !variables.nodeadm || request.operation != 'DELETE' || (
+        has(oldObject.type) && oldObject.type == 'bootstrap.kubernetes.io/token'
+        && oldObject.metadata.name.matches('^bootstrap-token-[a-z0-9]{6}$')
+      )
+    message: nodeadm may delete only bootstrap token Secrets (bootstrap-token-<6 [a-z0-9]>) in kube-system

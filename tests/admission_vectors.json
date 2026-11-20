@@ -9198,6 +9198,180 @@
   "ha": true
  },
  {
+  "name": "ha: nodeadm deletes a bootstrap token Secret",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "bootstrap-token-a1b2c3",
+    "namespace": "kube-system"
+   },
+   "type": "bootstrap.kubernetes.io/token",
+   "stringData": {
+    "token-id": "a1b2c3",
+    "token-secret": "0123456789abcdef",
+    "usage-bootstrap-authentication": "true",
+    "auth-extra-groups": "system:bootstrappers:k3s:default-node-token"
+   }
+  },
+  "as": "nodeadm",
+  "want": "allow",
+  "reason_contains": "",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "bootstrap-token-a1b2c3",
+    "namespace": "kube-system"
+   },
+   "type": "bootstrap.kubernetes.io/token",
+   "stringData": {
+    "token-id": "a1b2c3",
+    "token-secret": "0123456789abcdef",
+    "usage-bootstrap-authentication": "true",
+    "auth-extra-groups": "system:bootstrappers:k3s:default-node-token"
+   }
+  },
+  "op": "delete",
+  "ha": true
+ },
+ {
+  "name": "ha: nodeadm deleting the k3s serving certificate is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "k3s-serving",
+    "namespace": "kube-system"
+   },
+   "type": "kubernetes.io/tls",
+   "stringData": {
+    "tls.crt": "x",
+    "tls.key": "y"
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may delete only bootstrap token Secrets (bootstrap-token-<6 [a-z0-9]>) in kube-system",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "k3s-serving",
+    "namespace": "kube-system"
+   },
+   "type": "kubernetes.io/tls",
+   "stringData": {
+    "tls.crt": "x",
+    "tls.key": "y"
+   }
+  },
+  "op": "delete",
+  "ha": true
+ },
+ {
+  "name": "ha: nodeadm deleting a node password Secret is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "n1.node-password.k3s",
+    "namespace": "kube-system"
+   },
+   "type": "Opaque",
+   "stringData": {
+    "hash": "x"
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may delete only bootstrap token Secrets (bootstrap-token-<6 [a-z0-9]>) in kube-system",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "n1.node-password.k3s",
+    "namespace": "kube-system"
+   },
+   "type": "Opaque",
+   "stringData": {
+    "hash": "x"
+   }
+  },
+  "op": "delete",
+  "ha": true
+ },
+ {
+  "name": "ha: nodeadm deleting an Opaque Secret named like a token is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "bootstrap-token-zzzzzz",
+    "namespace": "kube-system"
+   },
+   "type": "Opaque",
+   "stringData": {
+    "x": "y"
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may delete only bootstrap token Secrets (bootstrap-token-<6 [a-z0-9]>) in kube-system",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "bootstrap-token-zzzzzz",
+    "namespace": "kube-system"
+   },
+   "type": "Opaque",
+   "stringData": {
+    "x": "y"
+   }
+  },
+  "op": "delete",
+  "ha": true
+ },
+ {
+  "name": "ha: nodeadm deleting a bootstrap token with a 7-character id is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "bootstrap-token-abcdefg",
+    "namespace": "kube-system"
+   },
+   "type": "bootstrap.kubernetes.io/token",
+   "stringData": {
+    "token-id": "abcdefg",
+    "token-secret": "0123456789abcdef",
+    "usage-bootstrap-authentication": "true",
+    "auth-extra-groups": "system:bootstrappers:k3s:default-node-token"
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may delete only bootstrap token Secrets (bootstrap-token-<6 [a-z0-9]>) in kube-system",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "bootstrap-token-abcdefg",
+    "namespace": "kube-system"
+   },
+   "type": "bootstrap.kubernetes.io/token",
+   "stringData": {
+    "token-id": "abcdefg",
+    "token-secret": "0123456789abcdef",
+    "usage-bootstrap-authentication": "true",
+    "auth-extra-groups": "system:bootstrappers:k3s:default-node-token"
+   }
+  },
+  "op": "delete",
+  "ha": true
+ },
+ {
   "name": "ha: the Traefik DaemonSet's pod in portcullis-ingress (hostPort 80/443, restricted otherwise)",
   "object": {
    "apiVersion": "v1",

@@ -12,9 +12,10 @@ A denial must come from a Portcullis binding and carry the vector's reason.
 The vectors' test values are mapped to the live params: the Traefik image
 to traefikImage, the test generation 0123456789abcdef to the live one,
 ${NOW+<n>m} to now + n minutes. An op update / delete judges its existing
-object: fetched when it exists, else created as the CLI first (a Pod never
-scheduled, owned by the live DaemonSet traefik or one made for the run),
-deleted afterwards; a subresource is sent as one. Every vector prints PASS
+object: fetched when it exists (and then never deleted: k3s's own
+kube-system Secrets; the judged delete is a dry run), else created as the
+CLI first (a Pod never scheduled, owned by the live DaemonSet traefik or
+one made for the run) and deleted afterwards; a subresource is sent as one. Every vector prints PASS
 or FAIL; the run fails at the end when any did.
   python3 .github/ci/e2e-k3s-ha-admission.py [<context>]   (default ci)
 """
@@ -130,7 +131,8 @@ def run(v, owner):
                 if r.get("kind") == "DaemonSet" and r.get("name") == "traefik":
                     r["uid"] = owner()
     cur, _ = kjson(["-n", md["namespace"], "get", kind, md["name"]])
-    if cur is None:
+    made = cur is None  # a live object (k3s's own Secrets) is never deleted
+    if made:
         rc, out = k(["create", "-f", "-"], json.dumps(ex))
         if rc != 0:
             return None, f"creating the existing object: {out[:300]}"
@@ -146,7 +148,8 @@ def run(v, owner):
             rc, out = k([*who, "replace", "--dry-run=server", *sub, "-f", "-"], json.dumps(o))
         return rc == 0, out
     finally:
-        k(["-n", md["namespace"], "delete", kind, md["name"], "--wait=true", "--timeout=60s", "--ignore-not-found"])
+        if made:
+            k(["-n", md["namespace"], "delete", kind, md["name"], "--wait=true", "--timeout=60s", "--ignore-not-found"])
         drop_made_ds()
 
 
