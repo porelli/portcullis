@@ -136,13 +136,17 @@ kube_params_generation() {
 }
 
 # kube_doc_addresses — the admission params' addresses from
-# portcullis-cluster-addresses (§20.9): _K_DOC_NODES = every address of every
-# pending and active node, _K_DOC_API = api, each a host prefix, sorted
-# unique, space-separated. 0 = the document is used; 2 = there is none yet;
-# 1 = refused (_K_ERR): it doesn't parse, a node's state, mesh or address
-# list is wrong, or kube_cluster_addresses refuses it (fail closed).
+# portcullis-cluster-addresses (§20.9) and the live nodes: _K_DOC_NODES =
+# every address of every pending and active node, of every removed node
+# whose Node object still exists, and every InternalIP / ExternalIP of every
+# live Node (the union: the document is nodeadm's, the Node objects the API
+# server's); _K_DOC_API = api; each a /32, sorted unique, space-separated.
+# Strict IPv4 only (an IPv4 single-stack cluster: octets 0–255, no leading
+# zero; any IPv6 or malformed entry refuses the whole document). 0 = used;
+# 2 = no document yet; 1 = refused (_K_ERR): it doesn't parse, a live Node
+# is missing from it, or kube_cluster_addresses refuses it (fail closed).
 kube_doc_addresses() {
-  local out doc vals
+  local out doc vals live
   _K_DOC_NODES="" _K_DOC_API=""
   if ! out="$(kube_ctl -n "$(kube_ns)" get configmap "$KUBE_CLUSTER_ADDRESSES" -o json 2>&1)"; then
     case "$out" in *NotFound*) return 2 ;; esac
@@ -152,16 +156,25 @@ kube_doc_addresses() {
   [ -n "$doc" ] || return 2
   [ -n "${_K_API_EP:-}" ] || kube_detect_cidrs || return 1
   kube_cluster_addresses || return 1
-  vals="$(printf '%s' "$doc" | jq -r 'def ip: type == "string" and (test("^[0-9]{1,3}([.][0-9]{1,3}){3}$") or test("^[0-9a-fA-F:]+$"));
-      def host: if test(":") then . + "/128" else . + "/32" end;
-      select(.nodes | type == "object" and all(.[];
-          (.state == "pending" or .state == "active" or .state == "removed")
-          and (.mesh | ip) and (.lan | type == "array" and all(ip)) and (.public | type == "array" and all(ip))))
-      | [([.nodes[] | select(.state != "removed") | .mesh, .lan[], .public[]] | map(host) | unique | join(" ")),
-         (.api | map(host) | unique | join(" "))] | @tsv' 2>/dev/null)"
-  if [ -z "$vals" ]; then
-    _K_ERR="the cluster addresses (ConfigMap $KUBE_CLUSTER_ADDRESSES) don't parse: nothing is changed"; return 1
-  fi
+  live="$(kube_ctl get nodes -o json 2>/dev/null)" || { _K_ERR="kubectl get nodes failed: nothing is changed"; return 1; }
+  vals="$(printf '%s' "$doc" | jq -r --argjson live "$live" '
+      def oct: "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
+      def ip4: type == "string" and test("^" + oct + "([.]" + oct + "){3}$");
+      ([$live.items[].metadata.name]) as $names
+      | ([$live.items[].status.addresses[]? | select(.type == "InternalIP" or .type == "ExternalIP") | .address]) as $laddr
+      | select((.nodes | type == "object") and (.api | type == "array" and all(ip4))
+          and (.nodes | all(.[]; (.state == "pending" or .state == "active" or .state == "removed")
+               and (.mesh | ip4) and (.lan | type == "array" and all(ip4)) and (.public | type == "array" and all(ip4))))
+          and ($laddr | all(type == "string")))
+      | . as $d | ([$names[] | . as $n | select(($d.nodes | has($n)) | not)]) as $missing
+      | if ($missing | length) > 0 then "MISSING\t" + ($missing | join(" "))
+        else [([(.nodes | to_entries[] | select(.value.state != "removed" or (.key as $k | $names | index($k)))
+                 | .value | .mesh, .lan[], .public[]), ($laddr[] | select(ip4))] | map(. + "/32") | unique | join(" ")),
+              (.api | map(. + "/32") | unique | join(" "))] | @tsv end' 2>/dev/null)"
+  case "$vals" in
+    "") _K_ERR="the cluster addresses (ConfigMap $KUBE_CLUSTER_ADDRESSES) don't parse: nothing is changed"; return 1 ;;
+    MISSING*) _K_ERR="the cluster addresses don't list the node(s) ${vals#MISSING$'\t'}: nothing is changed"; return 1 ;;
+  esac
   IFS=$'\t' read -r _K_DOC_NODES _K_DOC_API <<< "$vals"
   [ -n "$_K_DOC_NODES" ] && [ -n "$_K_DOC_API" ] || { _K_ERR="the cluster addresses list no node or no API server: nothing is changed"; return 1; }
 }
@@ -206,6 +219,8 @@ kube_admission_active_put() {
 kube_params_sync() {
   local rc=0 cur gen base hub params
   kube_detect_cidrs || fail "can't read the cluster's networks: $_K_ERR"
+  [ "$_K_POD_CIDR" = "${PORTCULLIS_POD_CIDR:-}" ] \
+    || fail "params-sync: the cluster CIDR is $_K_POD_CIDR but .env has PORTCULLIS_POD_CIDR=${PORTCULLIS_POD_CIDR:-}: nothing is changed"
   kube_doc_addresses || rc=$?
   case "$rc" in
     2) info "params-sync: no cluster addresses yet (nodeadm writes them): nothing to sync"; return 0 ;;
@@ -407,28 +422,83 @@ kube_multi_node_checks() {
   kube_other_nodes_apparmor "$1"
 }
 
-# kube_node_args_checks <nodes json> — every k3s server's node-args:
-# --secrets-encryption, --disable=traefik, the network policy controller,
-# ServiceLB ("ok|fail<TAB>text" lines). An agent's are skipped; a node
-# whose node-args are unreadable fails (it can't be told apart).
-kube_node_args_checks() {
-  local name kind args bad
-  while IFS=$'\t' read -r name kind args; do
-    [ -n "$name" ] || continue
-    case "$kind" in
-      agent) continue ;;
-      server) ;;
-      *) _rt_chk fail "k3s node $name: its node-args (k3s.io/node-args) are unreadable: secrets encryption, the network policy controller, the bundled ingress and ServiceLB can't be checked"; continue ;;
+# _kn_roles <nodes json> — one line per node: name, "server" when it
+# carries node-role.kubernetes.io/control-plane=true (a label NodeRestriction
+# keeps a kubelet from setting on itself) else "agent", what its node-args
+# (k3s.io/node-args, which the node itself writes) claim ("server", "agent"
+# or "" when unreadable), the rest of its node-args, its InternalIPs.
+_kn_roles() {
+  printf '%s' "$1" | jq -r '.items[] | (.metadata.annotations["k3s.io/node-args"] // "" | (fromjson? // [])) as $a
+      | [.metadata.name, (if (.metadata.labels // {})["node-role.kubernetes.io/control-plane"] == "true" then "server" else "agent" end),
+         (if ($a | type) == "array" and ($a | length) > 0 and (($a[0] == "server") or ($a[0] == "agent")) then $a[0] else "" end),
+         (if ($a | type) == "array" then ($a[1:] | map(tostring) | join(" ")) else "" end),
+         ([.status.addresses[]? | select(.type == "InternalIP") | .address] | join(" "))] | map(explode | map(if . == 31 or . == 10 then 32 else . end) | implode) | join("\u001f")' 2>/dev/null
+}
+
+# kube_cluster_cidr <nodes json> — _K_POD_CIDR = the cluster CIDR of a k3s
+# cluster: every control-plane node's --cluster-cidr (k3s's default
+# 10.42.0.0/16 without one), which must all agree; a control-plane node
+# whose node-args don't say server fails closed. 2 = no control-plane node
+# (not k3s: the caller reads spec.podCIDRs); 1 = refused (_K_ERR).
+kube_cluster_cidr() {
+  local name role kind args ips c cidr="" n=0
+  while IFS=$'\x1f' read -r name role kind args ips; do
+    [ "$role" = server ] || continue
+    n=$((n + 1))
+    [ "$kind" = server ] || { _K_ERR="node $name is a control-plane node but its node-args say ${kind:-nothing readable}: refused"; return 1; }
+    c="10.42.0.0/16"
+    case " $args " in
+      *" --cluster-cidr="*) c="${args#*--cluster-cidr=}"; c="${c%% *}" ;;
+      *" --cluster-cidr "*) c="${args#*--cluster-cidr }"; c="${c%% *}" ;;
     esac
+    c="${c//,/ }"
+    [ -z "$cidr" ] || [ "$cidr" = "$c" ] || { _K_ERR="the servers' --cluster-cidr disagree ($cidr, $c on $name): refused"; return 1; }
+    cidr="$c"
+  done < <(_kn_roles "$1")
+  [ "$n" -gt 0 ] || return 2
+  _K_POD_CIDR="$cidr"
+}
+
+# kube_node_args_checks <nodes json> — every server's node-args:
+# --secrets-encryption, --disable=traefik, the network policy controller,
+# ServiceLB ("ok|fail<TAB>text" lines). A node is a server by its
+# control-plane label, never by its own node-args: a labelled node whose
+# node-args say otherwise (or are unreadable), an unlabelled one claiming to
+# be a server, and a set of control-plane nodes other than the API servers
+# (the kubernetes EndpointSlice) fail.
+kube_node_args_checks() {
+  local name role kind args ips bad cp="" api
+  while IFS=$'\x1f' read -r name role kind args ips; do
+    [ -n "$name" ] || continue
+    if [ "$role" = agent ]; then
+      case "$kind" in
+        agent) ;;
+        server) _rt_chk fail "k3s node $name: its node-args claim a server, but it has no control-plane label" ;;
+        *) _rt_chk fail "k3s node $name: its node-args (k3s.io/node-args) are unreadable: it can't be told apart" ;;
+      esac
+      continue
+    fi
+    cp="$cp $ips"
+    if [ "$kind" != server ]; then
+      _rt_chk fail "k3s node $name is a control-plane node but its node-args say ${kind:-nothing readable}: secrets encryption, the network policy controller, the bundled ingress and ServiceLB can't be checked"
+      continue
+    fi
     args=" $args " bad=""
     case "$args" in *" --secrets-encryption "*|*" --secrets-encryption=true "*) ;; *) bad="$bad, without --secrets-encryption" ;; esac
     case "$args" in *" --disable traefik "*|*" --disable=traefik "*|*" --disable=traefik,"*|*",traefik "*|*",traefik,"*) ;; *) bad="$bad, with its bundled Traefik (--disable=traefik missing)" ;; esac
     case "$args" in *" --disable-network-policy "*) bad="$bad, with --disable-network-policy" ;; esac
     case "$args" in *" --disable servicelb "*|*" --disable=servicelb "*|*"servicelb,"*|*",servicelb "*) bad="$bad, with ServiceLB disabled" ;; esac
     if [ -n "$bad" ]; then _rt_chk fail "k3s server $name runs${bad#,}: reinstall it with the init flags"; else _rt_chk ok "k3s server $name: secrets encryption, --disable=traefik, network policy, ServiceLB"; fi
-  done < <(printf '%s' "$1" | jq -r '.items[] | (.metadata.annotations["k3s.io/node-args"] // "" | (fromjson? // [])) as $a
-      | [.metadata.name, (if ($a | type) == "array" and ($a | length) > 0 then ($a[0] | tostring) else "" end),
-         (if ($a | type) == "array" then ($a[1:] | map(tostring) | join(" ")) else "" end)] | @tsv' 2>/dev/null)
+  done < <(_kn_roles "$1")
+  # The control-plane nodes are exactly the API servers.
+  cp="$(printf '%s\n' $cp | grep . | LC_ALL=C sort -u | tr '\n' ' ')"
+  api="$(kube_ctl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o json 2>/dev/null \
+    | jq -r '[.items[].endpoints[].addresses[]] | unique | .[]' 2>/dev/null | LC_ALL=C sort -u | tr '\n' ' ')"
+  if [ -z "$api" ] || [ "$cp" != "$api" ]; then
+    _rt_chk fail "the control-plane nodes (${cp% }) aren't the API servers (${api% }): the server roles can't be trusted"
+  else
+    _rt_chk ok "the control-plane nodes are the API servers (${cp% })"
+  fi
 }
 
 # kube_pids_checks <nodes json> — the kubelet's podPidsLimit is 1024 on

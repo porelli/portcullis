@@ -80,10 +80,9 @@ kube_detect_cidrs() {
   local nodes out
   _K_POD_CIDR="" _K_SVC_CIDR="" _K_API_EP="" _K_ERR=""
   nodes="$(kube_ctl get nodes -o json 2>/dev/null)" || { _K_ERR="kubectl get nodes failed"; return 1; }
-  # k3s (a server's node-args): the cluster CIDR, --cluster-cidr or k3s's
-  # 10.42.0.0/16; another distribution: the node's spec.podCIDRs.
-  _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '[.items[].metadata.annotations["k3s.io/node-args"] // empty | fromjson | select(.[0] == "server")][0] // empty
-    | . as $a | ([range(0; length) | select($a[.] | startswith("--cluster-cidr")) | if $a[.] | contains("=") then ($a[.] | sub("^--cluster-cidr="; "")) else $a[. + 1] end][0] // "10.42.0.0/16" | gsub(","; " "))' 2>/dev/null || true)"
+  # k3s: the control-plane nodes' agreeing --cluster-cidr (node.sh); another
+  # distribution: the node's spec.podCIDRs.
+  kube_cluster_cidr "$nodes" || [ "$?" = 2 ] || return 1
   case "$(printf '%s' "$nodes" | jq -r '.items | length' 2>/dev/null)" in
     0|"") _K_ERR="the cluster has no node"; return 1 ;;
     1) [ -n "$_K_POD_CIDR" ] || _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '.items[0].spec | (.podCIDRs // [.podCIDR // empty]) | join(" ")' 2>/dev/null || true)" ;;

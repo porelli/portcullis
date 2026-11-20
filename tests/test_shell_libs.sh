@@ -4356,7 +4356,7 @@ k_fixtures() {
   printf 'ci\nother\n' > "$KS/kube/contexts"
   echo '{"serverVersion":{"gitVersion":"v1.37.2+k3s1"}}' > "$KS/kube/version.json"
   cat > "$KS/kube/nodes.json" <<'J'
-{"items":[{"metadata":{"name":"node1","annotations":{"k3s.io/node-args":"[\"server\",\"--disable\",\"traefik\",\"--secrets-encryption\",\"--kubelet-arg\",\"pod-max-pids=1024\",\"--node-external-ip\",\"198.51.100.1\",\"--cluster-cidr\",\"10.42.0.0/24\"]"}},
+{"items":[{"metadata":{"name":"node1","labels":{"node-role.kubernetes.io/control-plane":"true"},"annotations":{"k3s.io/node-args":"[\"server\",\"--disable\",\"traefik\",\"--secrets-encryption\",\"--kubelet-arg\",\"pod-max-pids=1024\",\"--node-external-ip\",\"198.51.100.1\",\"--cluster-cidr\",\"10.42.0.0/24\"]"}},
   "spec":{"podCIDR":"10.42.0.0/24","podCIDRs":["10.42.0.0/24"]},
   "status":{"addresses":[{"type":"InternalIP","address":"10.1.0.4"},{"type":"ExternalIP","address":"198.51.100.1"}]}}]}
 J
@@ -4525,15 +4525,44 @@ if [ "$(printf '%s\n' "$OUT" | grep -c "^fail	node n2: kubelet podPidsLimit is 0
 else t_fail "kube_host_checks 3 nodes: $OUT"; fi
 expect_eq "kube_host_checks (3 nodes): AppArmor not checked on the two other nodes" \
   "$(printf '%s\n' "$OUT" | grep -c "^warn	AppArmor stacking on node n[23]: not checked")" 2
+# Roles come from the control-plane label, cross-checked with the API
+# servers; node-args can't promote or demote a node.
+expect_eq "kube_host_checks (3 nodes): control-plane nodes that aren't the API servers → fail" \
+  "$(printf '%s\n' "$OUT" | grep -c "^fail	the control-plane nodes (10.1.0.4 10.215.0.2 10.215.0.3) aren't the API servers (10.1.0.4)")" 1
+cp "$KS/kube/eps.json" "$KS/kube/eps.saved"
+echo '{"items":[{"ports":[{"port":6443}],"endpoints":[{"addresses":["10.1.0.4"]},{"addresses":["10.215.0.2"]},{"addresses":["10.215.0.3"]}]}]}' > "$KS/kube/eps.json"
+cp "$KS/kube/nodes.json" "$KS/kube/nodes.saved"
+jq '.items[1].metadata.annotations["k3s.io/node-args"] = "[\"agent\"]" | .items[2].metadata.labels = {}' "$KS/kube/nodes.saved" > "$KS/kube/nodes.json"
+OUT="$(kt 'kube_node_args_checks "$(kube_ctl get nodes -o json)"')"
+if [ "$(printf '%s\n' "$OUT" | grep -c "^fail	k3s node n2 is a control-plane node but its node-args say agent"):$(printf '%s\n' "$OUT" | grep -c "^fail	k3s node n3: its node-args claim a server, but it has no control-plane label"):$(printf '%s\n' "$OUT" | grep -c "^fail	the control-plane nodes (10.1.0.4 10.215.0.2) aren't the API servers")" = "1:1:1" ]; then
+  t_pass "kube_node_args_checks: a control-plane node claiming agent and an unlabelled node claiming server fail; the cross-check names the mismatch"
+else t_fail "node args roles: $OUT"; fi
+cp "$KS/kube/nodes.saved" "$KS/kube/nodes.json"
+OUT="$(kt 'kube_node_args_checks "$(kube_ctl get nodes -o json)"')"
+expect_eq "kube_node_args_checks: the control-plane nodes are exactly the API servers → ok" \
+  "$(printf '%s\n' "$OUT" | grep -c "^ok	the control-plane nodes are the API servers (10.1.0.4 10.215.0.2 10.215.0.3)")" 1
+mv "$KS/kube/eps.saved" "$KS/kube/eps.json"; rm -f "$KS/kube/nodes.saved"
 rm -f "$KS/kube/configz-n2.json"
-jq '.items |= map(.metadata.annotations = {})' "$KS/kube/nodes.json" > "$KS/kube/n3.json" && mv "$KS/kube/n3.json" "$KS/kube/nodes.json"
+jq '.items |= map(.metadata.annotations = {} | .metadata.labels = {})' "$KS/kube/nodes.json" > "$KS/kube/n3.json" && mv "$KS/kube/n3.json" "$KS/kube/nodes.json"
 OUT="$(kt 'kube_detect_cidrs || { echo "$_K_ERR"; exit 1; }')"
 case "$OUT" in *"more than one node and isn't k3s"*"rc=1") t_pass "kube_detect_cidrs: three nodes of another distribution → refused" ;; *) t_fail "kube detect multi non-k3s: $OUT" ;; esac
 k_fixtures
 expect_eq "kube_detect_cidrs: k3s's --cluster-cidr node arg is the pod CIDR" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR"')" "10.42.0.0/24
 rc=0"
 jq '.items[0].metadata.annotations["k3s.io/node-args"] = "[\"agent\",\"--cluster-cidr\",\"10.99.0.0/16\"]"' "$KS/kube/nodes.json" > "$KS/kube/n1.json" && mv "$KS/kube/n1.json" "$KS/kube/nodes.json"
-expect_eq "kube_detect_cidrs: only a server's node-args name the cluster CIDR (an agent's are ignored)" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR"')" "10.42.0.0/24
+case "$(kt 'kube_detect_cidrs || { echo "$_K_ERR"; exit 1; }')" in
+  *"node node1 is a control-plane node but its node-args say agent: refused"*"rc=1") t_pass "kube_detect_cidrs: a control-plane node whose node-args claim agent → refused (the role is the label's)" ;;
+  *) t_fail "kube detect cp agent" ;; esac
+# Two servers whose --cluster-cidr disagree → refused.
+k_fixtures
+jq '.items += [(.items[0] | .metadata.name = "node2" | .metadata.annotations["k3s.io/node-args"] = "[\"server\",\"--cluster-cidr=10.99.0.0/16\"]")]' "$KS/kube/nodes.json" > "$KS/kube/n1.json" && mv "$KS/kube/n1.json" "$KS/kube/nodes.json"
+case "$(kt 'kube_detect_cidrs || { echo "$_K_ERR"; exit 1; }')" in
+  *"the servers' --cluster-cidr disagree (10.42.0.0/24, 10.99.0.0/16 on node2)"*"rc=1") t_pass "kube_detect_cidrs: servers with different --cluster-cidr → refused" ;;
+  *) t_fail "kube detect cidr disagree" ;; esac
+# An unlabelled node's server node-args name no cluster CIDR (2 → spec.podCIDRs).
+k_fixtures
+jq '.items[0].metadata.labels = {}' "$KS/kube/nodes.json" > "$KS/kube/n1.json" && mv "$KS/kube/n1.json" "$KS/kube/nodes.json"
+expect_eq "kube_detect_cidrs: node-args without the control-plane label decide nothing (the node's podCIDRs)" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR"')" "10.42.0.0/24
 rc=0"
 # The cluster addresses document (contract §20.9): checked against the
 # fixed mesh and the cluster itself; it overrides nothing.
@@ -4574,10 +4603,30 @@ expect_eq "kube_admission_params_apply's generation is kube_params_generation, a
 # The cluster addresses → the params' addresses: pending and active nodes,
 # never a removed one; anything that doesn't validate changes nothing.
 CA_ST='{"v":1,"mesh_cidr":"10.215.0.0/24","cluster_cidr":"10.42.0.0/24","service_cidr":"10.43.0.0/16","api":["10.215.0.10","10.215.0.1"],"nodes":{"n1":{"mesh":"10.215.0.1","lan":["192.0.2.10"],"public":["198.51.100.7"],"state":"active"},"n2":{"mesh":"10.215.0.10","lan":[],"public":[],"state":"pending"},"n3":{"mesh":"10.215.0.30","lan":["192.0.2.30"],"public":[],"state":"removed"}}}'
+# The live nodes (the API server's view): n1 (with an ExternalIP the
+# document doesn't list) and n2, both control-plane servers.
+cp_node() { jq -nc --arg n "$1" --arg ip "$2" --arg ext "${3:-}" '{metadata: {name: $n, labels: {"node-role.kubernetes.io/control-plane": "true"},
+    annotations: {"k3s.io/node-args": "[\"server\",\"--cluster-cidr\",\"10.42.0.0/24\"]"}},
+  status: {addresses: ([{type: "InternalIP", address: $ip}] + (if $ext == "" then [] else [{type: "ExternalIP", address: $ext}] end))}}'; }
+live_nodes() { printf '%s\n' "$@" | jq -s '{items: .}' > "$KS/kube/nodes.json"; }
+live_nodes "$(cp_node n1 10.215.0.1 198.51.100.9)" "$(cp_node n2 10.215.0.10)"
 kda() { kt "kube_doc_addresses && echo \"\$_K_DOC_NODES|\$_K_DOC_API\" || { r=\$?; echo \"rc\$r \${_K_ERR:-}\"; exit \$r; }"; }
 ca "$CA_ST"
-expect_eq "kube_doc_addresses: every address of the pending and active nodes (not the removed one), api, each /32" "$(kda)" "10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32|10.215.0.1/32 10.215.0.10/32
+expect_eq "kube_doc_addresses: the pending and active nodes' addresses ∪ every live Node's (not a removed node without a Node), api, each /32" "$(kda)" "10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32|10.215.0.1/32 10.215.0.10/32
 rc=0"
+# A removed node whose Node object still exists stays excluded.
+live_nodes "$(cp_node n1 10.215.0.1 198.51.100.9)" "$(cp_node n2 10.215.0.10)" "$(cp_node n3 10.215.0.30 | jq -c '.metadata.labels = {} | .metadata.annotations = {"k3s.io/node-args": "[\"agent\"]"}')"
+case "$(kda)" in *"10.215.0.30/32"*"192.0.2.30/32"*"rc=0") t_pass "kube_doc_addresses: a removed node keeps its addresses excluded while its Node exists" ;; *) t_fail "kda removed live: $(kda)" ;; esac
+# A live Node the document doesn't list: no sync.
+live_nodes "$(cp_node n1 10.215.0.1 198.51.100.9)" "$(cp_node n2 10.215.0.10)" "$(cp_node n4 10.215.0.40 | jq -c '.metadata.labels = {} | .metadata.annotations = {}')"
+case "$(kda)" in *"rc1 the cluster addresses don't list the node(s) n4"*) t_pass "kube_doc_addresses: a live Node missing from the document → refused" ;; *) t_fail "kda missing: $(kda)" ;; esac
+live_nodes "$(cp_node n1 10.215.0.1 198.51.100.9)" "$(cp_node n2 10.215.0.10)"
+# Strict IPv4: an IPv6 or out-of-range entry refuses the whole document.
+for bad in '.nodes.n1.lan = ["2001:db8::1"]' '.nodes.n1.public = ["198.51.100.300"]' '.nodes.n2.lan = ["010.1.2.3"]' '.nodes.n1.public = ["::ffff:198.51.100.7"]'; do
+  ca "$(printf '%s' "$CA_ST" | jq -c "$bad")"
+  case "$(kda)" in *"rc1 "*"don't parse"*) t_pass "kube_doc_addresses: $bad → refused" ;; *) t_fail "kda strict $bad: $(kda)" ;; esac
+done
+ca "$CA_ST"
 ca "$(printf '%s' "$CA_ST" | jq -c '.nodes.n2.state = "joining"')"
 case "$(kda)" in *"rc1 the cluster addresses (ConfigMap portcullis-cluster-addresses) don't parse"*) t_pass "kube_doc_addresses: an unknown node state → refused" ;; *) t_fail "kda state: $(kda)" ;; esac
 ca "$(printf '%s' "$CA_ST" | jq -c '.nodes.n1.public = ["not an address"]')"
@@ -4594,14 +4643,16 @@ psync() { # psync <base params lines> → kube_params_sync with the stub's activ
   kt "kube_admission_params_apply() { echo \"APPLY \$1\"; printf '%s\n' \"\$2\" | awk -F'\t' '\$1 ~ /Addresses\$/'; }; kube_params_sync"
 }
 ca "$CA_ST"
-OUT="$(psync "$(printf '%s\n' "$PS_BASE" | sed 's#^nodeAddresses\t.*#nodeAddresses\t10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32#')")"
+OUT="$(psync "$(printf '%s\n' "$PS_BASE" | sed 's#^nodeAddresses\t.*#nodeAddresses\t10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32#')")"
 expect_eq "kube params-sync: the document's addresses already in the active generation → nothing" "$OUT" "rc=0"
 OUT="$(psync "$PS_BASE")"
-case "$OUT" in *"APPLY ghcr.io/porelli/portcullis-hub@sha256:"*"nodeAddresses	10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32"*"apiAddresses	10.215.0.1/32 10.215.0.10/32"*"rc=0")
+case "$OUT" in *"APPLY ghcr.io/porelli/portcullis-hub@sha256:"*"nodeAddresses	10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32"*"apiAddresses	10.215.0.1/32 10.215.0.10/32"*"rc=0")
   t_pass "kube params-sync: a pending node's addresses → the swap with the document's addresses and the active hub image" ;; *) t_fail "psync change: $OUT" ;; esac
 ca "$(printf '%s' "$CA_ST" | jq -c '.nodes.n2.mesh = "10.9.0.1"')"
 OUT="$(psync "$PS_BASE")"
 case "$OUT" in *APPLY*) t_fail "psync bad doc applied: $OUT" ;; *"rc=1") t_pass "kube params-sync: a node outside the mesh → nothing changed, exit 1" ;; *) t_fail "psync bad: $OUT" ;; esac
+OUT="$(kt 'PORTCULLIS_POD_CIDR=10.42.9.0/24; kube_params_sync')"
+case "$OUT" in *"the cluster CIDR is 10.42.0.0/24 but .env has PORTCULLIS_POD_CIDR=10.42.9.0/24: nothing is changed"*"rc=1") t_pass "kube params-sync: a cluster CIDR other than .env's → refused" ;; *) t_fail "psync cidr: $OUT" ;; esac
 rm -f "$KS/kube/active.json"; ca "$CA_ST"
 case "$(kt 'kube_params_sync')" in *"no active admission params yet"*"rc=1") t_pass "kube params-sync: no active record → refused (run up first)" ;; *) t_fail "psync no active" ;; esac
 rm -f "$KS/kube/cluster-addresses.json"
