@@ -573,6 +573,84 @@ def check_ha():
         F.add("router portcullis-node without nodeadm.enabled")
 
 
+def site_problems(docs, ha=True):
+    """Contract §20.11 on one render: in HA every pinned pod (K.SITE_PINNED)
+    requires portcullis.io/site In [main] in each of its required terms, and
+    no other pod carries any site term (frontdoor, nodeadm and the Traefik
+    DaemonSet included); without HA no pod carries one."""
+    out = []
+    pods = {n: sp for n, _, _, sp, _ in K.pod_specs(docs)}
+    for n, sp in sorted(pods.items()):
+        pinned = ha and n in K.SITE_PINNED
+        if pinned and not K.site_pinned(sp):
+            out.append(f"{n}: no required node affinity portcullis.io/site In [{K.PRIMARY_SITE}] (pinned to the primary site)")
+        if pinned and len(K.site_exprs(sp)) != len(K.node_terms(sp)):
+            out.append(f"{n}: site terms {K.site_exprs(sp)} beyond the one In [{K.PRIMARY_SITE}] per term")
+        if not pinned and K.site_exprs(sp):
+            out.append(f"{n}: a site term {K.site_exprs(sp)} ({'never pinned' if n in K.SITE_FREE else 'not in the pinned set'}{'' if ha else ', and none without HA'})")
+    return out
+
+
+def check_sites():
+    """Task 20 (contract §20.11): "sites: every pinned component requires
+    portcullis.io/site In [main]"; "sites: frontdoor, nodeadm, traefik carry
+    no site term" (and they are rendered, so the check bites); none without
+    HA; tests/k8s-ci-values-ha-sites.yaml (ha.primarySite main, as
+    kube_render_values writes it) renders the same; any other primarySite is
+    refused at render time; portcullis.sitePin merges a class term into the
+    site term (never replacing it: the CNPG instances' main + NotIn small,
+    Task 23) and renders only the class term without a pin."""
+    ha_vals = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    sites_vals = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha-sites.yaml").read_text())
+    merged = dict(ha_vals, ha=dict(ha_vals["ha"], **sites_vals.get("ha", {})))
+    if merged["ha"].get("primarySite") != K.PRIMARY_SITE:
+        F.add(f"tests/k8s-ci-values-ha-sites.yaml: ha.primarySite {merged['ha'].get('primarySite')} (main, as kube_render_values writes it)")
+    if K.values()["ha"].get("primarySite") != K.PRIMARY_SITE:
+        F.add(f"values.yaml: ha.primarySite {K.values()['ha'].get('primarySite')} (main)")
+    for label, vals, ha in (("sites", ha_vals, True), ("sites (ha-sites values)", merged, True),
+                            ("sites (3 nodes, 3 gates)", {"ha": dict(ha_vals["ha"], nonSmallNodesAtPrimary=3, gateReplicas=3), "nodeadm": ha_vals["nodeadm"]}, True),
+                            ("sites without HA", {"nodeadm": ha_vals["nodeadm"]}, False)):
+        docs = K.render(vals) + K.render(dict(vals, oneshot="hub"), "templates/oneshot.yaml")
+        for p in site_problems(docs, ha):
+            F.add(f"{label}: {p}")
+        names = {n for n, *_ in K.pod_specs(docs)}
+        want = K.SITE_PINNED | (K.SITE_FREE if ha else {"traefik", "nodeadm"})  # frontdoor: HA only
+        if not want <= names:
+            F.add(f"{label}: not rendered {sorted(want - names)} (the site check would pass vacuously)")
+    # The check bites (mutation tests): a pin removed, a site term on frontdoor.
+    docs = K.render(ha_vals)
+    bad = [json.loads(json.dumps(d)) for d in docs]
+    kc = next(d for d in bad if d.get("kind") == "StatefulSet" and d["metadata"]["name"] == "keycloak")
+    kc["spec"]["template"]["spec"].pop("affinity", None)
+    fd = next(d for d in bad if d.get("kind") == "Deployment" and d["metadata"]["name"] == "frontdoor")
+    fd["spec"]["template"]["spec"]["nodeSelector"] = {K.SITE_KEY: K.PRIMARY_SITE}
+    got = site_problems(bad)
+    if not any(p.startswith("keycloak:") for p in got) or not any(p.startswith("frontdoor:") for p in got):
+        F.add(f"site_problems misses an unpinned keycloak or a pinned frontdoor (mutation test): {got}")
+    # Any other primary site is refused at render time, with or without HA.
+    for extra in ({"ha": dict(ha_vals["ha"], primarySite="edge")}, {"ha": {"primarySite": "edge"}}, {"ha": {"primarySite": ""}}):
+        try:
+            K.render(extra)
+            F.add(f"the chart renders with ha.primarySite {extra['ha']['primarySite']!r} (only main in this version)")
+        except subprocess.CalledProcessError as e:
+            if "ha.primarySite" not in e.stderr:
+                F.add(f"ha.primarySite {extra['ha']['primarySite']!r} refused without naming ha.primarySite: {e.stderr.strip()[-200:]}")
+    # portcullis.sitePin merges a class term (Task 23's CNPG instances).
+    for label, spec, ha, want in (
+            ("pin + class", '"pin" true "nodeExpressions" (list (dict "key" "portcullis.io/class" "operator" "NotIn" "values" (list "small")))', True,
+             [{"matchExpressions": [{"key": K.SITE_KEY, "operator": "In", "values": [K.PRIMARY_SITE]},
+                                    {"key": "portcullis.io/class", "operator": "NotIn", "values": ["small"]}]}]),
+            ("pin", '"pin" true', True, [{"matchExpressions": [{"key": K.SITE_KEY, "operator": "In", "values": [K.PRIMARY_SITE]}]}]),
+            ("class only", '"nodeExpressions" (list (dict "key" "portcullis.io/class" "operator" "NotIn" "values" (list "small")))', True,
+             [{"matchExpressions": [{"key": "portcullis.io/class", "operator": "NotIn", "values": ["small"]}]}]),
+            ("pin without HA", '"pin" true', False, []),
+            ("no pin", '', True, [])):
+        got = K.render_helper(f'{{{{ include "portcullis.sitePin" (dict "root" . "s" (dict {spec})) }}}}', {"ha": {"enabled": ha}})
+        terms = ((yaml.safe_load(got) or {}).get("nodeAffinity") or {}).get("requiredDuringSchedulingIgnoredDuringExecution", {}).get("nodeSelectorTerms", [])
+        if terms != want:
+            F.add(f"portcullis.sitePin {label}: {terms} (want {want})")
+
+
 def main():
     comp = K.compose()
     docs = K.render()
@@ -584,6 +662,7 @@ def main():
     check_traefik(comp, docs)
     check_published()
     check_ha()
+    check_sites()
     for kind, items in D.items():
         for e in items:
             if (kind, e.get("service"), str(e.get("item"))) not in USED:

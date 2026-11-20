@@ -21,6 +21,9 @@
 
 KUBE_MIN_VERSION="1.33"
 KUBE_STORAGE_NS="portcullis-storage"
+# The primary site (contract §20.11): fixed to main in this version, the
+# chart's ha.primarySite (it refuses any other value).
+KUBE_PRIMARY_SITE="main"
 # Traefik's only watched namespace (the chart's edgeNamespace): the core
 # IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
 KUBE_EDGE_NS="portcullis-edge"
@@ -1592,7 +1595,7 @@ kube_traefik_peer() {
 # there; review M8: an unlabelled or NotReady node never counts); 0 when the
 # nodes can't be read (2 replicas).
 kube_nonsmall_at_primary() {
-  kube_ctl get nodes -l 'portcullis.io/site=main,portcullis.io/class in (home,cloud)' -o json 2>/dev/null \
+  kube_ctl get nodes -l "portcullis.io/site=$KUBE_PRIMARY_SITE,portcullis.io/class in (home,cloud)" -o json 2>/dev/null \
     | jq -r '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length' 2>/dev/null || echo 0
 }
 
@@ -1622,7 +1625,7 @@ kube_render_values() {
   if kube_ha_on; then ha=true; nsp="$(kube_nonsmall_at_primary)"; fi
   [[ "$nsp" =~ ^[0-9]+$ ]] || nsp=0
   jq -n --argjson images "$_K_IMAGES" --argjson hashes "${_K_HASHES:-{\}}" --argjson items "${_K_ITEMS:-{\}}" \
-    --argjson mon "$mon" --argjson wg "$wg" --argjson ha "$ha" --argjson nsp "$nsp" \
+    --argjson mon "$mon" --argjson wg "$wg" --argjson ha "$ha" --argjson nsp "$nsp" --arg psite "$KUBE_PRIMARY_SITE" \
     --arg domain "$PORTCULLIS_DOMAIN" --arg pod "$PORTCULLIS_POD_CIDR" --arg svc "$PORTCULLIS_SERVICE_CIDR" \
     --arg api "$PORTCULLIS_KUBE_API_ENDPOINTS" --arg nodes "${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}" \
     --arg tip "$PORTCULLIS_TRAEFIK_SERVICE_IP" --arg tvip "$PORTCULLIS_TRAEFIK_VPN_SERVICE_IP" --arg weip "$PORTCULLIS_WG_EDGE_SERVICE_IP" \
@@ -1658,7 +1661,7 @@ kube_render_values() {
      hub: {bindRoots: $roots, invitesProtectedGroups: $ipg, portalDisplayName: $pdn, clientCertTTL: $ttl,
            certExpiryWarnDays: $warn, impersonationMaxMinutes: $imp, selfImage: $images.hub, appsNamespace: $apps},
      alerting: {smtpFrom: $smtp}, appsNamespace: $apps,
-     ha: {enabled: $ha, nonSmallNodesAtPrimary: $nsp}}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
+     ha: {enabled: $ha, nonSmallNodesAtPrimary: $nsp, primarySite: $psite}}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
     || fail "could not write $f"
   kube_nodeadm_values "$f"
 }

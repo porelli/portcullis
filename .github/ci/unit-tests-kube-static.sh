@@ -44,7 +44,7 @@ export HELM
 
 echo "::group::helm lint"
 "$HELM" lint charts/portcullis -f tests/k8s-ci-values.yaml -f <("$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))')
-"$HELM" lint charts/portcullis -f tests/k8s-ci-values.yaml -f tests/k8s-ci-values-ha.yaml -f <("$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))')
+"$HELM" lint charts/portcullis -f tests/k8s-ci-values.yaml -f tests/k8s-ci-values-ha.yaml -f tests/k8s-ci-values-ha-sites.yaml -f <("$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))')
 echo "::endgroup::"
 
 # The Traefik CRDs as JSON schemas (strict: unknown fields refused).
@@ -79,7 +79,7 @@ for f in files:
 print(f"{n} CRD schemas")
 PY
 
-echo "::group::helm template → kubeconform (every profile on, every profile off, VPN modes, HA, nodeadm, the HA CI values)"
+echo "::group::helm template → kubeconform (every profile on, every profile off, VPN modes, HA, nodeadm, the HA CI values, the sites values)"
 IMGV="$TOOLS/images-values.yaml"
 "$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))' > "$IMGV"
 for combo in "--set renderNamespaces=true" \
@@ -88,6 +88,7 @@ for combo in "--set renderNamespaces=true" \
              "--set renderNamespaces=true --set ha.enabled=true" \
              "--set renderNamespaces=true --set ha.enabled=true --set nodeadm.enabled=true --set nodeadm.image=ghcr.io/porelli/portcullis-nodeadm@sha256:4444444444444444444444444444444444444444444444444444444444444444" \
              "--set renderNamespaces=true -f tests/k8s-ci-values-ha.yaml" \
+             "--set renderNamespaces=true -f tests/k8s-ci-values-ha.yaml -f tests/k8s-ci-values-ha-sites.yaml" \
              "-f tests/k8s-ci-values-ha.yaml --set ha.nonSmallNodesAtPrimary=3 --set ha.gateReplicas=3 --set wg.enabled=false --set monitoring.enabled=false"; do
   # shellcheck disable=SC2086  # the combo's flags
   "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" $combo > "$TOOLS/rendered.yaml"
@@ -118,6 +119,12 @@ fi
 if "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" --set images.vault=docker.io/hashicorp/vault:2.2.1 >/dev/null 2>&1; then
   echo "FAIL: the chart renders an image without a digest"; exit 1
 fi
+# The primary site is main only (contract §20.11, Task 20): any other is refused.
+for site in edge ""; do
+  if "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" -f tests/k8s-ci-values-ha.yaml --set-string "ha.primarySite=$site" >/dev/null 2>&1; then
+    echo "FAIL: the chart renders with ha.primarySite \"$site\" (main only)"; exit 1
+  fi
+done
 # The egress policy fails closed without the node / API addresses, and
 # excludes every API endpoint even off the nodes.
 for empty in nodeAddresses apiEndpoints; do

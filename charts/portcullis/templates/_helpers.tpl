@@ -91,8 +91,10 @@ NEW (HA, Task 19; contract §20.1, spec §6 "Placement"):
   - priorityClass (default portcullis-core: ruling I5, every core pod);
   - with ha.enabled, the not-ready / unreachable tolerations at 30 s on
     every pod (contract §3.4: the cluster's default is 300 s);
-  - pin (bool): the primary-site pin hook, portcullis.sitePin (Task 20
-    renders it; empty until then);
+  - pin (bool): in HA, pinned to the primary site (portcullis.sitePin:
+    a required node affinity portcullis.io/site In [ha.primarySite]);
+    nodeExpressions ([NodeSelectorRequirement]): a class term, merged into
+    the same required term (never replacing it);
   - namespace (default the release's), daemonSet ({nodeSelector}): a
     DaemonSet instead (Traefik on the ingress nodes in HA), RollingUpdate
     maxUnavailable 1 (its hostPorts can't surge).
@@ -119,7 +121,7 @@ DoNotSchedule. */}}
 {{- if and (not $spread) $sts $sts.claims }}{{ $spread = "DoNotSchedule" }}{{ end }}
 {{- if and (not $spread) (or $sts (gt $n 1)) }}{{ $spread = "ScheduleAnyway" }}{{ end }}
 {{- $img := include "portcullis.image" (list $root ($s.image | default $s.name)) }}
-{{- $pin := "" }}{{- if $s.pin }}{{- $pin = include "portcullis.sitePin" (dict "root" $root "s" $s) | trim }}{{- end }}
+{{- $pin := include "portcullis.sitePin" (dict "root" $root "s" $s) | trim }}
 apiVersion: apps/v1
 kind: {{ ternary "DaemonSet" (ternary "StatefulSet" "Deployment" (not (empty $sts))) (not (empty $ds)) }}
 metadata:
@@ -361,12 +363,46 @@ a service with no measurement requests its limit; values memoryRequestMi
 {{- end }}
 
 {{/*
-portcullis.sitePin (dict "root" . "s" <spec>) — the primary-site pin (plan
-Task 20: a required node affinity term portcullis.io/site In
-[<ha.primarySite>], merged with the class term). A hook only until Task 20:
-it renders nothing, so `pin: true` on a spec changes nothing yet.
+portcullis.primarySite — ha.primarySite, the primary site (contract
+§20.11): fixed to main in this version, so any other value (or none) is
+refused at render time. kube_render_values writes main; there is no option.
+*/}}
+{{- define "portcullis.primarySite" -}}
+{{- $p := .Values.ha.primarySite | default "" -}}
+{{- if ne $p "main" -}}
+{{- fail (printf "ha.primarySite %q: the primary site is main and can't be changed in this version (contract §20.11)" $p) -}}
+{{- end -}}
+{{- $p -}}
+{{- end }}
+
+{{/*
+portcullis.sitePin (dict "root" . "s" <spec>) — a pod's affinity (the body
+under `affinity:`), contract §20.11. With ha.enabled and `pin: true` it
+requires portcullis.io/site In [<ha.primarySite>]: the data and sign-in
+pieces run only at the primary site (CNPG, Vault, the Sentinels and
+sessions, the Hub, domains, Keycloak, LLDAP, the gates, enroll, mcp-gate,
+wg; Longhorn's disks through the node label nodeadm sets). A class term
+(`nodeExpressions`, e.g. portcullis.io/class NotIn [small], plan R2) is
+merged into the same required term, never replacing it (nodeSelectorTerms
+are ORed, a term's expressions ANDed). Without HA, or without `pin`, only
+the class term (nothing without one). Never on the Traefik DaemonSet,
+frontdoor or nodeadm (tests/k8s_parity.py check_sites).
 */}}
 {{- define "portcullis.sitePin" -}}
+{{- $root := .root -}}{{- $s := .s -}}
+{{- $site := include "portcullis.primarySite" $root -}}
+{{- $exprs := list -}}
+{{- if and $s.pin $root.Values.ha.enabled -}}
+{{- $exprs = append $exprs (dict "key" "portcullis.io/site" "operator" "In" "values" (list $site)) -}}
+{{- end -}}
+{{- $exprs = concat $exprs ($s.nodeExpressions | default list) -}}
+{{- with $exprs }}
+nodeAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    nodeSelectorTerms:
+      - matchExpressions:
+          {{- toYaml . | nindent 10 }}
+{{- end }}
 {{- end }}
 
 {{/*

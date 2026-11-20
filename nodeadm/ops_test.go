@@ -1070,3 +1070,38 @@ func TestSetMinimumsByNamespace(t *testing.T) {
 		t.Fatalf("snapshot sets %v", got)
 	}
 }
+
+// TestLabelsLonghornDiskOnlyAtMain (contract §20.11, Task 20): a labels
+// change sets node.longhorn.io/create-default-disk=true only on a storage
+// node at main, and takes it away when the node leaves storage or main.
+func TestLabelsLonghornDiskOnlyAtMain(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	for _, c := range []struct {
+		name    string
+		req     LabelsReq
+		wantSet bool
+	}{
+		{"storage at main", LabelsReq{Class: "home", Site: "main", Storage: true}, true},
+		{"storage at edge", LabelsReq{Class: "cloud", Site: "edge", Storage: true}, false},
+		{"storage at main again", LabelsReq{Class: "home", Site: "main", Storage: true}, true},
+		{"no storage at main", LabelsReq{Class: "home", Site: "main"}, false},
+		{"small at main", LabelsReq{Class: "small", Site: "main"}, false},
+	} {
+		w := h.internal(clientHub, "PUT", "/v1/nodes/n1/labels", c.req)
+		if w.Code/100 != 2 {
+			t.Fatalf("%s: labels %d %s", c.name, w.Code, w.Body)
+		}
+		n, err := h.kube.CoreV1().Nodes().Get(ctx, "n1", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, ok := n.Labels["node.longhorn.io/create-default-disk"]
+		if c.wantSet != (ok && v == "true") || (!c.wantSet && ok) {
+			t.Errorf("%s: create-default-disk %q (present %v), want set %v", c.name, v, ok, c.wantSet)
+		}
+		if got := n.Labels["portcullis.io/site"]; got != c.req.Site {
+			t.Errorf("%s: site %q", c.name, got)
+		}
+	}
+}

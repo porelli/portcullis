@@ -14,6 +14,7 @@
 --kubelet-arg=pod-max-pids=1024
 --kubelet-arg=sync-frequency=10s
 --node-ip=10.215.0.1
+--node-label=node.longhorn.io/create-default-disk=true
 --node-label=portcullis.io/class=home
 --node-label=portcullis.io/ingress=true
 --node-label=portcullis.io/site=main

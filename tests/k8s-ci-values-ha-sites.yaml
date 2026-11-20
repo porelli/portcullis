@@ -1,0 +1,7 @@
+# The sites render of the static checks (tests/k8s_parity.py check_sites,
+# k8s_hardening.py check_sites_storage), on top of tests/k8s-ci-values.yaml
+# and tests/k8s-ci-values-ha.yaml: the primary site as kube_render_values
+# writes it (contract §20.11: fixed to main in this version; the chart
+# refuses any other value).
+ha:
+  primarySite: main

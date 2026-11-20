@@ -407,6 +407,55 @@ def check_ha_shape():
         F.add("gate_shape_problems misses a replicated pod on a node-local PVC (mutation test)")
 
 
+REPLICATED_CLASS = "portcullis-core-replicated"
+
+
+def replicated_mount_problems(docs):
+    """Contract §20.11 (storage only at main): a pod mounting a volume of
+    portcullis-core-replicated (a PVC of that class, or a StatefulSet claim
+    of it) must be one of the pinned set (K.SITE_PINNED) and carry the site
+    term: Longhorn's replicas live at main only, so a pod elsewhere would
+    reach its volume across the mesh (or not at all)."""
+    rep = {c["metadata"]["name"] for c in K.by_kind(docs, "PersistentVolumeClaim") if c["spec"].get("storageClassName") == REPLICATED_CLASS}
+    out = []
+    for d in docs:
+        if d.get("kind") not in ("Deployment", "StatefulSet", "DaemonSet", "Pod"):
+            continue
+        name = d["metadata"]["name"]
+        spec = pod_spec_of(d)
+        uses = {(v.get("persistentVolumeClaim") or {}).get("claimName") for v in spec.get("volumes", [])} & rep
+        uses |= {c["metadata"]["name"] for c in d.get("spec", {}).get("volumeClaimTemplates", []) or []
+                 if c["spec"].get("storageClassName") == REPLICATED_CLASS}
+        if uses and (name not in K.SITE_PINNED or not K.site_pinned(spec)):
+            out.append(f"{name} mounts {sorted(uses)} ({REPLICATED_CLASS}) but isn't pinned to {K.PRIMARY_SITE}")
+    return out
+
+
+def check_sites_storage():
+    """Task 20: "sites: no pod but the pinned set's may mount
+    portcullis-core-replicated", on the HA renders (the one-shots too), with
+    a mutation test (Grafana given hub-state-r; the Hub's pin dropped)."""
+    base = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    sites = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha-sites.yaml").read_text())
+    for label, vals in (("ha", base), ("ha sites", dict(base, ha=dict(base["ha"], **sites["ha"])))):
+        docs = K.render(vals)
+        for os_ in ("dns-tool", "hub"):
+            docs += K.render(dict(vals, oneshot=os_), "templates/oneshot.yaml")
+        if not any(c["spec"].get("storageClassName") == REPLICATED_CLASS for c in K.by_kind(docs, "PersistentVolumeClaim")):
+            F.add(f"{label}: no {REPLICATED_CLASS} PVC rendered (the check would pass vacuously)")
+        for p in replicated_mount_problems(docs):
+            F.add(f"sites: {label}: {p}")
+    docs = K.render(base)
+    bad = copy.deepcopy(docs)
+    gf = next(d for d in bad if d.get("kind") == "Deployment" and d["metadata"]["name"] == "grafana")
+    gf["spec"]["template"]["spec"].setdefault("volumes", []).append({"name": "x", "persistentVolumeClaim": {"claimName": "hub-state-r"}})
+    hub = next(d for d in bad if d["metadata"]["name"] == "hub" and d.get("kind") == "Deployment")
+    hub["spec"]["template"]["spec"].pop("affinity", None)
+    got = replicated_mount_problems(bad)
+    if not any(p.startswith("grafana ") for p in got) or not any(p.startswith("hub ") for p in got):
+        F.add(f"replicated_mount_problems misses Grafana on hub-state-r or an unpinned Hub (mutation test): {got}")
+
+
 def check_log_ports():
     """HA (contract §20.10): every HA pod has the baseline; group-gate and
     mcp-gate are StatefulSets of ha.gateReplicas, each replica its own
@@ -567,6 +616,7 @@ def main():
     check_nodeadm()
     check_log_ports()
     check_ha_shape()
+    check_sites_storage()
     check_psa()
     check_priorities()
     check_classes(docs + K.render({"ha": {"enabled": True}}))

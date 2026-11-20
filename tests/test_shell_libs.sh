@@ -4784,9 +4784,9 @@ ki_reset; printf 'MemTotal:        3600000 kB\n' > "$KI/root/proc/meminfo"
 expect_eq "kube_k3s_server_flags: 3 600 000 KiB (below 3.5 GiB) → small" "$(kik 'kube_k3s_server_flags | grep class=')" "--node-label=portcullis.io/class=small
 rc=0"
 ki_reset; printf 'MemTotal:        3700000 kB\n' > "$KI/root/proc/meminfo"
-expect_eq "kube_k3s_server_flags: 3 700 000 KiB (above 3.5 GiB) → home, storage on" "$(kik 'kube_k3s_server_flags | grep -E "class=|storage=" | tr "\n" " "')" "--node-label=portcullis.io/class=home --node-label=portcullis.io/storage=true rc=0"
+expect_eq "kube_k3s_server_flags: 3 700 000 KiB (above 3.5 GiB) → home, storage on (and Longhorn's default disk: the first node is at main)" "$(kik 'kube_k3s_server_flags | grep -E "class=|storage=|create-default-disk" | tr "\n" " "')" "--node-label=portcullis.io/class=home --node-label=portcullis.io/storage=true --node-label=node.longhorn.io/create-default-disk=true rc=0"
 ki_reset; printf 'MemTotal:        2000000 kB\n' > "$KI/root/proc/meminfo"
-expect_eq "kube_k3s_server_flags: 2 GB → class small, no storage label" "$(kik 'kube_k3s_server_flags | grep -E "class=|storage="')" "--node-label=portcullis.io/class=small
+expect_eq "kube_k3s_server_flags: 2 GB → class small, no storage label (no default disk)" "$(kik 'kube_k3s_server_flags | grep -E "class=|storage=|create-default-disk"')" "--node-label=portcullis.io/class=small
 rc=0"
 ki_reset; mkdir -p "$KI/root/proc/device-tree"; printf 'Raspberry Pi 5 Model B Rev 1.0\0' > "$KI/root/proc/device-tree/model"
 expect_eq "kube_k3s_server_flags: a Raspberry Pi → small" "$(kik 'kube_k3s_server_flags | grep -c class=small')" "1
@@ -5218,11 +5218,14 @@ expect_eq "kube_render_values: .env → values (the networks, the ClusterIPs, th
 expect_eq "kube_render_values: no secret in values.yaml (0600)" "$(grep -cE 'PG-SECRET|HUB-PROXY|KC-SECRET' "$K15/secrets/kube/values.yaml" || true):$(file_mode "$K15/secrets/kube/values.yaml")" "0:600"
 # HA (Task 19): ha.enabled from PORTCULLIS_HA=on, the non-small nodes at main.
 OUT="$(kt "$K15_ENV; _K_IMAGES='{}'; kube_render_values; jq -c .ha \"$K15/secrets/kube/values.yaml\"")"
-expect_eq "kube_render_values: ha off without PORTCULLIS_HA=on" "$(printf '%s\n' "$OUT" | head -n1)" '{"enabled":false,"nonSmallNodesAtPrimary":0}'
+expect_eq "kube_render_values: ha off without PORTCULLIS_HA=on" "$(printf '%s\n' "$OUT" | head -n1)" '{"enabled":false,"nonSmallNodesAtPrimary":0,"primarySite":"main"}'
 OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on; kube_nonsmall_at_primary() { echo 3; }; _K_IMAGES='{}'; kube_render_values; jq -c .ha \"$K15/secrets/kube/values.yaml\"")"
-expect_eq "kube_render_values: PORTCULLIS_HA=on → ha.enabled, the non-small nodes at main (Keycloak ×3)" "$(printf '%s\n' "$OUT" | head -n1)" '{"enabled":true,"nonSmallNodesAtPrimary":3}'
+expect_eq "kube_render_values: PORTCULLIS_HA=on → ha.enabled, the non-small nodes at main (Keycloak ×3)" "$(printf '%s\n' "$OUT" | head -n1)" '{"enabled":true,"nonSmallNodesAtPrimary":3,"primarySite":"main"}'
 OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on; kube_nonsmall_at_primary() { echo oops; }; _K_IMAGES='{}'; kube_render_values; jq -c .ha.nonSmallNodesAtPrimary \"$K15/secrets/kube/values.yaml\"")"
 expect_eq "kube_render_values: an unreadable node count → 0 (Keycloak ×2)" "$(printf '%s\n' "$OUT" | head -n1)" "0"
+# Task 20 (contract §20.11): the primary site is fixed to main, never from .env (no option).
+OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on PORTCULLIS_PRIMARY_SITE=edge; kube_nonsmall_at_primary() { echo 2; }; _K_IMAGES='{}'; kube_render_values; jq -r .ha.primarySite \"$K15/secrets/kube/values.yaml\"")"
+expect_eq "kube_render_values: ha.primarySite is main" "$(printf '%s\n' "$OUT" | head -n1)" "main"
 OUT="$(kt "kube_ctl() { printf '%s' '{\"items\":[{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}]}},{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"False\"}]}},{\"status\":{}}]}'; echo \"\$*\" > '$WORK/nsp-args'; }; kube_nonsmall_at_primary")"
 expect_eq "kube_nonsmall_at_primary: Ready home / cloud nodes at main only (review M8)" "$(printf '%s\n' "$OUT" | head -n1 | sed 's/rc=0//'):$(cat "$WORK/nsp-args")" \
   "1:get nodes -l portcullis.io/site=main,portcullis.io/class in (home,cloud) -o json"

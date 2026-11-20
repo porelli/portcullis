@@ -137,6 +137,10 @@ ha:
   # them from the nodes' labels; preflight P33: every pinned set is bounded
   # by main): Keycloak runs 3 replicas from 3 of them, else 2.
   nonSmallNodesAtPrimary: 0
+  # The primary site (contract §20.11): the data and sign-in pieces run only
+  # there (portcullis.sitePin), and storage nodes are only there. Fixed to
+  # main in this version: the chart refuses any other value.
+  primarySite: main
   # The node mesh pcmesh (§20.11): the nodeagents answer on :7443 there.
   meshCIDR: 10.215.0.0/24
   nodeadmNamespace: portcullis-nodeadm

@@ -70,6 +70,28 @@ def render(extra=None, show_only=None):
     return [doc for doc in yaml.safe_load_all(out) if doc]
 
 
+def render_helper(body, extra=None):
+    """One helper call rendered alone: a copy of the chart with a template
+    holding only <body> (the chart's own values, the CI values + extra)."""
+    import shutil
+    helm = os.environ.get("HELM", "helm")
+    with tempfile.TemporaryDirectory() as d:
+        c = pathlib.Path(d) / "portcullis"
+        shutil.copytree(CHART, c)
+        (c / "templates" / "zz-helper-test.yaml").write_text(body + "\n")
+        iv = pathlib.Path(d) / "images.yaml"
+        iv.write_text(yaml.safe_dump(images_values()))
+        ev = pathlib.Path(d) / "extra.yaml"
+        ev.write_text(yaml.safe_dump(extra or {}))
+        out = subprocess.run([helm, "template", "portcullis", str(c), "-n", NS, "-f", str(ROOT / "tests" / "k8s-ci-values.yaml"),
+                              "-f", str(iv), "-f", str(ev), "--show-only", "templates/zz-helper-test.yaml"],
+                             capture_output=True, text=True)
+    if out.returncode != 0 and "could not find template" in out.stderr:
+        return ""  # an empty render: helm has no document to show
+    out.check_returncode()
+    return out.stdout.split("\n", 2)[2] if out.stdout.startswith("---\n# Source:") else out.stdout
+
+
 def by_kind(docs, kind):
     return [d for d in docs if d.get("kind") == kind]
 
@@ -154,3 +176,45 @@ def mem_request(name, limit):
 def values():
     """charts/portcullis/values.yaml (the chart's defaults)."""
     return yaml.safe_load((CHART / "values.yaml").read_text())
+
+
+# Sites (contract §20.11, plan Task 20): the pods pinned to the primary
+# site main in HA (a required node affinity portcullis.io/site In [main] in
+# every term, merged with any class term). CNPG, the Sentinels and Longhorn's
+# disks add themselves when Tasks 23 / 24 create them. LLDAP is pinned with
+# the sign-in pieces (its data lives at main). The hub one-shot mounts the
+# Hub's replicated volume. Never pinned: the Traefik DaemonSet (ingress
+# nodes at every site), frontdoor (it must write DNS when main's uplink is
+# down) and nodeadm (any server); every other pod (monitoring) carries no
+# site term either.
+PRIMARY_SITE = "main"
+SITE_KEY = "portcullis.io/site"
+SITE_PINNED = {"postgres", "vault", "sessions", "hub", "domains", "keycloak", "forward-auth", "forward-auth-ext",
+               "group-gate", "enroll", "mcp-gate", "wg", "lldap", "oneshot-hub"}
+SITE_FREE = {"traefik", "frontdoor", "nodeadm"}
+
+
+def node_terms(spec):
+    """The required node affinity terms of a pod spec ([] without)."""
+    na = (spec.get("affinity") or {}).get("nodeAffinity") or {}
+    return (na.get("requiredDuringSchedulingIgnoredDuringExecution") or {}).get("nodeSelectorTerms") or []
+
+
+def site_exprs(spec):
+    """Every portcullis.io/site expression of a pod spec: its required and
+    preferred node affinity terms and its nodeSelector."""
+    out = [e for t in node_terms(spec) for e in t.get("matchExpressions", []) + t.get("matchFields", []) if e.get("key") == SITE_KEY]
+    na = (spec.get("affinity") or {}).get("nodeAffinity") or {}
+    for w in na.get("preferredDuringSchedulingIgnoredDuringExecution") or []:
+        out += [e for e in w.get("preference", {}).get("matchExpressions", []) if e.get("key") == SITE_KEY]
+    if SITE_KEY in (spec.get("nodeSelector") or {}):
+        out.append({"key": SITE_KEY, "nodeSelector": spec["nodeSelector"][SITE_KEY]})
+    return out
+
+
+def site_pinned(spec):
+    """True when every required term holds portcullis.io/site In [main]
+    (and there is at least one term)."""
+    want = {"key": SITE_KEY, "operator": "In", "values": [PRIMARY_SITE]}
+    terms = node_terms(spec)
+    return bool(terms) and all(want in t.get("matchExpressions", []) for t in terms)

@@ -339,7 +339,7 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 		want = append(want, l)
 	}
 	server := "https://10.215.0.1:6443"
-	want = append(want, "--server="+server, "--node-label=node.longhorn.io/create-default-disk=true")
+	want = append(want, "--server="+server)
 	sort.Strings(want)
 	rec := &nodeRecord{Role: "server", Class: "home", Site: "main", MeshIP: ip, Ingress: true, Storage: true}
 	got := joinFlags(rec, "n7", server, "10.42.0.0/16")

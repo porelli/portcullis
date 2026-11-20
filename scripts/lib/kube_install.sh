@@ -159,8 +159,11 @@ kube_k3s_server_flags() {
 --node-label=portcullis.io/ingress=true
 --node-label=svccontroller.k3s.cattle.io/enablelb=true
 EOF
-  # Storage is off by default on small nodes.
-  [ "$class" = small ] || echo "--node-label=portcullis.io/storage=true"
+  # Storage is off by default on small nodes. The first node is at the
+  # primary site, so a storage node gets Longhorn's default-disk label too
+  # (contract §20.11: only storage nodes at main; nodeadm's joinFlags and
+  # labels do the same for later nodes).
+  [ "$class" = small ] || printf '%s\n' "--node-label=portcullis.io/storage=true" "--node-label=node.longhorn.io/create-default-disk=true"
 }
 
 # kube_flannel_conf — flannel's net-conf, used verbatim by k3s (so it

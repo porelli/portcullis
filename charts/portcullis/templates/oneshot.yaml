@@ -4,7 +4,7 @@ oneshot=<service>`), from the service's own spec: the same image digest,
 user, capabilities and labels, restartPolicy Never, secrets only on stdin.
   dns-tool: the domains image's `domains dns` (compose profile tools);
   hub:      `hub signin reset-core` against the Hub's data (the Hub scaled
-            to 0 first). */ -}}
+            to 0 first), pinned to the primary site in HA as the Hub. */ -}}
 {{- if eq .Values.oneshot "dns-tool" }}
 apiVersion: v1
 kind: Pod
@@ -57,6 +57,12 @@ spec:
   automountServiceAccountToken: false
   enableServiceLinks: false
   priorityClassName: portcullis-core
+  {{- /* It mounts the Hub's volume (hub-state-r in HA, at main only):
+  pinned with the Hub (contract §20.11). */}}
+  {{- with include "portcullis.sitePin" (dict "root" . "s" (dict "pin" true)) | trim }}
+  affinity:
+    {{- . | nindent 4 }}
+  {{- end }}
   securityContext:
     runAsNonRoot: true
     runAsUser: {{ .Values.uids.hub }}
