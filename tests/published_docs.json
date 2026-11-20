@@ -20,7 +20,8 @@
   "key": "user-attributes.json",
   "mount": "/hub-data",
   "readers": [
-   "group-gate"
+   "group-gate",
+   "mcp-gate"
   ],
   "mode": "0444",
   "fs_group": null,

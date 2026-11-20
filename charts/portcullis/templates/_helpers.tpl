@@ -363,7 +363,7 @@ compares them. mode is decimal (0444 = 292, 0440 = 288).
 */}}
 {{- define "portcullis.pubDocs" -}}
 - {doc: group-gate-policy, object: pub-group-gate-policy, kind: configmap, key: group-gate-policy.json, mount: /hub-data, readers: [group-gate], mode: 292}
-- {doc: user-attributes, object: pub-user-attributes, kind: configmap, key: user-attributes.json, mount: /hub-data, readers: [group-gate], mode: 292}
+- {doc: user-attributes, object: pub-user-attributes, kind: configmap, key: user-attributes.json, mount: /hub-data, readers: [group-gate, mcp-gate], mode: 292}
 - {doc: portal-apps, object: pub-portal-apps, kind: configmap, key: portal-apps.json, mount: /hub-data, readers: [group-gate], mode: 292}
 - {doc: signin-keycloak, object: pub-signin-keycloak, kind: configmap, key: signin-keycloak.json, mount: /hub-data, readers: [keycloak], mode: 292}
 - {doc: impersonation, object: pub-impersonation, kind: configmap, key: impersonation.json, mount: /hub-data, readers: [group-gate, keycloak], mode: 292}

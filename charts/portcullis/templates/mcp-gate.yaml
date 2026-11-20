@@ -3,8 +3,9 @@ core Services' cluster DNS names (apps can't create Services in this
 namespace, so nothing can shadow them); Keycloak through kcinternal. The
 companions' gate aliases portcullis-mcp-<instance>--<companion> are the
 Hub's ClusterIP Services in the apps namespace: its search domain resolves
-them by the bare alias, as Docker's DNS does. /hub-data is its published documents (projected, read-only:
-portcullis.published, contract §4); fsGroup 10001 reads the Secret
+them by the bare alias, as Docker's DNS does. /hub-data is its published
+documents (mcp-gate.json, mcp-credentials.json, user-attributes.json;
+projected, read-only: portcullis.published, contract §4); fsGroup 10001 reads the Secret
 pub-mcp-credentials (0440) and owns its data as the Hub's group.
 HA (contract §20.10): a
 StatefulSet, one access log per replica, served to the Hub on :8092
