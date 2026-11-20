@@ -83,7 +83,7 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 	if len(vs) < 24 {
 		t.Fatalf("%d vectors", len(vs))
 	}
-	cross, porkbun, internal, noLease := 0, false, false, false
+	cross, porkbun, internal, noLease, ties := 0, false, false, false, 0
 	for _, v := range vs {
 		if v.CrossSite {
 			cross++
@@ -172,6 +172,63 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 				t.Errorf("%s: %s left with no address", v.Name, c.Name)
 			}
 		}
+		// Every removal follows 3 consecutive unhealthy rounds (§20.8: S6
+		// eligibility, R10 blind probers and span, a STRICT failing majority:
+		// a tie keeps the address), fail-static rounds not counted.
+		streak, owner := map[string]int{}, map[string]string{}
+		for id, n := range v.Nodes {
+			for _, a := range n.Public {
+				owner[a] = id
+			}
+		}
+		removedAt := map[time.Time][]string{}
+		for _, c := range v.Want.Changes {
+			if c.Op == "remove" {
+				removedAt[c.T] = append(removedAt[c.T], owner[c.Value])
+			}
+		}
+		for _, r := range v.Rounds {
+			health, anyOK := map[string]bool{}, false
+			for id, n := range v.Nodes {
+				if !n.Ingress {
+					continue
+				}
+				elig, failing, failSites, sites := 0, 0, map[string]bool{}, map[string]bool{}
+				for _, p := range r.Probes {
+					res, ok := p.Results[id]
+					if !ok || p.Site == n.Site || (!p.ReachedAny && !p.EgressOK) {
+						continue
+					}
+					elig++
+					sites[p.Site] = true
+					if !res.OK {
+						failing++
+						failSites[p.Site] = true
+					}
+				}
+				if elig > 0 && 2*failing == elig {
+					ties++
+				}
+				bad := 2*failing > elig && !(len(sites) >= 2 && len(failSites) < 2)
+				health[id] = r.Ready[id] && !bad
+				anyOK = anyOK || health[id]
+			}
+			if !anyOK {
+				continue
+			}
+			for id, h := range health {
+				if h {
+					streak[id] = 0
+				} else {
+					streak[id]++
+				}
+			}
+			for _, id := range removedAt[r.T] {
+				if streak[id] < 3 {
+					t.Errorf("%s: %s removed at %s after %d unhealthy rounds", v.Name, id, r.T.Format(time.TimeOnly), streak[id])
+				}
+			}
+		}
 		for name, want := range v.Want.Addresses {
 			if len(want) != len(set[name]) {
 				t.Errorf("%s: %s replays to %d addresses, want %v", v.Name, name, len(set[name]), want)
@@ -182,6 +239,9 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 				}
 			}
 		}
+	}
+	if ties == 0 {
+		t.Error("no case with a tie among the eligible probers (it keeps the address)")
 	}
 	if cross < 10 || !porkbun || !internal || !noLease {
 		t.Errorf("coverage: %d cross-site cases (want ≥ 10), Porkbun ~10 min %v, internal-only %v, without the Lease %v", cross, porkbun, internal, noLease)
