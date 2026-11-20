@@ -64,7 +64,7 @@ ha_install_cnpg() {
   kube_namespace_apply "$KUBE_CNPG_NS" $psa || fail "could not create the namespace $KUBE_CNPG_NS"
   info "Cluster setup: CloudNativePG operator ($KUBE_CNPG_CHART)..."
   kube_helm upgrade --install "$KUBE_CNPG_RELEASE" "$PORTCULLIS_HOME/$KUBE_CNPG_CHART" -n "$KUBE_CNPG_NS" \
-    -f "$PORTCULLIS_HOME/$KUBE_CNPG_VALUES" --history-max 3 --wait --timeout 5m >&2 \
+    -f "$PORTCULLIS_HOME/$KUBE_CNPG_VALUES" --history-max 3 --wait --timeout 5m >/dev/null \
     || fail "the CloudNativePG operator didn't install (see above)"
   _kube_applied_set cluster.cnpg "$KUBE_CNPG_CHART_SHA256"
 }
