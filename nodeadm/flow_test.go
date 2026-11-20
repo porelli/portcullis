@@ -327,7 +327,8 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 	ip := "10.215.0.7"
 	var want []string
 	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-		if l == "--cluster-init" {
+		// A joining server learns the agent token from the datastore.
+		if l == "--cluster-init" || strings.HasPrefix(l, "--agent-token-file=") {
 			continue
 		}
 		l = strings.ReplaceAll(l, "10.215.0.1", ip)
@@ -437,7 +438,7 @@ func secretFlow(t *testing.T) (*harness, []string, [][]byte) {
 	}
 	keep(h.join(t, js, map[string]int{"n1": 150, "n2": 4, "n3": 5, "n6": 4}))
 	keep(h.join(t, js, map[string]int{"n1": 3, "n2": 4, "n3": 5, "n6": 4}))
-	secrets = append(secrets, testServerToken, "0123456789abcdef0123456789abcdef")
+	secrets = append(secrets, testServerToken, "0123456789abcdef0123456789abcdef", testAgentToken, "fedcba9876543210fedcba9876543210")
 	h.putState(t, func(st *nodeadmState) {
 		st.Nodes["n3"] = &nodeRecord{Role: "server", Serial: "aa:bb", MeshIP: "10.215.0.3"}
 	})
@@ -566,6 +567,20 @@ func TestRevokeRotatesServerToken(t *testing.T) {
 	}
 	if want := []string{"rotate:n1", "apply:n1", "apply:n3", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
 		t.Fatalf("rotations %v", h.agents.rotations)
+	}
+	// No call to an agent ever carries a server token (old or new): it
+	// gets the agent token; the servers the new server token.
+	for i, step := range h.agents.rotations {
+		tok := h.agents.tokens[i]
+		if step == "apply:n4" && (tok != testAgentToken || strings.Contains(tok, "::server:")) {
+			t.Fatalf("the agent n4 was sent %.12q", tok)
+		}
+		if step != "apply:n4" && (tok == testAgentToken || !strings.Contains(tok, "::server:")) {
+			t.Fatalf("%s was sent a non-server token", step)
+		}
+	}
+	if sec, _ := h.kube.CoreV1().Secrets(coreNS).Get(ctx, tokenSecret, metav1.GetOptions{}); string(sec.Data[agentTokenKey]) != testAgentToken {
+		t.Fatal("the rotation lost the agent token")
 	}
 	tok, _ := h.s.serverToken(ctx)
 	if tok == testServerToken || tok != h.boot.current || caHash(tok) != caHash(testServerToken) || !strings.Contains(tok, "::server:") {
@@ -831,5 +846,86 @@ func TestInternalClients(t *testing.T) {
 		if w := h.internal(c, "POST", "/v1/nodes/n1/cordon", map[string]any{}); w.Code != http.StatusForbidden {
 			t.Errorf("%s cordon: %d", c, w.Code)
 		}
+	}
+}
+
+// TestEnrolVoidedDuringSigning: a node removed or revoked while enroll
+// signs its CSR: the new certificate is revoked at once and the node never
+// joins (a Removed record is refused by the signed join).
+func TestEnrolVoidedDuringSigning(t *testing.T) {
+	h := newHarness(t)
+	j := h.issue(t, "n4", "agent", "cloud", "main", "10.215.0.4")
+	h.enroll.onSign = func() {
+		if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=cooperative", nil); w.Code != 204 {
+			t.Errorf("void: %d %s", w.Code, w.Body)
+		}
+	}
+	w := h.enrol(t, j, "")
+	if w.Code != 409 || strings.Contains(w.Body.String(), "BEGIN") {
+		t.Fatalf("enrol: %d %s", w.Code, w.Body)
+	}
+	if len(h.enroll.revoked) != 1 {
+		t.Fatalf("revoked %v", h.enroll.revoked)
+	}
+	if r := h.state(t).Nodes["n4"]; r == nil || !r.Removed || r.Serial != "" {
+		t.Fatalf("record %+v", r)
+	}
+	// Even with a certificate that chains (the signed one), no material.
+	c, k := h.ca.client("n4." + clusterDomain)
+	h.putState(t, func(st *nodeadmState) { st.Nodes["n4"].Serial = certSerial(c) })
+	if w := h.join(t, &joiner{id: "n4", cert: c, key: k}, nearRTT); w.Code != 403 {
+		t.Fatalf("a removed node's join: %d", w.Code)
+	}
+}
+
+// TestEnrolRefusesBadAddresses: the enrolment report's LAN address must be
+// unicast, outside the cluster's networks and nobody else's; the public one
+// truly public. A refusal burns nothing.
+func TestEnrolRefusesBadAddresses(t *testing.T) {
+	for _, tc := range []struct{ name, lan, pub string }{
+		{"loopback LAN", "127.0.0.1:51830", ""},
+		{"link-local LAN", "169.254.1.1:51830", ""},
+		{"LAN in the mesh", "10.215.0.9:51830", ""},
+		{"LAN in the cluster network", "10.42.3.4:51830", ""},
+		{"another node's LAN address", "192.0.2.11:51830", ""},
+		{"a private public address", "", "10.0.0.1:51830"},
+		{"a CGNAT public address", "", "100.64.0.1:51830"},
+		{"port 0", "", "203.0.113.9:0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			j := h.issue(t, "n4", "agent", "cloud", "main", "10.215.0.4")
+			nonce := h.nonce(t, "n4")
+			rep := MeshReport{Pub: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ="}
+			if tc.lan != "" {
+				rep.LAN = &tc.lan
+			}
+			if tc.pub != "" {
+				rep.Public = &tc.pub
+			}
+			body, _ := json.Marshal(enrolReq{ServerID: "n4", Nonce: nonce, Proof: j.proof(nonce), CSR: j.csrPEM, Mesh: rep})
+			w := h.public("POST", "/node/v1/enrol", body, nil)
+			if w.Code != 400 || !strings.Contains(w.Body.String(), "the enrolment report is refused") {
+				t.Fatalf("%d %s", w.Code, w.Body)
+			}
+			if st := h.state(t); st.Codes["n4"].Used || st.Nodes["n4"] != nil || len(h.enroll.signed) != 0 {
+				t.Fatal("a refused report burnt the code or signed")
+			}
+		})
+	}
+	// A valid LAN address is kept normalised.
+	h := newHarness(t)
+	j := h.issue(t, "n4", "agent", "cloud", "main", "10.215.0.4")
+	nonce := h.nonce(t, "n4")
+	lan := "192.168.7.9:51830"
+	body, _ := json.Marshal(enrolReq{ServerID: "n4", Nonce: nonce, Proof: j.proof(nonce), CSR: j.csrPEM,
+		Mesh: MeshReport{Pub: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=", LAN: &lan}})
+	if w := h.public("POST", "/node/v1/enrol", body, nil); w.Code != 200 || *h.state(t).Nodes["n4"].Mesh.LAN != lan {
+		t.Fatalf("a valid LAN address: %d", w.Code)
+	}
+	// An annotation's invalid addresses are dropped (a node can't widen
+	// what it publishes by editing its own object).
+	if a := h.s.cleanAddrs(NodeAddresses{Mesh: "10.215.0.1", LAN: []string{"127.0.0.1", "192.0.2.10"}, Public: []string{"10.0.0.1", "8.8.8.8"}}); !slices.Equal(a.LAN, []string{"192.0.2.10"}) || !slices.Equal(a.Public, []string{"8.8.8.8"}) {
+		t.Fatalf("cleanAddrs %+v", a)
 	}
 }

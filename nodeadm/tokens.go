@@ -29,6 +29,7 @@ import (
 const (
 	tokenSecret      = "nodeadm-k3s-token"
 	tokenKey         = "token"
+	agentTokenKey    = "agent"
 	bootstrapTTL     = 14 * time.Minute // inside the VAP's 15 min, with skew
 	bootstrapGroup   = "system:bootstrappers:k3s:default-node-token"
 	bootstrapNS      = "kube-system"
@@ -48,6 +49,21 @@ func (s *Server) serverToken(ctx context.Context) (string, error) {
 	t := strings.TrimSpace(string(sec.Data[tokenKey]))
 	if !k10Re.MatchString(t) {
 		return "", errors.New("the Secret " + tokenSecret + " doesn't hold a K10 server token")
+	}
+	return t, nil
+}
+
+// agentToken reads the agent token (k3s --agent-token-file, K10…::node:…):
+// what agents hold; never the server token.
+func (s *Server) agentToken(ctx context.Context) (string, error) {
+	sec, err := s.kube.CoreV1().Secrets(s.cfg.CoreNS).Get(ctx, tokenSecret, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("reading the Secret %s: %w", tokenSecret, err)
+	}
+	t := strings.TrimSpace(string(sec.Data[agentTokenKey]))
+	m := k10Re.FindStringSubmatch(t)
+	if m == nil || strings.HasPrefix(m[2], serverTokenLabel+":") {
+		return "", errors.New("the Secret " + tokenSecret + " doesn't hold a K10 agent token")
 	}
 	return t, nil
 }
@@ -126,8 +142,10 @@ func (s *Server) bootstrapToken(ctx context.Context) (string, error) {
 // rotateServerToken (mode=revoke, §20.2 / §20.4): a new server token in
 // the Secret, applied through a surviving server's nodeagent (step rotate,
 // checked with server-bootstrap: the old token 401, the new one 200), then
-// step apply on every node, the servers one at a time and then the agents,
-// each Ready again before the next. gone is the revoked node.
+// step apply on every node, the servers one at a time (the new server
+// token) and then the agents (their agent token: an agent never holds the
+// server token), each Ready again before the next. gone is the revoked
+// node.
 func (s *Server) rotateServerToken(ctx context.Context, gone string) error {
 	old, err := s.serverToken(ctx)
 	if err != nil {
@@ -179,15 +197,25 @@ func (s *Server) rotateServerToken(ctx context.Context, gone string) error {
 	if err != nil {
 		return fmt.Errorf("reading the Secret %s: %w", tokenSecret, err)
 	}
-	sec.Data = map[string][]byte{tokenKey: []byte(newTok)}
+	agentTok, err := s.agentToken(ctx)
+	if err != nil {
+		return err
+	}
+	sec.Data[tokenKey] = []byte(newTok)
 	sec.StringData = nil
 	if _, err := s.kube.CoreV1().Secrets(s.cfg.CoreNS).Update(ctx, sec, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("writing the Secret %s: %w", tokenSecret, err)
 	}
 	s.log.Info("server token rotated", "on", rot.Name)
+	// The servers get the new server token, one at a time; the agents
+	// their agent token (k3s --agent-token-file), never the server one.
 	for _, n := range append(servers, agents...) {
-		if err := s.agents.TokenRotate(ctx, n.Name, n.Mesh, newTok, "apply"); err != nil {
-			return fmt.Errorf("applying the new server token on %s: %w", n.Name, redactErr(err, newTok, old))
+		tok := newTok
+		if n.Role != "server" {
+			tok = agentTok
+		}
+		if err := s.agents.TokenRotate(ctx, n.Name, n.Mesh, tok, "apply"); err != nil {
+			return fmt.Errorf("applying the token on %s: %w", n.Name, redactErr(err, newTok, old, agentTok))
 		}
 		if err := s.waitReady(ctx, n.Name); err != nil {
 			return err

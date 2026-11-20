@@ -50,9 +50,13 @@ type fakeEnroll struct {
 	signed  []string    // role:cn
 	revoked []string
 	fail    error
+	onSign  func() // runs while "enroll signs" (outside the lock)
 }
 
 func (f *fakeEnroll) Sign(_ context.Context, role, cn, csrPEM string) (*SignedCert, error) {
+	if f.onSign != nil {
+		f.onSign()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail != nil {
@@ -209,6 +213,7 @@ func (ca *testCA) client(cn string) (*x509.Certificate, *ecdsa.PrivateKey) {
 
 const (
 	testServerToken = "K10b7335c14c0febed58f896145ef153d44a59bd0dfa5065771f18cc99c514c0edb::server:0123456789abcdef0123456789abcdef"
+	testAgentToken  = "K10b7335c14c0febed58f896145ef153d44a59bd0dfa5065771f18cc99c514c0edb::node:fedcba9876543210fedcba9876543210"
 	coreNS          = "portcullis"
 )
 
@@ -305,7 +310,7 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 		}
 	}
 	objs = append(objs,
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tokenSecret, Namespace: coreNS}, Data: map[string][]byte{tokenKey: []byte(testServerToken + "\n")}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tokenSecret, Namespace: coreNS}, Data: map[string][]byte{tokenKey: []byte(testServerToken + "\n"), agentTokenKey: []byte(testAgentToken)}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: addressesCM, Namespace: coreNS}},
 	)
 	h.kube = fake.NewSimpleClientset(objs...)
@@ -314,7 +319,7 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 		FencingNS: "portcullis-fencing", LonghornNS: "longhorn-system", ClusterCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 		EgressHost: "api.porkbun.com", PodName: "nodeadm-0", Script: []byte("#!/bin/sh\necho join\n"),
 		ScriptSHA256: strings.Repeat("a", 64), AgentSHA256: map[string]string{"amd64": strings.Repeat("b", 64), "arm64": strings.Repeat("c", 64)},
-		AgentFiles: map[string]string{}}
+		AgentFiles: map[string]string{}, AllowDocAddrs: true}
 	dir := t.TempDir()
 	for _, a := range []string{"amd64", "arm64"} {
 		p := dir + "/nodeagent-" + a

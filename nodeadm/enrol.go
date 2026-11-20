@@ -344,6 +344,15 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 	if now.After(c.ExpiresAt) {
 		return s.refuseEnrol(req.ServerID, "code_expired")
 	}
+	// The node's self-reported addresses (refused, never silently dropped).
+	cl, err := s.clusterNodes(r.Context())
+	if err != nil {
+		return err
+	}
+	if req.Mesh, err = s.checkReport(req.Mesh, req.ServerID, cl, st); err != nil {
+		s.log.Warn("enrolment refused: its report", "server_id", req.ServerID, "why", err.Error())
+		return errPlain(http.StatusBadRequest, "the enrolment report is refused: %v", err)
+	}
 	var code codeRecord
 	err = s.mutate(r.Context(), func(st *nodeadmState) error {
 		cur := st.Codes[req.ServerID]
@@ -370,12 +379,21 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := s.mutate(r.Context(), func(st *nodeadmState) error {
 		n := st.Nodes[req.ServerID]
-		if n == nil {
-			return fmt.Errorf("%s was removed during its enrolment", req.ServerID)
+		if n == nil || n.Removed {
+			return errVoided
 		}
 		n.Serial, n.NotAfter = normSerial(signed.Serial), signed.NotAfter
 		return nil
 	}); err != nil {
+		if errors.Is(err, errVoided) {
+			// Removed or revoked while enroll signed: the new certificate
+			// is revoked at once and no node record keeps it.
+			if rerr := s.enroll.Revoke(r.Context(), normSerial(signed.Serial)); rerr != nil {
+				s.log.Error("couldn't revoke a voided enrolment's certificate", "server_id", req.ServerID, "serial", normSerial(signed.Serial))
+			}
+			s.log.Warn("enrolment voided during signing: certificate revoked", "server_id", req.ServerID)
+			return errPlain(http.StatusConflict, "node %s was removed during its enrolment", req.ServerID)
+		}
 		return err
 	}
 	s.log.Info("node enrolled", "server_id", req.ServerID, "serial", normSerial(signed.Serial))
@@ -451,7 +469,7 @@ func (s *Server) verifySigned(r *http.Request, body []byte, st *nodeadmState) (s
 		return "", errUnsigned
 	}
 	rec := st.Nodes[id]
-	if rec == nil || rec.Serial == "" || rec.Serial != certSerial(cert) {
+	if rec == nil || rec.Removed || rec.Serial == "" || rec.Serial != certSerial(cert) {
 		return "", errUnsigned
 	}
 	t, err := time.Parse(time.RFC3339, tm)
@@ -571,6 +589,21 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("no Ready server with a mesh address")
 	}
 	serverURL := "https://" + serverIP + ":6443"
+	// Released only while the node is still enrolled with this
+	// certificate (a removal or revocation meanwhile: no material).
+	now := s.now()
+	if err := s.mutate(ctx, func(st *nodeadmState) error {
+		n := st.Nodes[id]
+		if n == nil || n.Removed || n.Serial != rec.Serial {
+			return errUnsigned
+		}
+		n.JoinedAt = &now
+		n.ServerToken = n.ServerToken || rec.Role == "server"
+		n.JoinState, n.WaitingSince = joinReleased, nil
+		return nil
+	}); err != nil {
+		return err
+	}
 	var token string
 	if rec.Role == "server" {
 		token, err = s.serverToken(ctx)
@@ -578,17 +611,6 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 		token, err = s.bootstrapToken(ctx)
 	}
 	if err != nil {
-		return err
-	}
-	now := s.now()
-	if err := s.mutate(ctx, func(st *nodeadmState) error {
-		if n := st.Nodes[id]; n != nil {
-			n.JoinedAt = &now
-			n.ServerToken = n.ServerToken || rec.Role == "server"
-			n.JoinState, n.WaitingSince = joinReleased, nil
-		}
-		return nil
-	}); err != nil {
 		return err
 	}
 	flags := joinFlags(rec, id, serverURL)
@@ -625,7 +647,10 @@ func (s *Server) setJoinState(ctx context.Context, id, state string) {
 	}
 }
 
-var errNoChange = errors.New("no change")
+var (
+	errNoChange = errors.New("no change")
+	errVoided   = errors.New("voided")
+)
 
 // checkRTT: §20.11's limits, the Hub's texts (site_roles_vectors.json):
 // every server in the report, a server ≤ 100 ms, an agent ≤ 250 ms.

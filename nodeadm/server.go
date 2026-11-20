@@ -83,6 +83,9 @@ type Config struct {
 	ScriptSHA256 string            // sha256 of Script (the code's script_sha256)
 	AgentFiles   map[string]string // arch → path of nodeagent-<arch>
 	AgentSHA256  map[string]string // arch → sha256
+	// AllowDocAddrs admits the documentation ranges as public addresses
+	// (tests only, like the front door's testprovider build).
+	AllowDocAddrs bool
 }
 
 // Timing holds the durations the tests shorten.

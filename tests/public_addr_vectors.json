@@ -1,0 +1,254 @@
+{
+ "v": 1,
+ "cases": [
+  {
+   "name": "8.8.8.8",
+   "address": "8.8.8.8",
+   "excluded": [],
+   "public": true,
+   "public_with_documentation": true
+  },
+  {
+   "name": "1.1.1.1",
+   "address": "1.1.1.1",
+   "excluded": [],
+   "public": true,
+   "public_with_documentation": true
+  },
+  {
+   "name": "2606:4700:4700::1111",
+   "address": "2606:4700:4700::1111",
+   "excluded": [],
+   "public": true,
+   "public_with_documentation": true
+  },
+  {
+   "name": "198.51.100.7",
+   "address": "198.51.100.7",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": true
+  },
+  {
+   "name": "203.0.113.4",
+   "address": "203.0.113.4",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": true
+  },
+  {
+   "name": "192.0.2.1",
+   "address": "192.0.2.1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": true
+  },
+  {
+   "name": "2001:db8::1",
+   "address": "2001:db8::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": true
+  },
+  {
+   "name": "3fff::1",
+   "address": "3fff::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": true
+  },
+  {
+   "name": "10.0.0.1",
+   "address": "10.0.0.1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "172.16.5.4",
+   "address": "172.16.5.4",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "192.168.1.10",
+   "address": "192.168.1.10",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "100.64.0.1",
+   "address": "100.64.0.1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "127.0.0.1",
+   "address": "127.0.0.1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "169.254.169.254",
+   "address": "169.254.169.254",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "224.0.0.1",
+   "address": "224.0.0.1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "0.0.0.0",
+   "address": "0.0.0.0",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "255.255.255.255",
+   "address": "255.255.255.255",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "192.0.0.8",
+   "address": "192.0.0.8",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "198.18.0.1",
+   "address": "198.18.0.1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "240.0.0.1",
+   "address": "240.0.0.1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "::1",
+   "address": "::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "fe80::1",
+   "address": "fe80::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "fc00::1",
+   "address": "fc00::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "ff02::1",
+   "address": "ff02::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "::",
+   "address": "::",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "2001:2::1",
+   "address": "2001:2::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "2002::1",
+   "address": "2002::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "64:ff9b:1::1",
+   "address": "64:ff9b:1::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "4000::1",
+   "address": "4000::1",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "an IPv4-mapped IPv6 address",
+   "address": "::ffff:8.8.8.8",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "a zone",
+   "address": "fe80::1%eth0",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "not an address",
+   "address": "not an address",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "a prefix",
+   "address": "8.8.8.8/32",
+   "excluded": [],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "inside the mesh",
+   "address": "10.215.0.3",
+   "excluded": [
+    "10.215.0.0/24"
+   ],
+   "public": false,
+   "public_with_documentation": false
+  },
+  {
+   "name": "inside an excluded network",
+   "address": "8.8.4.4",
+   "excluded": [
+    "8.8.4.0/24"
+   ],
+   "public": false,
+   "public_with_documentation": false
+  }
+ ]
+}

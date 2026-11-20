@@ -133,7 +133,9 @@ func (s *Server) clusterNodes(ctx context.Context) ([]clusterNode, error) {
 	}
 	out := make([]clusterNode, 0, len(l.Items))
 	for i := range l.Items {
-		out = append(out, toClusterNode(&l.Items[i]))
+		c := toClusterNode(&l.Items[i])
+		c.Addresses = s.cleanAddrs(c.Addresses)
+		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
