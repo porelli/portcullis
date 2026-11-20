@@ -672,3 +672,22 @@ never on small nodes, one per host), at least 1.
 
 {{/* portcullis.pgHost — the CNPG primary's Service (portcullis-pg-rw). */}}
 {{- define "portcullis.pgHost" -}}portcullis-pg-rw.{{ .Values.cnpg.namespace }}.svc.cluster.local{{- end }}
+
+{{/*
+portcullis.pgImage — the CNPG Cluster's imageName: images.postgres with its
+tag (CNPG's webhook refuses a digest without a tag: "can't detect
+upgrades"). The CLI resolves pinned refs to name@sha256, so the tag is
+images.json's pin, used only when its digest is the resolved one.
+*/}}
+{{- define "portcullis.pgImage" -}}
+{{- $ref := include "portcullis.image" (list . "postgres") -}}
+{{- if regexMatch ":[A-Za-z0-9._-]+@sha256:" $ref -}}
+{{- $ref -}}
+{{- else -}}
+{{- $pin := (.Files.Get "images.json" | fromJson).images.postgres | default "" -}}
+{{- if not (hasSuffix (index (splitList "@" $ref) 1) $pin) -}}
+{{- fail (printf "images.postgres %q isn't images.json's pin %q (the CNPG Cluster needs its tag)" $ref $pin) -}}
+{{- end -}}
+{{- $pin -}}
+{{- end -}}
+{{- end }}

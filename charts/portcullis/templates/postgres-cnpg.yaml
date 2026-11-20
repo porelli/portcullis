@@ -42,7 +42,7 @@ metadata:
     helm.sh/resource-policy: keep
 spec:
   instances: {{ $n }}
-  imageName: {{ include "portcullis.image" (list . "postgres") }}
+  imageName: {{ include "portcullis.pgImage" . }}
   imagePullPolicy: IfNotPresent
   priorityClassName: portcullis-core
   enableSuperuserAccess: false

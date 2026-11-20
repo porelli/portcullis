@@ -681,8 +681,10 @@ def pg_problems(docs, vals):
     s = c["spec"]
     if c["metadata"]["namespace"] != K.CNPG_NS:
         out.append(f"Cluster in {c['metadata']['namespace']} (want {K.CNPG_NS})")
-    if s.get("imageName") != K.images_values()["images"]["postgres"]:
-        out.append(f"Cluster imageName {s.get('imageName')} is not images.postgres")
+    # With its tag (CNPG refuses a bare digest), = images.json's pin.
+    pin = json.loads((K.CHART / "images.json").read_text())["images"]["postgres"]
+    if s.get("imageName") != pin or ":" not in s["imageName"].split("@")[0].rsplit("/", 1)[1]:
+        out.append(f"Cluster imageName {s.get('imageName')} is not images.json's tagged pin {pin}")
     if s.get("instances") != want_n:
         out.append(f"Cluster instances {s.get('instances')} (want {want_n})")
     sync = (s.get("postgresql") or {}).get("synchronous")
@@ -744,6 +746,19 @@ def check_postgres():
         for p in pg_problems(K.render(vals), vals):
             F.add(f"{label}: {p}")
     docs = K.render(ha_vals)
+    # The CLI's digest-only ref: the tag comes back from images.json; another
+    # digest is refused at render time.
+    pin = json.loads((K.CHART / "images.json").read_text())["images"]["postgres"]
+    repo, dig = pin.split("@")[0].rsplit(":", 1)[0], pin.split("@")[1]
+    c = K.cnpg_cluster(K.render({"images": {"postgres": f"{repo}@{dig}"}}))
+    if c is None or c["spec"]["imageName"] != pin:
+        F.add(f"postgres: the CLI's digest-only images.postgres doesn't render images.json's tagged pin ({(c or {}).get('spec', {}).get('imageName')})")
+    try:
+        K.render({"images": {"postgres": f"{repo}@sha256:{'1' * 64}"}})
+        F.add("postgres: another digest than images.json's renders (the tag would be wrong)")
+    except subprocess.CalledProcessError as e:
+        if "the CNPG Cluster needs its tag" not in e.stderr:
+            F.add(f"postgres: another digest refused without naming the tag: {e.stderr.strip()[-200:]}")
     for mutate in (lambda c: c["spec"].__setitem__("instances", 3), lambda c: c["spec"]["postgresql"]["synchronous"].__setitem__("dataDurability", "required"),
                    lambda c: c["spec"].__setitem__("enableSuperuserAccess", True), lambda c: c["spec"]["storage"].__setitem__("storageClass", "portcullis-core-replicated")):
         bad = [json.loads(json.dumps(d)) for d in docs]
