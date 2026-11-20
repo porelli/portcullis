@@ -192,10 +192,17 @@ func ownedBy(p *corev1.Pod, kind, name string) bool {
 	return false
 }
 
-// setMinimums: per set name, the members it needs: the quorum of Vault
-// and the Sentinels (2 of 3), else its PDB's minAvailable, else 1.
-func (s *Server) setMinimums(ctx context.Context, pods []corev1.Pod) map[string]int {
-	mins := map[string]int{vaultSet: 2, sentinelSet: 2}
+// setKey: a set is (namespace, name): an apps PDB never sets a core
+// set's minimum (Task 12 review M9). The snapshot's pod carries the
+// namespace.
+type setKey struct{ ns, name string }
+
+// setMinimums: per set, the members it needs: the quorum of Vault and the
+// Sentinels in the core namespace (2 of 3), else the minAvailable of a PDB
+// of its namespace, else 1.
+func (s *Server) setMinimums(ctx context.Context, pods []corev1.Pod) map[setKey]int {
+	core := s.cfg.CoreNS
+	mins := map[setKey]int{{core, vaultSet}: 2, {core, sentinelSet}: 2}
 	pdbs, err := s.kube.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return mins
@@ -211,9 +218,9 @@ func (s *Server) setMinimums(ctx context.Context, pods []corev1.Pod) map[string]
 		for i := range pods {
 			p := &pods[i]
 			if p.Namespace == pdb.Namespace && sel.Matches(labels.Set(p.Labels)) {
-				name := podSetName(p)
-				if name != vaultSet && name != sentinelSet {
-					mins[name] = max(mins[name], pdb.Spec.MinAvailable.IntValue())
+				k := setKey{p.Namespace, podSetName(p)}
+				if k != (setKey{core, vaultSet}) && k != (setKey{core, sentinelSet}) {
+					mins[k] = max(mins[k], pdb.Spec.MinAvailable.IntValue())
 				}
 			}
 		}
@@ -221,7 +228,7 @@ func (s *Server) setMinimums(ctx context.Context, pods []corev1.Pod) map[string]
 	return mins
 }
 
-func snapPod(p *corev1.Pod, mins map[string]int) SnapPod {
+func snapPod(p *corev1.Pod, mins map[setKey]int) SnapPod {
 	sp := SnapPod{Name: p.Name, Namespace: p.Namespace, Node: p.Spec.NodeName, PriorityClass: p.Spec.PriorityClassName,
 		PreemptionPolicy: "PreemptLowerPriority", Tolerations: []Toleration{}, RequiredAffinity: [][]Expr{}, DaemonSet: isDaemonSetPod(p)}
 	if p.Spec.Priority != nil {
@@ -281,7 +288,7 @@ func snapPod(p *corev1.Pod, mins map[string]int) SnapPod {
 	if !sp.DaemonSet {
 		name := podSetName(p)
 		if name != p.Name {
-			m := mins[name]
+			m := mins[setKey{p.Namespace, name}]
 			if m == 0 {
 				m = 1
 			}

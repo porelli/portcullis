@@ -19,10 +19,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -1029,5 +1031,42 @@ func TestPendingRevokeSurvivesReEnrol(t *testing.T) {
 	}
 	if r := h.state(t).Nodes["n5"]; r == nil || r.Removed || r.Serial != cur {
 		t.Fatalf("the re-enrolled record changed: %+v", r)
+	}
+}
+
+// TestSetMinimumsByNamespace (Task 12 review M9): an apps-namespace PDB on
+// a set named like a core one changes only its own set's minimum; the
+// core quorum sets keep 2.
+func TestSetMinimumsByNamespace(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	apps := "portcullis-apps"
+	for _, ns := range []string{coreNS, apps} {
+		for _, set := range []string{"keycloak", vaultSet} {
+			p := agentPod(set+"-0", ns, "n1", set, "StatefulSet", map[string]string{"app": set})
+			h.kube.CoreV1().Pods(ns).Create(ctx, p, metav1.CreateOptions{})
+		}
+	}
+	three := intstr.FromInt(3)
+	for _, set := range []string{"keycloak", vaultSet} {
+		h.kube.PolicyV1().PodDisruptionBudgets(apps).Create(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: set, Namespace: apps},
+			Spec: policyv1.PodDisruptionBudgetSpec{MinAvailable: &three, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": set}}}}, metav1.CreateOptions{})
+	}
+	pods, _ := h.kube.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	mins := h.s.setMinimums(ctx, pods.Items)
+	for k, want := range map[setKey]int{{coreNS, "keycloak"}: 0, {coreNS, vaultSet}: 2, {apps, "keycloak"}: 3, {apps, vaultSet}: 3} {
+		if mins[k] != want {
+			t.Errorf("%s/%s: min %d, want %d", k.ns, k.name, mins[k], want)
+		}
+	}
+	got := map[string]int{}
+	for i := range pods.Items {
+		sp := snapPod(&pods.Items[i], mins)
+		if sp.Set != nil {
+			got[sp.Namespace+"/"+sp.Set.Name] = sp.Set.Min
+		}
+	}
+	if got[coreNS+"/keycloak"] != 1 || got[apps+"/keycloak"] != 3 || got[coreNS+"/"+vaultSet] != 2 {
+		t.Fatalf("snapshot sets %v", got)
 	}
 }
