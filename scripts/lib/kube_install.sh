@@ -603,7 +603,8 @@ kube_traefik_image() {
 #   ingress   a pod of portcullis-ingress (another generation's binding lets
 #             a dry run annotated with its generation by);
 #   nodes     as a node identity (system:node:portcullis-admission-probe,
-#             group system:nodes), its own Node without placement labels.
+#             group system:nodes), its own Node without placement labels,
+#             with the unlabelled taint a registration must carry.
 _kube_probe_ha() {
   local b="$1" g="$2" cns m
   cns="$(kube_ns)"
@@ -620,7 +621,11 @@ _kube_probe_ha() {
             "usage-bootstrap-authentication": "true", "auth-extra-groups": "system:bootstrappers:k3s:default-node-token"}}' \
         | kube_ctl -n kube-system --as="$KUBE_NODEADM_SA" --as-group=system:masters create --dry-run=server -f - ;;
     portcullis-nodes-guard-labels)
-      M="$m" jq -n '{apiVersion: "v1", kind: "Node", metadata: (env.M | fromjson)}' \
+      # Otherwise admissible: a node registers with exactly the unlabelled
+      # taint (R-NODELABELS round 2), else an older generation's binding
+      # refuses it first with its own message and the probe never sees ours.
+      M="$m" jq -n '{apiVersion: "v1", kind: "Node", metadata: (env.M | fromjson),
+          spec: {taints: [{key: "nodeadm.portcullis/unlabelled", value: "true", effect: "NoSchedule"}]}}' \
         | kube_ctl --as=system:node:portcullis-admission-probe --as-group=system:nodes --as-group=system:authenticated create --dry-run=server -f - ;;
     portcullis-ingress-guard-pods)
       M="$m" IMG="${KUBE_HUB_IMAGE:-$PORTCULLIS_HELPER_IMAGE}" jq -n '{apiVersion: "v1", kind: "Pod", metadata: (env.M | fromjson),
