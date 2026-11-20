@@ -327,8 +327,9 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 	ip := "10.215.0.7"
 	var want []string
 	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-		// A joining server learns the agent token from the datastore.
-		if l == "--cluster-init" || strings.HasPrefix(l, "--agent-token-file=") {
+		// A joining server gets the agent token in the answer (written to
+		// init's --agent-token-file path).
+		if l == "--cluster-init" {
 			continue
 		}
 		l = strings.ReplaceAll(l, "10.215.0.1", ip)
@@ -480,7 +481,11 @@ func TestJoinNeverLogsSecrets(t *testing.T) {
 			}
 			var ja joinAnswer
 			json.Unmarshal(a, &ja)
+			// The contract's secrets: the token, and a server's agent token.
 			rest := strings.ReplaceAll(string(a), ja.Token, "")
+			if ja.AgentToken != "" {
+				rest = strings.ReplaceAll(rest, ja.AgentToken, "")
+			}
 			if ja.Token != "" && strings.Contains(rest, sc) {
 				t.Errorf("join answer %d carries a secret outside its token", i)
 			}

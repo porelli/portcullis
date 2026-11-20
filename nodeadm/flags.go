@@ -12,6 +12,8 @@ package main
 //     enablelb), storage, node.longhorn.io/create-default-disk=true only on
 //     a storage node at main (§20.11);
 //   - --node-taint=portcullis.io/small=true:NoSchedule on class small.
+// A server also gets --agent-token-file (init's; the answer's agent_token
+// goes there, 0600, as the token does).
 // An agent gets the subset k3s agent takes: --server, --token-file,
 // --node-name, --node-ip, the labels and taint, the flannel interface and
 // net-conf, the kubelet args. The token itself is never a flag: the
@@ -20,11 +22,12 @@ package main
 import "sort"
 
 const (
-	k3sTokenFile   = "/etc/rancher/k3s/token"
-	k3sFlannelConf = "/etc/rancher/k3s/flannel-net-conf.json"
-	meshIface      = "pcmesh"
-	primarySite    = "main"
-	smallTaint     = "portcullis.io/small=true:NoSchedule"
+	k3sTokenFile      = "/etc/rancher/k3s/token"
+	k3sAgentTokenFile = "/etc/rancher/k3s/agent-token"
+	k3sFlannelConf    = "/etc/rancher/k3s/flannel-net-conf.json"
+	meshIface         = "pcmesh"
+	primarySite       = "main"
+	smallTaint        = "portcullis.io/small=true:NoSchedule"
 )
 
 // nodeLabels are the --node-label values of a node (§20.1).
@@ -58,6 +61,7 @@ func joinFlags(rec *nodeRecord, id, serverURL string) []string {
 	}
 	if rec.Role == "server" {
 		f = append(f,
+			"--agent-token-file="+k3sAgentTokenFile,
 			"--secrets-encryption",
 			"--disable=traefik",
 			"--write-kubeconfig-mode=0600",

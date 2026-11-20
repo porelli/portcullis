@@ -86,6 +86,7 @@ var apiRoutes = []string{
 	"POST /v1/codes", "GET /v1/cluster", "PUT /v1/nodes/{id}/labels", "POST /v1/nodes/{id}/cordon", "POST /v1/nodes/{id}/uncordon",
 	"POST /v1/nodes/{id}/drain", "DELETE /v1/nodes/{id}?mode=cooperative", "DELETE /v1/nodes/{id}?mode=revoke",
 	"GET /node/join.sh", "GET /node/nodeagent-{arch}", "POST /node/v1/nonce", "POST /node/v1/enrol", "POST /node/v1/join",
+	"POST /node/v1/renew",
 }
 
 var apiKinds = map[string]int{"quorum_minimum": 409, "replica_minimum": 409, "unknown_node": 404, "proof_invalid": 403, "mesh_pending": 409, "waiting_admission": 409, "not_leader": 503}
@@ -295,10 +296,23 @@ var routeBodies = map[string][2]func() any{
 		}{}
 	}, func() any {
 		return &struct {
-			Role      string   `json:"role"`
-			ServerURL string   `json:"server_url"`
-			Token     string   `json:"token"`
-			Flags     []string `json:"flags"`
+			Role        string   `json:"role"`
+			ServerURL   string   `json:"server_url"`
+			Token       string   `json:"token"`
+			ClusterCIDR string   `json:"cluster_cidr"`
+			Flags       []string `json:"flags"`
+		}{}
+	}},
+	"POST /node/v1/renew": {func() any {
+		return &struct {
+			ServerID string `json:"server_id"`
+			CSR      string `json:"csr"`
+		}{}
+	}, func() any {
+		return &struct {
+			Certificate string `json:"certificate"`
+			CA          string `json:"ca"`
+			NotAfter    string `json:"not_after"`
 		}{}
 	}},
 }

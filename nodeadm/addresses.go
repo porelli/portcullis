@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"time"
 
@@ -287,6 +288,19 @@ func (s *Server) reconcile(ctx context.Context) {
 func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 	var gone []string
 	for id, r := range st.Nodes {
+		for _, sr := range r.PendingRevoke {
+			if err := s.enroll.Revoke(ctx, sr); err != nil {
+				continue
+			}
+			s.log.Info("a renewed-away certificate revoked", "node", id, "serial", sr)
+			nid, ser := id, sr
+			_ = s.mutate(ctx, func(st *nodeadmState) error {
+				if n := st.Nodes[nid]; n != nil {
+					n.PendingRevoke = slices.DeleteFunc(n.PendingRevoke, func(x string) bool { return x == ser })
+				}
+				return nil
+			})
+		}
 		if !r.Removed || st.Ops[id] != nil {
 			continue
 		}

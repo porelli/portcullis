@@ -218,6 +218,18 @@ func (ca *testCA) sign(cn string, pub any, dns []string) ([]byte, *x509.Certific
 	return der, c
 }
 
+func (ca *testCA) signAt(cn string, pub any, nb, na time.Time) ([]byte, *x509.Certificate) {
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(1000 + serialN.Add(1)), Subject: pkix.Name{CommonName: cn},
+		NotBefore: nb, NotAfter: na, KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, ca.cert, pub, ca.key)
+	if err != nil {
+		panic(err)
+	}
+	c, _ := x509.ParseCertificate(der)
+	return der, c
+}
+
 func (ca *testCA) client(cn string) (*x509.Certificate, *ecdsa.PrivateKey) {
 	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	_, c := ca.sign(cn, &k.PublicKey, nil)

@@ -3,10 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"net/http/httptest"
 	"reflect"
 	"slices"
@@ -233,6 +239,34 @@ func setupCase(t *testing.T, vs *apiVectors, c apiCase) (*harness, []byte, map[s
 			body = []byte(`{"server_id":"n4","rtt_ms":{"n1":3,"n2":251,"n3":5}}`)
 			hdr = signedHeaders(c4, k4, "n4", c.Request.Path, body, h.s.now())
 		}
+	case "POST /node/v1/renew":
+		h.setNow(time.Date(2026, 11, 18, 10, 5, 0, 0, time.UTC))
+		h.putState(t, func(s *nodeadmState) {
+			s.Nodes["n4"] = vecNodeRecord("4e:4f:44:45", true)
+		})
+		na, _ := time.Parse(time.RFC3339, "2026-12-18T10:00:00Z")
+		h.enroll.cert = &SignedCert{CertPEM: vs.PKI.NodeCertPEM, Serial: "4e:4f:44:45", NotAfter: na, CAPEM: vs.PKI.CAPEM}
+		if strings.Contains(st, "re-signed by the test") {
+			k4, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			var c4 *x509.Certificate
+			if strings.Contains(st, "issued an hour ago") {
+				_, c4 = h.ca.signAt("n4.cluster.portcullis.internal", &k4.PublicKey, h.s.now().Add(-time.Hour), h.s.now().Add(720*time.Hour))
+			} else {
+				_, c4 = h.ca.sign("n4.cluster.portcullis.internal", &k4.PublicKey, nil)
+			}
+			h.putState(t, func(s *nodeadmState) {
+				s.Nodes["n4"].Serial = certSerial(c4)
+				s.Nodes["n4"].Removed = strings.Contains(st, "record removed")
+			})
+			cn := "n4.cluster.portcullis.internal"
+			if strings.Contains(st, "names n5") {
+				cn = "n5.cluster.portcullis.internal"
+			}
+			nk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			der, _ := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: cn}}, nk)
+			body, _ = json.Marshal(renewReq{ServerID: "n4", CSR: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))})
+			hdr = signedHeaders(c4, k4, "n4", c.Request.Path, body, h.s.now())
+		}
 	case "POST /v1/nodes/{id}/drain", "DELETE /v1/nodes/{id}?mode=cooperative":
 		if strings.Contains(st, "PDB refuses") {
 			set, node := "vault", "n2"
@@ -321,7 +355,8 @@ func TestAPIVectors(t *testing.T) {
 				var got, exp joinAnswer
 				json.Unmarshal(w.Body.Bytes(), &got)
 				json.Unmarshal(c.Response.Body, &exp)
-				if got.Role != exp.Role || got.ServerURL != exp.ServerURL || got.Token != exp.Token {
+				if got.Role != exp.Role || got.ServerURL != exp.ServerURL || got.Token != exp.Token ||
+					got.ClusterCIDR != exp.ClusterCIDR || got.AgentToken != exp.AgentToken {
 					t.Errorf("answer %+v, want %+v", got, exp)
 				}
 				for _, f := range exp.Flags {
@@ -397,6 +432,15 @@ func checkCaseEffects(t *testing.T, h *harness, c apiCase) {
 		}
 		if len(h.enroll.signed) != 0 {
 			t.Errorf("a refused enrol signed a CSR")
+		}
+	case "renew":
+		r := st.Nodes["n4"]
+		if r == nil || r.Serial != "4e:4f:44:45" || len(h.enroll.revoked) != 1 || len(h.enroll.signed) != 1 || h.enroll.signed[0] != "node-cluster:n4.cluster.portcullis.internal" {
+			t.Errorf("renewal: record %+v, revoked %v, signed %v", r, h.enroll.revoked, h.enroll.signed)
+		}
+	case "renew: not due yet", "renew: a CSR for another name", "renew: a removed node", "renew: no signature":
+		if len(h.enroll.signed) != 0 {
+			t.Errorf("a refused renewal signed %v", h.enroll.signed)
 		}
 	case "enrol: an expired code (logged code_expired)":
 		if !strings.Contains(h.logs.String(), "kind=code_expired") {

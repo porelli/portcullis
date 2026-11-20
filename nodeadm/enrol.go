@@ -570,10 +570,16 @@ type joinReq struct {
 }
 
 type joinAnswer struct {
-	Role      string   `json:"role"`
-	ServerURL string   `json:"server_url"`
-	Token     string   `json:"token"`
-	Flags     []string `json:"flags"`
+	Role      string `json:"role"`
+	ServerURL string `json:"server_url"`
+	Token     string `json:"token"`
+	// AgentToken: a server only (k3s --agent-token-file; the nodeagent
+	// writes it 0600 like the token). Never given to an agent.
+	AgentToken string `json:"agent_token,omitempty"`
+	// ClusterCIDR: the cluster's pod network (portcullis-cluster-addresses,
+	// .env PORTCULLIS_POD_CIDR: what params-sync checks).
+	ClusterCIDR string   `json:"cluster_cidr"`
+	Flags       []string `json:"flags"`
 }
 
 // POST /node/v1/join
@@ -686,9 +692,11 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	}); err != nil {
 		return err
 	}
-	var token string
+	var token, agentTok string
 	if rec.Role == "server" {
-		token, err = s.serverToken(ctx)
+		if token, err = s.serverToken(ctx); err == nil {
+			agentTok, err = s.agentToken(ctx)
+		}
 	} else {
 		token, err = s.bootstrapToken(ctx, tokID)
 	}
@@ -698,7 +706,8 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	flags := joinFlags(rec, id, serverURL)
 	s.log.Info("join material issued", "server_id", id, "role", rec.Role, "token_id", tokenID(token))
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, joinAnswer{Role: rec.Role, ServerURL: serverURL, Token: token, Flags: flags})
+	writeJSON(w, http.StatusOK, joinAnswer{Role: rec.Role, ServerURL: serverURL, Token: token, AgentToken: agentTok,
+		ClusterCIDR: s.cfg.ClusterCIDR, Flags: flags})
 	return nil
 }
 

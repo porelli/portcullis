@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http/httptest"
@@ -767,5 +771,70 @@ func TestRevokeStepsVersion(t *testing.T) {
 	op.Role = "agent"
 	if err := h.s.revokeStep(ctx, op); err != nil {
 		t.Fatalf("an agent's done after one rotation: %v", err)
+	}
+}
+
+// TestServerJoinGetsAgentToken (Task 9 ruling I2): a joining server gets
+// the agent token (agent_token, --agent-token-file) and the cluster CIDR;
+// an agent never gets the agent or server token.
+func TestServerJoinGetsAgentToken(t *testing.T) {
+	h := newHarness(t)
+	j := h.issue(t, "n5", "server", "home", "main", "10.215.0.5")
+	h.enrol(t, j, "")
+	w := h.join(t, j, nearRTT)
+	var ans joinAnswer
+	if err := json.Unmarshal(w.Body.Bytes(), &ans); w.Code != 200 || err != nil {
+		t.Fatalf("server join: %d %s", w.Code, w.Body)
+	}
+	if ans.Token != testServerToken || ans.AgentToken != testAgentToken || ans.ClusterCIDR != "10.42.0.0/16" ||
+		!slices.Contains(ans.Flags, "--agent-token-file=/etc/rancher/k3s/agent-token") {
+		t.Fatalf("server answer: cidr %q, agent token given %v, flags %v", ans.ClusterCIDR, ans.AgentToken != "", ans.Flags)
+	}
+	a := h.issue(t, "n6", "agent", "home", "main", "10.215.0.6")
+	h.enrol(t, a, "")
+	w = h.join(t, a, nearRTT)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "agent_token") || strings.Contains(w.Body.String(), "::node:") ||
+		strings.Contains(w.Body.String(), "--agent-token-file") || !strings.Contains(w.Body.String(), `"cluster_cidr":"10.42.0.0/16"`) {
+		t.Fatalf("agent answer: %d %s", w.Code, w.Body)
+	}
+}
+
+// TestRenewOnce (Task 9 ruling I4): two renewals with the same current
+// certificate: one wins; the other's new certificate is revoked; the
+// renewed node signs joins with the new certificate only.
+func TestRenewOnce(t *testing.T) {
+	h := newHarness(t)
+	j := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
+	if w := h.enrol(t, j, ""); w.Code != 200 {
+		t.Fatalf("enrol: %d", w.Code)
+	}
+	// The enrolment's certificate (test CA, 2026-01-01..2027-01-01) is due.
+	h.enroll.cert = nil
+	mk := func() ([]byte, map[string]string) {
+		der, _ := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "n5." + clusterDomain}}, j.key)
+		body, _ := json.Marshal(renewReq{ServerID: "n5", CSR: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))})
+		return body, signedHeaders(j.cert, j.key, "n5", "/node/v1/renew", body, h.s.now())
+	}
+	b1, h1 := mk()
+	b2, h2 := mk()
+	w1 := h.public("POST", "/node/v1/renew", b1, h1)
+	w2 := h.public("POST", "/node/v1/renew", b2, h2)
+	if w1.Code != 200 || w2.Code != 403 && w2.Code != 409 {
+		t.Fatalf("renewals: %d %s / %d %s", w1.Code, w1.Body, w2.Code, w2.Body)
+	}
+	var ans struct{ Certificate string }
+	json.Unmarshal(w1.Body.Bytes(), &ans)
+	blk, _ := pem.Decode([]byte(ans.Certificate))
+	nc, _ := x509.ParseCertificate(blk.Bytes)
+	if r := h.state(t).Nodes["n5"]; r.Serial != certSerial(nc) || !slices.Contains(h.enroll.revoked, certSerial(j.cert)) {
+		t.Fatalf("record serial %s, revoked %v", r.Serial, h.enroll.revoked)
+	}
+	// The old certificate no longer signs a join; the new one does.
+	if w := h.join(t, j, nearRTT); w.Code != 403 {
+		t.Fatalf("a join with the renewed-away certificate: %d", w.Code)
+	}
+	j.cert = nc
+	if w := h.join(t, j, nearRTT); w.Code != 200 {
+		t.Fatalf("a join with the renewed certificate: %d %s", w.Code, w.Body)
 	}
 }
