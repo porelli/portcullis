@@ -18,6 +18,10 @@ vpn:
   reservedPools: "10.42.0.0/24 10.43.0.0/16"
 acme:
   email: admin@ci.example.org
+# The API server's webhook sources (kube_apiserver_sources: the endpoint
+# and the node's pod-range gateway addresses).
+cnpg:
+  apiServerSources: ["10.1.0.4", "10.42.0.0", "10.42.0.1"]
 installID: 0b0e2b3c-1111-4222-8333-444455556666
 hashes:
   certs: "0000"

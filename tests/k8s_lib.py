@@ -20,6 +20,13 @@ INGRESS_NS = "portcullis-ingress"
 # Compose services with no Kubernetes form (the Roles replace the socket
 # proxies; the mail slot is Docker / Podman only, contract §19.12).
 ABSENT = {"socket-proxy-traefik", "socket-proxy-hub", "mail-cert"}
+# Compose services whose Kubernetes form isn't a workload of the chart
+# (plan Task 23): Postgres is the CloudNativePG Cluster portcullis-pg in
+# CNPG_NS (k8s_parity.py check_postgres, k8s_netpol_matrix.py
+# check_postgres hold it to its own rules).
+REPLACED = {"postgres"}
+CNPG_NS = "cnpg-system"
+PG_CLUSTER = "portcullis-pg"
 # Compose networks with no Kubernetes form (the link networks too: Servers
 # needs a Docker or Podman primary, contract §17.1).
 ABSENT_NETS = {"socket-proxy-traefik", "socket-proxy-hub",
@@ -92,6 +99,33 @@ def render_helper(body, extra=None):
     return out.stdout.split("\n", 2)[2] if out.stdout.startswith("---\n# Source:") else out.stdout
 
 
+def cnpg_cluster(docs):
+    """The CNPG Cluster portcullis-pg of a render (None without)."""
+    return next((d for d in docs if d.get("kind") == "Cluster" and d["metadata"]["name"] == PG_CLUSTER), None)
+
+
+def render_cnpg():
+    """The CloudNativePG operator as ./portcullis installs it (ha_install_cnpg):
+    the vendored chart with the vendored values file, release cnpg in
+    CNPG_NS."""
+    helm = os.environ.get("HELM", "helm")
+    out = subprocess.run([helm, "template", "cnpg", str(ROOT / "kube" / "ha" / "cnpg" / "cloudnative-pg-0.29.2.tgz"), "-n", CNPG_NS,
+                          "-f", str(ROOT / "kube" / "ha" / "cnpg" / "values.yaml")], check=True, capture_output=True, text=True).stdout
+    return [doc for doc in yaml.safe_load_all(out) if doc]
+
+
+def placement_specs(docs):
+    """{name: pod spec} of every pod the chart renders, plus "postgres":
+    the CNPG Cluster's instances, as a pod spec holding the Cluster's
+    nodeAffinity (CNPG copies spec.affinity.nodeAffinity onto each)."""
+    out = {n: sp for n, _, _, sp, _ in pod_specs(docs)}
+    c = cnpg_cluster(docs)
+    if c is not None:
+        na = (c["spec"].get("affinity") or {}).get("nodeAffinity")
+        out["postgres"] = {"affinity": {"nodeAffinity": na}} if na else {}
+    return out
+
+
 def by_kind(docs, kind):
     return [d for d in docs if d.get("kind") == kind]
 
@@ -104,9 +138,11 @@ def pod_specs(docs):
     """(name, namespace, labels, pod spec, annotations) of every pod the chart renders."""
     out = []
     for d in docs:
-        if d.get("kind") in ("Deployment", "StatefulSet", "DaemonSet"):
+        if d.get("kind") in ("Deployment", "StatefulSet", "DaemonSet", "Job"):
             t = d["spec"]["template"]
-            out.append((d["metadata"]["name"], d["metadata"]["namespace"], t["metadata"].get("labels", {}), t["spec"], t["metadata"].get("annotations", {})))
+            # A Job by its component (its name carries a hash of its inputs).
+            name = t["metadata"].get("labels", {}).get("portcullis.io/component", d["metadata"]["name"]) if d["kind"] == "Job" else d["metadata"]["name"]
+            out.append((name, d["metadata"]["namespace"], t["metadata"].get("labels", {}), t["spec"], t["metadata"].get("annotations", {})))
         elif d.get("kind") == "Pod":
             out.append((d["metadata"]["name"], d["metadata"]["namespace"], d["metadata"].get("labels", {}), d["spec"], d["metadata"].get("annotations", {})))
     return out
@@ -180,8 +216,10 @@ def values():
 
 # Sites (contract §20.11, plan Task 20): the pods pinned to the primary
 # site main in HA (a required node affinity portcullis.io/site In [main] in
-# every term, merged with any class term). CNPG, the Sentinels and Longhorn's
-# disks add themselves when Tasks 23 / 24 create them. LLDAP is pinned with
+# every term, merged with any class term). CNPG's instances (the Cluster
+# portcullis-pg's affinity, "postgres": k8s_parity.py check_sites) and
+# LLDAP's schema Job (Task 23); the Sentinels and Longhorn's disks add
+# themselves when Task 24 creates them. LLDAP is pinned with
 # the sign-in pieces (its data lives at main). The hub one-shot mounts the
 # Hub's replicated volume. Never pinned: the Traefik DaemonSet (ingress
 # nodes at every site), frontdoor (it must write DNS when main's uplink is
@@ -190,7 +228,7 @@ def values():
 PRIMARY_SITE = "main"
 SITE_KEY = "portcullis.io/site"
 SITE_PINNED = {"postgres", "vault", "sessions", "hub", "domains", "keycloak", "forward-auth", "forward-auth-ext",
-               "group-gate", "enroll", "mcp-gate", "wg", "lldap", "oneshot-hub"}
+               "group-gate", "enroll", "mcp-gate", "wg", "lldap", "oneshot-hub", "lldap-schema"}
 SITE_FREE = {"traefik", "frontdoor", "nodeadm"}
 
 

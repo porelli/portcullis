@@ -4348,7 +4348,7 @@ printf '%s\n' "$*" >> "$STUB_DIR/helm-calls"
 printf 'helm %s\n' "$*" >> "$STUB_DIR/order"
 case "$*" in
   *" template "*"--show-only templates/oneshot.yaml"*) printf 'apiVersion: v1\nkind: Pod\nmetadata:\n  name: oneshot\nspec:\n  containers:\n    - name: x\n      image: ghcr.io/porelli/portcullis-hub@sha256:%064d\n      command: ["/usr/local/bin/hub"]\n' 1 ;;
-  *" upgrade --install "*) [ -z "${STUB_HELM_FAIL:-}" ] || { echo "Error: context deadline exceeded" >&2; exit 1; } ;;
+  *" upgrade --install portcullis "*) [ -z "${STUB_HELM_FAIL:-}" ] || { echo "Error: context deadline exceeded" >&2; exit 1; } ;;
 esac
 exit 0
 HSTUB
@@ -5005,7 +5005,7 @@ expect_eq "cluster setup: the five namespaces with PSA labels and K11's label + 
 expect_eq "cluster setup: CRDs and VAPs applied server-side (never Helm), bindings.yaml never applied under its own names, the storage API egress to each endpoint" \
   "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*/bindings.json' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:0:1:1"
 expect_eq "cluster setup: applied.json records every step (0600)" \
-  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.crds cluster.namespaces cluster.params cluster.priorities cluster.storage:600"
+  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.cnpg cluster.crds cluster.namespaces cluster.params cluster.priorities cluster.storage:600"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
 expect_eq "cluster setup: unchanged params → the same generation re-applied and probed, nothing deleted, no Hub scaling" \
@@ -5062,7 +5062,7 @@ rm -rf "$CS_ROOT/secrets/kube"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_APPLY_FAIL_MATCH=kube/admission/policies.yaml; kube_cluster_setup")"
 case "$OUT" in *"could not apply the admission policies"*"rc=1") t_pass "cluster setup: a failed VAP apply fails the setup" ;; *) t_fail "cluster setup VAP failure: $OUT" ;; esac
 expect_eq "cluster setup: a failed VAP apply leaves applied.json without the admission and params steps" \
-  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json")" "cluster.crds cluster.namespaces cluster.priorities cluster.storage"
+  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json")" "cluster.cnpg cluster.crds cluster.namespaces cluster.priorities cluster.storage"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE=ghcr.io/porelli/portcullis-hub:edge; kube_cluster_setup")"
 case "$OUT" in *"isn't resolved to a digest"*"rc=1") t_pass "cluster setup: an unresolved Hub tag → refused (the params pin a digest)" ;; *) t_fail "cluster setup tag: $OUT" ;; esac
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES=' '; kube_ctl() { [ \"\$1 \$2\" = 'get nodes' ] && { echo '{\"items\":[]}'; return 0; }; command kubectl --context ci \"\$@\"; }; kube_admission_params x")"
@@ -5165,6 +5165,8 @@ K15="$WORK/k15"
 k15_root() {
   rm -rf "$K15"; mkdir -p "$K15/secrets/hub/lldap" "$K15/secrets/wg" "$K15/secrets/domains/certs-endpoint" "$K15/secrets/kube" "$K15/certs/revocation" "$K15/certs/truststore"
   printf 'SECRET-LLDAP-PW-123' > "$K15/secrets/hub/lldap/password"
+  # LLDAP's server key (ha.sh kube_lldap_server_key keeps a present one).
+  mkdir -p "$K15/secrets/lldap-key"; printf 'LLDAP-SERVER-KEY' > "$K15/secrets/lldap-key/server_key"
   printf 'portcullis-hub' > "$K15/secrets/hub/lldap/username"
   printf '{"root_token":"ROOT-TOKEN-XYZ"}' > "$K15/secrets/vault-init.json"
   printf 'CA-KEY-SECRET' > "$K15/secrets/domains/certs-endpoint/ca.key"
@@ -5336,9 +5338,9 @@ expect_eq "restore: an unreadable Secret list refuses (a credential would surviv
 # with that password, which Keycloak then reads (the old one = Keycloak never
 # connects again).
 RB="$(sed -n '/^_backup_restore_kube() {/,/^}/p' "$HERE/../scripts/lib/kube.sh")"
-expect_eq "kube restore: kube_sync_secrets after the .env is restored and before the fresh Postgres" \
-  "$(printf '%s\n' "$RB" | awk '/cat "\$dir\/.env"/ {printf "cat "} /kube_sync_secrets/ {printf "kube_sync_secrets "} /_kube_empty_volume postgres_data/ {printf "_kube_empty_volume "}')" \
-  "cat kube_sync_secrets _kube_empty_volume "
+expect_eq "kube restore: kube_sync_secrets and the roles' Secrets after the .env is restored, before the CNPG databases are replaced (plan Task 23)" \
+  "$(printf '%s\n' "$RB" | awk '/cat "\$dir\/.env"/ {printf "cat "} /kube_sync_secrets/ {printf "kube_sync_secrets "} /^ *kube_pg_sync_secrets/ {printf "kube_pg_sync_secrets "} /_kube_restore_pg "/ {printf "_kube_restore_pg "}')" \
+  "cat kube_sync_secrets kube_pg_sync_secrets _kube_restore_pg "
 # The LLDAP guard on kubernetes counts LLDAP's users from its PVC (never the
 # docker-only volume helper), and still refuses an empty LLDAP.
 OUT="$(kt '_restore_lldap_count() { echo DOCKER-HELPER; }; _restore_kc_federated_count() { echo 5; }; _kube_restore_lldap_count() { echo 3; }; _restore_lldap_guard false; echo "rc=$?"')"
@@ -6193,6 +6195,62 @@ expect_eq "link status: a peer silent for 10 min → stale, a problem" \
   "$(ls_json on "${LST/\"handshake\":\"$NOW\"/\"handshake\":\"$OLD\"}" | jq -c '{problem, s: [.peers[] | .stale]}')" '{"problem":true,"s":[true,false]}'
 expect_eq "link status: the role on, wg not answering → a problem" "$(ls_json on '' | jq -c '{up, problem}')" '{"up":false,"problem":true}'
 expect_eq "link status: link null in a fresh status.json → down" "$(ls_json on "{\"version\":1,\"written\":\"$NOW\",\"link\":null}" | jq -c '{up, problem}')" '{"up":false,"problem":true}'
+
+# ── HA Task 23: Postgres on CloudNativePG (scripts/lib/ha.sh) ──
+CN="$WORK/cnpg"; rm -rf "$CN"; mkdir -p "$CN/kube/ha/cnpg" "$CN/charts/portcullis"
+cp "$HERE/../kube/ha/cnpg/cloudnative-pg-0.29.2.tgz" "$HERE/../kube/ha/cnpg/values.yaml" "$CN/kube/ha/cnpg/"
+cp "$HERE/../charts/portcullis/namespaces.json" "$CN/charts/portcullis/"
+k_fixtures; rm -f "$KS/helm-calls" "$KS/kubectl-calls"; mkdir -p "$WORK/cnroot/secrets"
+OUT="$(kt "PORTCULLIS_HOME='$CN' PORTCULLIS_ROOT='$WORK/cnroot'; ha_install_cnpg")"
+expect_eq "ha_install_cnpg: applies pinned manifests only (digest check): the vendored chart with its values file, release cnpg in cnpg-system, waited for" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c "^--kube-context ci upgrade --install cnpg $CN/kube/ha/cnpg/cloudnative-pg-0.29.2.tgz -n cnpg-system -f $CN/kube/ha/cnpg/values.yaml --history-max 3 --wait --timeout 5m$" "$KS/helm-calls")" "rc=0:1"
+expect_eq "ha_install_cnpg: never helm --set (with a secret or anything: every value in the vendored file)" \
+  "$(grep -c -- '--set' "$KS/helm-calls" || true):$(declare -f ha_install_cnpg | grep -c -- '--set' || true)" "0:0"
+expect_eq "ha_install_cnpg: cnpg-system with PSA restricted (namespaces.json cnpg) and the install's ownership" \
+  "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object" and .kind == "Namespace" and .metadata.name == "cnpg-system") | [.metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.annotations["portcullis.io/install"]]' 2>/dev/null)" \
+  '["restricted","0b0e2b3c-1111-4222-8333-444455556666"]'
+printf 'x' >> "$CN/kube/ha/cnpg/cloudnative-pg-0.29.2.tgz"; rm -f "$KS/helm-calls"
+OUT="$(kt "PORTCULLIS_HOME='$CN' PORTCULLIS_ROOT='$WORK/cnroot'; ha_install_cnpg" 2>&1)"
+case "$OUT" in *"the CloudNativePG pins don't hold: kube/ha/cnpg/cloudnative-pg-0.29.2.tgz has sha256 "*"not the pinned 9df3f074"*"rc=1") t_pass "ha_install_cnpg: a chart that isn't the pinned sha256 → refused, nothing installed" ;; *) t_fail "cnpg tampered chart: $OUT" ;; esac
+expect_eq "ha_install_cnpg: the refused chart never reached helm" "$(cat "$KS/helm-calls" 2>/dev/null | grep -c upgrade || true)" 0
+cp "$HERE/../kube/ha/cnpg/cloudnative-pg-0.29.2.tgz" "$CN/kube/ha/cnpg/"
+sed -i.bak 's/^  tag: .*/  tag: "1.30.2"/' "$CN/kube/ha/cnpg/values.yaml" && rm -f "$CN/kube/ha/cnpg/values.yaml.bak"
+OUT="$(kt "PORTCULLIS_HOME='$CN' PORTCULLIS_ROOT='$WORK/cnroot'; ha_install_cnpg" 2>&1)"
+case "$OUT" in *"doesn't pin the operator image to sha256:f96f6be3"*"rc=1") t_pass "ha_install_cnpg: values without the pinned operator digest → refused" ;; *) t_fail "cnpg unpinned values: $OUT" ;; esac
+expect_eq "the argv grep covers scripts/lib/ha.sh" "$(printf '%s\n' "$HERE"/../scripts/lib/*.sh | grep -c '/ha\.sh$')" 1
+OUT="$(kt "kube_ctl() { echo '{\"items\":[{\"spec\":{\"podCIDR\":\"10.42.0.0/24\"}},{\"spec\":{\"podCIDR\":\"10.42.1.0/24\"}},{\"spec\":{}},{\"spec\":{\"podCIDR\":\"bogus\"}}]}'; }; kube_apiserver_sources; echo")"
+expect_eq "kube_apiserver_sources: the API endpoints and each server's pod-range gateways (flannel .0, cni0 .1), nothing unparsable" \
+  "$(printf '%s\n' "$OUT" | head -n1)" "10.1.0.4 10.42.0.0 10.42.0.1 10.42.1.0 10.42.1.1"
+OUT="$(kt "PORTCULLIS_KUBE_API_ENDPOINTS=; kube_ctl() { return 1; }; kube_apiserver_sources; echo \"[\$(kube_apiserver_sources)]\"")"
+expect_eq "kube_apiserver_sources: nothing readable → empty (kube_render_values then refuses)" "$(printf '%s\n' "$OUT" | grep -c '^\[\]$')" 1
+expect_eq "kube_render_values: refuses without the API server's addresses (the CNPG webhook would admit nobody)" \
+  "$(declare -f kube_render_values | grep -c 'the CNPG webhook would admit nobody')" 1
+k_fixtures; k15_root; rm -f "$KS/order"
+OUT="$(kt "$K15_ENV LLDAP_PG_PASSWORD=LLPG-SECRET-888; kube_pg_sync_secrets" </dev/null)"
+expect_eq "kube_pg_sync_secrets: the roles' basic-auth Secrets in cnpg-system and LLDAP's URL Secret in the core namespace, built --from-file" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -cE 'create secret generic portcullis-pg-keycloak -n cnpg-system --type=kubernetes.io/basic-auth --from-file=|create secret generic portcullis-pg-lldap -n cnpg-system --type=kubernetes.io/basic-auth --from-file=|create secret generic portcullis-pg-lldap -n portcullis --from-file=' "$KS/kubectl-calls")" "rc=0:3"
+expect_eq "kube_pg_sync_secrets: no password on argv (kubectl / helm argv recorded)" \
+  "$(cat "$KS/kubectl-calls" "$KS/helm-calls" 2>/dev/null | grep -cE 'LLPG-SECRET-888|PG-SECRET-777' || true)" 0
+expect_eq "kube_pg_sync_secrets: LLDAP's URL is the rw Service's, its password in the Secret (base64), never in a log" \
+  "$(grep -c "$(printf 'postgres://lldap:LLPG-SECRET-888@portcullis-pg-rw.cnpg-system.svc.cluster.local:5432/lldap' | base64 | tr -d '\n')" "$KS/kubectl-stdin"):$(printf '%s\n' "$OUT" | grep -c 'LLPG-SECRET-888' || true)" "1:0"
+OUT="$(kt "$K15_ENV; kube_images_ready() { echo NO-IMAGES; }; kube_ctl() { echo \"KCTL \$*\"; }; kube_lldap_server_key; echo done")"
+expect_eq "kube_lldap_server_key: a present key is kept (no pod)" "$(printf '%s\n' "$OUT" | grep -c 'KCTL\|NO-IMAGES' || true):$(cat "$K15/secrets/lldap-key/server_key")" "0:LLDAP-SERVER-KEY"
+expect_eq "kube_lldap_server_key: the key read with exec cat into a 0600 file, never a pod's logs" \
+  "$(declare -f kube_lldap_server_key | grep -c ' logs '):$(declare -f kube_lldap_server_key | grep -c 'exec "$name" -c keygen')" "0:1"
+PGX="$WORK/pgx"; rm -rf "$PGX"; mkdir -p "$PGX/b1" "$PGX/b2"
+printf 'PGDMPkc' > "$PGX/b1/postgres.dump"; printf 'PGDMPll' > "$PGX/b1/lldap.dump"
+printf 'PGDMPkc' > "$PGX/b2/postgres.dump"; printf 'tar' > "$PGX/b2/lldap_data.tar.gz"
+pgx() { kt "_kube_pg_wait() { :; }; _kube_pg_exec() { echo \"PG \$*\" >> '$PGX/calls'; case \"\$1\" in pg_restore) cat > '$PGX/in-'\"\$2\" ;; esac; }; kube_ctl() { echo \"KCTL \$*\" >> '$PGX/calls'; }; _kube_restore_pg '$1'" 2>&1; }
+rm -f "$PGX/calls"; OUT="$(pgx "$PGX/b1")"
+expect_eq "_kube_restore_pg (test_restore_into_cnpg): keycloak and lldap emptied, then pg_restore'd as their own roles in one transaction; LLDAP's schema Jobs removed" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c '^PG dropdb --if-exists --force keycloak$\|^PG createdb -O keycloak keycloak$\|^PG pg_restore -d keycloak --no-owner --no-privileges --role=keycloak --exit-on-error --single-transaction$\|^PG dropdb --if-exists --force lldap$\|^PG pg_restore -d lldap --no-owner --no-privileges --role=lldap --exit-on-error --single-transaction$' "$PGX/calls"):$(cat "$PGX/in--d" 2>/dev/null | head -c 7):$(grep -c 'KCTL -n portcullis delete job -l portcullis.io/component=lldap-schema' "$PGX/calls")" "rc=0:5:PGDMPll:1"
+rm -f "$PGX/calls"; OUT="$(pgx "$PGX/b2")"
+case "$OUT" in *"This backup's LLDAP is SQLite (lldap_data.tar.gz, made on Docker / Podman): it isn't converted into Postgres on Kubernetes yet, so LLDAP starts empty."*"rc=0") t_pass "_kube_restore_pg: a Docker backup → Keycloak restored, LLDAP's database emptied with a warning (the conversion is Task 26)" ;; *) t_fail "restore pg docker backup: $OUT" ;; esac
+expect_eq "_kube_restore_pg: a Docker backup's lldap volume never restored into Postgres here" "$(grep -c 'pg_restore -d lldap' "$PGX/calls" || true)" 0
+OUT="$(kt "_kube_pg_exec() { echo 3; }; _kube_pg_lldap_count; _kube_pg_exec() { echo 'ERROR: relation \"users\" does not exist'; return 1; }; _kube_pg_lldap_count")"
+expect_eq "the restore's LLDAP guard on Kubernetes counts LLDAP's users in Postgres; no schema → missing" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "3 missing "
+OUT="$(kt "_kube_pg_exec() { echo \"PG \$*\"; }; rt_exec postgres -- pg_dump -d keycloak -Fc; rt_exec -i postgres -- pg_restore --list")"
+expect_eq "rt_exec postgres on Kubernetes: the CNPG primary's postgres container" "$(printf '%s\n' "$OUT" | grep -c '^PG pg_dump -d keycloak -Fc$\|^PG pg_restore --list$')" 2
 
 echo ""
 echo "$PASS passed, $FAIL failed"

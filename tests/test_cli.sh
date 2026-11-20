@@ -465,7 +465,7 @@ cp "$HERE/../docker-compose.yml" "$WORK/gen/"
 if python3 -c 'import yaml' 2>/dev/null; then
   python3 "$WORK/gen/scripts/gen-images-yaml.py"
   expect_eq "gen-images-yaml.py --check: a fresh file passes" "$(python3 "$WORK/gen/scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "rc=0"
-  sed -i.bak 's/postgres:18[^ ]*/postgres:17/' "$WORK/gen/charts/portcullis/images.yaml"
+  sed -i.bak 's/vault:2[^ ]*/vault:1/' "$WORK/gen/charts/portcullis/images.yaml"
   expect_eq "gen-images-yaml.py --check: a stale file → exit 1" "$(python3 "$WORK/gen/scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "charts/portcullis/images.yaml is stale: run scripts/gen-images-yaml.py
 rc=1"
   expect_eq "charts/portcullis/images.yaml is current" "$(python3 "$HERE/../scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "rc=0"

@@ -1,0 +1,39 @@
+# The CloudNativePG operator's values (plan Task 23, D8; Amendment 1 pins
+# CloudNativePG v1.30.2): the chart cloudnative-pg-0.29.2.tgz next to this
+# file is the cloudnative-pg/charts release asset (sha256 9df3f074…, its
+# appVersion 1.30.2; its CRDs are byte-equal to the pinned cnpg-1.30.2.yaml
+# release asset's, sha256 ea4cc355…), installed by ./portcullis
+# (ha_install_cnpg, scripts/lib/ha.sh) as the release cnpg in cnpg-system,
+# on every Kubernetes install. Never --set: every value is here (no secret
+# exists for the operator: it makes its own webhook certificate).
+#
+# - config.clusterWide false: the chart's namespaced mode. The operator
+#   watches cnpg-system only (WATCH_NAMESPACE) and its namespaced rights are
+#   a Role there: none in the core namespace or portcullis-apps (spec §7.4).
+#   Cluster-scoped it reads nodes and clusterimagecatalogs and patches its
+#   own two webhook configurations (their CA bundle).
+# - the image by digest (the operator copies itself into each instance pod
+#   from OPERATOR_IMAGE_NAME, the same ref).
+# - priorityClassName portcullis-core (ruling I5: every non-app pod).
+# - the memory of the upstream manifest (cnpg-1.30.2.yaml: 100Mi / 200Mi).
+# - no PodMonitor, no Grafana dashboard (no prometheus-operator here).
+# The flows of cnpg-system (default deny, the operator's documented ones)
+# are the core chart's templates/postgres-cnpg.yaml.
+image:
+  repository: ghcr.io/cloudnative-pg/cloudnative-pg
+  tag: "1.30.2@sha256:f96f6be3d81ec93819b443c665c575c609342fca840df90d4d87dae314a5b913"
+  pullPolicy: IfNotPresent
+crds:
+  create: true
+config:
+  clusterWide: false
+priorityClassName: portcullis-core
+resources:
+  limits:
+    memory: 200Mi
+  requests:
+    memory: 100Mi
+monitoring:
+  podMonitorEnabled: false
+  grafanaDashboard:
+    create: false

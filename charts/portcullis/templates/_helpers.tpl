@@ -655,3 +655,20 @@ HUB_TRAEFIK_PEER, the peer of its routed apps' NetworkPolicies (Hub Task
 {{- if and $v (not (regexMatch "^[a-z0-9-]{1,32}$" $v)) }}{{ fail "dnsProvider must be a DNS provider's name ([a-z0-9-], at most 32)" }}{{ end -}}
 {{- $v -}}
 {{- end }}
+
+{{/*
+portcullis.pgInstances — the CNPG Cluster's instances (plan Task 23,
+preflight P40): 1 without HA; in HA min(3, the non-small nodes at the
+primary site) (ha.nonSmallNodesAtPrimary: the instances are pinned there,
+never on small nodes, one per host), at least 1.
+*/}}
+{{- define "portcullis.pgInstances" -}}
+{{- if .Values.ha.enabled -}}
+{{- max 1 (min 3 (int .Values.ha.nonSmallNodesAtPrimary)) -}}
+{{- else -}}
+1
+{{- end -}}
+{{- end }}
+
+{{/* portcullis.pgHost — the CNPG primary's Service (portcullis-pg-rw). */}}
+{{- define "portcullis.pgHost" -}}portcullis-pg-rw.{{ .Values.cnpg.namespace }}.svc.cluster.local{{- end }}

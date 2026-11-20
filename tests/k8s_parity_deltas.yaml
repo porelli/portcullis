@@ -1,7 +1,10 @@
 # Reviewed differences between charts/portcullis and docker-compose.yml
 # (tests/k8s_parity.py). Every entry needs a reason; one that no longer
 # applies fails the check. Kinds: user, caps, env-missing, env-extra, mount,
-# bind, tmpfs-mode, kube-probe.
+# bind, tmpfs-mode, kube-probe. Postgres has no compose-shaped form on
+# Kubernetes at all ("postgres: CNPG on Kubernetes", plan Task 23): it is the
+# CloudNativePG Cluster portcullis-pg, held to its own rules by
+# k8s_parity.py check_postgres.
 
 user:
   # compose has no `user:` (the image's USER); restricted PSA needs the
@@ -50,6 +53,9 @@ env-missing:
 env-extra:
   - {service: hub, item: HUB_DNS_PROVIDER, reason: "Kubernetes: the main domain's DNS provider name for the HA page (Hub Task 15); on Docker the Hub reads core.env's DNS_PROVIDER; a name only, never a credential"}
   - {service: hub, item: HUB_TRAEFIK_PEER, reason: "Kubernetes: the routed apps' NetworkPolicy peer, = the admission params' traefik (kube_traefik_peer; Hub Task 13)"}
+  - {service: lldap, item: LLDAP_DATABASE_URL, reason: "postgres: CNPG on Kubernetes (Task 23, D8): LLDAP on the Cluster portcullis-pg's database lldap, the URL from the CLI's Secret portcullis-pg-lldap; Docker keeps SQLite"}
+  - {service: lldap, item: LLDAP_KEY_FILE, reason: "postgres: CNPG on Kubernetes (Task 23, Amendment 2): one server key on every replica, the CLI's Secret secrets-lldap-key, read-only"}
+  - {service: lldap, item: LLDAP_KEY_SEED, reason: "postgres: CNPG on Kubernetes (Task 23): emptied so the template config's well-known key_seed doesn't override the key file"}
   - {service: keycloak, item: JAVA_OPTS_KC_HEAP, reason: "Task 19 review I2: the heap capped at 768 Mi on Kubernetes so the 1024 Mi request bounds it (Docker keeps the image's default share of mem_limit); re-measured in Task 33"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD, reason: "spec §5: the kubernetesCRD provider"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES, reason: "spec §5: exactly the core and the apps namespace"}
@@ -87,7 +93,6 @@ mount:
 
 tmpfs-mode:
   - {service: hub, item: /home/hub, reason: "K-P25: emptyDir has no mode (it is 0777); only uid 10001 runs in the pod"}
-  - {service: postgres, item: /var/run/postgresql, reason: "K-P25: emptyDir has no mode (it is 0777, compose's 1777 without the sticky bit); only uid 70 runs in the pod"}
 
 kube-probe:
   # Distroless images without a compose healthcheck: a readiness httpGet

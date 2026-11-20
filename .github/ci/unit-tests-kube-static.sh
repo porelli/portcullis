@@ -47,10 +47,19 @@ echo "::group::helm lint"
 "$HELM" lint charts/portcullis -f tests/k8s-ci-values.yaml -f tests/k8s-ci-values-ha.yaml -f tests/k8s-ci-values-ha-sites.yaml -f <("$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))')
 echo "::endgroup::"
 
-# The Traefik CRDs as JSON schemas (strict: unknown fields refused).
+# The CloudNativePG operator as ./portcullis installs it (ha_install_cnpg:
+# the vendored, pinned chart with its values file; plan Task 23): its
+# CRDs join the schemas (the chart renders a Cluster and a Database).
+echo "::group::helm lint + template: the CloudNativePG operator (kube/ha/cnpg)"
+echo "9df3f074ecaa8af10277ad155899470618ea9a565d7c7c48187bdc7887655960  kube/ha/cnpg/cloudnative-pg-0.29.2.tgz" | sha256sum -c --quiet - \
+  || { echo "FAIL: kube/ha/cnpg/cloudnative-pg-0.29.2.tgz isn't the pinned release asset"; exit 1; }
+"$HELM" template cnpg kube/ha/cnpg/cloudnative-pg-0.29.2.tgz -n cnpg-system -f kube/ha/cnpg/values.yaml > "$TOOLS/cnpg.yaml"
+echo "::endgroup::"
+
+# The Traefik and CloudNativePG CRDs as JSON schemas (strict: unknown fields refused).
 SCHEMAS="$TOOLS/crd-schemas"
 rm -rf "$SCHEMAS" && mkdir -p "$SCHEMAS"
-"$PY" - charts/portcullis/crds/*.yaml "$SCHEMAS" <<'PY'
+"$PY" - charts/portcullis/crds/*.yaml "$TOOLS/cnpg.yaml" "$SCHEMAS" <<'PY'
 import json, pathlib, sys, yaml
 *files, out = sys.argv[1:]
 def strict(s):
@@ -103,6 +112,11 @@ for os in dns-tool hub; do
     -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$K8S_SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json" \
     "$TOOLS/oneshot.yaml"
 done
+# The operator's render (its CRDs are the schemas above: no schema for a CRD).
+"$KUBECONFORM" -strict -summary -skip CustomResourceDefinition -kubernetes-version "$K8S_VERSION" \
+  -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$K8S_SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json" \
+  -schema-location "$SCHEMAS/{{ .Group }}/{{ .ResourceKind }}_{{ .ResourceAPIVersion }}.json" \
+  "$TOOLS/cnpg.yaml"
 # The CLI-applied manifests (probe, storage, admission; not the template of
 # the params' keys).
 KUBE_FILES=()

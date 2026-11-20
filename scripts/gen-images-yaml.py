@@ -7,7 +7,8 @@ Every compose service that exists on Kubernetes gets one entry:
     mcp-gate, wg) and the Hub / Keycloak defaults: {tag_ref: <ref>:edge},
     which the CLI resolves to a digest at up / upgrade, so the chart only
     ever sees name@sha256:... .
-The socket proxies have no Kubernetes form (the Roles replace them).
+The socket proxies have no Kubernetes form (the Roles replace them);
+Postgres takes CloudNativePG's image (KUBE_IMAGES).
 
   scripts/gen-images-yaml.py           rewrite the files (images.yaml and images.json)
   scripts/gen-images-yaml.py --check   exit 1 when the file is stale
@@ -29,6 +30,11 @@ REGISTRY = "ghcr.io/porelli/portcullis-"
 CORE_BUILT = ("group-gate", "enroll", "domains", "mcp-gate", "wg")
 # Mail is Docker / Podman only (contract §19.12): no chart images.
 ABSENT = ("socket-proxy-traefik", "socket-proxy-hub", "mail", "mailctl", "mail-resolver", "mail-cert")
+# Services whose Kubernetes form runs another image than compose's (plan
+# Task 23): Postgres is a CloudNativePG Cluster there, on the operator's
+# Postgres image (CloudNativePG 1.30.2's default, PostgreSQL 18; the index
+# digest), compose's postgres:18 alpine image stays Docker / Podman's.
+KUBE_IMAGES = {"postgres": "ghcr.io/cloudnative-pg/postgresql:18.7-system-trixie@sha256:13f5dc1b42c5d96233724be976740df031136ca013f98a56a2877a62b362b453"}
 PINNED = re.compile(r"^[a-z0-9.-]+\.[a-z]+(:[0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
 DEFAULT = re.compile(r"^\$\{[A-Z_]+:-(ghcr\.io/porelli/portcullis-[a-z-]+:edge)\}$")
 
@@ -45,7 +51,7 @@ def entries(compose):
     for name, svc in sorted(compose["services"].items()):
         if name in ABSENT:
             continue
-        image = svc.get("image") or ""
+        image = KUBE_IMAGES.get(name) or svc.get("image") or ""
         built = "build" in svc or image.startswith("portcullis-")
         if built:
             base = image[len("portcullis-"):] if image else name

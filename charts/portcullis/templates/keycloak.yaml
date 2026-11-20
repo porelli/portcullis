@@ -14,7 +14,10 @@ PDB, spread; one embedded Infinispan cluster (Keycloak's default ispn
 cache over JDBC_PING) on 7800 / 57800 between Keycloak pods only, bound
 to the pod's address. A StatefulSet for the stable names Traefik's
 Keycloak servers use (keycloak-<i>.keycloak-pods: the retry and passive
-health check, traefik-file-middlewares.yaml), no volume of its own. */ -}}
+health check, traefik-file-middlewares.yaml), no volume of its own.
+Postgres (plan Task 23): the CNPG primary's Service portcullis-pg-rw in
+cnpg-system (every Kubernetes install); KC_CACHE=ispn stated in HA (plan
+Amendment 2; Keycloak 26's default stack is jdbc-ping). */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $s := dict
   "name" "keycloak" "uid" .Values.uids.keycloak "gid" 0 "readOnly" false "pin" true
@@ -31,7 +34,7 @@ health check, traefik-file-middlewares.yaml), no volume of its own. */ -}}
   "ports" (list (dict "name" "http" "port" 8080) (dict "name" "management" "port" 9000))
   "env" (list
     (dict "name" "KC_DB" "value" "postgres")
-    (dict "name" "KC_DB_URL" "value" "jdbc:postgresql://postgres:5432/keycloak")
+    (dict "name" "KC_DB_URL" "value" (printf "jdbc:postgresql://%s:5432/keycloak" (include "portcullis.pgHost" .)))
     (dict "name" "KC_DB_USERNAME" "value" "keycloak")
     (dict "name" "KC_DB_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "POSTGRES_PASSWORD")))
     (dict "name" "KC_BOOTSTRAP_ADMIN_USERNAME" "value" .Values.keycloak.admin)
@@ -59,6 +62,7 @@ a replacement waits Pending for its own node rather than co-locate. */ -}}
 {{- $_ = set $s "spread" "DoNotSchedule" }}
 {{- $_ = set $s "ports" (concat $s.ports (list (dict "name" "jgroups" "port" 7800) (dict "name" "jgroups-fd" "port" 57800))) }}
 {{- $_ = set $s "env" (concat $s.env (list
+  (dict "name" "KC_CACHE" "value" "ispn")
   (dict "name" "POD_IP" "valueFrom" (dict "fieldRef" (dict "fieldPath" "status.podIP")))
   (dict "name" "JAVA_OPTS_APPEND" "value" "-Djgroups.bind.address=$(POD_IP)"))) }}
 {{- end }}

@@ -1,10 +1,10 @@
-{{- /* The six namespaces, rendered only for kubeconform in CI
+{{- /* The seven namespaces, rendered only for kubeconform in CI
 (renderNamespaces): ./portcullis init creates them itself — PSA labels and
 K11's ownership label + install annotation —, never Helm. The PSA levels:
 namespaces.json, the CLI's own source too. */ -}}
 {{- if .Values.renderNamespaces }}
 {{- $psa := .Files.Get "namespaces.json" | fromJson }}
-{{- range $n := list (list .Release.Namespace "core") (list .Values.appsNamespace "apps") (list .Values.storageNamespace "storage") (list .Values.edgeNamespace "edge") (list .Values.ingressNamespace "ingress") (list .Values.ha.nodeadmNamespace "nodeadm") }}
+{{- range $n := list (list .Release.Namespace "core") (list .Values.appsNamespace "apps") (list .Values.storageNamespace "storage") (list .Values.edgeNamespace "edge") (list .Values.ingressNamespace "ingress") (list .Values.ha.nodeadmNamespace "nodeadm") (list .Values.cnpg.namespace "cnpg") }}
 {{- $l := required (printf "namespaces.json has no %s" (index $n 1)) (get $psa (index $n 1)) }}
 ---
 apiVersion: v1

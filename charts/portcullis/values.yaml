@@ -161,6 +161,18 @@ ha:
   # (GATE_OPENED_PRUNE_DAYS; the Hub's default history_days, contract §8.2).
   openedPruneDays: 365
 
+# Postgres on CloudNativePG (plan Task 23, D8: every Kubernetes install):
+# the Cluster portcullis-pg in this namespace (the operator's, installed by
+# ./portcullis: ha_install_cnpg), 1 instance, in HA min(3, the non-small
+# nodes at the primary site); databases keycloak and lldap.
+# apiServerSources: the addresses the API server's webhook calls come from
+# (kube_apiserver_sources: the API endpoints and each server's pod-range
+# gateway addresses), the only peers of the operator's webhook port.
+cnpg:
+  namespace: cnpg-system
+  apiServerSources: []
+  storageSize: 5Gi
+
 # The measured memory peaks, MiB (user ruling 2026-11-19, plan Amendment 2):
 # the higher of the test server's `docker stats` (spike-cluster.md, "H7")
 # and the k3d cluster's `kubectl top` working set under load

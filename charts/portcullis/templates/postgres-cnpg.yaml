@@ -1,0 +1,264 @@
+{{- /* Postgres on CloudNativePG (plan Task 23, D8 "the HA shape always";
+spec §7.4; compose: postgres). The operator is ./portcullis' (namespace
+cnpg-system, ha_install_cnpg: the pinned chart, namespaced mode: no rights
+outside cnpg-system). Here, in cnpg-system:
+  - the Cluster portcullis-pg: portcullis.pgInstances instances (1; in HA
+    min(3, non-small nodes at main), preflight P40); with 2 the
+    synchronous standby is "preferred" (a lone standby failing doesn't
+    stop writes), with 3 "required" (Amendment 2: zero loss on one
+    failure); one instance per host (required anti-affinity), pinned to
+    the primary site in HA and never on a small node (portcullis.sitePin
+    with the class term merged, P36); its volumes on portcullis-core
+    (local: the database replicates itself, spec §8.1 "replicate once"),
+    the K3 owner annotations through inheritedMetadata (uid 26, the image's
+    postgres); priority portcullis-core (ruling I5); no superuser password
+    (enableSuperuserAccess false: the CLI's pg_dump / pg_restore exec into
+    the primary as postgres, peer authentication on the socket); the roles
+    keycloak and lldap with their passwords from the CLI's Secrets
+    portcullis-pg-keycloak / portcullis-pg-lldap (kube_pg_sync_secrets,
+    never Helm), reconciled by the operator; the database keycloak
+    (initdb) and the Database lldap;
+  - the namespace's flows: default deny; kube-dns; the operator's
+    documented ones (the API server, the instances' status port 8000, its
+    webhook :9443 from the API server's addresses only, cnpg.apiServerSources);
+    the instances' (each other on 5432 / 8000, the API server); Postgres
+    5432 from Keycloak, LLDAP and LLDAP's schema Job only (their egress:
+    netpol-networks.yaml to-postgres).
+Kept on uninstall (helm.sh/resource-policy keep: the data). */ -}}
+{{- $cns := .Values.cnpg.namespace -}}
+{{- $n := include "portcullis.pgInstances" . | int -}}
+{{- $ps := dict "pin" true -}}
+{{- if .Values.ha.enabled }}{{ $_ := set $ps "nodeExpressions" (list (dict "key" "portcullis.io/class" "operator" "NotIn" "values" (list "small"))) }}{{ end -}}
+{{- $pin := include "portcullis.sitePin" (dict "root" . "s" $ps) | trim -}}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: portcullis-pg
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/component: postgres
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  instances: {{ $n }}
+  imageName: {{ include "portcullis.image" (list . "postgres") }}
+  imagePullPolicy: IfNotPresent
+  priorityClassName: portcullis-core
+  enableSuperuserAccess: false
+  enablePDB: {{ gt $n 1 }}
+  inheritedMetadata:
+    labels:
+      app.kubernetes.io/managed-by: portcullis
+    annotations:
+      portcullis.io/uid: "26"
+      portcullis.io/gid: "26"
+      portcullis.io/mode: "0700"
+  {{- if ge $n 2 }}
+  postgresql:
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: {{ ternary "required" "preferred" (ge $n 3) }}
+  {{- end }}
+  bootstrap:
+    initdb:
+      database: keycloak
+      owner: keycloak
+      secret:
+        name: portcullis-pg-keycloak
+  managed:
+    roles:
+      - name: keycloak
+        ensure: present
+        login: true
+        passwordSecret:
+          name: portcullis-pg-keycloak
+      - name: lldap
+        ensure: present
+        login: true
+        passwordSecret:
+          name: portcullis-pg-lldap
+  storage:
+    storageClass: portcullis-core
+    size: {{ .Values.cnpg.storageSize }}
+  resources:
+    limits:
+      memory: 1Gi
+    requests:
+      memory: {{ include "portcullis.memRequest" (list . "postgres" "1Gi") }}
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required
+    {{- with $pin }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.ha.enabled }}
+    tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+    {{- end }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: portcullis-pg-lldap
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  name: lldap
+  owner: lldap
+  ensure: present
+  cluster:
+    name: portcullis-pg
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kube-dns
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# The operator (its chart's pods): the API server, the instances' status
+# port; its webhook from the API server's addresses only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cnpg-operator
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cloudnative-pg
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        {{- range (required "cnpg.apiServerSources is required (the API server's addresses: kube_apiserver_sources)" .Values.cnpg.apiServerSources) }}
+        - ipBlock:
+            cidr: {{ . }}/32
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 9443
+  egress:
+    {{- range (required "apiEndpoints is required" .Values.apiEndpoints) }}
+    {{- $p := splitList ":" . }}
+    - to:
+        - ipBlock:
+            cidr: {{ index $p 0 }}/32
+      ports:
+        - protocol: TCP
+          port: {{ index $p 1 }}
+    {{- end }}
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: portcullis-pg
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# The instances (and the operator's initdb / join Job pods, labelled with
+# the cluster too): each other, the API server; Postgres from Keycloak,
+# LLDAP and LLDAP's schema Job in the core namespace; the status port from
+# the operator.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: portcullis-pg
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: portcullis-pg
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchExpressions:
+              - key: portcullis.io/component
+                operator: In
+                values: ["keycloak", "lldap", "lldap-schema"]
+      ports:
+        - protocol: TCP
+          port: 5432
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: portcullis-pg
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 8000
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: portcullis-pg
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 8000
+    {{- range (required "apiEndpoints is required" .Values.apiEndpoints) }}
+    {{- $p := splitList ":" . }}
+    - to:
+        - ipBlock:
+            cidr: {{ index $p 0 }}/32
+      ports:
+        - protocol: TCP
+          port: {{ index $p 1 }}
+    {{- end }}

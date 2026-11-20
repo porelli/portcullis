@@ -133,6 +133,34 @@ spec:
         - protocol: TCP
           port: {{ index $p 1 }}
     {{- end }}
+---
+# Postgres (plan Task 23): the CNPG instances in cnpg-system, from Keycloak,
+# LLDAP and LLDAP's schema Job only (their ingress: postgres-cnpg.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: to-postgres
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchExpressions:
+      - key: portcullis.io/component
+        operator: In
+        values: ["keycloak", "lldap", "lldap-schema"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.cnpg.namespace }}
+          podSelector:
+            matchLabels:
+              cnpg.io/cluster: portcullis-pg
+      ports:
+        - protocol: TCP
+          port: 5432
 {{- if not .Values.ha.enabled }}
 ---
 # Traefik → the apps' routed ports (the apps' own policies admit exactly

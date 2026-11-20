@@ -92,7 +92,7 @@ def check_services(comp, docs):
     deps = K.deployments(docs)
     imgs = K.images_values()["images"]
     for name, svc in sorted(comp["services"].items()):
-        if name in K.ABSENT or name == "dns-tool":
+        if name in K.ABSENT or name in K.REPLACED or name == "dns-tool":
             continue
         dep = deps.get(name)
         if not dep:
@@ -579,7 +579,7 @@ def site_problems(docs, ha=True):
     no other pod carries any site term (frontdoor, nodeadm and the Traefik
     DaemonSet included); without HA no pod carries one."""
     out = []
-    pods = {n: sp for n, _, _, sp, _ in K.pod_specs(docs)}
+    pods = K.placement_specs(docs)
     for n, sp in sorted(pods.items()):
         pinned = ha and n in K.SITE_PINNED
         if pinned and not K.site_pinned(sp):
@@ -613,7 +613,7 @@ def check_sites():
         docs = K.render(vals) + K.render(dict(vals, oneshot="hub"), "templates/oneshot.yaml")
         for p in site_problems(docs, ha):
             F.add(f"{label}: {p}")
-        names = {n for n, *_ in K.pod_specs(docs)}
+        names = set(K.placement_specs(docs))
         want = K.SITE_PINNED | (K.SITE_FREE if ha else {"traefik", "nodeadm"})  # frontdoor: HA only
         if not want <= names:
             F.add(f"{label}: not rendered {sorted(want - names)} (the site check would pass vacuously)")
@@ -624,9 +624,12 @@ def check_sites():
     kc["spec"]["template"]["spec"].pop("affinity", None)
     fd = next(d for d in bad if d.get("kind") == "Deployment" and d["metadata"]["name"] == "frontdoor")
     fd["spec"]["template"]["spec"]["nodeSelector"] = {K.SITE_KEY: K.PRIMARY_SITE}
+    pg = K.cnpg_cluster(bad)
+    pg["spec"]["affinity"].pop("nodeAffinity", None)
     got = site_problems(bad)
-    if not any(p.startswith("keycloak:") for p in got) or not any(p.startswith("frontdoor:") for p in got):
-        F.add(f"site_problems misses an unpinned keycloak or a pinned frontdoor (mutation test): {got}")
+    if not any(p.startswith("keycloak:") for p in got) or not any(p.startswith("frontdoor:") for p in got) \
+            or not any(p.startswith("postgres:") for p in got):
+        F.add(f"site_problems misses an unpinned keycloak, an unpinned CNPG Cluster or a pinned frontdoor (mutation test): {got}")
     # Any other primary site is refused at render time, with or without HA.
     for extra in ({"ha": dict(ha_vals["ha"], primarySite="edge")}, {"ha": {"primarySite": "edge"}}, {"ha": {"primarySite": ""}}):
         try:
@@ -651,6 +654,104 @@ def check_sites():
             F.add(f"portcullis.sitePin {label}: {terms} (want {want})")
 
 
+def pg_problems(docs, vals):
+    """One render's Postgres (plan Task 23, D8; Amendment 2; preflight
+    P36 / P40): no postgres Deployment / Service / PVC; the CNPG Cluster
+    portcullis-pg in cnpg-system on images.postgres, with
+    portcullis.pgInstances' instances (1, in HA min(3, non-small nodes at
+    main)) and their synchronous setting (none / preferred / required),
+    required hostname anti-affinity, in HA the class term NotIn [small]
+    (never without HA); storage portcullis-core with the K3 owner
+    annotations (26:26 0700), priority portcullis-core, no superuser; the
+    roles keycloak / lldap from the CLI's Secrets, the databases keycloak
+    (initdb) and lldap (Database); Keycloak's KC_DB_URL its rw Service;
+    LLDAP's LLDAP_DATABASE_URL from the Secret portcullis-pg-lldap, its key
+    file from secrets-lldap-key with the seed emptied, no PVC, its schema
+    Job; in HA 2 LLDAP replicas."""
+    out = []
+    ha = bool((vals.get("ha") or {}).get("enabled"))
+    nsp = int((vals.get("ha") or {}).get("nonSmallNodesAtPrimary") or 0)
+    want_n = max(1, min(3, nsp)) if ha else 1
+    for d in docs:
+        if d.get("kind") in ("Deployment", "StatefulSet", "Service", "PersistentVolumeClaim") and d["metadata"]["name"] in ("postgres", "postgres-data", "lldap-data"):
+            out.append(f"{d['kind']} {d['metadata']['name']}: Postgres is the CNPG Cluster (no compose-shaped postgres, no lldap-data)")
+    c = K.cnpg_cluster(docs)
+    if c is None:
+        return out + ["no CNPG Cluster portcullis-pg"]
+    s = c["spec"]
+    if c["metadata"]["namespace"] != K.CNPG_NS:
+        out.append(f"Cluster in {c['metadata']['namespace']} (want {K.CNPG_NS})")
+    if s.get("imageName") != K.images_values()["images"]["postgres"]:
+        out.append(f"Cluster imageName {s.get('imageName')} is not images.postgres")
+    if s.get("instances") != want_n:
+        out.append(f"Cluster instances {s.get('instances')} (want {want_n})")
+    sync = (s.get("postgresql") or {}).get("synchronous")
+    want_sync = None if want_n == 1 else {"method": "any", "number": 1, "dataDurability": "required" if want_n == 3 else "preferred"}
+    if sync != want_sync:
+        out.append(f"Cluster synchronous {sync} (want {want_sync})")
+    a = s.get("affinity") or {}
+    if (a.get("enablePodAntiAffinity"), a.get("topologyKey"), a.get("podAntiAffinityType")) != (True, "kubernetes.io/hostname", "required"):
+        out.append(f"Cluster affinity {a}: required anti-affinity on kubernetes.io/hostname")
+    cls = {"key": "portcullis.io/class", "operator": "NotIn", "values": ["small"]}
+    terms = ((a.get("nodeAffinity") or {}).get("requiredDuringSchedulingIgnoredDuringExecution") or {}).get("nodeSelectorTerms") or []
+    if ha != (bool(terms) and all(cls in t.get("matchExpressions", []) for t in terms)):
+        out.append(f"Cluster class term NotIn [small]: {terms} ({'every term' if ha else 'none without HA'})")
+    st = s.get("storage") or {}
+    ann = (s.get("inheritedMetadata") or {}).get("annotations") or {}
+    if st.get("storageClass") != "portcullis-core" or ann.get("portcullis.io/uid") != "26" or ann.get("portcullis.io/gid") != "26" or ann.get("portcullis.io/mode") != "0700":
+        out.append(f"Cluster storage {st} / owner annotations {ann} (portcullis-core, 26:26 0700)")
+    if s.get("priorityClassName") != "portcullis-core" or s.get("enableSuperuserAccess") is not False:
+        out.append("Cluster: priorityClassName portcullis-core and enableSuperuserAccess false")
+    roles = {r["name"]: r.get("passwordSecret", {}).get("name") for r in (s.get("managed") or {}).get("roles", [])}
+    if roles != {"keycloak": "portcullis-pg-keycloak", "lldap": "portcullis-pg-lldap"}:
+        out.append(f"Cluster managed roles {roles}")
+    if (s.get("bootstrap") or {}).get("initdb", {}).get("database") != "keycloak":
+        out.append("Cluster bootstrap initdb database keycloak")
+    dbs = [(d["spec"].get("name"), d["spec"].get("owner"), d["spec"]["cluster"]["name"]) for d in K.by_kind(docs, "Database")]
+    if dbs != [("lldap", "lldap", K.PG_CLUSTER)]:
+        out.append(f"Databases {dbs} (want lldap owned by lldap)")
+    wl = {d["metadata"]["name"]: d for d in docs if d.get("kind") in ("Deployment", "StatefulSet")}
+    env = lambda n: {e["name"]: e for e in wl[n]["spec"]["template"]["spec"]["containers"][0].get("env", [])}
+    if env("keycloak")["KC_DB_URL"].get("value") != f"jdbc:postgresql://{K.PG_CLUSTER}-rw.{K.CNPG_NS}.svc.cluster.local:5432/keycloak":
+        out.append(f"keycloak KC_DB_URL {env('keycloak')['KC_DB_URL']}")
+    le = env("lldap")
+    if le.get("LLDAP_DATABASE_URL", {}).get("valueFrom") != {"secretKeyRef": {"name": "portcullis-pg-lldap", "key": "LLDAP_DATABASE_URL"}}:
+        out.append(f"lldap LLDAP_DATABASE_URL {le.get('LLDAP_DATABASE_URL')} (from the Secret portcullis-pg-lldap)")
+    if le.get("LLDAP_KEY_SEED", {}).get("value") != "" or le.get("LLDAP_KEY_FILE", {}).get("value") != "/run/lldap-key/server_key":
+        out.append("lldap: LLDAP_KEY_FILE /run/lldap-key/server_key, LLDAP_KEY_SEED empty")
+    lp = wl["lldap"]["spec"]["template"]["spec"]
+    vols = {v["name"]: v for v in lp.get("volumes", [])}
+    if any("persistentVolumeClaim" in v for v in vols.values()) or vols.get("key", {}).get("secret", {}).get("secretName") != "secrets-lldap-key":
+        out.append(f"lldap volumes {sorted(vols)}: no PVC, the key from secrets-lldap-key")
+    if [c["name"] for c in lp.get("initContainers", [])] != ["wait-schema"] or lp.get("enableServiceLinks") is not False:
+        out.append("lldap: the init container wait-schema, enableServiceLinks false")
+    if wl["lldap"]["spec"].get("replicas") != (2 if ha else 1):
+        out.append(f"lldap replicas {wl['lldap']['spec'].get('replicas')} (want {2 if ha else 1})")
+    jobs = [j for j in K.by_kind(docs, "Job") if j["metadata"]["name"].startswith("lldap-schema-")]
+    if len(jobs) != 1 or [c["name"] for c in jobs[0]["spec"]["template"]["spec"].get("initContainers", [])] != ["wait-postgres", "create-schema"]:
+        out.append("one Job lldap-schema-<hash> (wait-postgres, create-schema, record)")
+    return out
+
+
+def check_postgres():
+    """Task 23: "postgres: CNPG cluster, LLDAP DATABASE_URL from Secret",
+    without HA, on the CI HA values and with 3 non-small nodes; and the
+    check bites (mutation tests)."""
+    ha_vals = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    for label, vals in (("postgres", {}), ("postgres (ha)", ha_vals),
+                        ("postgres (ha, 3 nodes)", dict(ha_vals, ha=dict(ha_vals["ha"], nonSmallNodesAtPrimary=3))),
+                        ("postgres (ha, 1 node)", dict(ha_vals, ha=dict(ha_vals["ha"], nonSmallNodesAtPrimary=1)))):
+        for p in pg_problems(K.render(vals), vals):
+            F.add(f"{label}: {p}")
+    docs = K.render(ha_vals)
+    for mutate in (lambda c: c["spec"].__setitem__("instances", 3), lambda c: c["spec"]["postgresql"]["synchronous"].__setitem__("dataDurability", "required"),
+                   lambda c: c["spec"].__setitem__("enableSuperuserAccess", True), lambda c: c["spec"]["storage"].__setitem__("storageClass", "portcullis-core-replicated")):
+        bad = [json.loads(json.dumps(d)) for d in docs]
+        mutate(K.cnpg_cluster(bad))
+        if not pg_problems(bad, ha_vals):
+            F.add("pg_problems misses a mutated Cluster (mutation test)")
+
+
 def main():
     comp = K.compose()
     docs = K.render()
@@ -663,6 +764,7 @@ def main():
     check_published()
     check_ha()
     check_sites()
+    check_postgres()
     for kind, items in D.items():
         for e in items:
             if (kind, e.get("service"), str(e.get("item"))) not in USED:

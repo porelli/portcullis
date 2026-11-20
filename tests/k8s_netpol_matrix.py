@@ -100,7 +100,7 @@ def allowed(policies, src, dst, port, proto="TCP", ingress_only=False):
                and sel_match(p["spec"]["podSelector"], pod.labels)]
         if not sel:
             # The core, apps, ingress (HA) and nodeadm namespaces are default-deny.
-            return pod.ns not in (K.NS, K.APPS_NS, K.INGRESS_NS, "portcullis-nodeadm")
+            return pod.ns not in (K.NS, K.APPS_NS, K.INGRESS_NS, "portcullis-nodeadm", K.CNPG_NS)
         for p in sel:
             for rule in p["spec"].get(field) or []:
                 peers = rule.get(peers_key)
@@ -289,7 +289,56 @@ def check_ha_flows():
             F.add(f"ha flows: {src} → {dst}:{port}/{proto}: {'allowed' if got else 'denied'}, want {'allowed' if want else 'denied'}")
 
 
+def check_postgres():
+    """Plan Task 23 (contract §20.1 "Network flows"; spec §7.4): cnpg-system
+    is default-deny; Postgres :5432 on the CNPG instances admits Keycloak,
+    LLDAP and LLDAP's schema Job from the core namespace and the instances
+    themselves, nothing else (every other core pod, a pod of another
+    namespace wearing Keycloak's label, an app pod, the operator, the
+    internet); the instances talk to each other on 5432 / 8000 and to the
+    API server; the operator reaches the API server and the instances' 8000
+    (not 5432), and its webhook :9443 admits only the API server's
+    addresses (cnpg.apiServerSources): no pod, not the internet; nothing
+    else reaches the operator. Without and with HA."""
+    vals = K.yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values.yaml").read_text())
+    srcs = vals["cnpg"]["apiServerSources"]
+    api = [(e.split(":")[0], int(e.split(":")[1])) for e in vals["apiEndpoints"]]
+    for ha in (False, True):
+        docs = K.render({"ha": {"enabled": ha}})
+        pols = K.by_kind(docs, "NetworkPolicy")
+        pods = {}
+        for name, ns, labels, spec, _ in K.pod_specs(docs):
+            ports = [(p["containerPort"], p.get("protocol", "TCP")) for c in spec["containers"] for p in c.get("ports", [])]
+            pods[name] = Peer(name, ns, labels, ports)
+        if "lldap-schema" not in pods:
+            F.add("postgres: no lldap-schema Job pod rendered")
+            return
+        inst = Peer("portcullis-pg-1", K.CNPG_NS, {"cnpg.io/cluster": K.PG_CLUSTER, "cnpg.io/podRole": "instance"})
+        inst2 = Peer("portcullis-pg-2", K.CNPG_NS, {"cnpg.io/cluster": K.PG_CLUSTER, "cnpg.io/podRole": "instance"})
+        op = Peer("cnpg-operator", K.CNPG_NS, {"app.kubernetes.io/name": "cloudnative-pg", "app.kubernetes.io/instance": "cnpg"})
+        stray = Peer("cnpg-stray", K.CNPG_NS, {"app": "x"})
+        fake_kc = Peer("fake-keycloak", K.APPS_NS, {"portcullis.io/component": "keycloak", "portcullis.io/instance": "x"})
+        app = Peer("app", K.APPS_NS, {"portcullis.io/instance": "echo", "portcullis.io/service": "web"})
+        ext = Peer("external", None, {}, ip=EXTERNAL)
+        rows = [(pods[n], inst, 5432, n in ("keycloak", "lldap", "lldap-schema")) for n in sorted(pods)]
+        rows += [(inst, inst2, 5432, True), (inst2, inst, 8000, True), (op, inst, 8000, True), (op, inst, 5432, False),
+                 (fake_kc, inst, 5432, False), (app, inst, 5432, False), (ext, inst, 5432, False), (stray, inst, 5432, False),
+                 (stray, op, 9443, False), (inst, op, 9443, False), (pods["hub"], op, 9443, False), (ext, op, 9443, False),
+                 (inst, ext, 443, False), (op, ext, 443, False), (inst, pods["hub"], 8888, False)]
+        rows += [(Peer(f"apiserver-{ip}", None, {}, ip=ip), op, 9443, True) for ip in srcs]
+        rows += [(Peer("node", None, {}, ip="10.1.0.9"), op, 9443, False)]
+        rows += [(x, Peer("api", None, {}, ip=ip), port, True) for ip, port in api for x in (op, inst)]
+        rows += [(stray, Peer("api", None, {}, ip=ip), port, False) for ip, port in api]
+        for n in ("keycloak", "lldap", "lldap-schema"):
+            rows += [(pods[n], inst, 8000, False), (pods[n], op, 9443, False)]
+        for src, dst, port, want in rows:
+            got = allowed(pols, src, dst, port, ingress_only=src.ns == K.APPS_NS)
+            if got != want:
+                F.add(f"postgres (ha {ha}): {src} → {dst}:{port}: {'allowed' if got else 'denied'}, want {'allowed' if want else 'denied'}")
+
+
 def main():
+    check_postgres()
     check_ha_flows()
     check_nodeadm()
     check_ha()
@@ -314,7 +363,7 @@ def check_compose(docs, ha):
         pods[name] = Peer(name, ns, labels, ports)
     nets = {}
     for name, svc in comp["services"].items():
-        if name in K.ABSENT or name == "dns-tool":
+        if name in K.ABSENT or name in K.REPLACED or name == "dns-tool":
             continue
         n = svc.get("networks") or []
         nets[name] = set(n if isinstance(n, list) else n.keys()) - K.ABSENT_NETS - K.VPN_NETS

@@ -526,6 +526,8 @@ _KUBE_POD_HEALTH_JQ='
 # new config's), else its newest non-terminating pod's.
 _rtk_health() {
   local pods dep
+  # Postgres is the CNPG Cluster's primary (ha.sh, plan Task 23).
+  [ "$1" != postgres ] || { _kube_pg_health; return 0; }
   dep="$(kube_ctl -n "$(kube_ns)" get deploy "$1" -o json 2>/dev/null)" || { echo missing; return 0; }
   if ! printf '%s' "$dep" | jq -e '(.status.observedGeneration // 0) >= .metadata.generation
       and (.status.updatedReplicas // 0) == (.spec.replicas // 1) and (.status.replicas // 0) == (.status.updatedReplicas // 0)' >/dev/null 2>&1; then
@@ -537,17 +539,19 @@ _rtk_health() {
 }
 
 _rtk_running() {
+  [ "$1" != postgres ] || { kube_pg_primary >/dev/null; return; }
   [ "$(_rtk_pods_json "$1" | jq -r '[.[] | select(.status.phase == "Running")] | length' 2>/dev/null)" -gt 0 ] 2>/dev/null
 }
 
 # _rtk_ps [--json] — the core pods as compose's JSON lines (Service, Name,
-# State, Health, Status), so status reads one format.
+# State, Health, Status), so status reads one format; a Job's pods (LLDAP's schema) aren't services.
 _rtk_ps() {
   local all
   all="$(kube_ctl -n "$(kube_ns)" get pods -l "$_KUBE_COMPONENT" -o json 2>/dev/null)" || return 1
   if [ "${1:-}" = --json ]; then
     printf '%s' "$all" | jq -c "$_KUBE_POD_HEALTH_JQ"'
-      .items[] | (.status.containerStatuses // [] | .[0] // {}) as $cs | health as $h
+      .items[] | select([.metadata.ownerReferences[]?.kind] | index("Job") | not)
+      | (.status.containerStatuses // [] | .[0] // {}) as $cs | health as $h
       | {Service: .metadata.labels["portcullis.io/component"], Name: .metadata.name,
          State: (if .status.phase == "Running" then "running" elif .status.phase == "Pending" then "created" else "exited" end),
          Health: (if $h == "running" then "" else $h end),
@@ -565,6 +569,8 @@ _rtk_exec() {
   local svc="$1"
   shift
   [ "${1:-}" != -- ] || shift
+  # Postgres: the CNPG primary's postgres container (ha.sh).
+  [ "$svc" != postgres ] || { _kube_pg_exec "$@"; return; }
   kube_ctl -n "$(kube_ns)" exec -i "deploy/$svc" -c "$svc" -- "$@" \
     2> >(awk '!/^command terminated with exit code [0-9]+$/ { print; fflush() }' >&2)
 }
@@ -593,6 +599,7 @@ _rtk_logs() {
 # whatever its probes say (an uninitialised Vault never starts).
 _rtk_rolled_running() {
   local dep pods
+  [ "$1" != postgres ] || { [ "$(_kube_pg_health)" = healthy ]; return; }
   dep="$(kube_ctl -n "$(kube_ns)" get deploy "$1" -o json 2>/dev/null)" || return 1
   printf '%s' "$dep" | jq -e '(.status.observedGeneration // 0) >= .metadata.generation
       and (.status.updatedReplicas // 0) == (.spec.replicas // 1) and (.status.replicas // 0) == (.status.updatedReplicas // 0)' >/dev/null 2>&1 || return 1
@@ -883,7 +890,7 @@ _kube_apply_files() {
   done
 }
 
-# kube_psa <core|apps|storage|edge|ingress> — the namespace's PSA levels
+# kube_psa <core|apps|storage|edge|ingress|nodeadm|cnpg> — the namespace's PSA levels
 # "<enforce> <warn> <audit>" from charts/portcullis/namespaces.json (the
 # chart renders the same file); fails on anything but three known levels.
 kube_psa() {
@@ -1244,6 +1251,10 @@ kube_cluster_setup() {
     || fail "could not apply the storage namespace's API egress policy"
   _kube_applied_set cluster.storage "$(_kube_sha "$st"/*)"
 
+  # Postgres' operator (plan Task 23, D8: every install), before the chart
+  # sends its Cluster to the operator's webhook.
+  ha_install_cnpg
+
   info "Cluster setup: Traefik CRDs ($(basename "$crds" .yaml))..."
   _kube_apply_files "$crds" || fail "could not apply the Traefik CRDs"
   _kube_applied_set cluster.crds "$(_kube_sha "$crds")"
@@ -1536,6 +1547,8 @@ kube_sync_secrets() {
   [ "${1:-}" = --full ] || [ "${KUBE_SYNC_FULL:-}" = 1 ] && full=true
   ns="$(kube_ns)"
   kube_nodeadm_prepare
+  # LLDAP's server key (ha.sh): made once, synced as secrets-lldap-key.
+  kube_lldap_server_key
   kube_sync_stage
   _K_HASHES='{}'
   live="$_K_STAGE/.live" want="$_K_STAGE/.live/want.json"
@@ -1621,9 +1634,12 @@ kube_render_values() {
   local mon=false wg=false
   case ",${COMPOSE_PROFILES:-}," in *,monitoring,*) mon=true ;; esac
   case ",${COMPOSE_PROFILES:-}," in *,wg,*) wg=true ;; esac
-  local ha=false nsp=0
+  local ha=false nsp=0 apisrc
   if kube_ha_on; then ha=true; nsp="$(kube_nonsmall_at_primary)"; fi
   [[ "$nsp" =~ ^[0-9]+$ ]] || nsp=0
+  # The CNPG webhook's only peers (plan Task 23): fail closed without them.
+  apisrc="$(kube_apiserver_sources)"
+  [ -n "$apisrc" ] || fail "can't read the API server's addresses (the API endpoints, the control-plane nodes' pod ranges): the CNPG webhook would admit nobody"
   jq -n --argjson images "$_K_IMAGES" --argjson hashes "${_K_HASHES:-{\}}" --argjson items "${_K_ITEMS:-{\}}" \
     --argjson mon "$mon" --argjson wg "$wg" --argjson ha "$ha" --argjson nsp "$nsp" --arg psite "$KUBE_PRIMARY_SITE" --arg dnsname "${DNS_PROVIDER:-}" \
     --arg domain "$PORTCULLIS_DOMAIN" --arg pod "$PORTCULLIS_POD_CIDR" --arg svc "$PORTCULLIS_SERVICE_CIDR" \
@@ -1644,7 +1660,7 @@ kube_render_values() {
     --arg kca "${KEYCLOAK_ADMIN:-admin}" --arg bdn "${LLDAP_BASE_DN:-dc=portcullis,dc=local}" \
     --arg roots "${HUB_OVERRIDE_BIND_ROOTS:-}" --arg ipg "${INVITE_PROTECTED_GROUPS:-}" --arg pdn "${PORTAL_DISPLAY_NAME:-Portcullis}" \
     --arg ttl "${CLIENT_CERT_TTL:-720h}" --arg warn "${CERT_EXPIRY_WARN_DAYS:-7}" --arg imp "${IMPERSONATION_MAX_MINUTES:-30}" \
-    --arg smtp "${ALERT_SMTP_FROM:-}" --arg ret "${PROMETHEUS_RETENTION:-30d}" --arg apps "$(kube_apps_ns)" '
+    --arg apisrc "$apisrc" --arg smtp "${ALERT_SMTP_FROM:-}" --arg ret "${PROMETHEUS_RETENTION:-30d}" --arg apps "$(kube_apps_ns)" '
     def words: split(" ") | map(select(. != ""));
     {domain: $domain, podCIDR: $pod, serviceCIDR: $svc, apiEndpoints: ($api | words), nodeAddresses: ($nodes | words),
      traefikServiceIP: $tip, traefikVPNServiceIP: $tvip, wgEdgeServiceIP: $weip,
@@ -1662,6 +1678,7 @@ kube_render_values() {
            certExpiryWarnDays: $warn, impersonationMaxMinutes: $imp, selfImage: $images.hub, appsNamespace: $apps},
      alerting: {smtpFrom: $smtp}, appsNamespace: $apps,
      ha: {enabled: $ha, nonSmallNodesAtPrimary: $nsp, primarySite: $psite},
+     cnpg: {apiServerSources: ($apisrc | words)},
      dnsProvider: (if ($dnsname | test("^[a-z0-9-]{1,32}$")) then $dnsname else "" end)}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
     || fail "could not write $f"
   kube_nodeadm_values "$f"
@@ -1727,6 +1744,7 @@ _rtk_up() {
   hub_env_write
   kube_sync_secrets
   kube_cluster_setup
+  kube_pg_sync_secrets
   if [ -z "${_K_PROBED:-}" ]; then
     kube_netpol_probe || fail "NetworkPolicy enforcement isn't proven (see above): nothing deployed"
     _K_PROBED=1
@@ -1876,7 +1894,6 @@ kube_pvc_name() {
 kube_volume_owner() {
   case "$1" in
     traefik_acme) echo "65532:65532" ;;
-    postgres_data) echo "70:70" ;;
     vault_data) echo "100:1000" ;;
     hub_secrets) echo "$CT_UID_HUB:$CT_UID_HUB" ;;
     *) echo "$2:$3" ;;
@@ -1962,7 +1979,10 @@ _backup_create_kube() {
   [ ! -d "$PORTCULLIS_ROOT/secrets" ] || cp -a "$PORTCULLIS_ROOT/secrets" "$work/secrets"
   _strip_host_files "$work/secrets"
   printf '  %-26s' "vault (raft snapshot)"; _backup_vault_snapshot "$work/vault.snap"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
-  printf '  %-26s' "postgres (pg_dump)"; _backup_pg_dump "$work/postgres.dump"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
+  # The CNPG databases (plan Task 23): keycloak as postgres.dump (the layout
+  # every runtime shares), LLDAP's as lldap.dump (no lldap_data volume here).
+  printf '  %-26s' "postgres (pg_dump)"; _kube_pg_dump keycloak "$work/postgres.dump"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
+  printf '  %-26s' "lldap (pg_dump)"; _kube_pg_dump lldap "$work/lldap.dump"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
   for spec in $BACKUP_FILE_VOLUMES; do
     IFS=: read -r key uid gid <<< "$spec"
     _kube_volume_exists "$key" || continue
@@ -2067,17 +2087,6 @@ _kube_restore_vault() {
   ok "Vault restored and unsealed with the original key."
 }
 
-# _kube_restore_lldap_count — LLDAP's users besides admin / portcullis-hub
-# from its PVC (group-gate's python, read-only, as LLDAP's uid), or "missing".
-_kube_restore_lldap_count() {
-  local pod out
-  _kube_volume_exists lldap_data || { echo missing; return 0; }
-  pod="$(_kube_helper_pod lldap-data "$CT_UID_LLDAP:$CT_UID_LLDAP" ro "$(_kube_image_of group-gate)")" || { echo missing; return 0; }
-  out="$(kube_ctl -n "$(kube_ns)" exec "$pod" -- env PYTHONDONTWRITEBYTECODE=1 python3 -c "$_BACKUP_PY_COUNT_LLDAP" 2>/dev/null || echo missing)"
-  _kube_helper_done "$pod"
-  echo "$out"
-}
-
 # _backup_restore_kube <dir> <yes> <allow-empty-lldap> — restore on
 # kubernetes: the Hub to 0, the person-secret instances to 0 and their *-pw
 # Secrets emptied; the pre-restore copy; everything to 0; .env (keeping this
@@ -2130,16 +2139,18 @@ _backup_restore_kube() {
   # Postgres initialises with POSTGRES_PASSWORD from it, and Keycloak reads the
   # same key (with the old one live here Keycloak never connected again).
   kube_sync_secrets --full || fail "could not sync the restored secret variables"
-  # Fresh Postgres and Vault (emptied in place, as their owners).
-  _kube_empty_volume postgres_data 70 70 || fail "could not empty postgres-data"
+  # The roles' passwords from the restored .env (ha.sh), then the CNPG
+  # databases replaced by the dumps (Keycloak and LLDAP are at 0), and a
+  # fresh Vault (emptied in place, as its owner).
+  kube_pg_sync_secrets
+  _kube_restore_pg "$dir"
   _kube_empty_volume vault_data 100 1000 || fail "could not empty vault-data"
-  info "Starting Postgres..."
-  _kube_scale postgres 1 && rt_start postgres || fail "Postgres doesn't start on the emptied volume"
-  _restore_pg "$dir"
   _kube_restore_vault "$dir"
   for spec in $BACKUP_FILE_VOLUMES; do
     IFS=: read -r key uid gid <<< "$spec"
     [ -f "$dir/$key.tar.gz" ] || continue
+    # LLDAP is on Postgres here: no lldap_data volume (see _kube_restore_pg).
+    [ "$key" != lldap_data ] || continue
     info "Restoring volume $key..."
     _kube_restore_volume "$dir" "$key" "$uid" "$gid" || fail "could not restore volume $key"
   done
@@ -2188,48 +2199,6 @@ _restic_host() {
     export RESTIC_REPOSITORY="${BACKUP_REPOSITORY#local:}" RESTIC_PASSWORD="$BACKUP_PASSWORD" RESTIC_CACHE_DIR="$BACKUP_ROOT/.restic-cache" RESTIC_PROGRESS_FPS=0.2
     restic "${args[@]}"
   )
-}
-
-# _backup_verify_dir_kube <dir> — backup_verify_dir on kubernetes: the
-# checksums, the raft snapshot, the dump (pg_restore --list in the running
-# Postgres, over exec stdin), LLDAP's database (group-gate's python in a
-# helper pod, the archive on stdin), every archive readable.
-_backup_verify_dir_kube() {
-  local dir="$1" t rc=0 n f pod
-  _backup_check_layout "$dir"
-  _backup_check_manifest "$dir" || fail "checksum mismatch in $dir"
-  ok "checksums match MANIFEST.json ($(jq '.files | length' "$dir/MANIFEST.json") files)"
-  t="$(mktemp -d)"
-  if tar -xzf "$dir/vault.snap" -C "$t" 2>/dev/null && [ -s "$t/state.bin" ] && jq -e '.Index > 0' "$t/meta.json" >/dev/null 2>&1; then
-    ok "vault.snap parses (raft index $(jq -r .Index "$t/meta.json"))"
-  else
-    rc=1; warn "vault.snap is not a valid raft snapshot"
-  fi
-  rm -rf "$t"
-  if n="$(rt_exec -i postgres -- pg_restore --list < "$dir/postgres.dump" 2>/dev/null | grep -c 'TABLE DATA')" && [ "$n" -gt 0 ]; then
-    ok "postgres.dump lists $n tables' data"
-  else
-    rc=1; warn "postgres.dump does not list (pg_restore --list)"
-  fi
-  if [ -f "$dir/lldap_data.tar.gz" ]; then
-    if pod="$(_kube_helper_pod "" 65534:65534 ro "$(_kube_image_of group-gate)")"; then
-      if f="$(kube_ctl -n "$(kube_ns)" exec -i "$pod" -- env PYTHONDONTWRITEBYTECODE=1 python3 -c "$_BACKUP_PY_CHECK_LLDAP" < "$dir/lldap_data.tar.gz")"; then
-        ok "lldap: $f"
-      else
-        rc=1; warn "lldap_data.tar.gz: the LLDAP database is unusable"
-      fi
-      _kube_helper_done "$pod"
-    else
-      rc=1; warn "could not start a helper to check lldap_data.tar.gz"
-    fi
-  else
-    rc=1; warn "no lldap_data.tar.gz"
-  fi
-  for f in "$dir"/*.tar.gz; do
-    [ -f "$f" ] || continue
-    tar -tzf "$f" >/dev/null 2>&1 && ok "$(basename "$f") is a readable archive" || { rc=1; warn "$(basename "$f") is corrupt"; }
-  done
-  return "$rc"
 }
 
 # ── the cluster check's refresh: `kube check`, its timer, status ──

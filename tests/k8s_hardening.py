@@ -60,7 +60,10 @@ def check_pod(name, ns, labels, spec, ann):
         F.add(f"{name}: no portcullis.io/component label")
     if spec.get("priorityClassName") != "portcullis-core":
         F.add(f"{name}: priorityClassName {spec.get('priorityClassName')} (every core pod: portcullis-core)")
-    if not any(k.startswith("portcullis.io/net-") for k in labels) and labels.get("portcullis.io/component") not in ("hub-oneshot",):
+    # LLDAP's schema Job (plan Task 23) talks to Postgres only, by its own
+    # policy (to-postgres): no compose network; its pod template is
+    # immutable, so its name, not a config-hash, follows its inputs.
+    if not any(k.startswith("portcullis.io/net-") for k in labels) and labels.get("portcullis.io/component") not in ("hub-oneshot", "lldap-schema"):
         F.add(f"{name}: no portcullis.io/net-* label")
     tok = spec.get("automountServiceAccountToken")
     if name in TOKEN_OK:
@@ -82,7 +85,7 @@ def check_pod(name, ns, labels, spec, ann):
         kinds = set(v) - {"name"}
         if not kinds <= RESTRICTED_VOLUMES:
             F.add(f"{name}: volume {v['name']} of type {sorted(kinds)} (restricted allows {sorted(RESTRICTED_VOLUMES)})")
-    if "portcullis.io/config-hash" not in ann and ns == K.NS and labels.get("portcullis.io/oneshot") != "true":
+    if "portcullis.io/config-hash" not in ann and ns == K.NS and labels.get("portcullis.io/oneshot") != "true" and name != "lldap-schema":
         F.add(f"{name}: no portcullis.io/config-hash annotation")
     for c in spec.get("containers", []) + spec.get("initContainers", []):
         cn = f"{name}/{c['name']}"
@@ -266,7 +269,9 @@ def ha_replicas(vals):
     g = int(vals["ha"].get("gateReplicas", K.values()["ha"]["gateReplicas"]))
     kc = 3 if int(vals["ha"].get("nonSmallNodesAtPrimary", 0)) >= 3 else 2
     return {"group-gate": ("StatefulSet", g), "mcp-gate": ("StatefulSet", g), "forward-auth": ("Deployment", g),
-            "forward-auth-ext": ("Deployment", g), "keycloak": ("StatefulSet", kc), "alertmanager": ("StatefulSet", 2)}
+            "forward-auth-ext": ("Deployment", g), "keycloak": ("StatefulSet", kc), "alertmanager": ("StatefulSet", 2),
+            # LLDAP on Postgres (plan Task 23, Amendment 2: 2 replicas are safe).
+            "lldap": ("Deployment", 2)}
 
 
 def gate_shape_problems(docs, vals=None):
@@ -417,7 +422,7 @@ def check_ha_shape():
     docs = K.render(base)
     bad = _c.deepcopy(docs)
     ff = next(d for d in bad if d.get("kind") == "Deployment" and d["metadata"]["name"] == "forward-auth")
-    ff["spec"]["template"]["spec"].setdefault("volumes", []).append({"name": "x", "persistentVolumeClaim": {"claimName": "lldap-data"}})
+    ff["spec"]["template"]["spec"].setdefault("volumes", []).append({"name": "x", "persistentVolumeClaim": {"claimName": "prometheus-data"}})
     if not any("pinned" in p for p in gate_shape_problems(bad, base)):
         F.add("gate_shape_problems misses a replicated pod on a node-local PVC (mutation test)")
 
@@ -511,6 +516,70 @@ def check_log_ports():
             c = (v.get("persistentVolumeClaim") or {}).get("claimName")
             if c in ("group-gate-data", "mcp-gate-data", "wg-data") and name != c[: -len("-data")]:
                 F.add(f"ha: {name} mounts {c} (the log ports replace it)")
+
+
+CNPG_CHART_SHA256 = "9df3f074ecaa8af10277ad155899470618ea9a565d7c7c48187bdc7887655960"
+CNPG_IMAGE = "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.2@sha256:f96f6be3d81ec93819b443c665c575c609342fca840df90d4d87dae314a5b913"
+
+
+def check_cnpg():
+    """Plan Task 23 (spec §7.4, ruling I5, security): the vendored operator
+    chart is the pinned release asset (and ha.sh pins the same sha256 and
+    image digest); its render runs the pinned image by digest, every pod
+    portcullis-core and restricted, namespaced: its only Role is in
+    cnpg-system, its cluster-wide rules read nodes / clusterimagecatalogs
+    and patch its own webhook configurations only (no Secret, pod or exec
+    right in the core or apps namespace); its webhooks name its own Service.
+    The Cluster (every render): portcullis-core, its image by digest, no
+    superuser."""
+    import hashlib
+    tgz = K.ROOT / "kube" / "ha" / "cnpg" / "cloudnative-pg-0.29.2.tgz"
+    if hashlib.sha256(tgz.read_bytes()).hexdigest() != CNPG_CHART_SHA256:
+        F.add(f"{tgz.name}: not the pinned release asset ({CNPG_CHART_SHA256})")
+    ha_sh = (K.ROOT / "scripts" / "lib" / "ha.sh").read_text()
+    if f'KUBE_CNPG_CHART_SHA256="{CNPG_CHART_SHA256}"' not in ha_sh or f'KUBE_CNPG_IMAGE_DIGEST="{CNPG_IMAGE.split("@")[1]}"' not in ha_sh:
+        F.add("scripts/lib/ha.sh: KUBE_CNPG_CHART_SHA256 / KUBE_CNPG_IMAGE_DIGEST differ from the pins")
+    docs = K.render_cnpg()
+    for d in docs:
+        if d.get("kind") in POD_KINDS:
+            sp = pod_spec_of(d)
+            if sp.get("priorityClassName") != "portcullis-core":
+                F.add(f"cnpg: {d['kind']} {d['metadata']['name']}: priorityClassName {sp.get('priorityClassName')} (ruling I5)")
+            psc = sp.get("securityContext", {})
+            for c in sp.get("containers", []) + sp.get("initContainers", []):
+                sc = c.get("securityContext", {})
+                if c["image"] != CNPG_IMAGE or sc.get("allowPrivilegeEscalation") is not False or sc.get("capabilities", {}).get("drop") != ["ALL"] \
+                        or sc.get("readOnlyRootFilesystem") is not True or psc.get("runAsNonRoot") is not True \
+                        or (sc.get("seccompProfile") or psc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
+                    F.add(f"cnpg: {d['metadata']['name']}/{c['name']}: the pinned image, restricted (no escalation, drop ALL, read-only, non-root, RuntimeDefault)")
+            if sp.get("hostNetwork") or any("hostPath" in v for v in sp.get("volumes", [])):
+                F.add(f"cnpg: {d['metadata']['name']}: hostNetwork / hostPath")
+            env = {e["name"]: e.get("value") for e in sp["containers"][0].get("env", [])}
+            if env.get("WATCH_NAMESPACE") != K.CNPG_NS or env.get("OPERATOR_IMAGE_NAME") != CNPG_IMAGE:
+                F.add(f"cnpg: the operator watches {env.get('WATCH_NAMESPACE')} (want {K.CNPG_NS} only) and copies {env.get('OPERATOR_IMAGE_NAME')}")
+    roles = [d for d in docs if d.get("kind") == "Role"]
+    if [r["metadata"]["namespace"] for r in roles] != [K.CNPG_NS]:
+        F.add(f"cnpg: Roles in {[r['metadata'].get('namespace') for r in roles]} (one, in {K.CNPG_NS})")
+    bound = {b["roleRef"]["name"] for b in docs if b.get("kind") == "ClusterRoleBinding"}
+    allowed = {("", "nodes"), ("admissionregistration.k8s.io", "mutatingwebhookconfigurations"),
+               ("admissionregistration.k8s.io", "validatingwebhookconfigurations"), ("postgresql.cnpg.io", "clusterimagecatalogs")}
+    for cr in (d for d in docs if d.get("kind") == "ClusterRole" and d["metadata"]["name"] in bound):
+        for r in cr.get("rules", []):
+            for g in r.get("apiGroups", []):
+                for res in r.get("resources", []):
+                    if (g, res) not in allowed or set(r.get("verbs", [])) - {"get", "list", "watch", "patch"}:
+                        F.add(f"cnpg: the bound ClusterRole {cr['metadata']['name']} grants {r.get('verbs')} on {g}/{res} cluster-wide")
+    for w in (d for d in docs if d.get("kind") in ("MutatingWebhookConfiguration", "ValidatingWebhookConfiguration")):
+        for h in w["webhooks"]:
+            svc = h["clientConfig"].get("service") or {}
+            if (svc.get("namespace"), svc.get("name")) != (K.CNPG_NS, "cnpg-webhook-service") or "url" in h["clientConfig"]:
+                F.add(f"cnpg: webhook {h['name']} calls {h['clientConfig']}")
+    for vals in ({}, yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())):
+        c = K.cnpg_cluster(K.render(vals))
+        s = (c or {}).get("spec", {})
+        if c is None or s.get("priorityClassName") != "portcullis-core" or not re.search(r"@sha256:[0-9a-f]{64}$", s.get("imageName", "")) \
+                or s.get("enableSuperuserAccess") is not False:
+            F.add("the CNPG Cluster: priorityClassName portcullis-core, imageName by digest, enableSuperuserAccess false")
 
 
 def main():
@@ -634,6 +703,7 @@ def main():
     check_traefik_peer()
     check_sites_storage()
     check_psa()
+    check_cnpg()
     check_priorities()
     check_classes(docs + K.render({"ha": {"enabled": True}}))
     check_core_exec()
@@ -662,7 +732,9 @@ PSA_WANT = {"core": ["restricted"] * 3, "apps": ["privileged", "baseline", "base
             "storage": ["privileged", "baseline", "baseline"], "edge": ["restricted"] * 3,
             "ingress": ["privileged", "baseline", "baseline"],
             # nodeadm: restricted (no etcd key, no hostPath: review I6).
-            "nodeadm": ["restricted"] * 3}
+            "nodeadm": ["restricted"] * 3,
+            # cnpg-system (plan Task 23, spec §7.4): restricted.
+            "cnpg": ["restricted"] * 3}
 
 
 NODEADM_NS = "portcullis-nodeadm"
@@ -771,7 +843,7 @@ def check_psa():
         if src.get(role) != want:
             F.add(f"namespaces.json {role}: {src.get(role)} (want {want})")
     names = {"core": K.NS, "apps": K.APPS_NS, "storage": "portcullis-storage", "edge": K.EDGE_NS, "ingress": "portcullis-ingress",
-             "nodeadm": NODEADM_NS}
+             "nodeadm": NODEADM_NS, "cnpg": "cnpg-system"}
     ns = {d["metadata"]["name"]: d["metadata"].get("labels", {}) for d in K.by_kind(K.render({"renderNamespaces": True}), "Namespace")}
     for role, n in names.items():
         got = [ns.get(n, {}).get(f"pod-security.kubernetes.io/{m}") for m in ("enforce", "warn", "audit")]
