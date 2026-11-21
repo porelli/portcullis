@@ -29,9 +29,8 @@ outside cnpg-system). Here, in cnpg-system:
     Cluster's WAL archiver, the ObjectStore portcullis-backup (the keys
     under <destination>/cnpg, path-style, the credentials from the CLI's
     Secret backup-destination, gzip, retention backup.cnpg.retention), a
-    daily ScheduledBackup through the plugin, and the instances' egress to
-    the destination's port outside the cluster's ranges (as
-    egress-internet).
+    daily ScheduledBackup through the plugin, and the instance pods' egress
+    to exactly the destination endpoint's addresses and port.
 Kept on uninstall (helm.sh/resource-policy keep: the data). */ -}}
 {{- $bk := .Values.backup.cnpg -}}
 {{- $cns := .Values.cnpg.namespace -}}
@@ -186,8 +185,10 @@ spec:
     name: portcullis-pg
 ---
 # The instances' archive and base backups (the plugin's sidecar in each
-# instance pod) reach the destination: its port, anywhere but the cluster's
-# own ranges (egress-internet's except list).
+# instance pod: cnpg.io/podRole instance, never the operator's Job pods)
+# reach exactly the destination endpoint's addresses (backup.cnpg.
+# endpointCIDRs, resolved by the CLI at every up: ha.sh backup_dest_cidrs,
+# never inside the cluster) on its port (security ruling, Task 26).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -199,25 +200,15 @@ spec:
   podSelector:
     matchLabels:
       cnpg.io/cluster: portcullis-pg
+      cnpg.io/podRole: instance
   policyTypes: ["Egress"]
   egress:
     - to:
+        {{- range (required "backup.cnpg.endpointCIDRs is required" $bk.endpointCIDRs) }}
+        {{- if not (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/32$" .) }}{{ fail (printf "backup.cnpg.endpointCIDRs: %s isn't one IPv4 address (/32)" .) }}{{ end }}
         - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - {{ required "podCIDR is required" .Values.podCIDR }}
-              - {{ required "serviceCIDR is required" .Values.serviceCIDR }}
-              - 169.254.0.0/16
-              - {{ .Values.ha.meshCIDR }}
-              {{- range .Values.nodeAddresses }}
-              - {{ . }}/32
-              {{- end }}
-              {{- range .Values.apiEndpoints }}
-              {{- $a := index (splitList ":" .) 0 }}
-              {{- if not (has $a $.Values.nodeAddresses) }}
-              - {{ $a }}/32
-              {{- end }}
-              {{- end }}
+            cidr: {{ . }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ $bk.port | int }}

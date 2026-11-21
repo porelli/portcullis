@@ -817,6 +817,7 @@ def main():
     check_psa()
     check_cnpg()
     check_ha_infra()
+    check_backup_egress()
     check_priorities()
     check_classes(docs + K.render({"ha": {"enabled": True}}))
     check_core_exec()
@@ -1742,6 +1743,49 @@ def check_ha_infra():
 
 
 K_LONGHORN_NS, K_FENCING_NS, K_CERTMANAGER_NS = "longhorn-system", "portcullis-fencing", "cert-manager"
+
+
+def check_backup_egress():
+    """Security ruling (Task 26): the backup egress reaches exactly the
+    destination endpoint's addresses on its port, from exactly the pods that
+    talk to it — the chart's portcullis-pg-backup (the CNPG instance pods
+    only) and ha.sh's Longhorn policies (longhorn-manager and the instance
+    managers, never a namespace-wide {}); a non-/32 endpoint is refused at
+    render time."""
+    import copy
+    base = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    bk = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-backup.yaml").read_text())
+    vals = copy.deepcopy(base); vals.update(bk)
+    docs = K.render(vals, "templates/postgres-cnpg.yaml")
+    pols = [d for d in K.by_kind(docs, "NetworkPolicy") if d["metadata"]["name"] == "portcullis-pg-backup"]
+    if len(pols) != 1:
+        F.add(f"backup egress: {len(pols)} portcullis-pg-backup policies (want 1 with backup.cnpg.enabled)")
+    else:
+        sp = pols[0]["spec"]
+        if sp["podSelector"] != {"matchLabels": {"cnpg.io/cluster": "portcullis-pg", "cnpg.io/podRole": "instance"}}:
+            F.add(f"backup egress: portcullis-pg-backup selects {sp['podSelector']} (the instance pods only)")
+        to = [t for e in sp.get("egress", []) for t in e.get("to", [])]
+        if to != [{"ipBlock": {"cidr": c}} for c in bk["backup"]["cnpg"]["endpointCIDRs"]] or sp.get("ingress"):
+            F.add(f"backup egress: portcullis-pg-backup reaches {to} (exactly the endpoint's /32s)")
+        if [p for e in sp["egress"] for p in e.get("ports", [])] != [{"protocol": "TCP", "port": bk["backup"]["cnpg"]["port"]}]:
+            F.add("backup egress: portcullis-pg-backup's port isn't the destination's")
+    bad = copy.deepcopy(vals); bad["backup"]["cnpg"]["endpointCIDRs"] = ["0.0.0.0/0"]
+    try:
+        K.render(bad, "templates/postgres-cnpg.yaml")
+        F.add("backup egress: an endpointCIDRs of 0.0.0.0/0 renders (want refused)")
+    except subprocess.CalledProcessError:
+        pass
+    if [d for d in K.by_kind(K.render(base, "templates/postgres-cnpg.yaml"), "NetworkPolicy") if d["metadata"]["name"] == "portcullis-pg-backup"]:
+        F.add("backup egress: portcullis-pg-backup without a destination")
+    ha_sh = (K.ROOT / "scripts" / "lib" / "ha.sh").read_text()
+    if "_ha_backup_egress \"$KUBE_LONGHORN_NS\" backup-destination '{}'" in ha_sh or re.search(r"_ha_backup_egress [^\n]*'\{\}'", ha_sh):
+        F.add("ha.sh: a namespace-wide ({}) backup egress policy")
+    m = re.search(r"HA_LONGHORN_BACKUP_PODS='([^']*)'", ha_sh)
+    want = {"backup-destination-manager": {"matchLabels": {"app": "longhorn-manager"}},
+            "backup-destination-instance-manager": {"matchLabels": {"longhorn.io/component": "instance-manager"}}}
+    got = {ln.split(" ", 1)[0]: json.loads(ln.split(" ", 1)[1]) for ln in (m.group(1).splitlines() if m else []) if ln.strip()}
+    if got != want:
+        F.add(f"ha.sh HA_LONGHORN_BACKUP_PODS {got} (longhorn-manager and the instance managers, by their pinned labels)")
 
 
 def barman_render():

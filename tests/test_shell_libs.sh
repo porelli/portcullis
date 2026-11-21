@@ -6778,7 +6778,7 @@ case "$OUT" in *"node m1: /var/lib/longhorn is on a ZFS dataset"*"rc=1") t_pass 
 OUT="$(h24 ha_install_longhorn)"
 expect_eq "ha_install_longhorn: namespace (PSA longhorn) → deny policies → node checks → render (API + initiator sources) → apply → waits → StorageClass" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;K get namespace longhorn-system -o name;K -n longhorn-system delete networkpolicy backup-destination --ignore-not-found;K apply;"
+  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;K get namespace longhorn-system -o name;K -n longhorn-system delete networkpolicy backup-destination-manager backup-destination-instance-manager --ignore-not-found;K apply;"
 expect_eq "ha_install_longhorn: then its backup target (Task 26; no destination here → an empty target, no egress policy)" \
   "$(grep -v '^---$' "$WORK/h24-applied" 2>/dev/null | jq -c 'select(.kind? == "BackupTarget") | .spec' 2>/dev/null | tail -n1)" '{"backupTargetURL":"","credentialSecret":"","pollInterval":"5m0s"}'
 expect_eq "ha_install_longhorn: the namespace is longhorn-system with namespaces.json's longhorn levels; applied.json records ha.longhorn" \
@@ -7048,12 +7048,27 @@ case "$OUT" in *"REPO=s3:https://s3.example.org/pc-bucket/site-a/core"*"KEYS-OK"
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket/site-a BACKUP_PASSWORD=x BACKUP_REPOSITORY=/srv/elsewhere; _restic_require")"
 case "$OUT" in *"isn't the backup destination's"*"rc=1") t_pass "restic: another BACKUP_REPOSITORY next to the destination is refused" ;; *) t_fail "restic two repositories: $OUT" ;; esac
 # The chart's values and the Hub's record.
-OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org:9000/pc-bucket/site-a; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 0; }; kube_backup_values \$f; jq -c .backup \$f")"
-case "$OUT" in *'{"destination":true,"cnpg":{"enabled":true,"destinationPath":"s3://pc-bucket/site-a/cnpg","endpointURL":"https://s3.example.org:9000","port":9000,'*) t_pass "kube_backup_values: the destination, CNPG's path and endpoint under <url>/cnpg" ;; *) t_fail "kube_backup_values: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9:9000/pc-bucket/site-a; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 0; }; kube_backup_values \$f; jq -c .backup \$f")"
+case "$OUT" in *'{"destination":true,"cnpg":{"enabled":true,"destinationPath":"s3://pc-bucket/site-a/cnpg","endpointURL":"https://203.0.113.9:9000","port":9000,"endpointCIDRs":["203.0.113.9/32"],'*) t_pass "kube_backup_values: the destination, CNPG's path and endpoint under <url>/cnpg" ;; *) t_fail "kube_backup_values: $OUT" ;; esac
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 1; }; kube_backup_values \$f; jq -c '.backup | [.destination, .cnpg.enabled]' \$f")"
 case "$OUT" in *'[true,false]'*) t_pass "kube_backup_values: no CNPG archive while the plugin isn't ready" ;; *) t_fail "kube_backup_values no plugin: $OUT" ;; esac
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=; f=\$(mktemp); echo '{}' > \$f; kube_backup_values \$f; jq -c '.backup | [.destination, .cnpg.enabled]' \$f")"
 case "$OUT" in *'[false,false]'*) t_pass "kube_backup_values: no destination → nothing" ;; *) t_fail "kube_backup_values none: $OUT" ;; esac
+# Security ruling: the backup egress reaches exactly the endpoint, from the exact pods.
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.ci.invalid/pc-bucket; getent() { [ \"\$1 \$2\" = 'ahostsv4 s3.ci.invalid' ] && printf '198.51.100.20 STREAM s3.ci.invalid\n198.51.100.21 STREAM\n198.51.100.20 DGRAM\n'; }; backup_dest_cidrs")"
+expect_eq "backup_dest_cidrs: a host name resolved now, each IPv4 a /32, unique" "$(printf '%s\n' "$OUT" | tr '\n' ' ')" "198.51.100.20/32 198.51.100.21/32 rc=0 "
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.ci.invalid/pc-bucket; getent() { return 2; }; backup_dest_cidrs")"
+case "$OUT" in *"doesn't resolve to an IPv4 address"*"rc=1") t_pass "backup_dest_cidrs: an unresolvable endpoint is refused (no policy)" ;; *) t_fail "backup_dest_cidrs unresolvable: $OUT" ;; esac
+for ip in 10.42.0.7 10.43.0.1 10.215.0.2 198.51.100.1 10.1.0.4; do
+  OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://$ip/pc-bucket PORTCULLIS_KUBE_NODE_ADDRESSES=198.51.100.1; backup_dest_cidrs")"
+  case "$OUT" in *"resolves inside the cluster ($ip)"*"rc=1") t_pass "backup_dest_cidrs: an endpoint inside the cluster ($ip) is refused" ;; *) t_fail "backup_dest_cidrs in-cluster $ip: $OUT" ;; esac
+done
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; _ha_backup_egress longhorn-system x '{}'")"
+case "$OUT" in *"a pod selector naming the component is required"*"rc=1") t_pass "_ha_backup_egress: a namespace-wide selector is refused" ;; *) t_fail "_ha_backup_egress {}: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=http://203.0.113.9/pc-bucket; _ha_backup_egress longhorn-system backup-destination-manager '{\"matchLabels\":{\"app\":\"longhorn-manager\"}}'")"
+expect_eq "_ha_backup_egress: the exact pods, the endpoint's /32 and port only" \
+  "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(.kind? == "NetworkPolicy") | [.spec.podSelector, .spec.egress]')" \
+  '[{"matchLabels":{"app":"longhorn-manager"}},[{"to":[{"ipBlock":{"cidr":"203.0.113.9/32"}}],"ports":[{"protocol":"TCP","port":80}]}]]'
 OUT="$(bdk "kube_backup_status_record")"
 expect_eq "kube_backup_status_record: ConfigMap portcullis-backup-status with last_success (RFC 3339 UTC)" \
   "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -r 'select(.metadata.name? == "portcullis-backup-status") | .data.last_success' | grep -cE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')" 1

@@ -191,6 +191,7 @@ backup:
     destinationPath: ""
     endpointURL: ""
     port: 443
+    endpointCIDRs: []
     retention: 30d
     schedule: "0 15 3 * * *"
 

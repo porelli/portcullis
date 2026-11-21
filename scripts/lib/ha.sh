@@ -951,6 +951,8 @@ KUBE_BACKUP_EXTRA_VOLUMES="hub_backups:$CT_UID_HUB:$CT_UID_HUB"
 kube_sync_prepare_t26() {
   lldap_key_seed_require
   kube_backup_destination_sync || fail "could not sync the backup destination's Secret backup-destination"
+  # Longhorn's target and egress, the endpoint re-resolved (no Longhorn: nothing).
+  ha_longhorn_backup_target
 }
 KUBE_BARMAN_NS="$KUBE_CNPG_NS"
 
@@ -989,16 +991,19 @@ _kube_barman_ready() { _ha_deploy_ready "$KUBE_BARMAN_NS" barman-cloud >/dev/nul
 # kube_backup_values <values file> — backup.* (see the header): destination
 # = the URL is set; cnpg.* only when the plugin is ready too.
 kube_backup_values() {
-  local f="$1" dest=false cnpg=false path="" ep="" port=443
+  local f="$1" dest=false cnpg=false path="" ep="" port=443 cidrs=""
   if [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
     dest=true
     backup_dest_parts
     path="s3://$_BD_BUCKET/${_BD_PREFIX:+$_BD_PREFIX/}cnpg" ep="$_BD_ENDPOINT"
-    case "$_BD_HOST" in *:*) port="${_BD_HOST##*:}" ;; *) [ "$_BD_SCHEME" = https ] || port=80 ;; esac
-    ! _kube_barman_ready || cnpg=true
+    port="$(backup_dest_port)"
+    if _kube_barman_ready; then
+      cnpg=true
+      cidrs="$(backup_dest_cidrs)" || fail "the backup destination's endpoint: see above (nothing rendered)"
+    fi
   fi
-  (umask 077 && jq --argjson d "$dest" --argjson c "$cnpg" --arg p "$path" --arg e "$ep" --argjson port "$port" \
-    '.backup = {destination: $d, cnpg: {enabled: $c, destinationPath: $p, endpointURL: $e, port: $port, retention: "30d", schedule: "0 15 3 * * *"}}' "$f" > "$f.tmp") \
+  (umask 077 && jq --argjson d "$dest" --argjson c "$cnpg" --arg p "$path" --arg e "$ep" --argjson port "$port" --arg cidrs "$cidrs" \
+    '.backup = {destination: $d, cnpg: {enabled: $c, destinationPath: $p, endpointURL: $e, port: $port, endpointCIDRs: ($cidrs | split("\n") | map(select(. != ""))), retention: "30d", schedule: "0 15 3 * * *"}}' "$f" > "$f.tmp") \
     && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" || fail "could not write the backup destination's values"
 }
 
@@ -1016,26 +1021,61 @@ kube_backup_status_record() {
   return "$rc"
 }
 
-# _ha_backup_egress <namespace> <name> <pod selector json> — a CLI-owned
-# NetworkPolicy: the pods reach the destination's port anywhere but the
-# cluster's ranges (the pod / service CIDRs, link-local, the node mesh, the
-# nodes and the API endpoints: egress-internet's except list).
-_ha_backup_egress() {
-  local port=443 nodes
+# backup_dest_port — the destination's TCP port (its URL's, else 443 / 80).
+backup_dest_port() {
   backup_dest_parts
-  case "$_BD_HOST" in *:*) port="${_BD_HOST##*:}" ;; *) [ "$_BD_SCHEME" = https ] || port=80 ;; esac
-  nodes="${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}"
-  [ -n "${PORTCULLIS_POD_CIDR:-}" ] && [ -n "${PORTCULLIS_SERVICE_CIDR:-}" ] && [ -n "$nodes" ] || { echo "the cluster's ranges are unknown: no egress policy for the destination" >&2; return 1; }
-  NS="$1" N="$2" SEL="$3" PORT="$port" POD="$PORTCULLIS_POD_CIDR" SVC="$PORTCULLIS_SERVICE_CIDR" MESH="$KUBE_MESH_CIDR" \
-    NODES="$nodes" API="${PORTCULLIS_KUBE_API_ENDPOINTS:-}" jq -n '
-    def words: split(" ") | map(select(. != ""));
+  case "$_BD_HOST" in *:*) echo "${_BD_HOST##*:}" ;; *) if [ "$_BD_SCHEME" = https ]; then echo 443; else echo 80; fi ;; esac
+}
+
+# backup_dest_cidrs — the destination endpoint's IPv4 addresses as /32s
+# (security ruling, Task 26: the backup egress policies reach exactly the
+# endpoint): an IPv4 literal as it is, a host name resolved now (getent
+# ahostsv4). Refused (exit 1, a message) when nothing resolves or an
+# address is inside the cluster (the pod / service CIDRs, the node mesh,
+# link-local, a node or an API endpoint): the policy would open the
+# cluster to itself. Re-resolved at every up (an endpoint's addresses can
+# change: until then its new ones are refused, fail closed).
+backup_dest_cidrs() {
+  local h ips a n bad=""
+  backup_dest_parts
+  h="${_BD_HOST%:*}"
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ips="$h"
+  else ips="$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | LC_ALL=C sort -u)"; fi
+  [ -n "$ips" ] || { echo "the backup destination's host $h doesn't resolve to an IPv4 address: no egress policy for it" >&2; return 1; }
+  for a in $ips; do
+    for n in ${PORTCULLIS_POD_CIDR:-} ${PORTCULLIS_SERVICE_CIDR:-} "$KUBE_MESH_CIDR" 169.254.0.0/16 127.0.0.0/8; do
+      ! cidr_contains "$n" "$a" 2>/dev/null || bad="$bad $a"
+    done
+    case " ${PORTCULLIS_KUBE_NODE_ADDRESSES:-} $(printf '%s\n' ${PORTCULLIS_KUBE_API_ENDPOINTS:-} | sed 's/:[0-9]*$//' | tr '\n' ' ') " in *" $a "*) bad="$bad $a" ;; esac
+  done
+  [ -z "$bad" ] || { echo "the backup destination resolves inside the cluster ($(printf '%s\n' $bad | sort -u | tr '\n' ' ' | sed 's/ $//')): refused" >&2; return 1; }
+  printf '%s/32\n' $ips
+}
+
+# _ha_backup_egress <namespace> <name> <pod selector json> — a CLI-owned
+# NetworkPolicy: the selected pods (never all of a namespace: the exact
+# component that talks to the destination) reach the destination
+# endpoint's addresses (backup_dest_cidrs) on its port, nothing else.
+_ha_backup_egress() {
+  local cidrs port
+  case "$3" in ''|'{}') echo "_ha_backup_egress: a pod selector naming the component is required" >&2; return 1 ;; esac
+  cidrs="$(backup_dest_cidrs)" || return 1
+  port="$(backup_dest_port)"
+  NS="$1" N="$2" SEL="$3" PORT="$port" C="$cidrs" jq -n '
     {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy",
      metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
      spec: {podSelector: (env.SEL | fromjson), policyTypes: ["Egress"],
-       egress: [{to: [{ipBlock: {cidr: "0.0.0.0/0", except: ([env.POD, env.SVC, "169.254.0.0/16", env.MESH]
-                   + ((env.NODES | words) + (env.API | words | map(split(":")[0])) | unique | map(. + "/32")))}}],
+       egress: [{to: [env.C | split("\n")[] | select(. != "") | {ipBlock: {cidr: .}}],
                  ports: [{protocol: "TCP", port: (env.PORT | tonumber)}]}]}}' | _ha_apply
 }
+
+# The Longhorn pods that reach the backup target (v1.13.0, pinned labels:
+# the chart's longhorn-manager DaemonSet app=longhorn-manager — it lists and
+# syncs the backup target; the v1 data engine's instance managers
+# longhorn.io/component=instance-manager, types.GetInstanceManagerLabels —
+# their replicas upload and fetch the blocks). Backing images aren't used.
+HA_LONGHORN_BACKUP_PODS='backup-destination-manager {"matchLabels":{"app":"longhorn-manager"}}
+backup-destination-instance-manager {"matchLabels":{"longhorn.io/component":"instance-manager"}}'
 
 # _ha_pins barmancloud: the plugin's release asset (Amendment 1).
 _ha_barman_pins() { echo "barman-cloud/upstream/plugin-barman-cloud-v0.16.0.yaml aee614683892dd4b44ff9f7afaca55254f1c28de17abbaa0552bf2e1228f7155"; }
@@ -1097,15 +1137,17 @@ _ha_barman_certs_ready() {
 # Secret (server-side apply of spec only; the manager keeps its status).
 # Without a destination: the target emptied and the egress removed.
 ha_longhorn_backup_target() {
-  local f url=""
+  local f url="" n sel
   kube_ctl get namespace "$KUBE_LONGHORN_NS" -o name >/dev/null 2>&1 || return 0
   if [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
     backup_dest_read; backup_dest_parts
     kube_backup_destination_sync || fail "could not sync the destination's Secret into $KUBE_LONGHORN_NS"
-    _ha_backup_egress "$KUBE_LONGHORN_NS" backup-destination '{}' || fail "could not apply Longhorn's egress to the backup destination"
+    while read -r n sel; do
+      _ha_backup_egress "$KUBE_LONGHORN_NS" "$n" "$sel" || fail "could not apply Longhorn's egress to the backup destination ($n)"
+    done <<< "$HA_LONGHORN_BACKUP_PODS"
     url="s3://$_BD_BUCKET@$_BD_AWS_DEFAULT_REGION/${_BD_PREFIX:+$_BD_PREFIX/}longhorn"
   else
-    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy backup-destination --ignore-not-found >/dev/null 2>&1 || true
+    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy backup-destination-manager backup-destination-instance-manager --ignore-not-found >/dev/null 2>&1 || true
   fi
   f="$(mktemp)"
   NS="$KUBE_LONGHORN_NS" U="$url" jq -n '{apiVersion: "longhorn.io/v1beta2", kind: "BackupTarget", metadata: {name: "default", namespace: env.NS},
