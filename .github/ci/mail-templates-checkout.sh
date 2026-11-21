@@ -7,7 +7,7 @@
 #    <dest>, as e2e-settings' "Templates" step; the step fails without
 #    stalwart/manifest.yaml's mail: block.
 # 2. P2: the stalwart template's adapter image lines (exactly
-#    ghcr.io/porelli/portcullis-mailctl:<tag>@sha256:<64 hex>, three of
+#    ghcr.io/porelli/portcullis-mailctl:<tag>@sha256:<64 hex>, four of
 #    them) become the locally built portcullis-mailctl:ci: core CI never
 #    pulls the published adapter, it tests the checkout's mailctl/.
 # 3. Nothing leaves the runner (P40): the template's resolver forwards
@@ -42,12 +42,12 @@ fi
 T="$dest/stalwart"
 grep -q '^mail:' "$T/manifest.yaml" 2>/dev/null || { echo "::error::$T/manifest.yaml has no mail: block"; exit 1; }
 
-# P2: exactly three adapter image lines of the pinned shape, nothing else
+# P2: exactly four adapter image lines (adapter-bin, key-init, adapter, admin-view) of the pinned shape, nothing else
 # naming the published adapter.
 re='^    image: ghcr\.io/porelli/portcullis-mailctl:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$'
 n="$(grep -cE "$re" "$T/compose.yml" || true)"
-[ "$n" = 3 ] || { echo "::error::$T/compose.yml: $n adapter image lines of the shape ghcr.io/porelli/portcullis-mailctl:<tag>@sha256:<digest> (want 3)"; exit 1; }
-[ "$(grep -c 'portcullis-mailctl' "$T/compose.yml")" = 3 ] || { echo "::error::$T/compose.yml names portcullis-mailctl outside its three image lines"; exit 1; }
+[ "$n" = 4 ] || { echo "::error::$T/compose.yml: $n adapter image lines of the shape ghcr.io/porelli/portcullis-mailctl:<tag>@sha256:<digest> (want 4)"; exit 1; }
+[ "$(grep -c 'portcullis-mailctl' "$T/compose.yml")" = 4 ] || { echo "::error::$T/compose.yml names portcullis-mailctl outside its four image lines"; exit 1; }
 sed -i -E "s#$re#    image: portcullis-mailctl:ci#" "$T/compose.yml"
 docker image inspect portcullis-mailctl:ci >/dev/null 2>&1 || { echo "::error::portcullis-mailctl:ci isn't built"; exit 1; }
 
