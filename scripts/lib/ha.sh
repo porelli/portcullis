@@ -1040,8 +1040,13 @@ kube_backup_destination_sync() {
 }
 
 # _kube_barman_ready — the plugin runs in cnpg-system (its Deployment
-# available): only then may the Cluster name it.
-_kube_barman_ready() { _ha_deploy_ready "$KUBE_BARMAN_NS" barman-cloud >/dev/null 2>&1; }
+# available, at least one replica: one scaled to 0 is "ready" to
+# _ha_deploy_ready but serves nothing — found in e2e-k3s): only then may
+# the Cluster name it.
+_kube_barman_ready() {
+  _ha_deploy_ready "$KUBE_BARMAN_NS" barman-cloud >/dev/null 2>&1 \
+    && kube_ctl -n "$KUBE_BARMAN_NS" get deploy barman-cloud -o json 2>/dev/null | jq -e '(.status.availableReplicas // 0) >= 1' >/dev/null 2>&1
+}
 
 # kube_backup_values <values file> — backup.* (see the header): destination
 # = the URL is set; cnpg.* only when the plugin is ready too.

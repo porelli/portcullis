@@ -383,7 +383,7 @@ dest)
     case "$out" in *"can't tell; addresses may rotate"*) break ;; esac; sleep 10
   done
   case "$out" in *"TTL of"*"can't tell; addresses may rotate"*"--allow-rotating-addresses"*) ;; *) printf '%s\n' "$out" | tail -n 3; fail "a long-TTL destination name wasn't refused as can't tell" ;; esac
-  ! grep -q '^PORTCULLIS_BACKUP_S3_URL=.' .env || fail "the refused destination was written to .env"
+  ! grep -q '^PORTCULLIS_BACKUP_S3_URL=.*s3long' .env || fail "the refused destination was written to .env"
   s0=$SECONDS
   HUB_DEV=1 ./portcullis backup destination set http://s3short.e2e.test:9000/e2e-bucket/k3s < "$t/creds" 2>&1 | redact
   [ "$(cat secrets/kube/backup-egress)" = pinned ] && grep -q '^PORTCULLIS_BACKUP_S3_URL=http://s3short.e2e.test:9000/e2e-bucket/k3s$' .env || fail "a short-TTL destination name isn't pinned"

@@ -7250,6 +7250,12 @@ expect_eq "status json: the plugin down → the Cluster is still read (plugin na
   "$(printf '%s\n' "$OUT" | head -n1 | jq -c '[.cnpg.plugin, .cnpg.plugin_ready, .cnpg.archiving, .cnpg.last_backup]')" '[true,false,true,"True"]'
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; kube_values_file() { echo '$KBS'; }; _kube_barman_ready() { return 1; }; kube_ctl() { return 1; }; kube_backup_status_json")"
 expect_eq "status json: the plugin down and the Cluster unreadable while the release archives → unreadable (a problem)" "$(printf '%s\n' "$OUT" | head -n1 | jq -c .cnpg)" '{"unreadable":true}'
+# Found in e2e-k3s: the plugin scaled to 0 isn't ready (0 of 0 available).
+for rep in 0:0 1:1 1:0; do
+  kbr_r="${rep%:*}" kbr_a="${rep#*:}"
+  OUT="$(kt "kube_ctl() { echo '{\"metadata\":{\"generation\":2},\"spec\":{\"replicas\":$kbr_r},\"status\":{\"observedGeneration\":2,\"availableReplicas\":$kbr_a,\"updatedReplicas\":$kbr_a}}'; }; _kube_barman_ready && echo READY || echo NOT")"
+  expect_eq "_kube_barman_ready: $kbr_r replica(s), $kbr_a available → $( [ "$kbr_a" = 1 ] && echo ready || echo not ready)" "$(printf '%s\n' "$OUT" | head -n1)" "$( [ "$kbr_a" = 1 ] && echo READY || echo NOT)"
+done
 # Review NM3: the opt-in is .env's only.
 rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; $ROT; backup_dest_egress_resolve")"
 case "$OUT" in *"PORTCULLIS_BACKUP_ALLOW_ROTATING in the environment (true) differs from .env (empty)"*"rc=1") t_pass "backup egress: the opt-in from the process environment alone → refused (.env only)" ;; *) t_fail "env opt-in: $OUT" ;; esac
