@@ -1436,7 +1436,9 @@ _kube_vault_shrink_record() {
 # echoes every clusterHeartbeatInterval, 5 s by default
 # (vault/request_forwarding.go:411): a healthy follower reads 0–5 s (seen
 # live: 0.8–4.9 s), and autopilot itself calls a lost one healthy for
-# ~14 s. "Since this round began" (last_contact + 1 s ≤ AGE) means a voter
+# ~14 s. "Since this round began" (last_contact + 3 s ≤ AGE: 1 s for the
+# whole-second AGE, 2 s for autopilot's cached state, raft-autopilot's
+# DefaultUpdateInterval; re-review 3 M-3) means a voter
 # lost before the round can't count up. The Duration.String() forms:
 # "0s", "3.1ms", "850µs", "1m2s"; unreadable = down.
 _KUBE_VAULT_PLAN_JQ='
@@ -1446,9 +1448,9 @@ _KUBE_VAULT_PLAN_JQ='
         else $p | map((.[0] | tonumber) * ({"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600}[.[1]])) | add end end;
   (env.AGE | tonumber) as $age
   | def up($s): ($s.healthy == true) and ($s.status == "leader"
-      or (($s.last_contact | secs) as $d | $d != null and $d < 7 and $d + 1 <= $age));
+      or (($s.last_contact | secs) as $d | $d != null and $d < 7 and $d + 3 <= $age));
   def maybe($s): ($s.healthy == true) and ($s.status != "leader")
-      and (($s.last_contact | secs) as $d | $d != null and $d < 7 and $d + 1 > $age);
+      and (($s.last_contact | secs) as $d | $d != null and $d < 7 and $d + 3 > $age);
   (env.S | fromjson | .data.servers) as $st
   | (env.P | split(" ") | map(select(. != ""))) as $peers
   | (env.K | split(" ") | map(select(. != ""))) as $keep
@@ -1465,7 +1467,8 @@ _kube_vault_age() { echo $(( $(date +%s) - $1 )); }
 
 # _kube_vault_shrink_read <keep> — through vault-0: the raft peers and
 # autopilot's state, re-read each second until every voter is seen alive
-# this round or KUBE_VAULT_PROVE_WAIT (7 s: the heartbeat + 2) has passed,
+# this round or KUBE_VAULT_PROVE_WAIT (9 s: the 5 s heartbeat, the 2 s
+# cache, 2 s slack) has passed,
 # then the plan (_KVS_PLAN, _KVS_BAD_STEP, _KVS_DOWN); 1 when either can't
 # be read; a peer this chart doesn't know fails.
 _kube_vault_shrink_read() {
@@ -1485,7 +1488,7 @@ _kube_vault_shrink_read() {
     # shellcheck disable=SC2086  # one id per word
     out="$(S="$state" P="$(printf '%s ' $peers)" K="$1" AGE="$age" jq -nc "$_KUBE_VAULT_PLAN_JQ" 2>/dev/null)" \
       || { _KVS_WHY="can't plan from Vault's autopilot state"; return 1; }
-    [ "$(printf '%s' "$out" | jq '.unproven | length')" != 0 ] && [ "$age" -lt "${KUBE_VAULT_PROVE_WAIT:-7}" ] || break
+    [ "$(printf '%s' "$out" | jq '.unproven | length')" != 0 ] && [ "$age" -lt "${KUBE_VAULT_PROVE_WAIT:-9}" ] || break
     sleep 1
   done
   _KVS_PLAN="$(printf '%s' "$out" | jq -r '.plan | join(" ")')"
@@ -1494,7 +1497,7 @@ _kube_vault_shrink_read() {
 }
 
 kube_vault_shrink_prepare() {
-  local cur want id keep i rec first=1 waited=0 limit removed=0
+  local cur want id keep i rec first=1 limit removed=0 since=""
   _KUBE_VAULT_SHRINK=""
   cur="$(kube_ctl -n "$(kube_ns)" get statefulset vault -o jsonpath='{.spec.replicas}' 2>/dev/null)" || cur=""
   [[ "$cur" =~ ^[0-9]+$ ]] || return 0        # no Vault yet (a first install)
@@ -1529,12 +1532,16 @@ kube_vault_shrink_prepare() {
         [ -z "$_KVS_WHY" ] || fail "$_KVS_WHY: refusing to lower its voters $cur → $want (nothing deployed)"
         fail "lowering Vault's voters $cur → $want would leave no quorum after removing $_KVS_BAD_STEP (down: ${_KVS_DOWN:-?}), its failure tolerance below 0: bring ${_KVS_DOWN:-the down voter} back first; nothing removed, nothing deployed"
       fi
-      [ "$waited" -lt "$limit" ] || fail "Vault's HA off stopped part way: ${_KVS_WHY:-removing $_KVS_BAD_STEP would leave no quorum (down: ${_KVS_DOWN:-?})}. Vault keeps its quorum; nothing more removed, nothing deployed — run ./portcullis up again once ${_KVS_DOWN:-every voter} is back"
-      sleep 2; waited=$((waited + 2)); continue
+      # Real seconds since this step's first failed read (re-review 3 N-e:
+      # each read itself can take up to KUBE_VAULT_PROVE_WAIT).
+      [ -n "$since" ] || since="$(date +%s)"
+      [ $(( $(date +%s) - since )) -lt "$limit" ] || fail "Vault's HA off stopped part way: ${_KVS_WHY:-removing $_KVS_BAD_STEP would leave no quorum (down: ${_KVS_DOWN:-?})} for $limit s. Vault keeps its quorum; nothing more removed, nothing deployed — run ./portcullis up again once ${_KVS_DOWN:-every voter} is back"
+      sleep 2; continue
     fi
-    [ -n "$_KVS_PLAN" ] || break
     if [ "$first" = 1 ]; then
-      # The record first: an interruption anywhere after this still owes the wipe.
+      # The record first, even with nothing to remove (re-review 3 N-f: the
+      # dropped replicas' PVCs are wiped all the same): an interruption
+      # anywhere after this still owes the wipe.
       rec=""; for ((i = cur - 1; i >= want; i--)); do rec="$rec vault-$i"; done
       N="$KUBE_VAULT_SHRINK_CM" NS="$(kube_ns)" D="${rec# }" jq -n '{apiVersion: "v1", kind: "ConfigMap",
           metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}}, data: {dropped: env.D}}' \
@@ -1542,24 +1549,25 @@ kube_vault_shrink_prepare() {
         || fail "could not record the voters being dropped (ConfigMap $KUBE_VAULT_SHRINK_CM): nothing removed, nothing deployed"
       first=0
     fi
+    [ -n "$_KVS_PLAN" ] || break
     id="${_KVS_PLAN%% *}"
     removed=$((removed + 1))
     [ "$removed" -le "$cur" ] || fail "Vault's raft still lists $_KVS_PLAN after $cur removals: refusing to lower its voters (nothing deployed; run ./portcullis up again)"
     info "Vault: removing raft peer $id (voters $cur → $want)..."
     vexec operator raft remove-peer "$id" >/dev/null 2>&1 || fail "could not remove Vault's raft peer $id: refusing to lower its voters (nothing deployed; run ./portcullis up again to resume)"
-    waited=0
+    since=""
   done
   # A removed leader steps down: the kept voters elect again before the
   # configuration reads back (found live: ~10 s). ≤ KUBE_VAULT_REMOVE_WAIT.
   local want_set peers
-  waited=0
+  since="$(date +%s)"
   want_set="$(printf '%s\n' $keep | sort | paste -sd' ' -)"
   while :; do
     peers="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '[.data.config.servers[].node_id] | sort | join(" ")' 2>/dev/null)" || peers=""
     [ "$peers" != "$want_set" ] || break
-    [ "$waited" -lt "$limit" ] \
-      || fail "Vault's raft peers are '$peers' after the removals, not '$want_set': refusing to lower its voters (nothing deployed)"
-    sleep 2; waited=$((waited + 2))
+    [ $(( $(date +%s) - since )) -lt "$limit" ] \
+      || fail "Vault's raft peers are '$peers' $limit s after the removals, not '$want_set': refusing to lower its voters (nothing deployed)"
+    sleep 2
   done
   _KUBE_VAULT_SHRINK="$rec"
 }

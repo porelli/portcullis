@@ -4602,9 +4602,14 @@ expect_eq "vault voters 3 → 1 with vault-1 down (re-review I-a): the unhealthy
 rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-1":{"healthy":true,"status":"voter","last_contact":"7.5s"},"vault-2":{"healthy":true,"status":"voter","last_contact":"850µs"}}')"
 expect_eq "vault voters 3 → 1, vault-1 still healthy to autopilot but 7.5 s since its last echo (past the 5 s heartbeat + 2; re-review 2 M-2) → counted down, removed first; the leader's 0s and 850µs count as up" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(removals)" "rc=0:vault-1,vault-2"
-rm -f "$VSH/rec"; OUT="$(VAGE=3 VPROVE=3 vshrink 3 '{"vault-0":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-1":{"healthy":true,"status":"voter","last_contact":"2.5s"},"vault-2":{"healthy":true,"status":"voter","last_contact":"0.5s"}}')"
-expect_eq "vault voters 3 → 1, vault-1 lost just before HA off (no echo since the round began 3 s ago, autopilot still healthy) → counted down, removed first; vault-2 echoed 0.5 s ago → up" \
+rm -f "$VSH/rec"; OUT="$(VAGE=4 VPROVE=4 vshrink 3 '{"vault-0":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-1":{"healthy":true,"status":"voter","last_contact":"2.5s"},"vault-2":{"healthy":true,"status":"voter","last_contact":"0.5s"}}')"
+expect_eq "vault voters 3 → 1, vault-1 lost just before HA off (no echo since the round began 4 s ago, autopilot still healthy) → counted down, removed first; vault-2 echoed 0.5 s before the (≤ 2 s old) state, 4 s in → up" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(removals)" "rc=0:vault-1,vault-2"
+rm -f "$VSH/rec"; OUT="$(VAGE=2 VPROVE=2 vshrink 3 '{"vault-0":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-1":{"healthy":true,"status":"voter","last_contact":"0.5s"},"vault-2":{"healthy":true,"status":"voter","last_contact":"0.5s"}}')"
+case "$OUT" in *"would leave no quorum after removing vault-2"*"rc=1") t_pass "vault voters 3 → 1, 2 s into the round a 0.5 s last contact is still unproven (autopilot's state may be 2 s old; re-review 3 M-3) → nobody counted up but the leader → refused before any removal" ;; *) t_fail "shrink cache margin: $OUT" ;; esac
+rm -f "$VSH/rec"; OUT="$(vshrink 3 "" "printf 'vault-0\n' > '$VSH/peers'")"
+expect_eq "vault voters 3 → 1, the raft peers already exactly vault-0 → nothing removed, but the record written and the dropped PVCs owed (re-review 3 N-f)" \
+  "$(printf '%s\n' "$OUT" | grep '^shrink='):$(removals):$(cat "$VSH/rec")" "shrink= vault-2 vault-1::vault-2 vault-1"
 rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":{"healthy":true,"status":"voter","last_contact":"1m2s"},"vault-1":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-2":true}')"
 case "$OUT" in *"would leave no quorum after removing vault-2 (down: vault-0), its failure tolerance below 0"*"rc=1") t_pass "vault voters 3 → 1, the kept vault-0 stale-healthy (1m2s since its last contact) → refused before any removal" ;; *) t_fail "shrink stale kept: $OUT" ;; esac
 vstate '{"vault-0":{"healthy":true,"status":"voter","last_contact":"9s"},"vault-1":true}' > "$VSH/state.after"
