@@ -619,7 +619,10 @@ func TestBindAddr(t *testing.T) {
 func TestTicketPostAndReplayAcrossRestart(t *testing.T) {
 	e := setup(t)
 	tk := e.ticket("root", 50*time.Second)
-	if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(tk), "", nil); resp.StatusCode != http.StatusForbidden || len(resp.Cookies()) != 0 {
+	// A GET is only the start page: it never reads a query ticket (no
+	// session, the ticket not echoed and not spent: the POST below opens).
+	if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(tk), "", nil); resp.StatusCode != http.StatusOK || len(resp.Cookies()) != 0 ||
+		strings.Contains(resp.Header.Get("X-Test-Body"), tk) {
 		t.Fatalf("GET with a query ticket: %d", resp.StatusCode)
 	}
 	if resp := e.do(t, "POST", "/portcullis/open?t="+url.QueryEscape(tk), "", map[string]string{"Content-Type": "application/x-www-form-urlencoded"}); resp.StatusCode != http.StatusForbidden {
@@ -674,8 +677,16 @@ func TestOriginChecks(t *testing.T) {
 			t.Errorf("%s: %d", name, resp.StatusCode)
 		}
 	}
-	if resp := e.open(t, tk(), map[string]string{"Sec-Fetch-Site": "same-site", "Origin": "https://hub.example.org"}); resp.StatusCode != http.StatusFound {
-		t.Fatalf("from the Hub: %d", resp.StatusCode)
+	// The ticket POST comes only from this origin now (the start page,
+	// fix-mail-admin-421): even the Hub's own origin is refused.
+	if resp := e.open(t, tk(), map[string]string{"Sec-Fetch-Site": "same-site", "Origin": "https://hub.example.org"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("from the Hub directly: %d", resp.StatusCode)
+	}
+	if resp := e.open(t, tk(), map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "https://mail-admin.example.org"}); resp.StatusCode != http.StatusFound {
+		t.Fatalf("from the start page: %d", resp.StatusCode)
+	}
+	if resp := e.open(t, tk(), map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "null"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("an opaque origin: %d", resp.StatusCode)
 	}
 	e.openSession(t)
 	for name, c := range map[string][3]string{
@@ -699,5 +710,39 @@ func TestOriginChecks(t *testing.T) {
 	e.up.mu.Unlock()
 	if resp := e.do(t, "GET", "/admin/", "", nil); resp.Header.Get("Access-Control-Allow-Origin") != "" {
 		t.Fatal("Stalwart's CORS header reached the browser")
+	}
+}
+
+// The start page (fix-mail-admin-421): a GET, its CSP runs only the
+// same-origin script, it names exactly the Hub's origin as the ticket's
+// sender and posts the form to this origin; no session is needed and none
+// is started.
+func TestStartPage(t *testing.T) {
+	e := setup(t)
+	resp := e.do(t, "GET", "/portcullis/open", "", nil)
+	body := resp.Header.Get("X-Test-Body")
+	csp := resp.Header.Get("Content-Security-Policy")
+	if resp.StatusCode != http.StatusOK || len(resp.Cookies()) != 0 || resp.Header.Get("Cache-Control") != "no-store" ||
+		!strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "form-action 'self'") || strings.Contains(csp, "unsafe") ||
+		!strings.Contains(body, `data-hub-origin="https://hub.example.org"`) || !strings.Contains(body, `action="/portcullis/open"`) ||
+		!strings.Contains(body, `<script src="/portcullis/open.js">`) || resp.Header.Get("Referrer-Policy") != "same-origin" {
+		t.Fatalf("start page %d %q %s", resp.StatusCode, csp, body)
+	}
+	js := e.do(t, "GET", "/portcullis/open.js", "", nil)
+	src := js.Header.Get("X-Test-Body")
+	if js.StatusCode != http.StatusOK || !strings.HasPrefix(js.Header.Get("Content-Type"), "text/javascript") || js.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("script %d %v", js.StatusCode, js.Header)
+	}
+	for _, want := range []string{"e.origin !== hub", "'portcullis-mail-admin-hello'", "e.ports.length !== 1", "'portcullis-mail-admin-ready'", "ticketRe.test(t)", "f.submit()"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("script lacks %q", want)
+		}
+	}
+	if r := e.do(t, "PUT", "/portcullis/open", "", nil); r.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("PUT: %d", r.StatusCode)
+	}
+	// Still behind the gate: no route key, no page.
+	if r := e.do(t, "GET", "/portcullis/open", "", map[string]string{RouteKeyHeader: ""}); r.StatusCode != http.StatusForbidden {
+		t.Errorf("no route key: %d", r.StatusCode)
 	}
 }
