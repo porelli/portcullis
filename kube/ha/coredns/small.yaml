@@ -1,8 +1,17 @@
 # portcullis-dns-small (plan Task 25, controller ruling 3; fix round 2,
-# re-review M-c): k3s v1.37.2+k3s1's CoreDNS on each small node at the
-# primary site (main), tolerating the small taint — k3s re-applies its own
-# coredns.yaml at every start and its tolerations list with it, so the
-# small nodes get our DaemonSet, which k3s never touches. Applied by
+# re-review M-c; Task 28: edge nodes): k3s v1.37.2+k3s1's CoreDNS on each
+# small node at the primary site (main), tolerating the small taint — k3s
+# re-applies its own coredns.yaml at every start and its tolerations list
+# with it, so the small nodes get our DaemonSet, which k3s never touches —
+# and on EVERY node outside main (small or not): k3s's Deployment is
+# required at main, so without it an edge pod's lookups crossed sites to
+# main's CoreDNS (and, with a main node lost, hit its dead endpoint until
+# it left; with main unreachable, failed). With PreferSameNode an edge pod
+# asks its own node's CoreDNS, whose upstream is that node's resolv.conf
+# (dnsPolicy Default) and whose kubernetes plugin reads the API over the
+# mesh. The two node sets are one required node affinity of two terms
+# (ORed): site main AND class small, or a site label that isn't main (a
+# node without a site label — not labelled yet — gets none). Applied by
 # ha.sh ha_coredns in HA only, removed with HA off; tests/k8s_hardening.py
 # holds its shape:
 #   - k3s's image (rancher/mirrored-coredns-coredns:1.14.7), pinned by its
@@ -38,7 +47,17 @@ spec:
       serviceAccountName: coredns
       automountServiceAccountToken: true
       dnsPolicy: Default
-      nodeSelector: {kubernetes.io/os: linux, portcullis.io/site: main, portcullis.io/class: small}
+      nodeSelector: {kubernetes.io/os: linux}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: portcullis.io/site, operator: In, values: [main]}
+                  - {key: portcullis.io/class, operator: In, values: [small]}
+              - matchExpressions:
+                  - {key: portcullis.io/site, operator: Exists}
+                  - {key: portcullis.io/site, operator: NotIn, values: [main]}
       tolerations:
         - {key: portcullis.io/small, operator: Exists, effect: NoSchedule}
         - {key: CriticalAddonsOnly, operator: Exists}

@@ -143,14 +143,23 @@ FRONTDOOR_RULES = [
 ]
 
 
+EDGE_DNS_TERMS = [
+    {"matchExpressions": [{"key": "portcullis.io/site", "operator": "In", "values": ["main"]},
+                          {"key": "portcullis.io/class", "operator": "In", "values": ["small"]}]},
+    {"matchExpressions": [{"key": "portcullis.io/site", "operator": "Exists"},
+                          {"key": "portcullis.io/site", "operator": "NotIn", "values": ["main"]}]},
+]
+
+
 def coredns_small_problems(docs):
     """kube/ha/coredns/small.yaml (plan Task 25 fix round 2, re-review M-c):
     our CoreDNS DaemonSet on the small nodes is restricted — non-root,
     RuntimeDefault, drop ALL plus NET_BIND_SERVICE alone (it binds :53),
     no escalation, read-only root,
     no host namespace / hostPath / privileged, only ConfigMap volumes —, on
-    k3s's CoreDNS image by digest, on the small nodes at main only, and the
-    PDB minAvailable 1 over both CoreDNS sets."""
+    k3s's CoreDNS image by digest, on the small nodes at main and every node
+    outside main only (Task 28: edge pods resolve on their own node), and
+    the PDB minAvailable 1 over both CoreDNS sets."""
     out = []
     ds = [d for d in docs if d.get("kind") == "DaemonSet"]
     pdb = [d for d in docs if d.get("kind") == "PodDisruptionBudget"]
@@ -179,9 +188,14 @@ def coredns_small_problems(docs):
         out.append("coredns small: no hostPort")
     if not re.fullmatch(r"docker\.io/rancher/mirrored-coredns-coredns:[0-9.]+@sha256:[0-9a-f]{64}", c.get("image", "")):
         out.append(f"coredns small: image {c.get('image')} (k3s's CoreDNS, by digest)")
-    if sp.get("nodeSelector", {}).get("portcullis.io/class") != "small" or sp.get("nodeSelector", {}).get("portcullis.io/site") != "main" \
-            or sp.get("serviceAccountName") != "coredns":
-        out.append("coredns small: the small nodes at main, k3s's ServiceAccount coredns")
+    # Task 28: the small nodes at main and every node at another site (an
+    # edge pod resolves on its own node), nothing else: exactly these two
+    # ORed terms, no other placement field.
+    if sp.get("nodeSelector") != {"kubernetes.io/os": "linux"} or sp.get("affinity") != {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": EDGE_DNS_TERMS}}} \
+            or sp.get("nodeName") or sp.get("serviceAccountName") != "coredns":
+        out.append("coredns small: the small nodes at main and every node outside main, k3s's ServiceAccount coredns")
+    if sp.get("tolerations") != [{"key": "portcullis.io/small", "operator": "Exists", "effect": "NoSchedule"}, {"key": "CriticalAddonsOnly", "operator": "Exists"}]:
+        out.append("coredns small: tolerates the small taint and CriticalAddonsOnly only")
     if ds[0]["spec"]["template"]["metadata"]["labels"].get("k8s-app") != "kube-dns" or pdb[0]["spec"] != {"minAvailable": 1, "selector": {"matchLabels": {"k8s-app": "kube-dns"}}}:
         out.append("coredns small: labelled k8s-app=kube-dns; the PDB minAvailable 1 on k8s-app=kube-dns")
     return out
@@ -199,7 +213,12 @@ def check_coredns_small():
                    lambda d: ds(d)["volumes"].append({"name": "h", "hostPath": {"path": "/"}}),
                    lambda d: ds(d)["containers"][0]["securityContext"].__setitem__("runAsNonRoot", False),
                    lambda d: ds(d)["containers"][0]["securityContext"].__setitem__("runAsUser", 0),
-                   lambda d: ds(d)["containers"][0]["ports"][0].__setitem__("hostPort", 53)):
+                   lambda d: ds(d)["containers"][0]["ports"][0].__setitem__("hostPort", 53),
+                   # Task 28: placement — every node, a third term, an extra toleration.
+                   lambda d: ds(d).pop("affinity"),
+                   lambda d: ds(d)["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"].append({"matchExpressions": [{"key": "kubernetes.io/os", "operator": "Exists"}]}),
+                   lambda d: ds(d)["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][1]["matchExpressions"].pop(1),
+                   lambda d: ds(d)["tolerations"].append({"operator": "Exists"})):
         bad = copy.deepcopy(docs)
         mutate(bad)
         if not coredns_small_problems(bad):

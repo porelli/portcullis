@@ -2251,14 +2251,17 @@ kube_vault_shrink_finish() {
 # stopped all cluster DNS (~6 min measured), and with a replica on a lost
 # node half the lookups still went there until its endpoint left, holding
 # Valkey's Sentinels in TILT (~100 s instead of ~9 s). In HA, one CoreDNS
-# on every node at the primary site, and each pod asks its own node's:
+# on every node (at the primary site and at every other), and each pod
+# asks its own node's:
 #   - k3s's Deployment coredns: one replica per non-small node at main
 #     (never more than those nodes: a required hostname anti-affinity, so
 #     a replica that can't be placed would stay Pending — re-review N-1),
 #     required at main, one per node (k3s's own spread is judged only at
 #     scheduling: a rollout left two on one node);
 #   - kube/ha/coredns/small.yaml: our restricted DaemonSet of the same
-#     CoreDNS on each small node at main, and the PDB coredns (both sets);
+#     CoreDNS on each small node at main and on every node at another
+#     site (Task 28: an edge pod resolves on its own node, never across
+#     sites), and the PDB coredns (both sets);
 #   - Service kube-dns: trafficDistribution PreferSameNode (a lost node
 #     answers no other node's pods; kube-proxy falls back cluster-wide only
 #     when a node's own endpoint is not ready — a hung but ready one fails
