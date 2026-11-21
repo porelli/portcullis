@@ -1429,13 +1429,17 @@ kube_backup_status_json() {
   e="$(cat "$PORTCULLIS_ROOT/secrets/kube/backup-egress" 2>/dev/null || true)"
   [ "$(jq -r '.backup.cnpg.enabled // false' "$(kube_values_file)" 2>/dev/null)" != true ] || want=true
   ! _kube_barman_ready || ready=true
-  if [ "$want" = true ] || [ "$ready" = true ]; then
+  # Re-review R2-M1: the plugin installed but down at the last up (the
+  # render then left it out) still gets a Postgres line: "stopped".
+  local inst=false
+  [ "$ready" = true ] || ! kube_ctl -n "$KUBE_BARMAN_NS" get deploy barman-cloud -o name >/dev/null 2>&1 || inst=true
+  if [ "$want" = true ] || [ "$ready" = true ] || [ "$inst" = true ]; then
     # The ScheduledBackup's next run (chart: 03:15 UTC daily).
     next=$(( $(date -u +%s) / 86400 * 86400 + 11700 )); [ "$next" -gt "$(date -u +%s)" ] || next=$((next + 86400))
     c="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null | jq -c --argjson want "$want" --argjson ready "$ready" --argjson next "$next" '
       [.status.conditions[]?] as $c
       | ((.spec.plugins // []) | any(.name == "barman-cloud.cloudnative-pg.io")) as $p
-      | if ($p | not) and ($want | not) then null else
+      | if ($p | not) and ($want | not) then {plugin: false, plugin_ready: $ready, archiving: false, stopped: true, last_backup: "Unknown", message: ""} else
         {plugin: $p, plugin_ready: $ready,
          archiving: (($c | map(select(.type == "ContinuousArchiving"))[0].status // "Unknown") == "True"),
          last_backup: ($c | map(select(.type == "LastBackupSucceeded"))[0].status // "Unknown"),
@@ -1459,6 +1463,8 @@ kube_backup_status_lines() {
   fi
   if [ "$(_bsl_q '.cnpg.unreadable // false' "$j")" = true ]; then
     _st_line fail "backup destination: the Postgres Cluster's archive state can't be read"; rc=1
+  elif [ "$(_bsl_q '.cnpg.stopped // false' "$j")" = true ]; then
+    _st_line fail "backup destination: Postgres archiving stopped: the Cluster doesn't name the barman-cloud plugin ($(_bsl_q 'if .cnpg.plugin_ready then "it is available now" else "it is not available" end' "$j"); it wasn't at the last ./portcullis up). Run ./portcullis up once the plugin runs (kubectl -n $KUBE_BARMAN_NS get deploy barman-cloud)"; rc=1
   elif [ "$(_bsl_q '.cnpg != null' "$j")" = true ]; then
     if [ "$(_bsl_q '.cnpg.plugin and (.cnpg.plugin_ready | not)' "$j")" = true ]; then
       _st_line fail "backup destination: the Postgres Cluster archives through the barman-cloud plugin, which isn't available (kubectl -n $KUBE_BARMAN_NS get deploy barman-cloud): WAL piles up until the disk fills"; rc=1

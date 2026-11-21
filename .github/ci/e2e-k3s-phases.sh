@@ -429,18 +429,21 @@ dest)
   # provided here only on a GitHub-hosted runner (a throwaway VM, never a
   # shared host) — open-iscsi and nfs-common from apt, iscsi_tcp, and a
   # multipathd blacklist drop-in for Longhorn's devices —, then checked on
-  # this node the way the CLI's probe checks them. One missing → the
-  # Longhorn part skips loudly (a notice and the job summary); the CNPG
+  # this node the way the CLI's probe checks them. On a GitHub-hosted
+  # runner a failed install or a prerequisite still missing FAILS the step
+  # (re-review R2-N3: never an unnoticed skip); elsewhere one missing → the
+  # Longhorn part skips loudly (a notice and the job summary). The CNPG
   # archive and the core offsite above have run either way.
   lh_skip=""
   if [ "${E2E_K3S_SKIP_LONGHORN:-}" = 1 ]; then lh_skip="E2E_K3S_SKIP_LONGHORN=1"
   else
     if [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
-      sudo apt-get install -y -qq open-iscsi nfs-common >/dev/null && sudo systemctl start iscsid && sudo modprobe iscsi_tcp || true
+      sudo apt-get install -y -qq open-iscsi nfs-common >/dev/null && sudo systemctl start iscsid && sudo modprobe iscsi_tcp \
+        || fail "could not provide Longhorn's node prerequisites on this GitHub-hosted runner (open-iscsi, nfs-common, iscsi_tcp)"
       if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
         sudo mkdir -p /etc/multipath/conf.d
-        printf '%s\n' 'blacklist {' '    devnode "^sd[a-z0-9]+"' '}' | sudo tee /etc/multipath/conf.d/longhorn.conf >/dev/null
-        sudo systemctl restart multipathd || true
+        printf '%s\n' 'blacklist {' '    devnode "^sd[a-z0-9]+"' '}' | sudo tee /etc/multipath/conf.d/longhorn.conf >/dev/null \
+          && sudo systemctl restart multipathd || fail "could not set multipathd's blacklist for Longhorn on this GitHub-hosted runner"
       fi
     fi
     miss=""
@@ -451,7 +454,10 @@ dest)
       cat /etc/multipath.conf /etc/multipath/conf.d/*.conf 2>/dev/null | sed 's/#.*//' | awk '/^[[:space:]]*blacklist[[:space:]]*\{/ { b = 1; next } b && /\}/ { b = 0 }
         b { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); if ($0 == "devnode \"^sd[a-z0-9]+\"") f = 1 } END { exit !f }' || miss="$miss multipathd-blacklist"
     fi
-    [ -z "$miss" ] || lh_skip="this runner lacks Longhorn's node prerequisites:$miss"
+    if [ -n "$miss" ]; then
+      [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ] || fail "Longhorn's node prerequisites are still missing on this GitHub-hosted runner after providing them:$miss"
+      lh_skip="this runner lacks Longhorn's node prerequisites:$miss"
+    fi
   fi
   if [ -n "$lh_skip" ]; then
     echo "::notice title=Longhorn backup skipped::Longhorn's part of the backup destination step was skipped ($lh_skip); the HA VMs proved it (task 26 report). The CNPG archive and the core offsite ran."

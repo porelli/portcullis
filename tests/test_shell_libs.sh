@@ -7196,6 +7196,35 @@ OUT="$(kt "_kube_restore_volume() { :; }; _kube_volume_exists() { :; }; _kube_em
 expect_eq "instance-backup move: pod to pod (hub-state's tar → hub-backups' tar), nothing unpacked on the host, a symlink member can't reach a host path" \
   "$(printf '%s' "$OUT" | tail -n1):$(grep -c 'exec src-pod -- tar -cf - -C /vol/backups .' "$MV/calls"):$(grep -c 'exec -i dst-pod -- sh -c m="$(stat -c %a /vol)" && tar -xf - -C /vol && chmod "$m" /vol' "$MV/calls"):$(cat "$MV/streamed"):$(test -e "$MV/outside/pwn" && echo PWNED || echo clean):$(declare -f _kube_restore_volume_t26 | grep -c 'tar -x[a-z]*f "\$dir' || true)" \
   "rc=0:1:1:TARSTREAM:clean:0"
+# Re-review R2-N1: the size check before hub-backups is emptied, and its refusal.
+OUT="$(kt 'for q in 1Gi 512Mi 2048Ki 1073741824 1G 10Ti 1.5Gi 1gi ""; do printf "%s=%s " "$q" "$(_kube_quantity_kib "$q")"; done; echo')"
+expect_eq "_kube_quantity_kib: binary / decimal suffixes and bytes in KiB; anything else nothing (refused upstream)" "$(printf '%s\n' "$OUT" | head -n1)" \
+  "1Gi=1048576 512Mi=524288 2048Ki=2048 1073741824=1048576 1G=976562 10Ti=10737418240 1.5Gi= 1gi= = "
+mvsize() { rm -f "$MV/calls" "$MV/streamed"; kt "_kube_restore_volume() { :; }; _kube_volume_exists() { :; }; _kube_empty_volume() { echo EMPTIED >> '$MV/calls'; }; _kube_helper_done() { echo \"DONE \$1\" >> '$MV/calls'; }
+  _kube_helper_pod() { case \"\$1\" in hub-state*) echo src-pod ;; *) echo dst-pod ;; esac; }
+  kube_ctl() { echo \"K \$*\" >> '$MV/calls'; case \"\$*\" in *'tar -cf -'*) printf TARSTREAM ;; *'tar -xf -'*) cat > '$MV/streamed' ;;
+    *'du -sk'*) echo '$1 /vol/backups' ;; *'get pvc'*) printf '%s' '$2' ;; esac; return 0; }
+  cd '$MV' && _kube_restore_volume_t26 '$MV/b' hub_data 10001 10001"; }
+OUT="$(mvsize 1048000 1Gi)"
+case "$OUT" in *"instance backups (1048000 KiB) don't fit the hub-backups volume (1048576 KiB): they stay in hub_data"*"rc=1")
+  expect_eq "instance-backup move: too big for hub-backups → refused before it is emptied, nothing streamed, the source helper removed" \
+    "$(grep -c '^EMPTIED$' "$MV/calls" || true):$(grep -c 'tar -cf' "$MV/calls" || true):$(test -e "$MV/streamed" && echo streamed || echo none):$(grep -c '^DONE src-pod$' "$MV/calls")" "0:0:none:1" ;;
+  *) t_fail "move too big: $OUT" ;; esac
+OUT="$(mvsize 900000 1Gi)"
+expect_eq "instance-backup move: within hub-backups (with the 5 % + 1 MiB margin) → moved" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^EMPTIED$' "$MV/calls")" "rc=0:1"
+for bad in "x:1Gi" "100:" "100:1.5Gi"; do
+  OUT="$(mvsize "${bad%%:*}" "${bad#*:}")"
+  case "$OUT" in *"don't fit the hub-backups volume"*"rc=1") t_pass "instance-backup move: an unreadable size or capacity ($bad) → refused (fail closed)" ;; *) t_fail "move unreadable $bad: $OUT" ;; esac
+done
+# Re-review R2-M1: the plugin installed but down at the last up → a Postgres line, never none.
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; kube_values_file() { echo /nonexistent; }; _kube_barman_ready() { return 1; }
+  kube_ctl() { case \"\$*\" in *'get deploy barman-cloud -o name'*) echo deployment.apps/barman-cloud ;; *'get cluster.postgresql.cnpg.io'*) echo '{\"spec\":{},\"status\":{\"conditions\":[]}}' ;; *) return 1 ;; esac; }
+  j=\$(kube_backup_status_json); echo \"J \$j\"; _st_line() { echo \"\$1 \$2\"; }; kube_backup_status_lines \"\$j\"; echo \"lines=\$?\"")"
+expect_eq "status: the plugin installed but down at the last up (the Cluster without it) → archiving stopped, a problem naming why" \
+  "$(printf '%s\n' "$OUT" | sed -n 's/^J //p' | jq -c '[.cnpg.stopped, .cnpg.plugin, .cnpg.plugin_ready]'):$(printf '%s\n' "$OUT" | grep -c "^fail backup destination: Postgres archiving stopped: the Cluster doesn't name the barman-cloud plugin (it is not available; it wasn't at the last ./portcullis up)"):$(printf '%s\n' "$OUT" | grep '^lines=')" \
+  '[true,false,false]:1:lines=1'
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; kube_values_file() { echo /nonexistent; }; _kube_barman_ready() { return 1; }; kube_ctl() { return 1; }; kube_backup_status_json")"
+expect_eq "status json: no plugin installed and the release not archiving → no Postgres object (nothing to judge)" "$(printf '%s\n' "$OUT" | head -n1 | jq -c .cnpg)" null
 # The first base backup after the release (found in e2e-k3s: not immediate).
 kbar() { kt "KBAR_VF=\$(mktemp); echo '{\"backup\":{\"cnpg\":{\"enabled\":$1}}}' > \$KBAR_VF; kube_values_file() { echo \$KBAR_VF; }; KUBE_PG_ARCHIVE_WAIT=5
   kube_ctl() { echo \"K \$*\" >> '$BD/kbar'; case \"\$*\" in *'get cluster.postgresql.cnpg.io'*) echo '{\"spec\":{\"instances\":1},\"status\":{\"readyInstances\":1,\"conditions\":[{\"type\":\"ContinuousArchiving\",\"status\":\"$2\"}]}}' ;;
