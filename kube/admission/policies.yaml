@@ -1727,7 +1727,8 @@ spec:
 # with the generation. HA (plan Task 24): the fencing and Longhorn
 # ServiceAccounts (portcullis-fencing, longhorn-system: SNR patches Nodes'
 # taints on every node it runs on) are judged as node identities: their
-# own taints (medik8s.io/, node.kubernetes.io/out-of-service) pass, a
+# own taints (remediation.medik8s.io/self-node-remediation,
+# node.kubernetes.io/out-of-service) pass, a
 # placement label or a Portcullis taint never does; SNR's agent (its own
 # ServiceAccount) only annotates its own Node; SNR's manager only changes
 # taints. Round 3: none of these identities sets a remediation.medik8s.io/
@@ -1735,7 +1736,11 @@ spec:
 # annotation or spec.unschedulable — the storm guard's inputs. Round 4:
 # nor an owner reference or a finalizer (a dangling owner would have the
 # garbage collector delete the Node); SNR's manager changes nothing but
-# its own two taints (medik8s.io/remediation, node.kubernetes.io/out-of-service).
+# its own two taints, exactly as SNR v0.13.0 writes them
+# (internal/controller/selfnoderemediation_controller.go NodeNoScheduleTaint
+# remediation.medik8s.io/self-node-remediation:NoSchedule, no value;
+# OutOfServiceTaint node.kubernetes.io/out-of-service=nodeshutdown:NoExecute;
+# round 5 C1).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -1784,17 +1789,19 @@ spec:
     expression: "request.operation != 'DELETE' && has(object.metadata.finalizers) ? object.metadata.finalizers : []"
   - name: oldFinalizers
     expression: "request.operation == 'UPDATE' && has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []"
-  # SNR's manager may add / remove only these taints (review round 4 nit 4).
-  - name: managerTaints
-    expression: "['medik8s.io/remediation', 'node.kubernetes.io/out-of-service']"
+  # SNR's manager may add / remove only its own two taints, key, value and
+  # effect as SNR v0.13.0 writes them (round 4 nit 4, round 5 C1):
+  # NodeNoScheduleTaint and OutOfServiceTaint.
   - name: newOtherTaints
     expression: >-
       request.operation != 'DELETE' && has(object.spec.taints)
-      ? object.spec.taints.filter(t, !(t.key in variables.managerTaints)) : []
+      ? object.spec.taints.filter(t, !((t.key == 'remediation.medik8s.io/self-node-remediation' && t.effect == 'NoSchedule' && (!has(t.value) || t.value == ''))
+          || (t.key == 'node.kubernetes.io/out-of-service' && t.effect == 'NoExecute' && has(t.value) && t.value == 'nodeshutdown'))) : []
   - name: oldOtherTaints
     expression: >-
       request.operation == 'UPDATE' && has(oldObject.spec.taints)
-      ? oldObject.spec.taints.filter(t, !(t.key in variables.managerTaints)) : []
+      ? oldObject.spec.taints.filter(t, !((t.key == 'remediation.medik8s.io/self-node-remediation' && t.effect == 'NoSchedule' && (!has(t.value) || t.value == ''))
+          || (t.key == 'node.kubernetes.io/out-of-service' && t.effect == 'NoExecute' && has(t.value) && t.value == 'nodeshutdown'))) : []
   - name: newUnsched
     expression: "request.operation != 'DELETE' && has(object.spec.unschedulable) && object.spec.unschedulable"
   - name: oldUnsched
@@ -1854,10 +1861,16 @@ spec:
         && size(variables.newFinalizers) == size(variables.oldFinalizers)
         && variables.newFinalizers.all(f, f in variables.oldFinalizers) && variables.oldFinalizers.all(f, f in variables.newFinalizers))
     message: nodes can't set a Node's owner references or finalizers
-  # SNR's manager (round 3 I1c, round 4 M2 + nit 4): the whole Node but its
-  # taints unchanged — labels, annotations, owners, finalizers (the rule
-  # above) and every other spec field — and of the taints only its own
-  # remediation taint and node.kubernetes.io/out-of-service put or lifted.
+  # SNR's manager (round 3 I1c, round 4 M2 + nit 4, round 5): the whole Node
+  # but its taints unchanged — labels, annotations, owners, finalizers (the
+  # rule above) and every other field of v1 NodeSpec (podCIDR, podCIDRs,
+  # providerID, unschedulable, configSource, externalID; nodeadm's
+  # TestManagerRuleJudgesEveryNodeSpecField holds the list to the vendored
+  # k8s.io/api; podPreemptionPolicy, alpha and forbidden while its gate is
+  # off, isn't referenced: the 1.33 floor's schema lacks it) — and of the
+  # taints only its own
+  # remediation.medik8s.io/self-node-remediation:NoSchedule and
+  # node.kubernetes.io/out-of-service=nodeshutdown:NoExecute put or lifted.
   - expression: >-
       request.userInfo.username != 'system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager'
       || (request.operation == 'UPDATE' && (has(request.subResource) ? request.subResource : '') == ''

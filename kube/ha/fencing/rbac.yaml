@@ -9,7 +9,8 @@
 #     create / delete, no pod or VolumeAttachment deletion (the
 #     OutOfServiceTaint strategy: the taint makes Kubernetes delete them);
 #     its DaemonSet and its certificate Secret written in portcullis-fencing
-#     only, by name (create can't be named); no Secret anywhere else;
+#     only, by name (create can't be named); no Secret anywhere else; no
+#     SelfNodeRemediation create / delete (round 5 M1);
 #   - SNR's agents (the DaemonSet on every node) have their OWN
 #     ServiceAccount (agent-daemonset.yaml.tmpl): Nodes read and updated —
 #     by the admission policy portcullis-node-labels only its own Node's
@@ -41,9 +42,17 @@ rules:
   - apiGroups: [storage.k8s.io]
     resources: [volumeattachments]
     verbs: [get, list, watch]
+  # Its config and templates it creates at start (snrconfighelper,
+  # template/creator.go). The SelfNodeRemediations themselves: never created
+  # or deleted by v0.13.0 (only Update for its finalizer and the status;
+  # review round 5 M1) — nodeadm alone creates and deletes them, in
+  # portcullis-fencing only.
   - apiGroups: [self-node-remediation.medik8s.io]
-    resources: [selfnoderemediationconfigs, selfnoderemediations, selfnoderemediationtemplates]
+    resources: [selfnoderemediationconfigs, selfnoderemediationtemplates]
     verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [self-node-remediation.medik8s.io]
+    resources: [selfnoderemediations]
+    verbs: [get, list, patch, update, watch]
   - apiGroups: [self-node-remediation.medik8s.io]
     resources: [selfnoderemediationconfigs/finalizers, selfnoderemediations/finalizers, selfnoderemediationtemplates/finalizers]
     verbs: [update]

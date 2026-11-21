@@ -1448,6 +1448,18 @@ def check_ha_infra():
             if not any(set(r["apiGroups"]) <= set(u["apiGroups"]) and set(r["resources"]) <= set(u["resources"])
                        and (set(r["verbs"]) <= set(u["verbs"]) or "*" in u["verbs"]) for u in up):
                 F.add(f"fencing: {mine}'s rule {r} isn't within the CSV's {theirs}")
+    # Review round 5 M1: only nodeadm creates or deletes SelfNodeRemediations.
+    def snr_manager_cr_writes(docs):
+        return [r for _, r in rules_of(docs, "ClusterRole", {"portcullis-snr"})
+                if set(r.get("apiGroups", [])) & {"self-node-remediation.medik8s.io", "*"}
+                and set(r["resources"]) & {"selfnoderemediations", "*"} and set(r["verbs"]) & {"create", "delete", "deletecollection", "*"}]
+    for r in snr_manager_cr_writes(fe):
+        F.add(f"fencing: SNR's manager may create / delete SelfNodeRemediations: {r} (nodeadm alone does)")
+    mut_fe = copy.deepcopy(fe)
+    next(d for d in mut_fe if d.get("kind") == "ClusterRole" and d["metadata"]["name"] == "portcullis-snr")["rules"].append(
+        {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["create"]})
+    if not snr_manager_cr_writes(mut_fe):
+        F.add("snr_manager_cr_writes misses a create rule on portcullis-snr (mutation test)")
     if {d["metadata"]["name"] for d in fe if d.get("kind") == "ClusterRole"} & {"self-node-remediation-controller-manager"}:
         F.add("fencing: the CSV's wide ClusterRole is still rendered")
     # Fix round 1: no Node Healthcheck at all; no Secret in any fencing
@@ -1570,9 +1582,19 @@ def check_ha_infra():
                 or "object.metadata.ownerReferences" not in nv.get("newOwners", "") or "object.metadata.finalizers" not in nv.get("newFinalizers", "") \
                 or "variables.newOwners.all(o, o in variables.oldOwners) && variables.oldOwners.all(o, o in variables.newOwners)" not in nexpr \
                 or "variables.newFinalizers.all(f, f in variables.oldFinalizers) && variables.oldFinalizers.all(f, f in variables.newFinalizers)" not in nexpr \
-                or nv.get("managerTaints") != "['medik8s.io/remediation', 'node.kubernetes.io/out-of-service']" \
+                or "managerTaints" in nv \
+                or any(("t.key == 'remediation.medik8s.io/self-node-remediation' && t.effect == 'NoSchedule' && (!has(t.value) || t.value == '')" not in nv.get(k, "")
+                        or "t.key == 'node.kubernetes.io/out-of-service' && t.effect == 'NoExecute' && has(t.value) && t.value == 'nodeshutdown'" not in nv.get(k, ""))
+                       for k in ("newOtherTaints", "oldOtherTaints")) \
                 or "variables.newOtherTaints.all(t, t in variables.oldOtherTaints) && variables.oldOtherTaints.all(t, t in variables.newOtherTaints)" not in nexpr:
             F.add("policies.yaml portcullis-node-labels: remediation.medik8s.io/ labels, nodeadm.portcullis/ annotations, cordons, owners / finalizers and the manager's own-taints-only rule")
+    # Round 5 C1: the manager's NoSchedule taint key = the agent template's
+    # NoSchedule toleration of SNR's own key (upstream-diffed, sha-pinned).
+    tol = re.findall(r'- key: "([^"]*medik8s\.io[^"]*)"\n +operator: "Exists"\n +effect: "NoSchedule"',
+                     (K.ROOT / "kube/ha/fencing/agent-daemonset.yaml.tmpl").read_text())
+    nv_taints = {v["name"]: v["expression"] for v in nlp["spec"]["variables"]}.get("newOtherTaints", "") if nlp else ""
+    if tol != ["remediation.medik8s.io/self-node-remediation"] or f"t.key == '{tol[0] if tol else ''}' && t.effect == 'NoSchedule'" not in nv_taints:
+        F.add(f"policies.yaml: the manager's NoSchedule taint isn't SNR's own key (the agent template tolerates {tol})")
     # Round 3 M2 + nit: the manager's probes pinned exactly; each pod policy refuses its own generation first.
     fa = (K.ROOT / "kube/ha/fencing/admission.yaml").read_text()
     for probe, path in (("livenessProbe", "/healthz"), ("readinessProbe", "/readyz"), ("startupProbe", "/healthz")):

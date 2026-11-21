@@ -269,7 +269,9 @@ def vectors():
     nodeadm_ann = {"metadata": {"annotations": {"nodeadm.portcullis/remediated-at": "2999-01-01T00:00:00Z"}}}
     cordon = {"spec": {"unschedulable": True}}
     harmless = {"metadata": {"annotations": {"example.org/vector": "1"}}}
-    remediation_taint = {"key": "medik8s.io/remediation", "value": "self-node-remediation", "effect": "NoExecute"}
+    # SNR v0.13.0's own taints, as its controller writes them (round 5 C1):
+    # NodeNoScheduleTaint (no value) and OutOfServiceTaint.
+    remediation_taint = {"key": "remediation.medik8s.io/self-node-remediation", "effect": "NoSchedule"}
     for who, ident, cases in (
         ("a node", node_id, [("labels itself excluded from remediation", exclude, False),
                              ("adds a nodeadm.portcullis/ annotation", nodeadm_ann, False),
@@ -303,6 +305,11 @@ def vectors():
                 "taints_add": [remediation_taint]})
     out.append({"policy": NL, "name": "SNR's manager adds the out-of-service taint", "allowed": True, "node": True, "as": manager_id,
                 "taints_add": [{"key": "node.kubernetes.io/out-of-service", "value": "nodeshutdown", "effect": "NoExecute"}]})
+    for what, t in (("its remediation key with NoExecute", {"key": "remediation.medik8s.io/self-node-remediation", "effect": "NoExecute"}),
+                    ("its remediation key with a value", {"key": "remediation.medik8s.io/self-node-remediation", "value": "x", "effect": "NoSchedule"}),
+                    ("out-of-service with another value", {"key": "node.kubernetes.io/out-of-service", "value": "x", "effect": "NoExecute"}),
+                    ("the round-4 wrong key medik8s.io/remediation", {"key": "medik8s.io/remediation", "value": "self-node-remediation", "effect": "NoExecute"})):
+        out.append({"policy": NL, "name": f"SNR's manager adds {what}", "allowed": False, "node": True, "as": manager_id, "taints_add": [t]})
     return out
 
 

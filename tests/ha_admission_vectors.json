@@ -18020,9 +18020,8 @@
   "policy": "portcullis-node-labels",
   "taints_add": [
    {
-    "effect": "NoExecute",
-    "key": "medik8s.io/remediation",
-    "value": "self-node-remediation"
+    "effect": "NoSchedule",
+    "key": "remediation.medik8s.io/self-node-remediation"
    }
   ]
  },
@@ -18044,6 +18043,89 @@
     "effect": "NoExecute",
     "key": "node.kubernetes.io/out-of-service",
     "value": "nodeshutdown"
+   }
+  ]
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds its remediation key with NoExecute",
+  "node": true,
+  "policy": "portcullis-node-labels",
+  "taints_add": [
+   {
+    "effect": "NoExecute",
+    "key": "remediation.medik8s.io/self-node-remediation"
+   }
+  ]
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds its remediation key with a value",
+  "node": true,
+  "policy": "portcullis-node-labels",
+  "taints_add": [
+   {
+    "effect": "NoSchedule",
+    "key": "remediation.medik8s.io/self-node-remediation",
+    "value": "x"
+   }
+  ]
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds out-of-service with another value",
+  "node": true,
+  "policy": "portcullis-node-labels",
+  "taints_add": [
+   {
+    "effect": "NoExecute",
+    "key": "node.kubernetes.io/out-of-service",
+    "value": "x"
+   }
+  ]
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds the round-4 wrong key medik8s.io/remediation",
+  "node": true,
+  "policy": "portcullis-node-labels",
+  "taints_add": [
+   {
+    "effect": "NoExecute",
+    "key": "medik8s.io/remediation",
+    "value": "self-node-remediation"
    }
   ]
  }
