@@ -1829,6 +1829,8 @@ _rtk_volume_pod() {
      metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "volume-helper", "portcullis.io/helper": "volume"}},
      spec: {restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false,
        securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.G | tonumber), seccompProfile: {type: "RuntimeDefault"}},
+       # Wherever its node-local PVC is, the small node too (a Vault voter: Task 25).
+       tolerations: [{key: "portcullis.io/small", operator: "Exists", effect: "NoSchedule"}],
        containers: [{name: "helper", image: env.IMG, command: ["sleep", "3600"],
          resources: {limits: {memory: "64Mi"}, requests: {memory: "64Mi"}},
          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},
@@ -1940,6 +1942,8 @@ _kube_helper_pod() {
      metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": env.C}},
      spec: {restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false,
        securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.G | tonumber), seccompProfile: {type: "RuntimeDefault"}},
+       # Wherever its node-local PVC is, the small node too (a Vault voter: Task 25).
+       tolerations: [{key: "portcullis.io/small", operator: "Exists", effect: "NoSchedule"}],
        containers: [{name: "helper", image: env.IMG, command: ["sleep", "3600"],
          resources: {limits: {memory: "256Mi"}, requests: {memory: "256Mi"}},
          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},

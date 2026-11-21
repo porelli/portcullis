@@ -1423,12 +1423,21 @@ kube_vault_shrink_prepare() {
     [[ "$id" =~ ^vault-[0-9]+$ ]] || fail "Vault's raft has a peer $id that isn't a voter of this chart: refusing to lower its voters (nothing deployed)"
     info "Vault: removing raft peer $id (voters $cur → $want)..."
     vexec operator raft remove-peer "$id" >/dev/null 2>&1 || fail "could not remove Vault's raft peer $id: refusing to lower its voters (nothing deployed)"
-    _KUBE_VAULT_SHRINK="$_KUBE_VAULT_SHRINK $id"
-    sleep "${KUBE_VAULT_REMOVE_WAIT:-5}"
   done
-  peers="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '[.data.config.servers[].node_id] | sort | join(" ")' 2>/dev/null)"
-  [ "$peers" = "$(printf '%s\n' $keep | sort | paste -sd' ' -)" ] \
-    || fail "Vault's raft peers are '$peers' after the removals, not '${keep# }': refusing to lower its voters (nothing deployed)"
+  # A removed leader steps down: the kept voters elect again before the
+  # configuration reads back (found live: ~10 s). ≤ KUBE_VAULT_REMOVE_WAIT.
+  local want_set waited=0
+  want_set="$(printf '%s\n' $keep | sort | paste -sd' ' -)"
+  while :; do
+    peers="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '[.data.config.servers[].node_id] | sort | join(" ")' 2>/dev/null)" || peers=""
+    [ "$peers" != "$want_set" ] || break
+    [ "$waited" -lt "${KUBE_VAULT_REMOVE_WAIT:-60}" ] \
+      || fail "Vault's raft peers are '$peers' after the removals, not '$want_set': refusing to lower its voters (nothing deployed)"
+    sleep 2; waited=$((waited + 2))
+  done
+  # Every dropped voter's PVC is emptied after (also when an earlier,
+  # interrupted run already removed its peer).
+  for ((i = cur - 1; i >= want; i--)); do _KUBE_VAULT_SHRINK="$_KUBE_VAULT_SHRINK vault-$i"; done
 }
 
 # kube_vault_shrink_finish — after the chart dropped them: each removed
@@ -1447,39 +1456,65 @@ kube_vault_shrink_finish() {
 
 # ── cluster DNS in HA (plan Task 25, controller ruling 3) ──
 
-# ha_coredns — k3s's packaged CoreDNS (one replica: losing its node stops
-# all cluster DNS, ~6 min measured; with a replica on a lost node half the
-# lookups still go there until its endpoint leaves, and Valkey's Sentinels
-# sit in TILT on the failed lookups: ~100 s instead of ~9 s). In HA:
-#   - Deployment coredns (kube-system): one replica per node at the primary
-#     site (at least 2), required there (portcullis.io/site), the small
-#     taint tolerated (the small node runs a Sentinel and a Vault voter),
-#     k3s's own hostname spread (DoNotSchedule) keeps them one per node;
-#   - Service kube-dns: trafficDistribution PreferSameNode — a pod's
-#     lookups go to its own node's CoreDNS, so a lost node never answers
-#     another node's pods (falling back cluster-wide only when its own is
-#     down);
+# ha_coredns — k3s's packaged CoreDNS is one replica: losing its node
+# stopped all cluster DNS (~6 min measured), and with a replica on a lost
+# node half the lookups still went there until its endpoint left, holding
+# Valkey's Sentinels in TILT (~100 s instead of ~9 s). In HA, one CoreDNS
+# on every node at the primary site, and each pod asks its own node's:
+#   - k3s's Deployment coredns: one replica per non-small node at main (at
+#     least 2), required at main, one per node (required hostname
+#     anti-affinity: k3s's own spread is judged only at scheduling, a
+#     rollout left two on one node);
+#   - our DaemonSet portcullis-dns-small (kube-system): the same CoreDNS
+#     (k3s v1.37.2+k3s1's image, pinned by digest; its ConfigMap coredns,
+#     read-only) on each small node at main, tolerating the small taint —
+#     the small node runs a Sentinel and a Vault voter;
+#   - Service kube-dns: trafficDistribution PreferSameNode (a lost node
+#     answers no other node's pods; cluster-wide only when a node's own is
+#     down); both sets carry k8s-app=kube-dns, so it selects them all;
 #   - PodDisruptionBudget coredns (ours): minAvailable 1.
-# What k3s keeps of it (v1.37.2+k3s1, pinned source): pkg/deploy
-# controller.go re-applies manifests/coredns.yaml only when its checksum
-# changes (:244-246), through wrangler's three-way apply, which leaves the
+# What survives k3s (its pinned source): pkg/deploy/controller.go forces a
+# re-apply of manifests/coredns.yaml at every k3s start (listFiles(force),
+# :98-101, :164-167) through wrangler's three-way apply, which keeps the
 # fields its manifest doesn't set (replicas, affinity, the Service's
-# trafficDistribution). Its tolerations list is in the manifest, so a k3s
-# upgrade resets ours until the next `up` / `kube check` re-applies this.
-KUBE_COREDNS_SMALL_TOL='{"key": "portcullis.io/small", "operator": "Exists", "effect": "NoSchedule"}'
+# trafficDistribution) but replaces those it does (the tolerations list:
+# found live, a small toleration on k3s's Deployment was gone after a
+# k3s restart) — hence our own DaemonSet for the small nodes, which k3s
+# never touches. Re-applied by every `up`.
+HA_COREDNS_IMAGE="docker.io/rancher/mirrored-coredns-coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286"
 ha_coredns() {
-  local n dep tols patch
-  n="$(kube_ctl get nodes -l "portcullis.io/site=$KUBE_PRIMARY_SITE" -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null)" || n=""
+  local n patch
+  n="$(kube_ctl get nodes -l "portcullis.io/site=$KUBE_PRIMARY_SITE,portcullis.io/class!=small" -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null)" || n=""
   [[ "$n" =~ ^[0-9]+$ ]] || fail "can't count the nodes at $KUBE_PRIMARY_SITE for CoreDNS (nothing deployed)"
   [ "$n" -ge 2 ] || n=2
-  dep="$(kube_ctl -n kube-system get deployment coredns -o json 2>/dev/null)" || fail "no Deployment kube-system/coredns (k3s's packaged CoreDNS): HA needs it (nothing deployed)"
-  tols="$(printf '%s' "$dep" | T="$KUBE_COREDNS_SMALL_TOL" jq -c '(.spec.template.spec.tolerations // []) as $t | (env.T | fromjson) as $s | if any($t[]; . == $s) then $t else $t + [$s] end')"
-  patch="$(N="$n" T="$tols" SITE="$KUBE_PRIMARY_SITE" jq -cn '{spec: {replicas: (env.N | tonumber), template: {spec: {tolerations: (env.T | fromjson),
-      affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions: [{key: "portcullis.io/site", operator: "In", values: [env.SITE]}]}]}}}}}}}')"
+  kube_ctl -n kube-system get deployment coredns -o name >/dev/null 2>&1 || fail "no Deployment kube-system/coredns (k3s's packaged CoreDNS): HA needs it (nothing deployed)"
+  patch="$(N="$n" SITE="$KUBE_PRIMARY_SITE" jq -cn '{spec: {replicas: (env.N | tonumber), template: {spec: {
+      affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions: [{key: "portcullis.io/site", operator: "In", values: [env.SITE]}]}]}},
+        podAntiAffinity: {requiredDuringSchedulingIgnoredDuringExecution: [{topologyKey: "kubernetes.io/hostname", labelSelector: {matchLabels: {"k8s-app": "kube-dns"}}}]}}}}}}')"
   kube_ctl -n kube-system patch deployment coredns --type=merge -p "$patch" >/dev/null || fail "could not spread CoreDNS over $KUBE_PRIMARY_SITE (nothing deployed)"
+  IMG="$HA_COREDNS_IMAGE" SITE="$KUBE_PRIMARY_SITE" jq -n '
+    def meta($n): {name: $n, namespace: "kube-system", labels: {"app.kubernetes.io/managed-by": "portcullis"}};
+    {apiVersion: "v1", kind: "List", items: [
+      {apiVersion: "apps/v1", kind: "DaemonSet", metadata: meta("portcullis-dns-small"),
+       spec: {selector: {matchLabels: {"portcullis.io/component": "dns-small"}},
+         updateStrategy: {type: "RollingUpdate", rollingUpdate: {maxUnavailable: 1}},
+         template: {metadata: {labels: {"portcullis.io/component": "dns-small", "k8s-app": "kube-dns"}},
+           spec: {priorityClassName: "system-cluster-critical", serviceAccountName: "coredns", dnsPolicy: "Default",
+             nodeSelector: {"kubernetes.io/os": "linux", "portcullis.io/site": env.SITE, "portcullis.io/class": "small"},
+             tolerations: [{key: "portcullis.io/small", operator: "Exists", effect: "NoSchedule"}, {key: "CriticalAddonsOnly", operator: "Exists"}],
+             containers: [{name: "coredns", image: env.IMG, imagePullPolicy: "IfNotPresent", args: ["-conf", "/etc/coredns/Corefile"],
+               ports: [{containerPort: 53, name: "dns", protocol: "UDP"}, {containerPort: 53, name: "dns-tcp", protocol: "TCP"}, {containerPort: 9153, name: "metrics", protocol: "TCP"}],
+               resources: {limits: {memory: "170Mi"}, requests: {cpu: "100m", memory: "70Mi"}},
+               securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {add: ["NET_BIND_SERVICE"], drop: ["ALL"]}},
+               livenessProbe: {httpGet: {path: "/health", port: 8080}, initialDelaySeconds: 60, periodSeconds: 10, timeoutSeconds: 1, failureThreshold: 3},
+               readinessProbe: {httpGet: {path: "/ready", port: 8181}, periodSeconds: 2, timeoutSeconds: 1, failureThreshold: 3},
+               volumeMounts: [{name: "config-volume", mountPath: "/etc/coredns", readOnly: true}, {name: "custom-config-volume", mountPath: "/etc/coredns/custom", readOnly: true}]}],
+             volumes: [{name: "config-volume", configMap: {name: "coredns", items: [{key: "Corefile", path: "Corefile"}, {key: "NodeHosts", path: "NodeHosts"}]}},
+                       {name: "custom-config-volume", configMap: {name: "coredns-custom", optional: true}}]}}}},
+      {apiVersion: "policy/v1", kind: "PodDisruptionBudget", metadata: meta("coredns"),
+       spec: {minAvailable: 1, selector: {matchLabels: {"k8s-app": "kube-dns"}}}}]}' | _ha_apply \
+    || fail "could not apply CoreDNS on the small nodes / its PodDisruptionBudget (nothing deployed)"
   kube_ctl -n kube-system patch service kube-dns --type=merge -p '{"spec": {"trafficDistribution": "PreferSameNode"}}' >/dev/null \
     || fail "could not set kube-dns's trafficDistribution PreferSameNode (nothing deployed)"
-  jq -n '{apiVersion: "policy/v1", kind: "PodDisruptionBudget", metadata: {name: "coredns", namespace: "kube-system", labels: {"app.kubernetes.io/managed-by": "portcullis"}},
-      spec: {minAvailable: 1, selector: {matchLabels: {"k8s-app": "kube-dns"}}}}' | _ha_apply || fail "could not apply CoreDNS's PodDisruptionBudget (nothing deployed)"
   _kube_applied_set ha.coredns "$n"
 }

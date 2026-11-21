@@ -4571,22 +4571,21 @@ kt "PORTCULLIS_ROOT='$JT'; kube_vault_join_tls_prepare" >/dev/null
 expect_eq "vault join TLS: kept on the next run (not reissued)" "$(cat "$JD"/*.crt | openssl dgst -sha256 -r)" "$SUM"
 expect_eq "vault join TLS: the CA key and the names file are never synced; the certificate and its key are" \
   "$(kt "_kube_sync_skip vault-join-tls/ca.key && echo skip; _kube_sync_skip vault-join-tls/sans && echo skip; _kube_sync_skip vault-join-tls/tls.key || echo sync" | grep -c -E '^(skip|sync)$')" 3
-# Cluster DNS in HA (controller ruling 3): one CoreDNS per node at main
-# (at least 2), required there, the small taint tolerated once (k3s's own
-# tolerations kept), PreferSameNode on kube-dns, a PDB.
+# Cluster DNS in HA (controller ruling 3): k3s's CoreDNS one per non-small
+# node at main (at least 2, required there, one per node), ours on the small
+# nodes (a DaemonSet k3s never re-applies), PreferSameNode, a PDB.
 CD="$WORK/coredns"; rm -rf "$CD"; mkdir -p "$CD"
-printf '%s' '{"spec":{"template":{"spec":{"tolerations":[{"key":"CriticalAddonsOnly","operator":"Exists"},{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}}}' > "$CD/dep.json"
-cdns() { rm -f "$CD/k" "$CD/apply"; kt "kube_ctl() { echo \"\$*\" >> '$CD/k'; case \"\$*\" in *'get nodes -l portcullis.io/site=main -o json') printf '{\"items\":[%s]}' '$1' ;; *'get deployment coredns -o json') cat '$CD/dep.json' ;; *' patch '*) [ -z '${2:-}' ] || return 1 ;; esac; }; _ha_apply() { cat > '$CD/apply'; }; ha_coredns"; }
+cdns() { rm -f "$CD/k" "$CD/apply"; kt "kube_ctl() { echo \"\$*\" >> '$CD/k'; case \"\$*\" in *'get nodes -l portcullis.io/site=main,portcullis.io/class!=small -o json') printf '{\"items\":[%s]}' '$1' ;; *'get deployment coredns -o name') echo deployment.apps/coredns ;; *' patch '*) [ -z '${2:-}' ] || return 1 ;; esac; }; _ha_apply() { cat > '$CD/apply'; }; ha_coredns"; }
 OUT="$(cdns '{},{},{}')"
 P="$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //')"
-expect_eq "HA CoreDNS: 3 nodes at main → 3 replicas, required at main, k3s's tolerations kept + the small one, PreferSameNode, a PDB minAvailable 1" \
-  "$(printf '%s\n' "$OUT" | tail -n1):$(printf '%s' "$P" | jq -c '[.spec.replicas, (.spec.template.spec.tolerations | length), (.spec.template.spec.tolerations | map(.key) | index("portcullis.io/small") != null), .spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values]'):$(grep -c 'patch service kube-dns --type=merge -p {"spec": {"trafficDistribution": "PreferSameNode"}}' "$CD/k"):$(jq -c '[.kind, .metadata.namespace, .spec.minAvailable]' "$CD/apply")" \
-  'rc=0:[3,3,true,["main"]]:1:["PodDisruptionBudget","kube-system",1]'
+expect_eq "HA CoreDNS: 3 non-small nodes at main → k3s's 3 replicas, required at main, one per node; PreferSameNode" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(printf '%s' "$P" | jq -c '[.spec.replicas, .spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values, .spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey, (.spec.template.spec | has("tolerations"))]'):$(grep -c 'patch service kube-dns --type=merge -p {"spec": {"trafficDistribution": "PreferSameNode"}}' "$CD/k")" \
+  'rc=0:[3,["main"],"kubernetes.io/hostname",false]:1'
+expect_eq "HA CoreDNS: our DaemonSet on the small nodes at main (the small taint tolerated, the pinned image, k3s's ConfigMap read-only, k8s-app=kube-dns) and a PDB minAvailable 1" \
+  "$(jq -c '[.items[0].kind, .items[0].spec.template.spec.nodeSelector["portcullis.io/class"], (.items[0].spec.template.spec.tolerations | map(.key) | index("portcullis.io/small") != null), (.items[0].spec.template.spec.containers[0].image | test("@sha256:[0-9a-f]{64}$")), .items[0].spec.template.metadata.labels["k8s-app"], .items[0].spec.template.spec.volumes[0].configMap.name, .items[1].kind, .items[1].spec.minAvailable]' "$CD/apply")" \
+  '["DaemonSet","small",true,true,"kube-dns","coredns","PodDisruptionBudget",1]'
 OUT="$(cdns '{}')"
-expect_eq "HA CoreDNS: one node at main → still 2 replicas" "$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //' | jq -c .spec.replicas)" 2
-printf '%s' '{"spec":{"template":{"spec":{"tolerations":[{"key":"portcullis.io/small","operator":"Exists","effect":"NoSchedule"}]}}}}' > "$CD/dep.json"
-OUT="$(cdns '{},{}')"
-expect_eq "HA CoreDNS: the small toleration added once (idempotent)" "$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //' | jq -c '.spec.template.spec.tolerations | length')" 1
+expect_eq "HA CoreDNS: one non-small node at main → still 2 replicas" "$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //' | jq -c .spec.replicas)" 2
 OUT="$(cdns '{},{}' fail)"
 case "$OUT" in *"could not spread CoreDNS"*"rc=1") t_pass "HA CoreDNS: a refused patch → refused (nothing deployed)" ;; *) t_fail "coredns patch fail: $OUT" ;; esac
 OUT="$(kt "kube_ctl() { return 1; }; kube_vault_pod")"
