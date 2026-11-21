@@ -5,11 +5,11 @@ go 1.27
 require (
 	filippo.io/age v1.3.2
 	github.com/aws/aws-sdk-go-v2 v1.48.0
-	github.com/aws/aws-sdk-go-v2/config v1.33.18
-	github.com/aws/aws-sdk-go-v2/credentials v1.21.0
+	github.com/aws/aws-sdk-go-v2/config v1.33.19
+	github.com/aws/aws-sdk-go-v2/credentials v1.21.1
 	github.com/aws/aws-sdk-go-v2/service/route53 v1.71.0
 	github.com/aws/smithy-go v1.28.9
-	github.com/digitalocean/godo v1.240.0
+	github.com/digitalocean/godo v1.243.0
 	github.com/go-acme/lego/v4 v4.35.2
 	github.com/letsencrypt/pebble/v2 v2.10.3
 	github.com/libdns/cloudflare v0.2.2
