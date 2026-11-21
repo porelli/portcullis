@@ -1036,17 +1036,26 @@ backup_dest_port() {
 # cluster to itself. Re-resolved at every up (an endpoint's addresses can
 # change: until then its new ones are refused, fail closed).
 backup_dest_cidrs() {
-  local h ips a n bad=""
+  local h ips a n nodes nets bad=""
   backup_dest_parts
   h="${_BD_HOST%:*}"
+  # Fail closed (security review): the cluster's ranges and nodes must be
+  # known, every range and address valid, before an address is judged.
+  [ -n "${PORTCULLIS_POD_CIDR:-}" ] && [ -n "${PORTCULLIS_SERVICE_CIDR:-}" ] \
+    || { echo "PORTCULLIS_POD_CIDR / PORTCULLIS_SERVICE_CIDR unknown: the backup destination can't be checked against the cluster (refused)" >&2; return 1; }
+  nodes="${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}"
+  [ -n "$nodes" ] || { echo "the nodes' addresses are unknown: the backup destination can't be checked against them (refused)" >&2; return 1; }
+  nets="$PORTCULLIS_POD_CIDR $PORTCULLIS_SERVICE_CIDR $KUBE_MESH_CIDR 169.254.0.0/16 127.0.0.0/8"
+  for n in $nets; do cidr_bounds "$n" >/dev/null 2>&1 || { echo "$n isn't an IPv4 CIDR: the backup destination can't be checked (refused)" >&2; return 1; }; done
   if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ips="$h"
   else ips="$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | LC_ALL=C sort -u)"; fi
   [ -n "$ips" ] || { echo "the backup destination's host $h doesn't resolve to an IPv4 address: no egress policy for it" >&2; return 1; }
   for a in $ips; do
-    for n in ${PORTCULLIS_POD_CIDR:-} ${PORTCULLIS_SERVICE_CIDR:-} "$KUBE_MESH_CIDR" 169.254.0.0/16 127.0.0.0/8; do
-      ! cidr_contains "$n" "$a" 2>/dev/null || bad="$bad $a"
+    ip_to_int "$a" >/dev/null 2>&1 || { echo "the backup destination's address $a isn't an IPv4 address (refused)" >&2; return 1; }
+    for n in $nets; do
+      ! cidr_contains "$n" "$a" || bad="$bad $a"
     done
-    case " ${PORTCULLIS_KUBE_NODE_ADDRESSES:-} $(printf '%s\n' ${PORTCULLIS_KUBE_API_ENDPOINTS:-} | sed 's/:[0-9]*$//' | tr '\n' ' ') " in *" $a "*) bad="$bad $a" ;; esac
+    case " $nodes $(printf '%s\n' ${PORTCULLIS_KUBE_API_ENDPOINTS:-} | sed 's/:[0-9]*$//' | tr '\n' ' ') " in *" $a "*) bad="$bad $a" ;; esac
   done
   [ -z "$bad" ] || { echo "the backup destination resolves inside the cluster ($(printf '%s\n' $bad | sort -u | tr '\n' ' ' | sed 's/ $//')): refused" >&2; return 1; }
   printf '%s/32\n' $ips
@@ -1076,6 +1085,9 @@ _ha_backup_egress() {
 # their replicas upload and fetch the blocks). Backing images aren't used.
 HA_LONGHORN_BACKUP_PODS='backup-destination-manager {"matchLabels":{"app":"longhorn-manager"}}
 backup-destination-instance-manager {"matchLabels":{"longhorn.io/component":"instance-manager"}}'
+# The names earlier versions used (always deleted): backup-destination
+# selected every pod of longhorn-system.
+HA_LONGHORN_BACKUP_OLD="backup-destination"
 
 # _ha_pins barmancloud: the plugin's release asset (Amendment 1).
 _ha_barman_pins() { echo "barman-cloud/upstream/plugin-barman-cloud-v0.16.0.yaml aee614683892dd4b44ff9f7afaca55254f1c28de17abbaa0552bf2e1228f7155"; }
@@ -1142,12 +1154,16 @@ ha_longhorn_backup_target() {
   if [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
     backup_dest_read; backup_dest_parts
     kube_backup_destination_sync || fail "could not sync the destination's Secret into $KUBE_LONGHORN_NS"
+    # The first version's namespace-wide policy (security review): gone first.
+    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy $HA_LONGHORN_BACKUP_OLD --ignore-not-found >/dev/null \
+      || fail "could not delete the old backup egress policy ($HA_LONGHORN_BACKUP_OLD) in $KUBE_LONGHORN_NS"
     while read -r n sel; do
       _ha_backup_egress "$KUBE_LONGHORN_NS" "$n" "$sel" || fail "could not apply Longhorn's egress to the backup destination ($n)"
     done <<< "$HA_LONGHORN_BACKUP_PODS"
     url="s3://$_BD_BUCKET@$_BD_AWS_DEFAULT_REGION/${_BD_PREFIX:+$_BD_PREFIX/}longhorn"
   else
-    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy backup-destination-manager backup-destination-instance-manager --ignore-not-found >/dev/null 2>&1 || true
+    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy $HA_LONGHORN_BACKUP_OLD backup-destination-manager backup-destination-instance-manager --ignore-not-found >/dev/null \
+      || fail "could not delete Longhorn's backup egress policies"
   fi
   f="$(mktemp)"
   NS="$KUBE_LONGHORN_NS" U="$url" jq -n '{apiVersion: "longhorn.io/v1beta2", kind: "BackupTarget", metadata: {name: "default", namespace: env.NS},

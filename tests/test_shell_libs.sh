@@ -6778,7 +6778,7 @@ case "$OUT" in *"node m1: /var/lib/longhorn is on a ZFS dataset"*"rc=1") t_pass 
 OUT="$(h24 ha_install_longhorn)"
 expect_eq "ha_install_longhorn: namespace (PSA longhorn) → deny policies → node checks → render (API + initiator sources) → apply → waits → StorageClass" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;K get namespace longhorn-system -o name;K -n longhorn-system delete networkpolicy backup-destination-manager backup-destination-instance-manager --ignore-not-found;K apply;"
+  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;K get namespace longhorn-system -o name;K -n longhorn-system delete networkpolicy backup-destination backup-destination-manager backup-destination-instance-manager --ignore-not-found;K apply;"
 expect_eq "ha_install_longhorn: then its backup target (Task 26; no destination here → an empty target, no egress policy)" \
   "$(grep -v '^---$' "$WORK/h24-applied" 2>/dev/null | jq -c 'select(.kind? == "BackupTarget") | .spec' 2>/dev/null | tail -n1)" '{"backupTargetURL":"","credentialSecret":"","pollInterval":"5m0s"}'
 expect_eq "ha_install_longhorn: the namespace is longhorn-system with namespaces.json's longhorn levels; applied.json records ha.longhorn" \
@@ -7014,7 +7014,7 @@ CSTUB
 chmod +x "$BD/bin/curl"
 BD_KEY="AKIATESTKEY0000SECRET1" BD_SEC="wJalrXUtnFEMI/K7MDENG/bPxRfiCYsecretKEY99"
 bdk() { rm -f "$BD/curl-argv" "$BD/curl-stdin"; k_fixtures; : > "$KS/kube/ns-cnpg-system.json"
-  kt "export PORTCULLIS_ROOT='$BD/root' BD_DIR='$BD' PATH='$BD/bin':\$PATH; env_load 2>/dev/null || true; $1"; }
+  kt "export PORTCULLIS_ROOT='$BD/root' BD_DIR='$BD' PATH='$BD/bin':\$PATH PORTCULLIS_KUBE_NODE_ADDRESSES=\${BD_NODES-198.51.100.1}; env_load 2>/dev/null || true; $1"; }
 OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_DEFAULT_REGION=eu-west-1\n' "$BD_KEY" "$BD_SEC" \
   | bdk "backup_dest_set https://s3.example.org/pc-bucket/site-a")"
 case "$OUT" in *"Backup destination set: https://s3.example.org/pc-bucket/site-a"*"wrote and deleted a test object"*"rc=0") t_pass "backup destination set: stored, tested, synced" ;; *) t_fail "backup destination set: $OUT" ;; esac
@@ -7062,6 +7062,28 @@ case "$OUT" in *"doesn't resolve to an IPv4 address"*"rc=1") t_pass "backup_dest
 for ip in 10.42.0.7 10.43.0.1 10.215.0.2 198.51.100.1 10.1.0.4; do
   OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://$ip/pc-bucket PORTCULLIS_KUBE_NODE_ADDRESSES=198.51.100.1; backup_dest_cidrs")"
   case "$OUT" in *"resolves inside the cluster ($ip)"*"rc=1") t_pass "backup_dest_cidrs: an endpoint inside the cluster ($ip) is refused" ;; *) t_fail "backup_dest_cidrs in-cluster $ip: $OUT" ;; esac
+done
+# Security review (fail closed): unknown ranges / nodes, a bad range or a bad
+# resolved address refuse instead of passing.
+for c in "PORTCULLIS_POD_CIDR=|POD_CIDR / PORTCULLIS_SERVICE_CIDR unknown" "PORTCULLIS_SERVICE_CIDR=|POD_CIDR / PORTCULLIS_SERVICE_CIDR unknown" \
+         "PORTCULLIS_POD_CIDR=10.42.0.0/99|isn't an IPv4 CIDR" "PORTCULLIS_SERVICE_CIDR=bogus|isn't an IPv4 CIDR"; do
+  OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket ${c%%|*}; backup_dest_cidrs")"
+  case "$OUT" in *"${c#*|}"*"rc=1") t_pass "backup_dest_cidrs: ${c%%|*} → refused" ;; *) t_fail "backup_dest_cidrs ${c%%|*}: $OUT" ;; esac
+done
+OUT="$(BD_NODES='' bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; kube_node_addresses() { :; }; backup_dest_cidrs")"
+case "$OUT" in *"the nodes' addresses are unknown"*"rc=1") t_pass "backup_dest_cidrs: no node addresses (none in .env, none from the cluster) → refused" ;; *) t_fail "backup_dest_cidrs no nodes: $OUT" ;; esac
+OUT="$(BD_NODES='' bdk "export PORTCULLIS_BACKUP_S3_URL=https://198.51.100.77/pc-bucket; kube_node_addresses() { echo '198.51.100.77 198.51.100.78'; }; backup_dest_cidrs")"
+case "$OUT" in *"resolves inside the cluster (198.51.100.77)"*"rc=1") t_pass "backup_dest_cidrs: the nodes from the cluster when .env has none (a node's address refused)" ;; *) t_fail "backup_dest_cidrs node fallback: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.ci.invalid/pc-bucket; getent() { echo '999.1.1.1 STREAM s3.ci.invalid'; }; backup_dest_cidrs")"
+case "$OUT" in *"isn't an IPv4 address (refused)"*"rc=1") t_pass "backup_dest_cidrs: a resolved address cidr_contains can't judge → refused" ;; *) t_fail "backup_dest_cidrs bad address: $OUT" ;; esac
+# Security review: the first version's namespace-wide backup-destination
+# policy is deleted by up (kube_sync_prepare_t26 → ha_longhorn_backup_target),
+# with a destination before the new ones, and without one.
+printf 'LLDAPSEEDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' > "$BD/root/secrets/lldap/key-seed" 2>/dev/null || { mkdir -p "$BD/root/secrets/lldap"; printf 'LLDAPSEEDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' > "$BD/root/secrets/lldap/key-seed"; }
+for d in "https://203.0.113.9/pc-bucket" ""; do
+  OUT="$(bdk ": > '$KS/kube/ns-longhorn-system.json'; export PORTCULLIS_BACKUP_S3_URL=$d; kube_sync_prepare_t26")"
+  expect_eq "up (${d:-no destination}): the old namespace-wide backup-destination policy in longhorn-system is deleted$( [ -n "$d" ] && echo ', before the new ones are applied')" \
+    "$(printf '%s\n' "$OUT" | tail -n1):$(awk '/-n longhorn-system delete networkpolicy backup-destination( |$)/ {del=NR} /apply --server-side/ && !a {a=NR} END {print (del && (!a || del < a)) ? "deleted-first" : "no"}' "$KS/kubectl-calls")" "rc=0:deleted-first"
 done
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; _ha_backup_egress longhorn-system x '{}'")"
 case "$OUT" in *"a pod selector naming the component is required"*"rc=1") t_pass "_ha_backup_egress: a namespace-wide selector is refused" ;; *) t_fail "_ha_backup_egress {}: $OUT" ;; esac
