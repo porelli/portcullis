@@ -481,17 +481,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // CSP runs no inline script).
 const startScriptPath = "/portcullis/open.js"
 
+// startPageCSP is the start page's whole Content-Security-Policy
+// (contract §19.13): nothing but its own same-origin script, its form
+// posting to this origin, never framed.
+const startPageCSP = "default-src 'none'; script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+
 // startPage is GET /portcullis/open, where the Hub's page navigates its
-// new tab (a GET: a browser retries a GET that a coalesced HTTP/2
-// connection answered 421, on a connection of this host's own). Its script
-// waits for the Hub's page (only https://hub.<parent>) to offer a
-// MessageChannel, answers "ready" on it, takes the ticket over it and
-// posts it here, same-origin. Without a ticket within 15 s it says to
-// open the view from Portcullis.
+// new tab. A GET, so a request that an HTTP/2 connection coalesced from
+// another TLS tier got 421 for is one browsers do retry in practice on a
+// connection of this host's own (RFC 9110 allows a retry whatever the
+// method; browsers don't reliably retry a cross-host POST), and the ticket
+// POST then goes on that connection. Its script waits for the Hub's page
+// (only https://hub.<parent>) to offer a MessageChannel, answers "ready"
+// on it, takes the ticket over it and posts it here, same-origin. If no
+// ticket has been posted 15 s after the page loaded, it stops listening
+// and says to open the view from Portcullis.
 func (p *Proxy) startPage(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", startPageCSP)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	// same-origin, never no-referrer: a no-referrer page's POST carries
 	// Origin: null, which the cross-origin check refuses.
@@ -505,26 +513,40 @@ func (p *Proxy) startPage(w http.ResponseWriter) {
 		html.EscapeString(p.hubOrigin()), startScriptPath)
 }
 
-// startJS is the start page's script (see startPage).
+// startJS is the start page's script (see startPage). It acts on the
+// first hello only, from the Hub's origin with exactly one port; the
+// ticket must come on that port, typed and well-formed; 15 s after the
+// page loaded without a posted ticket (no hello, a hello without a
+// ticket, a port that died) it gives up for good: the message shows and
+// later offers are ignored.
 const startJS = `(function () {
   'use strict';
   var hub = document.documentElement.getAttribute('data-hub-origin');
-  var taken = false;
   var ticketRe = /^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+  var taken = false;
+  var over = false;
+  function giveUp() {
+    over = true;
+    document.getElementById('portcullis-wait').hidden = false;
+  }
   window.addEventListener('message', function (e) {
-    if (taken || e.origin !== hub || !e.data || e.data.type !== 'portcullis-mail-admin-hello' || !e.ports || e.ports.length !== 1) {
+    if (over || taken || !hub || e.origin !== hub || !e.data || e.data.type !== 'portcullis-mail-admin-hello' || !e.ports || e.ports.length !== 1) {
       return;
     }
     taken = true;
     var port = e.ports[0];
     port.onmessage = function (m) {
-      var t = m.data && m.data.ticket;
       port.onmessage = null;
       port.close();
-      if (typeof t !== 'string' || !ticketRe.test(t)) {
-        document.getElementById('portcullis-wait').hidden = false;
+      if (over) {
         return;
       }
+      var t = m.data && m.data.type === 'portcullis-mail-admin-ticket' ? m.data.ticket : null;
+      if (typeof t !== 'string' || !ticketRe.test(t)) {
+        giveUp();
+        return;
+      }
+      over = true;
       var f = document.getElementById('portcullis-open');
       f.elements.t.value = t;
       f.submit();
@@ -532,8 +554,8 @@ const startJS = `(function () {
     port.postMessage({ type: 'portcullis-mail-admin-ready' });
   });
   setTimeout(function () {
-    if (!taken) {
-      document.getElementById('portcullis-wait').hidden = false;
+    if (!over) {
+      giveUp();
     }
   }, 15000);
 })();
