@@ -251,6 +251,9 @@ init_run() {
     kube_init_cluster
   else
     network_check
+    # A seed made just now next to an lldap_data that has a users.db: refuse
+    # before anything starts (users.sh).
+    lldap_key_seed_new_on_old_data
   fi
 
   if [ "$skip_dns" = true ] || [ "${DNS_PROVIDER:-none}" = none ]; then

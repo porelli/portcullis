@@ -1289,7 +1289,7 @@ mkdir -p "$B/secrets/vault-unseal" "$B/certs"
 echo 'PORTCULLIS_DOMAIN=x' > "$B/.env"
 echo '{"root_token":"r","unseal_keys_b64":["k"]}' > "$B/secrets/vault-init.json"
 printf k > "$B/secrets/vault-unseal/unseal-key"
-mkdir -p "$B/secrets/lldap"; printf 'SEED' > "$B/secrets/lldap/key-seed"
+mkdir -p "$B/secrets/lldap"; printf 'U0VFRC1TRUVELVNFRUQtU0VFRC1TRUVELVNFRUQtU0VFRC1TRUVELVNFRUQtU0VF' > "$B/secrets/lldap/key-seed"
 echo snap > "$B/vault.snap"; echo PGDMP > "$B/postgres.dump"; echo 'with space' > "$B/certs/a b.crt"
 _BACKUP_CFG='{"services":{"hub":{"image":"hub:1"},"keycloak":{"image":"kc:2"}}}'
 _backup_manifest "$B"
@@ -1301,9 +1301,10 @@ expect_eq "MANIFEST.json records runtime {name, version}" "$(jq -c .runtime "$B/
 expect_ok "manifest: checksums verify" _backup_check_manifest "$B"
 echo tampered >> "$B/postgres.dump"
 expect_fail "manifest: a modified file fails" _backup_check_manifest "$B"
-expect_ok "layout: complete backup accepted" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
+echo lldap > "$B/lldap_data.tar.gz"
+expect_ok "layout: complete backup accepted" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/users.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
 rm "$B/secrets/vault-unseal/unseal-key"
-expect_fail "layout: missing unseal key rejected" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
+expect_fail "layout: missing unseal key rejected" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/users.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
 
 BACKUP_ROOT="$WORK/backups"
 mkdir -p "$BACKUP_ROOT"/{20260101-000000,20260102-000000,20260103-000000,pre-restore-20260101-000000,offsite-20260101-000000,20260104-000000.partial}
@@ -6903,8 +6904,39 @@ for f in .env vault.snap postgres.dump secrets/vault-unseal/unseal-key; do echo 
 echo '{"root_token":"t","unseal_keys_b64":["k"]}' > "$KB/secrets/vault-init.json"
 KS_BK="$( (_backup_check_layout "$KB") 2>&1; echo "rc=$?")"
 case "$KS_BK" in *"lacks secrets/lldap/key-seed"*"rc=1"*) t_pass "backup layout: no LLDAP key seed → incomplete backup" ;; *) t_fail "backup layout seed: $KS_BK" ;; esac
-mkdir -p "$KB/secrets/lldap"; echo s > "$KB/secrets/lldap/key-seed"
-expect_ok "backup layout: with the seed → complete" _backup_check_layout "$KB"
+mkdir -p "$KB/secrets/lldap"; cp "$KS_F" "$KB/secrets/lldap/key-seed"
+KS_BK="$( (_backup_check_layout "$KB") 2>&1; echo "rc=$?")"
+case "$KS_BK" in *"lacks lldap_data.tar.gz"*"rc=1"*) t_pass "backup layout: a seed without its users.db archive → incomplete (never this host's users.db with the backup's seed)" ;; *) t_fail "backup layout lldap_data: $KS_BK" ;; esac
+echo x > "$KB/lldap_data.tar.gz"
+kbl() { (_backup_check_layout "$1"); }  # a subshell: fail exits
+expect_ok "backup layout: the seed and lldap_data.tar.gz → complete" kbl "$KB"
+printf 'short-seed' > "$KB/secrets/lldap/key-seed"
+KS_BK="$( (_backup_check_layout "$KB") 2>&1; echo "rc=$?")"
+case "$KS_BK" in *"in the backup, secrets/lldap/key-seed is too short"*"refusing to restore it"*"rc=1"*) t_pass "backup layout: a seed LLDAP can't use is refused before anything changes" ;; *) t_fail "backup layout bad seed: $KS_BK" ;; esac
+printf 'RanD0m STR1ng' > "$KB/secrets/lldap/key-seed"
+case "$( (_backup_check_layout "$KB") 2>&1)" in *"public default seed"*) t_pass "backup layout: the public default seed is refused" ;; *) t_fail "backup layout default seed" ;; esac
+# A hand-made seed that isn't base64 (long enough) is a problem too.
+case "$(ksp 'printf "%064d!" 0 > "$PORTCULLIS_ROOT/secrets/lldap/key-seed"')" in *"is not base64"*) t_pass "lldap key seed: not base64 → problem" ;; *) t_fail "lldap key seed: charset" ;; esac
+# init never replaces a seed file: an empty one is refused, not rewritten.
+KS_E="$WORK/ks-empty"; mkdir -p "$KS_E/secrets/lldap"; : > "$KS_E/secrets/lldap/key-seed"
+KS_GEN="$( (PORTCULLIS_ROOT="$KS_E"; lldap_key_seed_generate) 2>&1; echo "rc=$?")"
+case "$KS_GEN" in *"missing or empty"*"rc=1"*) t_pass "lldap key seed: init refuses an existing (empty) seed file instead of replacing it" ;; *) t_fail "init empty seed: $KS_GEN" ;; esac
+expect_eq "lldap key seed: the empty file is left as it was" "$(wc -c < "$KS_E/secrets/lldap/key-seed" | tr -d ' ')" 0
+expect_eq "lldap key seed: generation hard-links (ln never overwrites) and checks 64 characters" \
+  "$(declare -f lldap_key_seed_generate | grep -c 'ln "$tmp" "$f"'):$(declare -f lldap_key_seed_generate | grep -c '!= 64')" "1:1"
+# init on docker refuses a seed made next to an lldap_data holding a users.db.
+KS_O="$WORK/ks-olddata"; rm -rf "$KS_O"; mkdir -p "$KS_O"
+KS_OLD_OUT="$( (PORTCULLIS_ROOT="$KS_O"; lldap_key_seed_generate >/dev/null; docker() { echo "docker $*" >> "$WORK/ks-old-calls"; return 0; }
+  lldap_key_seed_new_on_old_data) 2>&1; echo "rc=$?")"
+case "$KS_OLD_OUT" in *"already holds a users.db"*"rc=1"*) t_pass "init: a new seed next to an existing users.db → refused up front" ;; *) t_fail "init old data: $KS_OLD_OUT" ;; esac
+expect_eq "init: the seed just made is removed again (a re-run behaves the same)" "$([ -e "$KS_O/secrets/lldap/key-seed" ] && echo kept || echo removed)" removed
+expect_ok "init: the users.db probe is read-only, no network, no capability" grep -q -- '--network none --read-only --cap-drop ALL .*type=volume,src=portcullis_lldap_data,dst=/v,readonly .* test -e /v/users.db' "$WORK/ks-old-calls"
+KS_OLD_OUT="$( (PORTCULLIS_ROOT="$KS_O"; lldap_key_seed_generate >/dev/null; docker() { case "$*" in "volume inspect"*) return 1 ;; esac; return 0; }
+  lldap_key_seed_new_on_old_data; echo "kept:$([ -s "$KS_O/secrets/lldap/key-seed" ] && echo yes)") 2>&1; echo "rc=$?")"
+case "$KS_OLD_OUT" in *"kept:yes"*"rc=0"*) t_pass "init: no lldap_data volume → the new seed stays" ;; *) t_fail "init no volume: $KS_OLD_OUT" ;; esac
+# shellcheck disable=SC2034  # read by lldap_key_seed_new_on_old_data
+KS_OLD_OUT="$( (PORTCULLIS_ROOT="$KS_O"; LLDAP_KEY_SEED_MADE=false; docker() { echo CALLED; }; lldap_key_seed_new_on_old_data; echo no-probe) 2>&1)"
+expect_eq "init: a seed that was already there → no probe" "$KS_OLD_OUT" no-probe
 # compose / chart / overlay: one mechanism everywhere (LLDAP_KEY_SEED_FILE).
 CY="$HERE/../docker-compose.yml"
 expect_eq "compose lldap: the seed by file, no key file, no plain seed, no image entrypoint, no config file" \
