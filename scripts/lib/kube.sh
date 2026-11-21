@@ -1557,8 +1557,9 @@ kube_sync_secrets() {
   [ "${1:-}" = --full ] || [ "${KUBE_SYNC_FULL:-}" = 1 ] && full=true
   ns="$(kube_ns)"
   kube_nodeadm_prepare
-  # LLDAP's server key (ha.sh): made once, synced as secrets-lldap-key.
-  kube_lldap_server_key
+  # LLDAP's key seed (users.sh, made by init): synced as secrets-lldap
+  # with secrets/lldap/; never synced without a usable one (fail closed).
+  lldap_key_seed_require
   kube_sessions_ha_prepare  # the session store's HA configs (ha.sh)
   kube_vault_join_tls_prepare  # Vault's join listener TLS (ha.sh)
   kube_sync_stage

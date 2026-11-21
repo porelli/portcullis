@@ -18,9 +18,9 @@
 #     roles' passwords), in the core namespace portcullis-pg-lldap (LLDAP's
 #     LLDAP_DATABASE_URL and PGPASSWORD for its schema Job), all built from
 #     0600 files in a 0700 staging dir (--from-file), never argv;
-#   - LLDAP's server key (kube_lldap_server_key): secrets/lldap-key/server_key,
-#     made once by `lldap create_schema` in an offline pod and read with
-#     exec cat (never a log), synced as Secret secrets-lldap-key;
+#   - LLDAP's key seed: secrets/lldap/key-seed (users.sh, made by init as
+#     on Docker), synced like every secrets/<dir> as Secret secrets-lldap
+#     and mounted on every replica and the schema Job (LLDAP_KEY_SEED_FILE);
 #   - the primary (kube_pg_primary: the pod portcullis-pg-rw selects), its
 #     health and exec for rt_health / rt_exec postgres.
 
@@ -236,53 +236,6 @@ kube_pg_sync_secrets() {
     rm -rf "$st"; fail "could not sync the Postgres roles' Secrets"
   fi
   rm -rf "$st"
-}
-
-# kube_lldap_server_key — secrets/lldap-key/server_key (0600), LLDAP's one
-# server key (plan Amendment 2: every replica mounts the same one; it
-# protects the OPAQUE password files): kept when present (a restore brings
-# the backup's), else made by `lldap create_schema` in an offline pod of
-# the pinned LLDAP image (a throwaway SQLite database, LLDAP_KEY_FILE in a
-# memory emptyDir; the dummy JWT secret / admin password it needs to start
-# are no secrets), read with exec cat into the file, never through a log.
-# In HA the pod is pinned like the data (review M2): main, never small.
-kube_lldap_server_key() {
-  local d="$PORTCULLIS_ROOT/secrets/lldap-key" img name ns tmp rc=0
-  [ -s "$d/server_key" ] && return 0
-  kube_images_ready
-  img="$(printf '%s' "$_K_IMAGES" | jq -r '.lldap // empty')"
-  [ -n "$img" ] || fail "no image for lldap"
-  ns="$(kube_ns)"
-  name="lldap-key-$(openssl rand -hex 3)"
-  N="$name" NS="$ns" IMG="$img" U="$CT_UID_LLDAP" jq -n '
-    {apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "keygen"}},
-     spec: {restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false, terminationGracePeriodSeconds: 1,
-       securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.U | tonumber), seccompProfile: {type: "RuntimeDefault"}},
-       volumes: [{name: "k", emptyDir: {medium: "Memory", sizeLimit: "16Mi"}}],
-       containers: [{name: "keygen", image: env.IMG, workingDir: "/k",
-         command: ["sh", "-c", "umask 077; /app/lldap create_schema >/dev/null 2>&1 && test -s /k/new/server_key && mv /k/new/server_key /k/server_key && exec sleep 600"],
-         env: [{name: "LLDAP_DATABASE_URL", value: "sqlite:///k/keygen.db?mode=rwc"}, {name: "LLDAP_KEY_FILE", value: "/k/new/server_key"},
-               {name: "LLDAP_KEY_SEED", value: ""}, {name: "LLDAP_JWT_SECRET", value: "keygen-only-not-a-secret"},
-               {name: "LLDAP_LDAP_USER_PASS", value: "keygen-only-not-a-secret"}],
-         volumeMounts: [{name: "k", mountPath: "/k"}],
-         resources: {limits: {memory: "128Mi"}, requests: {memory: "128Mi"}},
-         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}' \
-    | jq '.spec.initContainers = [.spec.containers[0] | .name = "mkdir" | .command = ["mkdir", "-p", "/k/new"] | del(.env) | del(.workingDir)]' \
-    | HA="$(kube_ha_on && echo on || true)" SITE="$KUBE_PRIMARY_SITE" jq 'if env.HA == "on" then .spec.affinity = {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions: [
-        {key: "portcullis.io/site", operator: "In", values: [env.SITE]}, {key: "portcullis.io/class", operator: "NotIn", values: ["small"]}]}]}}} else . end' \
-    | kube_ctl create -f - >/dev/null || fail "the LLDAP key pod was refused (see above)"
-  if ! kube_ctl -n "$ns" wait --for=condition=Ready "pod/$name" --timeout="${KUBE_POD_WAIT:-180}s" >/dev/null 2>&1; then
-    _kube_pod_diag "$name"
-    kube_ctl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
-    fail "could not make LLDAP's server key"
-  fi
-  (umask 077 && mkdir -p "$d")
-  tmp="$(mktemp "$d/.server_key.XXXXXX")"
-  kube_ctl -n "$ns" exec "$name" -c keygen -- sh -c 'i=0; while [ ! -s /k/server_key ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; cat /k/server_key' > "$tmp" 2>/dev/null || rc=$?
-  kube_ctl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
-  if [ "$rc" != 0 ] || [ ! -s "$tmp" ]; then rm -f "$tmp"; fail "could not read the LLDAP key pod's key"; fi
-  chmod 600 "$tmp" && mv -f "$tmp" "$d/server_key"
-  ok "Made LLDAP's server key (secrets/lldap-key/server_key)."
 }
 
 # ── backup / restore of the CNPG databases (plan Task 23) ──

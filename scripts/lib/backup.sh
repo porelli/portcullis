@@ -233,12 +233,19 @@ _backup_check_layout() {
   [ -f "$dir/MANIFEST.json" ] || fail "$dir has no MANIFEST.json — not a Portcullis backup."
   [ "$(jq -r .format "$dir/MANIFEST.json" 2>/dev/null)" = "$BACKUP_FORMAT" ] \
     || fail "$dir: unsupported backup format (want $BACKUP_FORMAT)."
-  # secrets/lldap/key-seed and lldap_data.tar.gz: LLDAP's stored passwords
-  # are bound to the seed (a users.db without its seed refuses to start).
-  # Backups made before the seed existed are refused (no back-compat).
-  for f in .env vault.snap postgres.dump secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/lldap/key-seed lldap_data.tar.gz; do
+  # secrets/lldap/key-seed and LLDAP's data: its stored passwords are bound
+  # to the seed (a users.db without its seed refuses to start). Backups
+  # made before the seed existed are refused (no back-compat). LLDAP's data
+  # is lldap_data.tar.gz (Docker / Podman: SQLite) or lldap.dump (Kubernetes:
+  # its Postgres database); Docker / Podman restore only the first (there is
+  # no Postgres → SQLite conversion), Kubernetes both (lldap_convert.sh).
+  for f in .env vault.snap postgres.dump secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/lldap/key-seed; do
     [ -s "$dir/$f" ] || fail "$dir lacks $f — incomplete backup."
   done
+  if [ ! -s "$dir/lldap_data.tar.gz" ]; then
+    [ -s "$dir/lldap.dump" ] || fail "$dir lacks lldap_data.tar.gz — incomplete backup."
+    _rt_is_kube || fail "$dir holds LLDAP as lldap.dump (a Kubernetes backup): Docker / Podman restore LLDAP only from lldap_data.tar.gz — restore it on Kubernetes."
+  fi
   # The seed and the users.db it protects travel together: a restore never
   # pairs this host's users.db with the backup's seed, or a seed LLDAP
   # can't use (users.sh lldap_key_seed_problem).

@@ -5475,8 +5475,8 @@ K15="$WORK/k15"
 k15_root() {
   rm -rf "$K15"; mkdir -p "$K15/secrets/hub/lldap" "$K15/secrets/wg" "$K15/secrets/domains/certs-endpoint" "$K15/secrets/kube" "$K15/certs/revocation" "$K15/certs/truststore"
   printf 'SECRET-LLDAP-PW-123' > "$K15/secrets/hub/lldap/password"
-  # LLDAP's server key (ha.sh kube_lldap_server_key keeps a present one).
-  mkdir -p "$K15/secrets/lldap-key"; printf 'LLDAP-SERVER-KEY' > "$K15/secrets/lldap-key/server_key"
+  # LLDAP's key seed (users.sh; kube_sync_secrets refuses without one).
+  mkdir -p "$K15/secrets/lldap"; printf 'LLDAPSEEDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' > "$K15/secrets/lldap/key-seed"
   printf 'portcullis-hub' > "$K15/secrets/hub/lldap/username"
   printf '{"root_token":"ROOT-TOKEN-XYZ"}' > "$K15/secrets/vault-init.json"
   printf 'CA-KEY-SECRET' > "$K15/secrets/domains/certs-endpoint/ca.key"
@@ -6568,10 +6568,12 @@ expect_eq "kube_pg_sync_secrets: LLDAP's URL is the rw Service's, its password i
   "$(grep -c "$(printf 'postgres://lldap:LLPG-SECRET-888@portcullis-pg-rw.cnpg-system.svc.cluster.local:5432/lldap' | base64 | tr -d '\n')" "$KS/kubectl-stdin"):$(printf '%s\n' "$OUT" | grep -c 'LLPG-SECRET-888' || true)" "1:0"
 expect_eq "kube_pg_sync_secrets: the roles' Secrets carry cnpg.io/reload (the operator re-applies a changed password only then)" \
   "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object" and .metadata.namespace? == "portcullis" and (.metadata.name | startswith("portcullis-pg-"))) | .metadata.labels["cnpg.io/reload"]' 2>/dev/null | sort | uniq -c | tr -s ' ')" "$(printf ' 2 "true"\n 1 null')"
-OUT="$(kt "$K15_ENV; kube_images_ready() { echo NO-IMAGES; }; kube_ctl() { echo \"KCTL \$*\"; }; kube_lldap_server_key; echo done")"
-expect_eq "kube_lldap_server_key: a present key is kept (no pod)" "$(printf '%s\n' "$OUT" | grep -c 'KCTL\|NO-IMAGES' || true):$(cat "$K15/secrets/lldap-key/server_key")" "0:LLDAP-SERVER-KEY"
-expect_eq "kube_lldap_server_key: the key read with exec cat into a 0600 file, never a pod's logs" \
-  "$(declare -f kube_lldap_server_key | grep -c ' logs '):$(declare -f kube_lldap_server_key | grep -c 'exec "$name" -c keygen')" "0:1"
+# HA ← main (Task 26 ruling): LLDAP's key is the seed file on Kubernetes too,
+# no keygen pod, no secrets-lldap-key.
+expect_eq "kube: no LLDAP keygen pod or server key file left (the seed is secrets-lldap)" \
+  "$(grep -c 'kube_lldap_server_key\|lldap-key\|secrets-lldap-key' "$HERE"/../scripts/lib/*.sh "$HERE"/../charts/portcullis/templates/*.yaml | awk -F: '{s += $2} END {print s}')" 0
+expect_eq "kube_sync_secrets requires LLDAP's seed before anything is synced" \
+  "$(declare -f kube_sync_secrets | awk '/lldap_key_seed_require/ {r=NR} /kube_sync_stage/ {s=NR} END {print (r && s > r) ? "first" : "no"}')" first
 PGX="$WORK/pgx"; rm -rf "$PGX"; mkdir -p "$PGX/b1" "$PGX/b2" "$PGX/pre"
 printf 'PGDMPkc' > "$PGX/b1/postgres.dump"; printf 'PGDMPll' > "$PGX/b1/lldap.dump"
 printf 'PGDMPkc' > "$PGX/b2/postgres.dump"; printf 'tar' > "$PGX/b2/lldap_data.tar.gz"

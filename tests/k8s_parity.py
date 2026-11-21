@@ -668,9 +668,10 @@ def pg_problems(docs, vals):
     annotations (26:26 0700), priority portcullis-core, no superuser; the
     roles keycloak / lldap from the CLI's Secrets, the databases keycloak
     (initdb) and lldap (Database); Keycloak's KC_DB_URL its rw Service;
-    LLDAP's LLDAP_DATABASE_URL from the Secret portcullis-pg-lldap, its key
-    file from secrets-lldap-key with the seed emptied, no PVC, its schema
-    Job; in HA 2 LLDAP replicas."""
+    LLDAP's LLDAP_DATABASE_URL from the Secret portcullis-pg-lldap, its seed
+    file from secrets-lldap (as compose: LLDAP_KEY_FILE empty, no plain
+    LLDAP_KEY_SEED), also in its schema Job, no PVC; in HA 2 LLDAP
+    replicas."""
     out = []
     ha = bool((vals.get("ha") or {}).get("enabled"))
     nsp = int((vals.get("cnpg") or {}).get("nodesAtPrimary") or 0)
@@ -723,12 +724,14 @@ def pg_problems(docs, vals):
     le = env("lldap")
     if le.get("LLDAP_DATABASE_URL", {}).get("valueFrom") != {"secretKeyRef": {"name": "portcullis-pg-lldap", "key": "LLDAP_DATABASE_URL"}}:
         out.append(f"lldap LLDAP_DATABASE_URL {le.get('LLDAP_DATABASE_URL')} (from the Secret portcullis-pg-lldap)")
-    if le.get("LLDAP_KEY_SEED", {}).get("value") != "" or le.get("LLDAP_KEY_FILE", {}).get("value") != "/run/lldap-key/server_key":
-        out.append("lldap: LLDAP_KEY_FILE /run/lldap-key/server_key, LLDAP_KEY_SEED empty")
+    seed = lambda e: "LLDAP_KEY_SEED" not in e and e.get("LLDAP_KEY_FILE", {}).get("value") == "" and e.get("LLDAP_KEY_SEED_FILE", {}).get("value") == "/run/portcullis/lldap/key-seed"
+    if not seed(le):
+        out.append("lldap: LLDAP_KEY_SEED_FILE /run/portcullis/lldap/key-seed, LLDAP_KEY_FILE empty, no LLDAP_KEY_SEED")
     lp = wl["lldap"]["spec"]["template"]["spec"]
     vols = {v["name"]: v for v in lp.get("volumes", [])}
-    if any("persistentVolumeClaim" in v for v in vols.values()) or vols.get("key", {}).get("secret", {}).get("secretName") != "secrets-lldap-key":
-        out.append(f"lldap volumes {sorted(vols)}: no PVC, the key from secrets-lldap-key")
+    seedvol = lambda vs: vs.get("key-seed", {}).get("secret", {}).get("secretName") == "secrets-lldap"
+    if any("persistentVolumeClaim" in v for v in vols.values()) or not seedvol(vols) or any(v.get("secret", {}).get("secretName") == "secrets-lldap-key" for v in vols.values()):
+        out.append(f"lldap volumes {sorted(vols)}: no PVC, the seed from secrets-lldap")
     if [c["name"] for c in lp.get("initContainers", [])] != ["wait-schema"] or lp.get("enableServiceLinks") is not False:
         out.append("lldap: the init container wait-schema, enableServiceLinks false")
     if wl["lldap"]["spec"].get("replicas") != (2 if ha else 1):
@@ -736,6 +739,11 @@ def pg_problems(docs, vals):
     jobs = [j for j in K.by_kind(docs, "Job") if j["metadata"]["name"].startswith("lldap-schema-")]
     if len(jobs) != 1 or [c["name"] for c in jobs[0]["spec"]["template"]["spec"].get("initContainers", [])] != ["wait-postgres", "create-schema"]:
         out.append("one Job lldap-schema-<hash> (wait-postgres, create-schema, record)")
+    else:
+        js = jobs[0]["spec"]["template"]["spec"]
+        cs = js["initContainers"][1]
+        if not seed({e["name"]: e for e in cs.get("env", [])}) or not seedvol({v["name"]: v for v in js.get("volumes", [])}):
+            out.append("lldap-schema's create-schema: the same seed file from secrets-lldap, LLDAP_KEY_FILE empty, no LLDAP_KEY_SEED")
     return out
 
 
