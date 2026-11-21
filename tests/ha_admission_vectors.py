@@ -281,6 +281,18 @@ def vectors():
                                        ("adds a harmless annotation", harmless, False)])):
         for what, patch, ok in cases:
             out.append({"policy": NL, "name": f"{who} {what}", "allowed": ok, "node": True, "as": ident, "patch": patch})
+    # Round 4 M2: owners and finalizers (a dangling owner = the GC deletes the
+    # Node), and the manager's taints pinned to its own two keys (nit 4).
+    owner = {"metadata": {"ownerReferences": [{"apiVersion": "v1", "kind": "Node", "name": "gone", "uid": "00000000-0000-4000-8000-000000000001"}]}}
+    finalizer = {"metadata": {"finalizers": ["example.org/hold"]}}
+    for who, ident, what, patch, target in (
+            ("a node", node_id, "adds an owner reference to its own Node", owner, "@NODE@"),
+            ("a node", node_id, "adds a finalizer to its own Node", finalizer, "@NODE@"),
+            ("SNR's manager", manager_id, "adds a finalizer to another Node", finalizer, "@NODE2@"),
+            ("SNR's manager", manager_id, "adds an owner reference to another Node", owner, "@NODE2@")):
+        out.append({"policy": NL, "name": f"{who} {what}", "allowed": False, "node": True, "as": ident, "patch": patch, "target": target})
+    out.append({"policy": NL, "name": "SNR's manager adds another NoExecute taint", "allowed": False, "node": True, "as": manager_id,
+                "taints_add": [{"key": "example.org/evict", "value": "x", "effect": "NoExecute"}]})
     out.append({"policy": NL, "name": "SNR's manager adds its remediation taint", "allowed": True, "node": True, "as": manager_id,
                 "taints_add": [remediation_taint]})
     out.append({"policy": NL, "name": "SNR's manager adds the out-of-service taint", "allowed": True, "node": True, "as": manager_id,

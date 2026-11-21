@@ -17888,6 +17888,123 @@
   "policy": "portcullis-node-labels"
  },
  {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:@NODE@"
+  },
+  "name": "a node adds an owner reference to its own Node",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "kind": "Node",
+      "name": "gone",
+      "uid": "00000000-0000-4000-8000-000000000001"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-node-labels",
+  "target": "@NODE@"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:@NODE@"
+  },
+  "name": "a node adds a finalizer to its own Node",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "finalizers": [
+     "example.org/hold"
+    ]
+   }
+  },
+  "policy": "portcullis-node-labels",
+  "target": "@NODE@"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds a finalizer to another Node",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "finalizers": [
+     "example.org/hold"
+    ]
+   }
+  },
+  "policy": "portcullis-node-labels",
+  "target": "@NODE2@"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds an owner reference to another Node",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "kind": "Node",
+      "name": "gone",
+      "uid": "00000000-0000-4000-8000-000000000001"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-node-labels",
+  "target": "@NODE2@"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds another NoExecute taint",
+  "node": true,
+  "policy": "portcullis-node-labels",
+  "taints_add": [
+   {
+    "effect": "NoExecute",
+    "key": "example.org/evict",
+    "value": "x"
+   }
+  ]
+ },
+ {
   "allowed": true,
   "as": {
    "groups": [

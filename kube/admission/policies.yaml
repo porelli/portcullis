@@ -1732,7 +1732,10 @@ spec:
 # ServiceAccount) only annotates its own Node; SNR's manager only changes
 # taints. Round 3: none of these identities sets a remediation.medik8s.io/
 # label (SNR's exclude-from-remediation: an admin's), a nodeadm.portcullis/
-# annotation or spec.unschedulable — the storm guard's inputs.
+# annotation or spec.unschedulable — the storm guard's inputs. Round 4:
+# nor an owner reference or a finalizer (a dangling owner would have the
+# garbage collector delete the Node); SNR's manager changes nothing but
+# its own two taints (medik8s.io/remediation, node.kubernetes.io/out-of-service).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -1771,6 +1774,27 @@ spec:
     expression: "request.operation != 'DELETE' && has(object.metadata.annotations) ? object.metadata.annotations : {}"
   - name: oldAnn
     expression: "request.operation == 'UPDATE' && has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+  # Review round 4 M2: owners and finalizers (a dangling owner makes the
+  # garbage collector delete the Node; a finalizer stalls its removal).
+  - name: newOwners
+    expression: "request.operation != 'DELETE' && has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []"
+  - name: oldOwners
+    expression: "request.operation == 'UPDATE' && has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []"
+  - name: newFinalizers
+    expression: "request.operation != 'DELETE' && has(object.metadata.finalizers) ? object.metadata.finalizers : []"
+  - name: oldFinalizers
+    expression: "request.operation == 'UPDATE' && has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []"
+  # SNR's manager may add / remove only these taints (review round 4 nit 4).
+  - name: managerTaints
+    expression: "['medik8s.io/remediation', 'node.kubernetes.io/out-of-service']"
+  - name: newOtherTaints
+    expression: >-
+      request.operation != 'DELETE' && has(object.spec.taints)
+      ? object.spec.taints.filter(t, !(t.key in variables.managerTaints)) : []
+  - name: oldOtherTaints
+    expression: >-
+      request.operation == 'UPDATE' && has(oldObject.spec.taints)
+      ? oldObject.spec.taints.filter(t, !(t.key in variables.managerTaints)) : []
   - name: newUnsched
     expression: "request.operation != 'DELETE' && has(object.spec.unschedulable) && object.spec.unschedulable"
   - name: oldUnsched
@@ -1820,9 +1844,20 @@ spec:
         && variables.oldAnn.all(k, !variables.annPrefixes.exists(p, k.startsWith(p)) || k in variables.newAnn)
         && variables.newUnsched == variables.oldUnsched)
     message: nodes can't set nodeadm's annotations or cordon a Node; nodeadm and the CLI do
-  # SNR's manager (round 3 I1c): taint changes only — the same labels,
-  # annotations and every other spec field (it puts and lifts its own
-  # remediation taints and node.kubernetes.io/out-of-service).
+  # Review round 4 M2: no matched identity adds, changes or drops an owner
+  # reference or a finalizer (none on a CREATE).
+  - expression: >-
+      request.operation == 'DELETE' || (size(variables.newOwners) <= 16 && size(variables.oldOwners) <= 16
+        && size(variables.newFinalizers) <= 16 && size(variables.oldFinalizers) <= 16
+        && size(variables.newOwners) == size(variables.oldOwners)
+        && variables.newOwners.all(o, o in variables.oldOwners) && variables.oldOwners.all(o, o in variables.newOwners)
+        && size(variables.newFinalizers) == size(variables.oldFinalizers)
+        && variables.newFinalizers.all(f, f in variables.oldFinalizers) && variables.oldFinalizers.all(f, f in variables.newFinalizers))
+    message: nodes can't set a Node's owner references or finalizers
+  # SNR's manager (round 3 I1c, round 4 M2 + nit 4): the whole Node but its
+  # taints unchanged — labels, annotations, owners, finalizers (the rule
+  # above) and every other spec field — and of the taints only its own
+  # remediation taint and node.kubernetes.io/out-of-service put or lifted.
   - expression: >-
       request.userInfo.username != 'system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager'
       || (request.operation == 'UPDATE' && (has(request.subResource) ? request.subResource : '') == ''
@@ -1830,8 +1865,12 @@ spec:
           && (has(object.spec.podCIDR) ? object.spec.podCIDR : '') == (has(oldObject.spec.podCIDR) ? oldObject.spec.podCIDR : '')
           && (has(object.spec.podCIDRs) ? object.spec.podCIDRs : []) == (has(oldObject.spec.podCIDRs) ? oldObject.spec.podCIDRs : [])
           && (has(object.spec.providerID) ? object.spec.providerID : '') == (has(oldObject.spec.providerID) ? oldObject.spec.providerID : '')
-          && !has(object.spec.configSource) && !has(object.spec.externalID))
-    message: SNR's manager may only change a Node's taints
+          && (has(object.spec.unschedulable) && object.spec.unschedulable) == (has(oldObject.spec.unschedulable) && oldObject.spec.unschedulable)
+          && !has(object.spec.configSource) && !has(object.spec.externalID)
+          && size(variables.newOtherTaints) <= 32 && size(variables.oldOtherTaints) <= 32
+          && size(variables.newOtherTaints) == size(variables.oldOtherTaints)
+          && variables.newOtherTaints.all(t, t in variables.oldOtherTaints) && variables.oldOtherTaints.all(t, t in variables.newOtherTaints))
+    message: SNR's manager may only put or lift its remediation and out-of-service taints
   # SNR's agent (plan Task 24, security ruling: the DaemonSet runs on every
   # node, edge and small ones too): only its own Node (the bound token's
   # node name), only an UPDATE, and only the annotations change.

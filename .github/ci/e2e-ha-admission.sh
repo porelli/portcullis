@@ -8,7 +8,8 @@
 # refused one refused BY ITS POLICY (the message names it); an
 # "ephemeral" vector adds an ephemeral container to its (admitted, real)
 # pod through pods/ephemeralcontainers; a "node" vector patches the first
-# Node as a node identity or SNR's manager under portcullis-node-labels
+# Node (or its "target", @NODE2@ = the second) as a node identity or SNR's
+# manager under portcullis-node-labels
 # (round 3 I1: the storm guard's inputs). Run by
 # e2e-ha-vm (Task 33) after the HA installs; locally against k3d / k3s.
 # With HUB_DEV=1 + PORTCULLIS_DEV_SNR_IMAGE the vectors' SNR image is that
@@ -41,6 +42,8 @@ print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in docs 
   kube/admission/policies.yaml kube/admission/bindings.yaml \
   | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
 node="$(kubectl --context "$ctx" get nodes -o jsonpath='{.items[0].metadata.name}')"
+node2="$(kubectl --context "$ctx" get nodes -o jsonpath='{.items[1].metadata.name}')"
+[ -n "$node2" ] || { echo "FAIL - the node vectors need two Nodes"; exit 1; }
 pinned="$(lib 'printf %s "$HA_SNR_IMAGE"')" img="$(lib ha_snr_image)"
 sleep 3   # the bindings see their params
 fail=0 n=0
@@ -51,10 +54,11 @@ while IFS= read -r v; do
     # A Node patch as a node identity / SNR's manager (impersonated).
     as=(--as "$(jq -r .as.user <<<"$v" | sed "s|@NODE@|$node|")")
     while IFS= read -r g; do as+=(--as-group "$g"); done < <(jq -r '.as.groups[]' <<<"$v")
+    tn="$(jq -r '.target // "@NODE@"' <<<"$v" | sed "s|@NODE2@|$node2|; s|@NODE@|$node|")"
     if jq -e '.taints_add' <<<"$v" >/dev/null; then
-      p="$(kubectl --context "$ctx" get node "$node" -o json | jq -c --argjson a "$(jq -c .taints_add <<<"$v")" '{spec: {taints: ((.spec.taints // []) + $a)}}')"
+      p="$(kubectl --context "$ctx" get node "$tn" -o json | jq -c --argjson a "$(jq -c .taints_add <<<"$v")" '{spec: {taints: ((.spec.taints // []) + $a)}}')"
     else p="$(jq -c .patch <<<"$v")"; fi
-    out="$(kubectl --context "$ctx" "${as[@]}" patch node "$node" --type=merge -p "$p" --dry-run=server 2>&1)" && got=true || got=false
+    out="$(kubectl --context "$ctx" "${as[@]}" patch node "$tn" --type=merge -p "$p" --dry-run=server 2>&1)" && got=true || got=false
   elif [ "$(jq -r '.ephemeral // false' <<<"$v")" = true ]; then
     # pods/ephemeralcontainers: an admitted pod made for real, then the
     # subresource update (server dry-run), then the pod removed.

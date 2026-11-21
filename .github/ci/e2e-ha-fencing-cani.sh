@@ -30,6 +30,10 @@ want yes "$A" list pods -n portcullis-fencing
 want no "$A" create nodes
 want no "$A" delete nodes
 want no "$A" patch nodes
+want yes "$A" list selfnoderemediations.self-node-remediation.medik8s.io -n portcullis-fencing
+want no "$A" patch selfnoderemediations.self-node-remediation.medik8s.io/status -n portcullis-fencing
+want no "$A" update selfnoderemediations.self-node-remediation.medik8s.io/status -n portcullis-fencing
+want no "$A" patch selfnoderemediations.self-node-remediation.medik8s.io -n portcullis-fencing
 M=portcullis-fencing:self-node-remediation-controller-manager
 want no "$M" list secrets -A
 want no "$M" get secrets -n portcullis

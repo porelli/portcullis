@@ -122,12 +122,12 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch, update]
+  # SNR's resources read only (review round 4 I1): in v0.13.0 every status
+  # write is the manager's (ReconcileManager); a status right here would
+  # let any node forge another remediation's phase or Succeeded.
   - apiGroups: [self-node-remediation.medik8s.io]
     resources: [selfnoderemediations, selfnoderemediationconfigs, selfnoderemediationtemplates]
     verbs: [get, list, watch]
-  - apiGroups: [self-node-remediation.medik8s.io]
-    resources: [selfnoderemediations/status]
-    verbs: [get, patch, update]
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]

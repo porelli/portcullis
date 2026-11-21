@@ -1338,6 +1338,13 @@ def snr_agent_problems(fe):
         if "secrets" in res or "*" in res or res & {"pods", "namespaces"} or ("nodes" in res and verbs - {"get", "list", "watch", "update"}) \
                 or res & {"daemonsets", "volumeattachments", "pods/exec"} or "*" in verbs:
             out.append(f"fencing: the agent's ClusterRole rule {r} (no Secret at all, its Node's annotations, nothing else written)")
+    # Review round 4 I1: SNR's resources read only — no status subresource,
+    # no write verb (a node could forge another remediation's phase).
+    for kind in ("ClusterRole", "Role"):
+        for _, r in rules_of(fe, kind, {"portcullis-snr-agent"}):
+            groups, res, verbs = set(r.get("apiGroups", [])), set(r["resources"]), set(r["verbs"])
+            if (groups & {"self-node-remediation.medik8s.io", "*"}) and (verbs - {"get", "list", "watch"} or any(x.endswith("/status") or x == "*" for x in res)):
+                out.append(f"fencing: the agent's {kind} writes SNR resources or their status: {r} (read only)")
     agent_role = [r for _, r in rules_of(fe, "Role", {"portcullis-snr-agent"})]
     # get / list / watch by name: the patched cache lists with the
     # metadata.name field selector (RBAC checks resourceNames then).
@@ -1501,6 +1508,12 @@ def check_ha_infra():
         {"apiGroups": [""], "resources": ["secrets"], "verbs": ["list", "watch"]})
     if not snr_agent_problems(mut_fe):
         F.add("snr_agent_problems misses a cluster-wide Secret rule on portcullis-snr-agent (mutation test)")
+    for extra in ({"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations/status"], "verbs": ["get", "patch", "update"]},
+                  {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["patch"]}):
+        mut_fe = copy.deepcopy(fe)
+        next(d for d in mut_fe if d.get("kind") == "ClusterRole" and d["metadata"]["name"] == "portcullis-snr-agent")["rules"].append(extra)
+        if not any("writes SNR resources" in p for p in snr_agent_problems(mut_fe)):
+            F.add(f"snr_agent_problems misses {extra} on portcullis-snr-agent (mutation test)")
     mgr_sa = {b["roleRef"]["name"] for b in fe if b.get("kind") == "ClusterRoleBinding"
               and any(x.get("name") == "self-node-remediation-controller-manager" for x in b.get("subjects", []))}
     if "portcullis-snr-agent" in mgr_sa or any(d.get("kind") == "DaemonSet" for d in fe):
@@ -1539,7 +1552,7 @@ def check_ha_infra():
         # Round 3 I1: the storm guard's admission vectors (node identities, SNR's manager).
         nl = [v for v in vecs if v["policy"] == "portcullis-node-labels"]
         if not any(v["allowed"] and v["as"]["user"].startswith("system:node:") for v in nl) \
-                or sum(not v["allowed"] for v in nl) < 7 or not any(v["allowed"] and v.get("taints_add") for v in nl):
+                or sum(not v["allowed"] for v in nl) < 10 or not any(v["allowed"] and v.get("taints_add") for v in nl):
             F.add("ha_admission_vectors: portcullis-node-labels needs a node's and the manager's refused / admitted vectors")
     # Round 3 I1: portcullis-node-labels guards the storm guard's inputs.
     nlp = next((d for d in yaml.safe_load_all((K.ROOT / "kube/admission/policies.yaml").read_text())
@@ -1553,8 +1566,13 @@ def check_ha_infra():
                 or "variables.newUnsched == variables.oldUnsched" not in nexpr \
                 or "self-node-remediation-controller-manager'" not in nexpr \
                 or "variables.newLabels == variables.oldLabels && variables.newAnn == variables.oldAnn" not in nexpr \
-                or "system:serviceaccount:portcullis-fencing:" not in nlp["spec"]["matchConditions"][0]["expression"]:
-            F.add("policies.yaml portcullis-node-labels: remediation.medik8s.io/ labels, nodeadm.portcullis/ annotations, cordons and the manager's taint-only rule")
+                or "system:serviceaccount:portcullis-fencing:" not in nlp["spec"]["matchConditions"][0]["expression"] \
+                or "object.metadata.ownerReferences" not in nv.get("newOwners", "") or "object.metadata.finalizers" not in nv.get("newFinalizers", "") \
+                or "variables.newOwners.all(o, o in variables.oldOwners) && variables.oldOwners.all(o, o in variables.newOwners)" not in nexpr \
+                or "variables.newFinalizers.all(f, f in variables.oldFinalizers) && variables.oldFinalizers.all(f, f in variables.newFinalizers)" not in nexpr \
+                or nv.get("managerTaints") != "['medik8s.io/remediation', 'node.kubernetes.io/out-of-service']" \
+                or "variables.newOtherTaints.all(t, t in variables.oldOtherTaints) && variables.oldOtherTaints.all(t, t in variables.newOtherTaints)" not in nexpr:
+            F.add("policies.yaml portcullis-node-labels: remediation.medik8s.io/ labels, nodeadm.portcullis/ annotations, cordons, owners / finalizers and the manager's own-taints-only rule")
     # Round 3 M2 + nit: the manager's probes pinned exactly; each pod policy refuses its own generation first.
     fa = (K.ROOT / "kube/ha/fencing/admission.yaml").read_text()
     for probe, path in (("livenessProbe", "/healthz"), ("readinessProbe", "/readyz"), ("startupProbe", "/healthz")):
