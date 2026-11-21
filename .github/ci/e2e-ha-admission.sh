@@ -18,10 +18,11 @@ cd "$(dirname "$0")/../.."
 ctx="${1:?usage: e2e-ha-admission.sh <kube context>}"
 export PORTCULLIS_KUBE_CONTEXT="$ctx" PORTCULLIS_KUBE_INSTALL_ID="${PORTCULLIS_KUBE_INSTALL_ID:-0e2e0000-0000-4000-8000-0000000000aa}"
 lib() { bash -c 'source scripts/lib/common.sh; '"$1"; }
-lib '_ha_probe_setup; psa="$(kube_psa fencing)"; kube_namespace_apply portcullis-fencing $psa'
-# The policies, the class the shapes name and the ServiceAccounts they run
-# as (the admission chain looks them up before any policy judges).
+# The class the shapes (and the in-force check pod) name first: the
+# admission chain looks it up before any policy judges.
 kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f kube/priorityclasses.yaml >/dev/null
+lib '_ha_probe_setup; psa="$(kube_psa fencing)"; kube_namespace_apply portcullis-fencing $psa'
+# The policies and the ServiceAccounts the shapes run as.
 for ns in portcullis-fencing portcullis-ha-probe; do
   kubectl --context "$ctx" -n "$ns" create serviceaccount vector-sa --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
 done
