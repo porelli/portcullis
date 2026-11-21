@@ -425,10 +425,39 @@ dest)
   [ -s "$t/data/e2e-bucket/k3s/core/config" ] || fail "no restic repository at <url>/core"
   K -n portcullis get configmap portcullis-backup-status -o jsonpath='{.data.last_success}' | grep -qE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T' || fail "no portcullis-backup-status record for the Hub"
   echo "PASS: the core offsite went to <url>/core (restic), recorded for the Hub's backup_stale"
-  if [ "${E2E_K3S_SKIP_LONGHORN:-}" = 1 ]; then
-    echo "SKIPPED: Longhorn and a Longhorn backup (E2E_K3S_SKIP_LONGHORN=1)"
+  # Longhorn's node prerequisites (the CLI's own check stays the judge):
+  # provided here only on a GitHub-hosted runner (a throwaway VM, never a
+  # shared host) — open-iscsi and nfs-common from apt, iscsi_tcp, and a
+  # multipathd blacklist drop-in for Longhorn's devices —, then checked on
+  # this node the way the CLI's probe checks them. One missing → the
+  # Longhorn part skips loudly (a notice and the job summary); the CNPG
+  # archive and the core offsite above have run either way.
+  lh_skip=""
+  if [ "${E2E_K3S_SKIP_LONGHORN:-}" = 1 ]; then lh_skip="E2E_K3S_SKIP_LONGHORN=1"
   else
-    sudo apt-get install -y -qq open-iscsi nfs-common >/dev/null && sudo systemctl start iscsid && sudo modprobe iscsi_tcp
+    if [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
+      sudo apt-get install -y -qq open-iscsi nfs-common >/dev/null && sudo systemctl start iscsid && sudo modprobe iscsi_tcp || true
+      if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
+        sudo mkdir -p /etc/multipath/conf.d
+        printf '%s\n' 'blacklist {' '    devnode "^sd[a-z0-9]+"' '}' | sudo tee /etc/multipath/conf.d/longhorn.conf >/dev/null
+        sudo systemctl restart multipathd || true
+      fi
+    fi
+    miss=""
+    { [ -e /usr/sbin/iscsiadm ] || [ -e /sbin/iscsiadm ]; } && pgrep -x iscsid >/dev/null || miss="$miss open-iscsi (iscsid running)"
+    [ -d /sys/module/iscsi_tcp ] || miss="$miss iscsi_tcp"
+    [ -e /usr/sbin/mount.nfs ] || [ -e /sbin/mount.nfs ] || miss="$miss nfs-common"
+    if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
+      cat /etc/multipath.conf /etc/multipath/conf.d/*.conf 2>/dev/null | sed 's/#.*//' | awk '/^[[:space:]]*blacklist[[:space:]]*\{/ { b = 1; next } b && /\}/ { b = 0 }
+        b { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); if ($0 == "devnode \"^sd[a-z0-9]+\"") f = 1 } END { exit !f }' || miss="$miss multipathd-blacklist"
+    fi
+    [ -z "$miss" ] || lh_skip="this runner lacks Longhorn's node prerequisites:$miss"
+  fi
+  if [ -n "$lh_skip" ]; then
+    echo "::notice title=Longhorn backup skipped::Longhorn's part of the backup destination step was skipped ($lh_skip); the HA VMs proved it (task 26 report). The CNPG archive and the core offsite ran."
+    [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "- **Longhorn backup to the destination: SKIPPED** ($lh_skip). Proven on the HA VMs (task 26); the CNPG archive and the core offsite ran and passed." >> "$GITHUB_STEP_SUMMARY"
+    echo "SKIPPED: Longhorn and a Longhorn backup ($lh_skip)"
+  else
     HUB_DEV=1 bash -c 'source scripts/lib/common.sh; env_load; runtime_export >/dev/null 2>&1 || true; ha_install_snapshotter && ha_install_longhorn' 2>&1 | tail -n 3
     for _ in $(seq 1 60); do [ "$(K -n longhorn-system get backuptargets.longhorn.io default -o jsonpath='{.status.available}')" = true ] && break; sleep 5; done
     [ "$(K -n longhorn-system get backuptargets.longhorn.io default -o jsonpath='{.status.available}')" = true ] || fail "Longhorn's backup target isn't available"
