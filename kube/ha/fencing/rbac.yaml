@@ -1,0 +1,273 @@
+# The fencing identities' rights, narrowed from the CSVs'
+# clusterPermissions (review lesson Task 23 I2; tests/k8s_hardening.py
+# check_ha_infra holds them to this and to a subset of the CSVs'):
+#   - SNR's manager (a Deployment pinned to the primary site's non-small
+#     nodes): Nodes read and patched (the out-of-service taint), no Node
+#     create / delete, no pod or VolumeAttachment deletion (the
+#     OutOfServiceTaint strategy: the taint makes Kubernetes delete them),
+#     Secrets written only in portcullis-fencing (its peers' certificate),
+#     no OpenShift API;
+#   - SNR's agents (the DaemonSet on every node, edge and small ones too)
+#     have their OWN ServiceAccount (agent-daemonset.yaml.tmpl, security
+#     ruling): Nodes read and updated — by the admission policy
+#     portcullis-node-labels only its own Node's annotations —, pods and
+#     SelfNodeRemediations read, and ONE Secret, its peers' certificate,
+#     get by name in portcullis-fencing (no cluster-wide Secret right);
+#   - NHC: no right to create or edit any ClusterRole: its aggregation role
+#     and binding are made here, NHC may only update those two by name.
+#     BLOCKED too: NHC v0.12.0 updates the aggregated role at every start,
+#     and the API server allows an aggregationRule update only with
+#     escalate (cluster-admin-equivalent: the selector could aggregate
+#     cluster-admin), so NHC exits; not granted.
+# BLOCKED (plan Task 24 report, security ruling): SNR v0.13.0 reads the
+# peers' certificate through a controller-runtime cache that lists Secrets
+# in every namespace (internal/certificates/storage.go GetCerts →
+# cache.GetInformer(&Secret{}); cmd/main.go sets no cache option, there is
+# no flag or env for it). The manager keeps that right (main-site,
+# non-small nodes only); without it the AGENT's peer-health client and
+# server can't start until SNR scopes that cache to its namespace (a
+# patched build or upstream fix: the ruling's options).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-snr
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: [storage.k8s.io]
+    resources: [volumeattachments]
+    verbs: [get, list, watch]
+  - apiGroups: [self-node-remediation.medik8s.io]
+    resources: [selfnoderemediationconfigs, selfnoderemediations, selfnoderemediationtemplates]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [self-node-remediation.medik8s.io]
+    resources: [selfnoderemediationconfigs/finalizers, selfnoderemediations/finalizers, selfnoderemediationtemplates/finalizers]
+    verbs: [update]
+  - apiGroups: [self-node-remediation.medik8s.io]
+    resources: [selfnoderemediationconfigs/status, selfnoderemediations/status, selfnoderemediationtemplates/status]
+    verbs: [get, patch, update]
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-snr
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: portcullis-snr}
+subjects:
+  - {kind: ServiceAccount, name: self-node-remediation-controller-manager, namespace: portcullis-fencing}
+---
+# SNR's writes in its own namespace: its DaemonSet, the peers' certificate
+# Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-snr
+  namespace: portcullis-fencing
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [apps]
+    resources: [daemonsets/finalizers]
+    verbs: [update]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create, delete, get, list, patch, update, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-snr
+  namespace: portcullis-fencing
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: portcullis-snr}
+subjects:
+  - {kind: ServiceAccount, name: self-node-remediation-controller-manager, namespace: portcullis-fencing}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: self-node-remediation-agent
+  namespace: portcullis-fencing
+  labels: {app.kubernetes.io/managed-by: portcullis}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-snr-agent
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  # No Secret right here (security ruling): the peers' certificate is the
+  # Role below, by name.
+  - apiGroups: [""]
+    resources: [namespaces, pods]
+    verbs: [get, list, watch]
+  # Its own Node's annotations only (portcullis-node-labels judges it).
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch, update]
+  - apiGroups: [self-node-remediation.medik8s.io]
+    resources: [selfnoderemediations, selfnoderemediationconfigs, selfnoderemediationtemplates]
+    verbs: [get, list, watch]
+  - apiGroups: [self-node-remediation.medik8s.io]
+    resources: [selfnoderemediations/status]
+    verbs: [get, patch, update]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-snr-agent
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: portcullis-snr-agent}
+subjects:
+  - {kind: ServiceAccount, name: self-node-remediation-agent, namespace: portcullis-fencing}
+---
+# The agent's one Secret: its peers' certificate, get by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-snr-agent
+  namespace: portcullis-fencing
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [self-node-remediation-certificates]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-snr-agent
+  namespace: portcullis-fencing
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: portcullis-snr-agent}
+subjects:
+  - {kind: ServiceAccount, name: self-node-remediation-agent, namespace: portcullis-fencing}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-nhc
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [nodes, pods]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles, clusterrolebindings]
+    verbs: [get, list, watch]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles, clusterrolebindings]
+    resourceNames: [node-healthcheck-operator-aggregation]
+    verbs: [update]
+  - apiGroups: [remediation.medik8s.io]
+    resources: [nodehealthchecks]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [remediation.medik8s.io]
+    resources: [nodehealthchecks/finalizers]
+    verbs: [update]
+  - apiGroups: [remediation.medik8s.io]
+    resources: [nodehealthchecks/status]
+    verbs: [get, patch, update]
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-nhc
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: portcullis-nhc}
+subjects:
+  - {kind: ServiceAccount, name: node-healthcheck-controller-manager, namespace: portcullis-fencing}
+---
+# NHC's remediation Leases (medik8s common lease manager): in medik8s-leases,
+# which the CLI makes (NHC may not create namespaces).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-nhc-leases
+  namespace: medik8s-leases
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-nhc-leases
+  namespace: medik8s-leases
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: portcullis-nhc-leases}
+subjects:
+  - {kind: ServiceAccount, name: node-healthcheck-controller-manager, namespace: portcullis-fencing}
+---
+# NHC's remediator rights (SNR's ext-remediation ClusterRole, aggregated):
+# made here so NHC needs no ClusterRole create.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-healthcheck-operator-aggregation
+  labels: {app.kubernetes.io/managed-by: portcullis}
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels: {rbac.ext-remediation/aggregate-to-ext-remediation: "true"}
+rules: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-healthcheck-operator-aggregation
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: node-healthcheck-operator-aggregation}
+subjects:
+  - {kind: ServiceAccount, name: node-healthcheck-controller-manager, namespace: portcullis-fencing}

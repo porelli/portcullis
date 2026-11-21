@@ -6357,6 +6357,124 @@ expect_eq "the restore's LLDAP guard on Kubernetes counts LLDAP's users in Postg
 OUT="$(kt "_kube_pg_exec() { echo \"PG \$*\"; }; rt_exec postgres -- pg_dump -d keycloak -Fc; rt_exec -i postgres -- pg_restore --list")"
 expect_eq "rt_exec postgres on Kubernetes: the CNPG primary's postgres container" "$(printf '%s\n' "$OUT" | grep -c '^PG pg_dump -d keycloak -Fc$\|^PG pg_restore --list$')" 2
 
+# ── HA Task 24: Longhorn, external-snapshotter, fencing, cert-manager (scripts/lib/ha.sh) ──
+H24="$WORK/h24"; rm -rf "$H24"; mkdir -p "$H24/kube/storage" "$H24/charts/portcullis" "$WORK/h24root/secrets"
+cp -R "$HERE/../kube/ha" "$H24/kube/"; cp "$HERE/../kube/storage/storageclass-replicated.yaml" "$H24/kube/storage/"
+cp "$HERE/../charts/portcullis/namespaces.json" "$H24/charts/portcullis/"
+# Nodes: m1, m2 (main storage), m3 (main small), e1 (edge).
+H24_NODES='{"items":[
+ {"metadata":{"name":"m1","labels":{"portcullis.io/site":"main","portcullis.io/class":"cloud","node.longhorn.io/create-default-disk":"true"}},"spec":{"podCIDR":"10.42.0.0/24"},"status":{"addresses":[{"type":"InternalIP","address":"10.215.0.1"}]}},
+ {"metadata":{"name":"m2","labels":{"portcullis.io/site":"main","portcullis.io/class":"home","node.longhorn.io/create-default-disk":"true"}},"spec":{"podCIDR":"10.42.1.0/24"},"status":{"addresses":[{"type":"InternalIP","address":"10.215.0.2"}]}},
+ {"metadata":{"name":"m3","labels":{"portcullis.io/site":"main","portcullis.io/class":"small"}},"spec":{"podCIDR":"10.42.2.0/24"},"status":{"addresses":[{"type":"InternalIP","address":"10.215.0.3"}]}},
+ {"metadata":{"name":"e1","labels":{"portcullis.io/site":"edge","portcullis.io/class":"cloud"}},"spec":{"podCIDR":"10.42.3.0/24"},"status":{"addresses":[{"type":"InternalIP","address":"10.215.0.4"}]}}]}'
+printf '%s' "$H24_NODES" > "$WORK/h24-nodes.json"
+# h24 <code>: the libs on the copy; kube_ctl logs every call (order) and
+# answers the nodes; the probes, the render and the waits are stubs set by
+# the code (STUB_PROBE: lines to answer, else every check ok).
+h24() {
+  rm -f "$WORK/h24-calls" "$WORK/h24-applied"
+  kt "PORTCULLIS_HOME='$H24' PORTCULLIS_ROOT='$WORK/h24root'
+    kube_ctl() { echo \"K \$*\" >> '$WORK/h24-calls'
+      case \"\$*\" in *'get nodes -o json'*) cat '$WORK/h24-nodes.json' ;; *'control-plane -o json'*) echo '{\"items\":[{\"spec\":{\"podCIDR\":\"10.42.0.0/24\"}}]}' ;; *'-f -')
+        cat >> '$WORK/h24-applied' ;; *' get namespace '*) return 0 ;; esac; }
+    kube_namespace_apply() { echo \"NS \$1 \$2\" >> '$WORK/h24-calls'; }
+    _ha_node_probes() { local ns=\"\$1\" c=\"\$2\" n x; shift 2; echo \"PROBE \$ns \$c \$*\" >> '$WORK/h24-calls'
+      for n in \"\$@\"; do for x in \$c; do
+        if [ -n \"\${STUB_PROBE_FAIL:-}\" ] && [ \"\$n \$x\" = \"\${STUB_PROBE_FAIL%%:*}\" ]; then echo \"\$n \$x fail \${STUB_PROBE_FAIL#*:}\"; else echo \"\$n \$x ok\"; fi
+      done; done; }
+    ha_render() { echo \"RENDER \$*\" >> '$WORK/h24-calls'; echo '{}'; }
+    _ha_wait() { echo \"WAIT \$2\" >> '$WORK/h24-calls'; }
+    _ha_crds_established() { :; }; _ha_fencing_cert() { echo CERT >> '$WORK/h24-calls'; }
+    ha_fencing_ready() { echo READY-CHECK >> '$WORK/h24-calls'; }
+    _kube_apply_files() { echo \"FILES \$*\" >> '$WORK/h24-calls'; }
+    $1" 2>&1
+}
+OUT="$(STUB_PROBE_FAIL='m2 iscsid:open-iscsi is not installed (apt install open-iscsi): Longhorn needs it' h24 ha_install_longhorn)"
+case "$OUT" in *"node m2: open-iscsi is not installed"*"Longhorn needs these on every node it runs on"*"(nothing installed)"*"rc=1")
+  t_pass "ha_install_longhorn: refuses without open-iscsi on every storage node (naming the node)" ;; *) t_fail "longhorn no iscsi: $OUT" ;; esac
+expect_eq "ha_install_longhorn: a failed check → nothing rendered or applied but the namespace's own deny policies" \
+  "$(grep -c 'RENDER\|FILES' "$WORK/h24-calls" || true):$(jq -r '.items[].metadata.name' "$WORK/h24-applied" | tr '\n' ' ')" "0:default-deny kube-dns kube-api longhorn-internal "
+expect_eq "ha_install_longhorn: checks the main site's non-small nodes (not the small m3, not edge's e1); the ZFS check on the storage nodes" \
+  "$(grep '^PROBE' "$WORK/h24-calls" | tr '\n' ';')" "PROBE longhorn-system iscsid iscsi_tcp nfs_common multipath_blacklist m1 m2;PROBE longhorn-system longhorn_path m1 m2;"
+OUT="$(STUB_PROBE_FAIL='m1 longhorn_path:/var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk' h24 ha_install_longhorn)"
+case "$OUT" in *"node m1: /var/lib/longhorn is on a ZFS dataset"*"rc=1") t_pass "ha_install_longhorn: a ZFS dataset under /var/lib/longhorn → refused (spike S2)" ;; *) t_fail "longhorn zfs: $OUT" ;; esac
+OUT="$(h24 ha_install_longhorn)"
+expect_eq "ha_install_longhorn: namespace (PSA longhorn) → deny policies → node checks → render (API + initiator sources) → apply → waits → StorageClass" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
+  "rc=0:NS;K apply;PROBE longhorn-system;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;"
+expect_eq "ha_install_longhorn: the namespace is longhorn-system with namespaces.json's longhorn levels; applied.json records ha.longhorn" \
+  "$(grep '^NS' "$WORK/h24-calls"):$(jq -r 'has("ha.longhorn")' "$WORK/h24root/secrets/kube/applied.json")" "NS longhorn-system privileged:true"
+printf 'x' >> "$H24/kube/ha/longhorn/upstream/longhorn-1.13.0.tgz"
+OUT="$(h24 ha_install_longhorn)"
+case "$OUT" in *"the Longhorn pins don't hold: kube/ha/longhorn/upstream/longhorn-1.13.0.tgz has sha256"*"not the pinned e57f010d"*"rc=1") t_pass "ha_install_longhorn: a chart that isn't the pinned release asset → refused" ;; *) t_fail "longhorn pin: $OUT" ;; esac
+expect_eq "ha_install_longhorn: a refused pin → not one cluster call" "$(cat "$WORK/h24-calls" 2>/dev/null | wc -l | tr -d ' ')" 0
+cp "$HERE/../kube/ha/longhorn/upstream/longhorn-1.13.0.tgz" "$H24/kube/ha/longhorn/upstream/"
+printf '%s' '{"items":[{"metadata":{"name":"m3","labels":{"portcullis.io/site":"main","portcullis.io/class":"small"}}}]}' > "$WORK/h24-nodes.json"
+OUT="$(h24 ha_install_longhorn)"
+case "$OUT" in *"no storage node at main"*"(nothing installed)"*"rc=1") t_pass "ha_install_longhorn: no storage node → refused" ;; *) t_fail "longhorn no storage: $OUT" ;; esac
+printf '%s' "$H24_NODES" > "$WORK/h24-nodes.json"
+OUT="$(STUB_PROBE_FAIL='e1 watchdog:no watchdog device (/dev/watchdog; modprobe softdog provides it)' h24 ha_install_fencing)"
+case "$OUT" in *"node e1 has no watchdog: fencing can't be confirmed (no watchdog device"*"fencing needs a watchdog on every node"*"(nothing installed)"*"rc=1")
+  t_pass "ha_install_fencing: refuses a node without /dev/watchdog: 'node <n> has no watchdog: fencing can't be confirmed'" ;; *) t_fail "fencing no watchdog: $OUT" ;; esac
+expect_eq "ha_install_fencing: every node checked (the small one and the edge one too); refused → no certificate, render or config" \
+  "$(grep '^PROBE' "$WORK/h24-calls"):$(grep -c 'CERT\|RENDER\|FILES' "$WORK/h24-calls" || true)" "PROBE portcullis-fencing watchdog m1 m2 m3 e1:0"
+OUT="$(h24 ha_install_fencing)"
+expect_eq "ha_install_fencing: namespace → policies → watchdogs → certificate → render → managers → config.yaml → agents → ha_fencing_ready" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
+  "rc=0:NS;K apply;PROBE portcullis-fencing;NS;K apply;CERT;RENDER fencing;K apply;WAIT the fencing managers;FILES config.yaml;WAIT SNR's agents (DaemonSet self-node-remediation-ds);READY-CHECK;"
+expect_eq "ha_install_fencing: portcullis-fencing's policies: deny, DNS, API, SNR's peers on 30001 only between agents" \
+  "$(jq -c '[.items[] | .metadata.name] + [.items[] | select(.metadata.name == "snr-peers") | .spec.ingress[0].ports[0].port]' < <(head -c "$(wc -c < "$WORK/h24-applied")" "$WORK/h24-applied" | jq -s '.[0]'))" \
+  '["default-deny","kube-dns","kube-api","snr-peers",30001]'
+OUT="$(h24 ha_install_snapshotter)"
+expect_eq "ha_install_snapshotter: its own kube-system policy first (only its pods), the CRDs, then the controller" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(head -c 4000 "$WORK/h24-applied" | jq -sc '.[0] | [.metadata.namespace, .spec.podSelector.matchLabels["app.kubernetes.io/name"], .spec.policyTypes]'):$(grep -o 'FILES .*crds.yaml\|RENDER snapshotter' "$WORK/h24-calls" | sed 's/FILES .*\//FILES /' | tr '\n' ';')" \
+  'rc=0:["kube-system","snapshot-controller",["Ingress","Egress"]]:FILES crds.yaml;RENDER snapshotter;'
+OUT="$(h24 ha_install_certmanager)"
+expect_eq "ha_install_certmanager: cert-manager (restricted) → deny + its webhook :10250 from the API server only → render" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep '^NS' "$WORK/h24-calls"):$(jq -sc '.[0].items[] | select(.metadata.name == "webhook") | [[.spec.ingress[0].from[].ipBlock.cidr], .spec.ingress[0].ports[0].port]' "$WORK/h24-applied")" \
+  'rc=0:NS cert-manager restricted:[["10.1.0.4/32","10.42.0.0/32","10.42.0.1/32"],10250]'
+# ha_fencing_ready (the jq over SNR's agents → per node ready), fail closed.
+FR_CFG='{"spec":{"watchdogFilePath":"/dev/watchdog","safeTimeToAssumeNodeRebootedSeconds":150}}'
+fr() { kt "_ha_deploy_ready() { [ -z \"\${STUB_MGR_DOWN:-}\" ]; }; kube_ctl() { case \"\$*\" in *'get nodes'*) printf '%s' '{\"items\":[{\"metadata\":{\"name\":\"m1\"}},{\"metadata\":{\"name\":\"m2\"}}]}' ;;
+    *'get pods'*) [ -n '$1' ] || return 1; printf '%s' '$1' ;; *selfnoderemediationconfigs*) printf '%s' '$2' ;; esac; }; ha_fencing_ready"; }
+AGENT='{"metadata":{"name":"self-node-remediation-ds-%s","ownerReferences":[{"kind":"DaemonSet","name":"self-node-remediation-ds"}]},"spec":{"nodeName":"%s"},"status":{"conditions":[{"type":"Ready","status":"%s"}]}}'
+A1="$(printf "$AGENT" a m1 True)" A2="$(printf "$AGENT" b m2 True)" A2N="$(printf "$AGENT" b m2 False)"
+expect_eq "ha_fencing_ready: every node's agent Ready and our configuration → each node ready, exit 0" \
+  "$(fr "{\"items\":[$A1,$A2]}" "$FR_CFG" | tr '\t\n' ' ;')" "m1 ready;m2 ready;rc=0;"
+expect_eq "ha_fencing_ready: m2's agent not Ready → m2 not ready, exit 1 (Task 31 stops: no stateful failover)" \
+  "$(fr "{\"items\":[$A1,$A2N]}" "$FR_CFG" | tr '\t\n' ' ;')" "m1 ready;m2 not ready (no Ready SNR agent);rc=1;"
+expect_eq "ha_fencing_ready: another safe time / watchdog (not ours) → no node ready" \
+  "$(fr "{\"items\":[$A1,$A2]}" '{"spec":{"watchdogFilePath":"/dev/watchdog","safeTimeToAssumeNodeRebootedSeconds":90}}' | grep -c 'not ready (SNR configuration missing or not ours)'):$(fr "{\"items\":[$A1,$A2]}" '{"spec":{}}' | tail -n1)" "2:rc=1"
+expect_eq "ha_fencing_ready: a manager (SNR or NHC) not available → no node ready (nothing remediates)" \
+  "$(STUB_MGR_DOWN=1 fr "{\"items\":[$A1,$A2]}" "$FR_CFG" | grep -c "not ready (the SNR / NHC managers aren't available)")" 2
+OUT="$(fr "" "$FR_CFG")"
+case "$OUT" in *"can't read SNR's agents: fencing unconfirmed"*"rc=1") t_pass "ha_fencing_ready: the agents unreadable → fencing unconfirmed, exit 1" ;; *) t_fail "fencing unreadable: $OUT" ;; esac
+# Fail closed (Global Constraints [24]): no volume leaves an unfenced node by timeout.
+expect_eq "fencing unconfirmed → no stateful failover: every server's kube-controller-manager never force-detaches (init flags, nodeadm's join flags)" \
+  "$(grep -c '^--kube-controller-manager-arg=disable-force-detach-on-timeout=true$' "$HERE/fixtures/k3s-server-flags.txt"):$(grep -c '"--kube-controller-manager-arg=disable-force-detach-on-timeout=true"' "$HERE/../nodeadm/flags.go")" "1:1"
+# The bundled settings (static; tests/k8s_hardening.py checks the render).
+LHV="$HERE/../kube/ha/longhorn/values.yaml"
+expect_eq "longhorn settings: node-down-pod-deletion-policy do-nothing, no soft anti-affinity, disks only on labelled nodes, system pods at main" \
+  "$(grep -cE '^  (nodeDownPodDeletionPolicy: do-nothing|replicaSoftAntiAffinity: false|createDefaultDiskLabeledNodes: true|systemManagedComponentsNodeSelector: "portcullis.io/site:main"|upgradeChecker: false)$' "$LHV")" 5
+expect_eq "fencing config: watchdog /dev/watchdog, safe time 150 (S3), OutOfServiceTaint, small nodes tolerated, NHC on every node" \
+  "$(grep -cE '^  (watchdogFilePath: /dev/watchdog|safeTimeToAssumeNodeRebootedSeconds: 150|maxApiErrorThreshold: 2)$|^      remediationStrategy: OutOfServiceTaint$|key: portcullis.io/small, operator: Exists|^  minHealthy: 51%$' "$HERE/../kube/ha/fencing/config.yaml")" 6
+# ha manifests: every image pinned by digest (lint_images over kube/ha;
+# a broken digest in a values file and a kustomization fails it).
+LT="$WORK/lint-ha"; rm -rf "$LT"; mkdir -p "$LT"
+( cd "$HERE/.." && find . -path ./.git -prune -o -path './kube/ha/*/upstream' -prune -o -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.sh' \
+    -o -name Dockerfile -o -name portcullis \) -print | tar -cf - -T - ) | tar -xf - -C "$LT"
+expect_eq "ha manifests: every image pinned by digest (tests/lint_images.sh)" "$(bash "$LT/tests/lint_images.sh" >/dev/null 2>&1; echo $?)" 0
+sed -i.bak 's/v2.18.0@sha256:[0-9a-f]*"/v2.18.0"/' "$LT/kube/ha/longhorn/values.yaml"
+awk '!/digest: sha256:9ad002/' "$LT/kube/ha/fencing/kustomization.yaml" > "$LT/k.t" && mv "$LT/k.t" "$LT/kube/ha/fencing/kustomization.yaml"
+OUT="$(bash "$LT/tests/lint_images.sh" 2>&1)"
+expect_eq "ha manifests: a values tag without a digest and a kustomization image without one → lint fails naming both" \
+  "$(printf '%s\n' "$OUT" | grep -c 'values.yaml:.*v2.18.0 (not <tag>@sha256)\|fencing/kustomization.yaml: image quay.io/medik8s/self-node-remediation-operator without a sha256 digest')" 2
+# Never on a non-HA install: only ha enable (Task 31) calls them.
+expect_eq "the Task 24 installs are never on a non-HA install (no caller in the cluster setup, rt_up, init or up)" \
+  "$(grep -n 'ha_install_\(longhorn\|snapshotter\|fencing\|certmanager\)\|ha_fencing_ready' "$HERE"/../scripts/lib/*.sh "$HERE"/../portcullis | grep -v '^[^:]*ha\.sh:' | grep -vc '^[^:]*:[0-9]*: *#' || true)" 0
+expect_eq "ha_install_*: never helm --set or helm install (a pinned render, applied server-side)" \
+  "$(declare -f ha_render ha_install_longhorn ha_install_fencing ha_install_snapshotter ha_install_certmanager 2>/dev/null | grep -c -- '--set\|helm upgrade\|helm install\|kube_helm' || true)" 0
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

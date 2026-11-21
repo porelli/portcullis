@@ -64,9 +64,28 @@ while IFS= read -r f; do
     case "$ref" in *'{{'*) continue ;; esac
     qualified "$ref" && [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "$f:$n: $ref"; bad=1; }
   done < <(grep -nE '^[[:space:]-]*image:[[:space:]]' "$f")
-done < <(find charts/portcullis/templates kube -name '*.yaml' 2>/dev/null | sort)
+done < <(find charts/portcullis/templates kube -name '*.yaml' ! -path 'kube/ha/*/upstream/*' 2>/dev/null | sort)
+# kube/ha/** (HA, plan Task 24): the vendored upstream files
+# (kube/ha/<c>/upstream/, sha256-pinned in scripts/lib/ha.sh) name tags;
+# what pins them is ours: every values file's `tag:` (a chart's image tag)
+# is <tag>@sha256:<64 hex>, every kustomization images: entry has a
+# sha256 digest. The rendered result is checked whole by
+# tests/k8s_hardening.py check_ha_images (every image, arg and env value).
+while IFS= read -r f; do
+  while IFS=: read -r n line; do
+    ref="$(printf '%s' "$line" | sed -E 's/.*tag:[[:space:]]*//; s/[}[:space:]]+$//; s/^"(.*)"$/\1/')"
+    [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "$f:$n: tag $ref (not <tag>@sha256)"; bad=1; }
+  done < <(grep -nE '(^|[{,[:space:]])tag:[[:space:]]' "$f")
+done < <(find kube/ha -name 'values.yaml' ! -path '*/upstream/*' 2>/dev/null | sort)
+while IFS= read -r f; do
+  awk -v f="$f" '
+    /^images:/ { i = 1; next } /^[^ #-]/ { i = 0 }
+    i && /^  - name:/ { if (name != "" && !dig) { print f ": image " name " without a sha256 digest"; bad = 1 } name = $3; dig = 0 }
+    i && /^    digest: sha256:[0-9a-f]{64}$/ { dig = 1 }
+    END { if (name != "" && !dig) { print f ": image " name " without a sha256 digest"; bad = 1 } exit bad }' "$f" || bad=1
+done < <(find kube/ha -name 'kustomization.yaml' ! -path '*/upstream/*' 2>/dev/null | sort)
 # Inline pinned refs: a pinned ref is what the CLI and CI pull / run.
-for f in portcullis scripts/lib/*.sh .github/workflows/*.yml .github/ci/*.sh .github/actions/*/action.yml $(find charts/portcullis kube -name '*.yaml' 2>/dev/null | sort); do
+for f in portcullis scripts/lib/*.sh .github/workflows/*.yml .github/ci/*.sh .github/actions/*/action.yml $(find charts/portcullis kube -name '*.yaml' ! -path 'kube/ha/*/upstream/*' 2>/dev/null | sort); do
   [ -f "$f" ] || continue
   while IFS=: read -r n ref; do
     qualified "$ref" || { echo "$f:$n: $ref"; bad=1; }

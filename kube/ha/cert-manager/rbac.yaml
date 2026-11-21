@@ -1,0 +1,128 @@
+# cert-manager's rights (plan Task 24, Amendment 2), narrowed from the
+# release manifest's (tests/k8s_hardening.py check_certmanager holds them):
+#   - the controller: Issuers, Certificates, CertificateRequests and their
+#     Secrets in cnpg-system only (its --namespace); its Lease in
+#     cert-manager;
+#   - the cainjector: the CA Secret and Certificates in cert-manager; the
+#     two cert-manager-webhook configurations read cluster-wide (its
+#     informers list them) and written only by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-cert-manager
+  namespace: cnpg-system
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [cert-manager.io]
+    resources: [issuers, issuers/status, certificates, certificates/status, certificaterequests, certificaterequests/status]
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: [cert-manager.io]
+    resources: [certificaterequests]
+    verbs: [create, delete]
+  - apiGroups: [cert-manager.io]
+    resources: [certificates/finalizers, certificaterequests/finalizers, issuers/finalizers]
+    verbs: [update]
+  # Read only: its shared informers list them (ACME itself is off).
+  - apiGroups: [acme.cert-manager.io]
+    resources: [orders, challenges]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, update, delete, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-cert-manager
+  namespace: cnpg-system
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: portcullis-cert-manager}
+subjects:
+  - {kind: ServiceAccount, name: cert-manager, namespace: cert-manager}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-cert-manager-leader
+  namespace: cert-manager
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [cert-manager-controller, cert-manager-cainjector-leader-election, cert-manager-cainjector-leader-election-core]
+    verbs: [get, update, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-cert-manager-leader
+  namespace: cert-manager
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: portcullis-cert-manager-leader}
+subjects:
+  - {kind: ServiceAccount, name: cert-manager, namespace: cert-manager}
+  - {kind: ServiceAccount, name: cert-manager-cainjector, namespace: cert-manager}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-cert-manager-cainjector
+  namespace: cert-manager
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [cert-manager.io]
+    resources: [certificates]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-cert-manager-cainjector
+  namespace: cert-manager
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: portcullis-cert-manager-cainjector}
+subjects:
+  - {kind: ServiceAccount, name: cert-manager-cainjector, namespace: cert-manager}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-cert-manager-cainjector
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingwebhookconfigurations, mutatingwebhookconfigurations]
+    verbs: [get, list, watch]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingwebhookconfigurations, mutatingwebhookconfigurations]
+    resourceNames: [cert-manager-webhook]
+    verbs: [update, patch]
+  # Its start-up check that the Certificate CRD is installed.
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    resourceNames: [certificates.cert-manager.io]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-cert-manager-cainjector
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: portcullis-cert-manager-cainjector}
+subjects:
+  - {kind: ServiceAccount, name: cert-manager-cainjector, namespace: cert-manager}

@@ -1,0 +1,23 @@
+# The replicated tier (plan Global Constraints, Task 24): Longhorn's v1
+# engine, two replicas never on one node (replica-soft-anti-affinity false),
+# a local replica where the pod runs when it can, Retain. Applied by
+# ha_install_longhorn only (HA; never on a non-HA install). Disks exist only
+# on main storage nodes (Longhorn's setting create-default-disk-labeled-
+# nodes + the node.longhorn.io/create-default-disk label init and nodeadm
+# set, P36); the core HA volumes move here in Task 31.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: portcullis-core-replicated
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+provisioner: driver.longhorn.io
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  numberOfReplicas: "2"
+  dataLocality: best-effort
+  staleReplicaTimeout: "30"
+  dataEngine: v1
+  fsType: ext4

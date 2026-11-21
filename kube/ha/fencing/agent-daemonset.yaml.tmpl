@@ -1,0 +1,119 @@
+# SNR's agent DaemonSet template (Go text/template, rendered by the SNR
+# manager from /install): upstream/self-node-remediation-deamonset.yaml.tmpl
+# (install/ at the v0.13.0 tag, the file the image ships; sha256 pinned)
+# with three changes only (tests/k8s_hardening.py check_ha_infra): its own
+# ServiceAccount self-node-remediation-agent (never the manager's), our
+# PriorityClass (ruling I5) and IfNotPresent (the image is pinned by
+# digest). Mounted over the image's file by managers.yaml (ConfigMap
+# snr-install, subPath).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: self-node-remediation-ds
+  namespace: {{.Namespace}}
+  labels:
+    k8s-app: self-node-remediation
+  annotations:
+    snr.medik8s.io/force-deletion-revision: "1"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: self-node-remediation
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app.kubernetes.io/name: self-node-remediation
+        app.kubernetes.io/component: agent
+    spec:
+      volumes:
+        - name: devices
+          hostPath:
+            path: /dev
+            type: Directory
+      serviceAccountName: self-node-remediation-agent
+      priorityClassName: portcullis-core
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: remediation.medik8s.io/exclude-from-remediation
+                  operator: NotIn
+                  values:
+                  - "true"
+      hostPID: true
+      containers:
+      - args:
+        - --is-manager=false
+        command:
+        - /manager
+        env:
+          - name: MY_NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          - name: DEPLOYMENT_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: WATCHDOG_PATH
+            value: {{.WatchdogPath}}
+          - name: PEER_API_SERVER_TIMEOUT
+            value: "{{.PeerApiServerTimeout}}"
+          - name: API_CHECK_INTERVAL
+            value: "{{.ApiCheckInterval}}"
+          - name: PEER_UPDATE_INTERVAL
+            value: "{{.PeerUpdateInterval}}"
+          - name: API_SERVER_TIMEOUT
+            value: "{{.ApiServerTimeout}}"
+          - name: PEER_DIAL_TIMEOUT
+            value: "{{.PeerDialTimeout}}"
+          - name: PEER_REQUEST_TIMEOUT
+            value: "{{.PeerRequestTimeout}}"
+          - name: MAX_API_ERROR_THRESHOLD
+            value: "{{.MaxApiErrorThreshold}}"
+          - name: IS_SOFTWARE_REBOOT_ENABLED
+            value: {{.IsSoftwareRebootEnabled}}
+          - name: END_POINT_HEALTH_CHECK_URL
+            value: {{.EndpointHealthCheckUrl}}
+          - name: HOST_PORT
+            value: "{{.HostPort}}"
+          - name: MIN_PEERS_FOR_REMEDIATION
+            value: "{{.MinPeersForRemediation}}"
+        image: {{.Image}}
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - name: devices
+            mountPath: /dev
+        securityContext:
+          privileged: true
+        name: manager
+        ports:
+        - containerPort: {{.HostPort}}
+          hostPort: {{.HostPort}}
+          name: self-n-r-port
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 20m
+            memory: 60Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        runAsUser: 0
+      terminationGracePeriodSeconds: 10
+      tolerations:
+        - key: "remediation.medik8s.io/self-node-remediation"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"

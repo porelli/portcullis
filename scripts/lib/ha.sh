@@ -456,3 +456,479 @@ _backup_verify_dir_kube() {
   done
   return "$rc"
 }
+
+# ══ HA infrastructure: Longhorn, external-snapshotter, fencing, cert-manager
+# (plan Task 24, Amendments 1–2) ══
+#
+# Installed ONLY by `ha enable`'s step 3 (plan Task 31 calls these; never a
+# non-HA install, never Docker / Podman). Each one, idempotent (every run
+# re-applies):
+#   1. checks the vendored upstream files against their sha256 pins
+#      (_ha_pins) and refuses with nothing installed;
+#   2. makes its namespace (PSA from namespaces.json) and applies its
+#      default-deny + DNS + API egress + the operator's own flows
+#      (ha_ns_policies) BEFORE anything runs there (as Task 23's I4);
+#   3. checks the nodes it needs (the host probes: open-iscsi, iscsi_tcp,
+#      nfs-common, the multipath blacklist, no ZFS dataset under Longhorn's
+#      path; a watchdog for fencing) and refuses naming each node;
+#   4. renders the pinned manifests (ha_render: helm template for Longhorn's
+#      chart, then kubectl kustomize with kube/ha/<c>/kustomization.yaml —
+#      images by digest, our PriorityClass, the narrowed RBAC; never --set),
+#      applies them server-side and waits for them;
+#   5. records ha.<c> in applied.json.
+# Fencing fails closed: ha_fencing_ready answers per node, and every node
+# must be ready before anything stateful fails over (Task 31 stops there);
+# k3s runs kube-controller-manager with disable-force-detach-on-timeout (a
+# volume never leaves an unfenced node by timeout) and Longhorn's
+# node-down-pod-deletion-policy is do-nothing: only SNR's out-of-service
+# taint moves a stateful pod off a dead node.
+
+KUBE_LONGHORN_NS="longhorn-system"
+KUBE_FENCING_NS="portcullis-fencing"
+KUBE_CERTMANAGER_NS="cert-manager"
+# NHC's remediation Leases (the medik8s lease manager's fixed namespace).
+KUBE_FENCING_LEASES_NS="medik8s-leases"
+HA_DIR="kube/ha"
+KUBE_REPLICATED_SC="kube/storage/storageclass-replicated.yaml"
+
+# _ha_pins <component> — "<path under kube/ha> <sha256>" words: the
+# upstream artifacts (Amendment 1; cert-manager: Task 24's pin), the
+# bundles' conversions (kube/ha/fencing/from-bundle.py) and SNR's agent
+# template at the v0.13.0 tag (agent-daemonset.yaml.tmpl's base).
+_ha_pins() {
+  case "$1" in
+    longhorn) echo "longhorn/upstream/longhorn-1.13.0.tgz e57f010d2a8bcf0da5b8b03ffecf49c5bc35ddc2663588ce8f22b7567b6133ed" ;;
+    snapshotter) echo "snapshotter/upstream/crds.yaml 9942127fab40ddd5b991745c3aa9127f883df96639b538e3103e51a227a463d5
+      snapshotter/upstream/rbac-snapshot-controller.yaml 99c4ac480b6c9563be0d85599e29cc7b68b25a82d250b0e789726727551e8d38
+      snapshotter/upstream/setup-snapshot-controller.yaml 54b9342a7433c377b83a671babf416660078a716ec2e63f658a77aa629de5581" ;;
+    fencing) echo "fencing/upstream/snr-v0.13.0-bundle.tar.gz c7d58af594390e5a544a4f0d51579e55462669bd8d5dfe37822dc833efd300c2
+      fencing/upstream/nhc-v0.12.0-bundle.tar.gz b12c9eb3bcc22136b8527974700f72260c2f19b141122ea6fe2dfa170f495597
+      fencing/upstream/snr-v0.13.0.yaml fc1076bb255eb59aa10a30386c0caf1a17b2f09922e50b3172344a13cac4f7ee
+      fencing/upstream/nhc-v0.12.0.yaml 11e9f93ba86105dc03a597fd55910d085bddc84d5514d782e95fad6c08b80514
+      fencing/upstream/self-node-remediation-deamonset.yaml.tmpl a82494959ab0cd212c466d67064df7cb23da1c3381da0974256ab26e106778c4" ;;
+    certmanager) echo "cert-manager/upstream/cert-manager-v1.21.3.yaml c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74" ;;
+    *) return 1 ;;
+  esac
+}
+
+# _ha_dir <component> — its directory under kube/ha.
+_ha_dir() { case "$1" in certmanager) echo cert-manager ;; *) echo "$1" ;; esac; }
+
+# ha_pins_ok <component> — every pinned file has its sha256 (fail closed:
+# _K_ERR names the first that doesn't, nothing is installed).
+ha_pins_ok() {
+  local p f want got
+  p="$(_ha_pins "$1")" || { _K_ERR="no pins for $1"; return 1; }
+  set -- $p
+  while [ $# -ge 2 ]; do
+    f="$1" want="$2"; shift 2
+    [ -f "$PORTCULLIS_HOME/$HA_DIR/$f" ] || { _K_ERR="$HA_DIR/$f is missing"; return 1; }
+    got="$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/$f")"
+    [ "$got" = "$want" ] || { _K_ERR="$HA_DIR/$f has sha256 $got, not the pinned $want"; return 1; }
+  done
+  _K_ERR=""
+}
+
+# ha_render <component> [<API server sources> <iSCSI initiator sources>] —
+# the component's manifests as `kubectl apply` gets them (YAML on stdout):
+# kubectl kustomize of kube/ha/<c>/ (snapshotter: the controller only, its
+# CRDs are upstream/crds.yaml; fencing: CRDs, managers, RBAC; its CRs are
+# config.yaml), Longhorn first through `helm template` of the pinned chart
+# with values.yaml and a generated sources file (the webhook's and the
+# iSCSI initiators' addresses, space-separated IPv4s: both required — the
+# chart's policies admit anyone without them). Local only (no cluster).
+ha_render() {
+  local c="$1" d="$PORTCULLIS_HOME/$HA_DIR" t rc=0
+  case "$c" in
+    snapshotter|fencing|certmanager) kubectl kustomize "$d/$(_ha_dir "$c")" ;;
+    longhorn)
+      [ -n "${2:-}" ] && [ -n "${3:-}" ] || { echo "ha_render longhorn: the webhook's and the iSCSI initiators' sources are required" >&2; return 1; }
+      t="$(mktemp -d)"
+      cp "$d/longhorn/kustomization.yaml" "$d/longhorn/rbac.yaml" "$t/"
+      A="$2" I="$3" jq -n 'def cidrs: split(" ") | map(select(. != "") | . + "/32");
+        {networkPolicies: {kubeAPIServerSourceCIDRs: (env.A | cidrs), v1DataEngineInitiatorSourceCIDRs: (env.I | cidrs)}}' > "$t/sources.json"
+      { helm template longhorn "$d/longhorn/upstream/longhorn-1.13.0.tgz" -n "$KUBE_LONGHORN_NS" --no-hooks \
+          -f "$d/longhorn/values.yaml" -f "$t/sources.json" > "$t/rendered.yaml" && kubectl kustomize "$t"; } || rc=1
+      rm -rf "$t"; return "$rc" ;;
+    *) echo "ha_render: unknown component $c" >&2; return 1 ;;
+  esac
+}
+
+# kube_node_host_sources — the addresses a node's own host traffic to a pod
+# comes from (Longhorn's iSCSI initiator runs in the host): every node's
+# InternalIP and the first two addresses of its pod range (flannel's and
+# cni0's, as kube_apiserver_sources). Empty and exit 1 when unreadable.
+kube_node_host_sources() {
+  local out
+  out="$(kube_ctl get nodes -o json 2>/dev/null | jq -r '.items[]
+      | ([.status.addresses[]? | select(.type == "InternalIP") | .address | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))][]),
+        (.spec.podCIDR // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$")) | split("/")[0] | split(".") | map(tonumber) as $o
+         | ($o | map(tostring) | join(".")), ($o[0:3] + [$o[3] + 1] | map(tostring) | join(".")))' 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# ha_ns_policies <namespace> <API endpoints (ip:port words)> [<webhook
+# sources (ip words)>] — a namespace's CLI-owned NetworkPolicies (a JSON
+# List): default-deny both ways, kube-dns, every pod's egress to the API
+# endpoints, and its operator's flows:
+#   longhorn-system  pods reach each other (the engines' replicas, the CSI
+#                    plugin → the manager); who may reach them is Longhorn's
+#                    own documented policies (the chart's, sources included);
+#   portcullis-fencing  SNR's agents ask each other on TCP 30001 (peer health);
+#   cert-manager     its webhook :10250 only from the API server's addresses.
+ha_ns_policies() {
+  NS="$1" API="$2" SRC="${3:-}" jq -n '
+    def words: split(" ") | map(select(. != ""));
+    def meta($n): {name: $n, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}};
+    def np($n; $spec): {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: meta($n), spec: $spec};
+    def agents: {matchLabels: {"app.kubernetes.io/name": "self-node-remediation", "app.kubernetes.io/component": "agent"}};
+    {apiVersion: "v1", kind: "List", items: ([
+      np("default-deny"; {podSelector: {}, policyTypes: ["Ingress", "Egress"]}),
+      np("kube-dns"; {podSelector: {}, policyTypes: ["Egress"],
+         egress: [{to: [{namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": "kube-system"}}, podSelector: {matchLabels: {"k8s-app": "kube-dns"}}}],
+                   ports: [{protocol: "UDP", port: 53}, {protocol: "TCP", port: 53}]}]}),
+      np("kube-api"; {podSelector: {}, policyTypes: ["Egress"],
+         egress: [env.API | words | .[] | split(":") as $p | {to: [{ipBlock: {cidr: ($p[0] + "/32")}}], ports: [{protocol: "TCP", port: ($p[1] | tonumber)}]}]})]
+      + (if env.NS == "longhorn-system" then [np("longhorn-internal"; {podSelector: {}, policyTypes: ["Egress"], egress: [{to: [{podSelector: {}}]}]})]
+         elif env.NS == "portcullis-fencing" then [np("snr-peers"; {podSelector: agents, policyTypes: ["Ingress", "Egress"],
+           ingress: [{from: [{podSelector: agents}], ports: [{protocol: "TCP", port: 30001}]}],
+           egress: [{to: [{podSelector: agents}], ports: [{protocol: "TCP", port: 30001}]}]})]
+         elif env.NS == "cert-manager" then [np("webhook"; {podSelector: {matchLabels: {"app.kubernetes.io/component": "webhook"}}, policyTypes: ["Ingress"],
+           ingress: [{from: [env.SRC | words | .[] | {ipBlock: {cidr: (. + "/32")}}], ports: [{protocol: "TCP", port: 10250}]}]})]
+         else [] end))}'
+}
+
+# ha_snapshotter_policy <API endpoints> — the snapshot-controller's own
+# policy in kube-system (only its pods: kube-system itself stays k3s'): no
+# ingress, egress to the API endpoints and kube-dns only.
+ha_snapshotter_policy() {
+  API="$1" jq -n '
+    def words: split(" ") | map(select(. != ""));
+    {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy",
+     metadata: {name: "snapshot-controller", namespace: "kube-system", labels: {"app.kubernetes.io/managed-by": "portcullis"}},
+     spec: {podSelector: {matchLabels: {"app.kubernetes.io/name": "snapshot-controller"}}, policyTypes: ["Ingress", "Egress"],
+       egress: ([env.API | words | .[] | split(":") as $p | {to: [{ipBlock: {cidr: ($p[0] + "/32")}}], ports: [{protocol: "TCP", port: ($p[1] | tonumber)}]}]
+         + [{to: [{podSelector: {matchLabels: {"k8s-app": "kube-dns"}}}], ports: [{protocol: "UDP", port: 53}, {protocol: "TCP", port: 53}]}])}}'
+}
+
+# _ha_apply — server-side apply of stdin (our field manager).
+_ha_apply() { kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null; }
+
+# _ha_namespace <role> <namespace> <API endpoints> [<sources>] — the
+# namespace with its PSA labels, then its policies (before anything runs).
+_ha_namespace() {
+  local psa
+  psa="$(kube_psa "$1")" || exit 1
+  # shellcheck disable=SC2086  # three single-word levels
+  kube_namespace_apply "$2" $psa || fail "could not create the namespace $2 (nothing installed)"
+  ha_ns_policies "$2" "$3" "${4:-}" | _ha_apply || fail "could not apply $2's NetworkPolicies (nothing installed)"
+}
+
+# The host probe (one pod per node, nodeName: a small node's taint doesn't
+# keep it off; hostPID and the host's root read-only, as nobody, in a PSA
+# privileged namespace with no network): one line per check, "<id> ok|fail
+# <detail>", the nodeagent's checks' texts (Hub internal/nodeagent/host).
+# shellcheck disable=SC2016  # the probe's own shell
+HA_PROBE_SH='
+has() { for f in "$@"; do [ -e "/host$f" ] && return 0; done; return 1; }
+running() { for c in /proc/[0-9]*/comm; do [ "$(cat "$c" 2>/dev/null)" = "$1" ] && return 0; done; return 1; }
+for c in $CHECKS; do case "$c" in
+  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo "iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it"
+    elif ! running iscsid; then echo "iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)"; else echo "iscsid ok"; fi ;;
+  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo "iscsi_tcp ok"; else echo "iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)"; fi ;;
+  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo "nfs_common ok"; else echo "nfs_common fail nfs-common is not installed (apt install nfs-common)"; fi ;;
+  multipath_blacklist)
+    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo "multipath_blacklist ok"
+    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed "s/#.*//" | awk '"'"'
+        /^[[:space:]]*blacklist[[:space:]]*\{/ { b = 1; next } b && /\}/ { b = 0 } b { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); if ($0 == "devnode \"^sd[a-z0-9]+\"") f = 1 } END { exit !f }'"'"'; then echo "multipath_blacklist ok"
+    else echo "multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \"^sd[a-z0-9]+\" } to /etc/multipath.conf and restart multipathd"; fi ;;
+  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e "$p" ] && [ "$p" != /host ]; do p="${p%/*}"; [ -n "$p" ] || p=/host; done
+    t="$(stat -f -c %T "$p" 2>/dev/null)"
+    case "$t" in "") echo "longhorn_path fail the file system of /var/lib/longhorn is unknown" ;;
+      zfs) echo "longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk" ;; *) echo "longhorn_path ok" ;; esac ;;
+  watchdog) if [ -c /host/dev/watchdog ]; then echo "watchdog ok"; else echo "watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)"; fi ;;
+esac; done'
+
+# _ha_node_probes <namespace> <checks (words)> <node>… — runs the probe on
+# each node (in parallel) and prints "<node> <id> ok|fail <detail>" lines;
+# a probe that doesn't complete is "<node> probe fail <why>" (fail closed).
+_ha_node_probes() {
+  local ns="$1" checks="$2" n i=0 name names="" j phase k
+  shift 2
+  for n in "$@"; do
+    i=$((i + 1)); name="ha-check-$i-$(openssl rand -hex 3)"; names="$names $name=$n"
+    N="$name" NS="$ns" NODE="$n" IMG="$PORTCULLIS_HELPER_IMAGE" C="$checks" S="$HA_PROBE_SH" jq -n '
+      {apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "ha-check"}},
+       spec: {nodeName: env.NODE, restartPolicy: "Never", hostPID: true, priorityClassName: "portcullis-core",
+         automountServiceAccountToken: false, enableServiceLinks: false, terminationGracePeriodSeconds: 1,
+         securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: "RuntimeDefault"}},
+         tolerations: [{operator: "Exists"}],
+         volumes: [{name: "host", hostPath: {path: "/", type: "Directory"}}],
+         containers: [{name: "check", image: env.IMG, command: ["sh", "-c", env.S], env: [{name: "CHECKS", value: env.C}],
+           volumeMounts: [{name: "host", mountPath: "/host", readOnly: true}],
+           resources: {limits: {memory: "32Mi"}, requests: {memory: "32Mi"}},
+           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}' \
+      | kube_ctl create -f - >/dev/null 2>&1 || { echo "$n probe fail the check pod was refused"; names="${names% *}"; }
+  done
+  for k in $names; do
+    name="${k%%=*}" n="${k#*=}" phase=""
+    for ((j = 0; j < "${KUBE_POD_WAIT:-180}"; j += 2)); do
+      phase="$(kube_ctl -n "$ns" get pod "$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      case "$phase" in Succeeded|Failed) break ;; esac
+      sleep 2
+    done
+    if [ "$phase" = Succeeded ]; then
+      kube_ctl -n "$ns" logs "pod/$name" 2>/dev/null | awk -v n="$n" '$2 == "ok" || $2 == "fail" { print n " " $0 }'
+    else
+      echo "$n probe fail the check pod didn't complete (${phase:-no phase}) within ${KUBE_POD_WAIT:-180} s"
+    fi
+    kube_ctl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
+  done
+}
+
+# _ha_checks_refuse <what> <probe lines> — every failing check as
+# "node <n>: <detail>", then refuses (fail closed: no line for a node is a
+# failure too, the caller counts).
+_ha_checks_refuse() {
+  local bad
+  bad="$(printf '%s\n' "$2" | awk '$3 == "fail" { n = $1; $1 = $2 = $3 = ""; sub(/^ +/, ""); print "  node " n ": " $0 }')"
+  [ -z "$bad" ] && return 0
+  printf '%s\n' "$bad" >&2
+  fail "$1 (nothing installed)"
+}
+
+# _ha_nodes_json — the cluster's nodes, or fail (never a guess).
+_ha_nodes_json() {
+  local j
+  j="$(kube_ctl get nodes -o json 2>/dev/null)" && printf '%s' "$j" | jq -e '.items | type == "array"' >/dev/null 2>&1 \
+    || fail "can't read the cluster's nodes (nothing installed)"
+  printf '%s\n' "$j"
+}
+
+# _ha_wait <seconds> <what> <cmd…> — retries cmd every 3 s; fails naming what.
+_ha_wait() {
+  local s="$1" what="$2" i
+  shift 2
+  for ((i = 0; i < s; i += 3)); do "$@" >/dev/null 2>&1 && return 0; sleep 3; done
+  fail "$what didn't come up within $s s"
+}
+
+# _ha_ds_ready <ns> <name> — a DaemonSet rolled out on every node it wants.
+_ha_ds_ready() {
+  kube_ctl -n "$1" get ds "$2" -o json 2>/dev/null | jq -e '(.status.desiredNumberScheduled // 0) > 0
+    and .status.observedGeneration == .metadata.generation and .status.numberReady == .status.desiredNumberScheduled
+    and (.status.updatedNumberScheduled // 0) == .status.desiredNumberScheduled' >/dev/null
+}
+
+# _ha_deploy_ready <ns> <name>… — Deployments available at their generation.
+_ha_deploy_ready() {
+  local ns="$1" d
+  shift
+  for d in "$@"; do
+    kube_ctl -n "$ns" get deploy "$d" -o json 2>/dev/null | jq -e '.status.observedGeneration == .metadata.generation
+      and (.status.availableReplicas // 0) >= (.spec.replicas // 1) and (.status.updatedReplicas // 0) >= (.spec.replicas // 1)' >/dev/null || return 1
+  done
+}
+
+# _ha_crds_established <file> — every CRD in the rendered file Established.
+_ha_crds_established() {
+  local crds
+  crds="$(awk '/^kind: CustomResourceDefinition$/ { c = 1 } c && /^  name: / { print "crd/" $2; c = 0 }' "$1")"
+  [ -z "$crds" ] && return 0
+  # shellcheck disable=SC2086  # crd/<name> words
+  kube_ctl wait --for=condition=Established $crds --timeout=120s >/dev/null
+}
+
+# ha_install_snapshotter — the VolumeSnapshot CRDs and the
+# snapshot-controller in kube-system (its own policy first).
+ha_install_snapshotter() {
+  local t
+  ha_pins_ok snapshotter || fail "the external-snapshotter pins don't hold: $_K_ERR (nothing installed)"
+  [ -n "${PORTCULLIS_KUBE_API_ENDPOINTS:-}" ] || fail "no kube API endpoint (PORTCULLIS_KUBE_API_ENDPOINTS): the snapshot-controller's policy would reach nothing (nothing installed)"
+  ha_snapshotter_policy "$PORTCULLIS_KUBE_API_ENDPOINTS" | _ha_apply || fail "could not apply the snapshot-controller's NetworkPolicy (nothing installed)"
+  info "HA: external-snapshotter v8.7.0 (VolumeSnapshot CRDs, snapshot-controller)..."
+  _kube_apply_files "$PORTCULLIS_HOME/$HA_DIR/snapshotter/upstream/crds.yaml" || fail "could not apply the VolumeSnapshot CRDs"
+  _ha_crds_established "$PORTCULLIS_HOME/$HA_DIR/snapshotter/upstream/crds.yaml" || fail "the VolumeSnapshot CRDs aren't established"
+  t="$(mktemp)"
+  ha_render snapshotter > "$t" || { rm -f "$t"; fail "could not render the snapshot-controller (kubectl kustomize)"; }
+  _ha_apply < "$t" || { rm -f "$t"; fail "could not apply the snapshot-controller"; }
+  rm -f "$t"
+  _ha_wait 300 "the snapshot-controller (kube-system)" _ha_deploy_ready kube-system snapshot-controller
+  _kube_applied_set ha.snapshotter "$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/snapshotter"/*.yaml "$PORTCULLIS_HOME/$HA_DIR/snapshotter/upstream"/*)"
+}
+
+# ha_install_longhorn — Longhorn v1.13.0 in longhorn-system and the
+# StorageClass portcullis-core-replicated. Refused (nothing installed)
+# without a storage node, without the nodes' addresses, or while a check
+# fails on a node Longhorn runs on (the main site's non-small nodes: they
+# attach the volumes) — open-iscsi with iscsid running, iscsi_tcp,
+# nfs-common, multipathd's blacklist — or a storage node's
+# /var/lib/longhorn is on a ZFS dataset (spike S2).
+ha_install_longhorn() {
+  local nodes lh storage api init lines n t
+  ha_pins_ok longhorn || fail "the Longhorn pins don't hold: $_K_ERR (nothing installed)"
+  nodes="$(_ha_nodes_json)" || exit 1
+  lh="$(printf '%s' "$nodes" | S="$KUBE_PRIMARY_SITE" jq -r '.items[] | select(.metadata.labels["portcullis.io/site"] == env.S and .metadata.labels["portcullis.io/class"] != "small") | .metadata.name')"
+  storage="$(printf '%s' "$nodes" | S="$KUBE_PRIMARY_SITE" jq -r '.items[] | select(.metadata.labels["portcullis.io/site"] == env.S and .metadata.labels["node.longhorn.io/create-default-disk"] == "true") | .metadata.name')"
+  [ -n "$storage" ] || fail "no storage node at $KUBE_PRIMARY_SITE (node.longhorn.io/create-default-disk=true): Longhorn would have no disk (nothing installed)"
+  api="$(kube_apiserver_sources)"
+  [ -n "$api" ] || fail "can't read the API server's addresses: Longhorn's webhook would admit nobody (nothing installed)"
+  init="$(kube_node_host_sources)" || fail "can't read the nodes' addresses: Longhorn's iSCSI targets would be open to every pod (nothing installed)"
+  _ha_namespace longhorn "$KUBE_LONGHORN_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
+  info "HA: checking the nodes Longhorn runs on ($(printf '%s' "$lh" | tr '\n' ' ' | sed 's/ $//'))..."
+  # shellcheck disable=SC2086  # node names
+  lines="$(_ha_node_probes "$KUBE_LONGHORN_NS" "iscsid iscsi_tcp nfs_common multipath_blacklist" $lh)"
+  # shellcheck disable=SC2086
+  lines="$lines
+$(_ha_node_probes "$KUBE_LONGHORN_NS" "longhorn_path" $storage)"
+  for n in $lh; do
+    printf '%s\n' "$lines" | awk -v n="$n" '$1 == n && $2 == "iscsid" { f = 1 } END { exit !f }' || lines="$lines
+$n probe fail no answer from the node's check"
+  done
+  _ha_checks_refuse "Longhorn needs these on every node it runs on: fix them and run it again" "$lines"
+  info "HA: Longhorn v1.13.0 (longhorn-system)..."
+  t="$(mktemp)"
+  ha_render longhorn "$api" "$init" > "$t" || { rm -f "$t"; fail "could not render Longhorn (helm template + kubectl kustomize)"; }
+  _ha_apply < "$t" || { rm -f "$t"; fail "could not apply Longhorn (see above)"; }
+  rm -f "$t"
+  _ha_wait 600 "Longhorn's manager (DaemonSet longhorn-manager)" _ha_ds_ready "$KUBE_LONGHORN_NS" longhorn-manager
+  _ha_wait 600 "Longhorn's CSI driver" _ha_longhorn_csi_ready
+  _kube_apply_files "$PORTCULLIS_HOME/$KUBE_REPLICATED_SC" || fail "could not apply the StorageClass portcullis-core-replicated"
+  _kube_applied_set ha.longhorn "$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/longhorn"/*.yaml "$PORTCULLIS_HOME/$HA_DIR/longhorn/upstream"/* "$PORTCULLIS_HOME/$KUBE_REPLICATED_SC")"
+}
+
+# _ha_longhorn_csi_ready — the driver deployer's CSI: the CSIDriver, the
+# plugin DaemonSet and the four controllers.
+_ha_longhorn_csi_ready() {
+  kube_ctl get csidriver driver.longhorn.io -o name >/dev/null 2>&1 \
+    && _ha_ds_ready "$KUBE_LONGHORN_NS" longhorn-csi-plugin \
+    && _ha_deploy_ready "$KUBE_LONGHORN_NS" csi-attacher csi-provisioner csi-resizer csi-snapshotter
+}
+
+# ha_install_certmanager — cert-manager v1.21.3 (Amendment 2: only the
+# barman-cloud plugin's certificates, in cnpg-system: Task 26 installs the
+# plugin). Needs cnpg-system (its Role is there).
+ha_install_certmanager() {
+  local src t
+  ha_pins_ok certmanager || fail "the cert-manager pins don't hold: $_K_ERR (nothing installed)"
+  kube_ctl get namespace "$KUBE_CNPG_NS" -o name >/dev/null 2>&1 || fail "no namespace $KUBE_CNPG_NS: cert-manager serves only the CloudNativePG plugin there (nothing installed)"
+  src="$(kube_apiserver_sources)"
+  [ -n "$src" ] || fail "can't read the API server's addresses: cert-manager's webhook would admit nobody (nothing installed)"
+  _ha_namespace certmanager "$KUBE_CERTMANAGER_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}" "$src"
+  info "HA: cert-manager v1.21.3 (cert-manager; certificates in $KUBE_CNPG_NS only)..."
+  t="$(mktemp)"
+  ha_render certmanager > "$t" || { rm -f "$t"; fail "could not render cert-manager (kubectl kustomize)"; }
+  _ha_apply < "$t" || { rm -f "$t"; fail "could not apply cert-manager (see above)"; }
+  rm -f "$t"
+  _ha_wait 300 "cert-manager" _ha_deploy_ready "$KUBE_CERTMANAGER_NS" cert-manager cert-manager-cainjector cert-manager-webhook
+  _ha_wait 180 "cert-manager's webhook CA" _ha_certmanager_webhook_ready
+  _kube_applied_set ha.certmanager "$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/cert-manager"/*.yaml "$PORTCULLIS_HOME/$HA_DIR/cert-manager/upstream"/*)"
+}
+
+# _ha_certmanager_webhook_ready — the cainjector put the webhook's CA into
+# its validating configuration (until then every cert-manager object is
+# refused).
+_ha_certmanager_webhook_ready() {
+  kube_ctl get validatingwebhookconfiguration cert-manager-webhook -o json 2>/dev/null | jq -e '[.webhooks[].clientConfig.caBundle // ""] | all(length > 0)' >/dev/null
+}
+
+# _ha_fencing_cert — the managers' webhook serving certificate (Secret
+# fencing-webhook-cert): no webhook configuration is registered, the
+# servers only have to start, so a throwaway self-signed one, made once
+# (openssl into a 0700 dir, kubectl --from-file paths: never argv).
+_ha_fencing_cert() {
+  local t f
+  kube_ctl -n "$KUBE_FENCING_NS" get secret fencing-webhook-cert -o name >/dev/null 2>&1 && return 0
+  t="$(mktemp -d)"; chmod 700 "$t"; f="$t/s.json"
+  if ! (umask 077 && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 -subj "/CN=fencing-webhook" \
+          -keyout "$t/tls.key" -out "$t/tls.crt" >/dev/null 2>&1) \
+     || ! kube_ctl -n "$KUBE_FENCING_NS" create secret tls fencing-webhook-cert --cert="$t/tls.crt" --key="$t/tls.key" --dry-run=client -o json > "$f" \
+     || ! _ha_apply < "$f"; then
+    rm -rf "$t"; fail "could not make the fencing managers' webhook certificate (nothing installed)"
+  fi
+  rm -rf "$t"
+}
+
+# BLOCKED (plan Task 24 report): with the security ruling's rights SNR
+# v0.13.0's agents can't start peer health (their Secret cache lists every
+# namespace) and NHC v0.12.0 can't start (it re-applies its aggregated
+# ClusterRole, which needs escalate): ha_fencing_ready then answers not
+# ready (fail closed) until a ruling on a patched build or another
+# remediator.
+# ha_install_fencing — SNR v0.13.0 + NHC v0.12.0 in portcullis-fencing
+# (spike S3, OLM-free) with config.yaml (watchdog /dev/watchdog, safe time
+# 150 s, OutOfServiceTaint, every node). Refused (nothing installed) while
+# any node has no watchdog: a node that can't be fenced is never declared
+# dead, and no stateful failover would be safe there. Ends with
+# ha_fencing_ready (every node's agent ready, or it fails).
+ha_install_fencing() {
+  local nodes all lines n t
+  ha_pins_ok fencing || fail "the fencing pins don't hold: $_K_ERR (nothing installed)"
+  nodes="$(_ha_nodes_json)" || exit 1
+  all="$(printf '%s' "$nodes" | jq -r '.items[].metadata.name')"
+  [ -n "$all" ] || fail "the cluster has no node (nothing installed)"
+  _ha_namespace fencing "$KUBE_FENCING_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
+  info "HA: checking every node's watchdog..."
+  # shellcheck disable=SC2086  # node names
+  lines="$(_ha_node_probes "$KUBE_FENCING_NS" watchdog $all)"
+  for n in $all; do
+    printf '%s\n' "$lines" | awk -v n="$n" '$1 == n && $2 == "watchdog" && $3 == "ok" { f = 1 } END { exit !f }' && continue
+    warn "node $n has no watchdog: fencing can't be confirmed$(printf '%s\n' "$lines" | awk -v n="$n" '$1 == n && $3 == "fail" { $1 = $2 = $3 = ""; sub(/^ +/, ""); print " (" $0 ")"; exit }')"
+    t=refused
+  done
+  [ "${t:-}" != refused ] || fail "fencing needs a watchdog on every node: without it a node is never declared dead, so nothing stateful fails over (nothing installed)"
+  _ha_namespace leases "$KUBE_FENCING_LEASES_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
+  _ha_fencing_cert
+  info "HA: Self Node Remediation v0.13.0 + Node Healthcheck v0.12.0 (portcullis-fencing)..."
+  t="$(mktemp)"
+  ha_render fencing > "$t" || { rm -f "$t"; fail "could not render fencing (kubectl kustomize)"; }
+  _ha_apply < "$t" || { rm -f "$t"; fail "could not apply fencing (see above)"; }
+  _ha_crds_established "$t" || { rm -f "$t"; fail "the fencing CRDs aren't established"; }
+  rm -f "$t"
+  _ha_wait 300 "the fencing managers" _ha_deploy_ready "$KUBE_FENCING_NS" self-node-remediation-controller-manager node-healthcheck-controller-manager
+  _kube_apply_files "$PORTCULLIS_HOME/$HA_DIR/fencing/config.yaml" || fail "could not apply the fencing configuration (kube/ha/fencing/config.yaml)"
+  _ha_wait 300 "SNR's agents (DaemonSet self-node-remediation-ds)" _ha_snr_ds_current
+  ha_fencing_ready >/dev/null || { ha_fencing_ready >&2 || true; fail "fencing isn't ready on every node (above): no stateful failover until it is"; }
+  _kube_applied_set ha.fencing "$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/fencing"/*.yaml "$PORTCULLIS_HOME/$HA_DIR/fencing"/*.tmpl "$PORTCULLIS_HOME/$HA_DIR/fencing/upstream"/*)"
+}
+
+# _ha_snr_ds_current — the agents' DaemonSet carries config.yaml's
+# tolerations (the manager re-rendered it) and is rolled out.
+_ha_snr_ds_current() {
+  kube_ctl -n "$KUBE_FENCING_NS" get ds self-node-remediation-ds -o json 2>/dev/null \
+    | jq -e 'any(.spec.template.spec.tolerations[]?; .key == "portcullis.io/small")' >/dev/null \
+    && _ha_ds_ready "$KUBE_FENCING_NS" self-node-remediation-ds
+}
+
+# ha_fencing_ready — per node "<node> ready|not ready (<why>)" and exit 0
+# only when every node is ready: the SNR configuration is ours (the
+# watchdog, the 150 s safe time), both managers are available, and the
+# node runs a Ready, current agent
+# of the DaemonSet self-node-remediation-ds (nodeadm's snapshot counts the
+# same pod for the Hub's ha_fencing_unavailable). Anything unreadable is
+# not ready (fail closed: no stateful failover).
+ha_fencing_ready() {
+  local nodes pods cfg mgr
+  nodes="$(kube_ctl get nodes -o json 2>/dev/null)" || { warn "can't read the nodes: fencing unconfirmed"; return 1; }
+  pods="$(kube_ctl -n "$KUBE_FENCING_NS" get pods -l app.kubernetes.io/name=self-node-remediation,app.kubernetes.io/component=agent -o json 2>/dev/null)" \
+    || { warn "can't read SNR's agents: fencing unconfirmed"; return 1; }
+  cfg="$(kube_ctl -n "$KUBE_FENCING_NS" get selfnoderemediationconfigs.self-node-remediation.medik8s.io self-node-remediation-config -o json 2>/dev/null || echo '{}')"
+  # The managers too: without NHC nothing is remediated, without SNR's
+  # manager no out-of-service taint.
+  mgr=ok
+  _ha_deploy_ready "$KUBE_FENCING_NS" self-node-remediation-controller-manager node-healthcheck-controller-manager || mgr=down
+  M="$mgr" jq -rn --argjson n "$nodes" --argjson p "$pods" --argjson c "$cfg" '
+    ($c.spec // {}) as $s
+    | (if $s.watchdogFilePath != "/dev/watchdog" or $s.safeTimeToAssumeNodeRebootedSeconds != 150 then "SNR configuration missing or not ours"
+       elif env.M != "ok" then "the SNR / NHC managers aren'"'"'t available" else "" end) as $bad
+    | [$p.items[]? | select(.metadata.deletionTimestamp == null and (.metadata.name | startswith("self-node-remediation-ds-"))
+        and any(.metadata.ownerReferences[]?; .kind == "DaemonSet" and .name == "self-node-remediation-ds")
+        and any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .spec.nodeName] as $ok
+    | [$n.items[] | .metadata.name as $m
+        | if $bad != "" then "\($m)\tnot ready (\($bad))"
+          elif ($ok | index($m)) then "\($m)\tready"
+          else "\($m)\tnot ready (no Ready SNR agent)" end]
+    | if length == 0 then "-\tnot ready (no node)" else .[] end' 2>/dev/null \
+    | awk -F'\t' '{ print } $2 != "ready" { bad = 1 } END { exit bad }'
+}

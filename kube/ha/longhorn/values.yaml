@@ -1,0 +1,82 @@
+# Longhorn v1.13.0 as ./portcullis installs it (plan Task 24; ha_install_
+# longhorn: `helm template` of upstream/longhorn-1.13.0.tgz, sha256 pinned,
+# with this file and the CLI's generated network-sources file only — never
+# --set —, then kubectl kustomize with kustomization.yaml). Every image by
+# digest (Amendment 1; the CSI sidecars and the rest of longhorn-images.txt
+# resolved from docker.io the same way).
+image:
+  longhorn:
+    engine: {repository: longhornio/longhorn-engine, tag: "v1.13.0@sha256:b0cc5090889d57705acd69c5106492992e84560170ac3bec4a1cc8dd3fe83ca6"}
+    manager: {repository: longhornio/longhorn-manager, tag: "v1.13.0@sha256:7372f3c59239e9a67c0017b3af32fabdf08c4dcc0631140161da9a47e3b142f0"}
+    ui: {repository: longhornio/longhorn-ui, tag: "v1.13.0@sha256:f22fb0254ae50195c1635ce428dfae26375956b3d7bd39640fae8fe33a236023"}
+    instanceManager: {repository: longhornio/longhorn-instance-manager, tag: "v1.13.0@sha256:fc9e1c15e81988b04c146866ce7010b6df3a70f88302809bf53e19b27d1658a3"}
+    shareManager: {repository: longhornio/longhorn-share-manager, tag: "v1.13.0@sha256:53950f78b7af38b8a943c298cd3020622191a4661a13036f69d83c154cc8690d"}
+    backingImageManager: {repository: longhornio/backing-image-manager, tag: "v1.13.0@sha256:49779b9a8ab535f1e86d224f8e2eb5c2c3713b8f1783403fe00612a75de2b3b8"}
+    supportBundleKit: {repository: longhornio/support-bundle-kit, tag: "v0.0.98@sha256:e64a01db35396f967175adcfd0177d2a50e75765c51efe86e55f13f49095d1ae"}
+  csi:
+    attacher: {repository: longhornio/csi-attacher, tag: "v4.13.0@sha256:fef34c2d823b78da7d6c29fdf0f80d236293b0ac06944d14e8c366add880a4c8"}
+    provisioner: {repository: longhornio/csi-provisioner, tag: "v6.3.0@sha256:2d2694540109d2e8887f62a0bc711aca8d3033e52dddf1c39bb5c65600d9c5af"}
+    nodeDriverRegistrar: {repository: longhornio/csi-node-driver-registrar, tag: "v2.18.0@sha256:085f63e62fea391734f5668d9cbb20ac8788a8e7faea83ce2c994f0cc1834fce"}
+    resizer: {repository: longhornio/csi-resizer, tag: "v2.2.1@sha256:63d0aef25114d4a682b25afa6d9623a3cfcc19aca910269124408476bbe2c6fd"}
+    snapshotter: {repository: longhornio/csi-snapshotter, tag: "v8.6.0@sha256:2bca9ac55170efa61dc50e5cc8d9550373db2e3e5161d82d3fdaac5c25150360"}
+    livenessProbe: {repository: longhornio/livenessprobe, tag: "v2.20.0@sha256:d1199b77452bfc11cfc62feb8a266758fe8d72953e97faac8065941e3767f1a3"}
+  pullPolicy: IfNotPresent
+# Longhorn's own documented flows (the chart's NetworkPolicies) on top of
+# the CLI's default-deny; the webhook's and the iSCSI initiator's source
+# addresses come from the CLI's generated sources file
+# (kubeAPIServerSourceCIDRs, v1DataEngineInitiatorSourceCIDRs).
+networkPolicies:
+  enabled: true
+  restrictInternalTraffic: true
+  type: k3s
+# Our StorageClass is kube/storage/storageclass-replicated.yaml: none of
+# Longhorn's, no default class.
+persistence:
+  createStorageClass: false
+  defaultClass: false
+# No upgrade-checker Job (and no phone-home, below).
+preUpgradeChecker:
+  jobEnabled: false
+  upgradeVersionCheck: false
+csi:
+  # The CSI controllers ×2 (a node loss leaves one leading).
+  attacherReplicaCount: 2
+  provisionerReplicaCount: 2
+  resizerReplicaCount: 2
+  snapshotterReplicaCount: 2
+  # No encrypted volumes: the CSI ServiceAccount reads no Secret anywhere.
+  allowControllerSecretAccess: false
+defaultSettings:
+  # Disks only on nodes labelled node.longhorn.io/create-default-disk=true:
+  # main storage nodes (init and nodeadm set it, R-NODELABELS; P36).
+  createDefaultDiskLabeledNodes: true
+  defaultDataPath: /var/lib/longhorn/
+  defaultReplicaCount: '{"v1":"2"}'
+  defaultDataLocality: best-effort
+  # Two replicas never on one node.
+  replicaSoftAntiAffinity: false
+  # Fencing decides (SNR's out-of-service taint), never Longhorn.
+  nodeDownPodDeletionPolicy: do-nothing
+  # Longhorn's system-managed pods (instance managers, engine images, CSI)
+  # on the primary site only: storage and every replicated-volume pod are
+  # there (portcullis.sitePin); a small node's NoSchedule taint keeps them
+  # off it (no toleration). T24 / H6: not on vm3 (small) or vm4 (edge).
+  systemManagedComponentsNodeSelector: "portcullis.io/site:main"
+  priorityClass: portcullis-core
+  upgradeChecker: false
+  allowCollectingLonghornUsageMetrics: false
+longhornManager:
+  priorityClass: portcullis-core
+  nodeSelector: {portcullis.io/site: main}
+longhornDriver:
+  priorityClass: portcullis-core
+  nodeSelector: {portcullis.io/site: main}
+longhornGlobalManager:
+  replicas: 2
+  priorityClass: portcullis-core
+  nodeSelector: {portcullis.io/site: main}
+  podDisruptionBudget: {enabled: true, minAvailable: 1}
+longhornUI:
+  replicas: 0
+  priorityClass: portcullis-core
+  nodeSelector: {portcullis.io/site: main}

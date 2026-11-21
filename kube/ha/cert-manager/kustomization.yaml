@@ -1,0 +1,76 @@
+# cert-manager v1.21.3 (Amendment 2: only for the barman-cloud plugin's
+# certificates, plan Task 26), the release asset upstream/cert-manager-
+# v1.21.3.yaml verbatim (sha256 pinned in scripts/lib/ha.sh), in namespace
+# cert-manager (PSA restricted, made by the CLI with its default-deny and
+# flows first). This overlay:
+#   - pins the three images by digest and names our class (ruling I5);
+#   - scopes the controller to the plugin's namespace cnpg-system
+#     (--namespace: no ClusterIssuer, no informer elsewhere), drops ACME
+#     and the ingress / gateway shims, and the cainjector to cert-manager
+#     (it injects only into cert-manager's own two webhook configurations);
+#   - leader election in cert-manager, not kube-system;
+#   - replaces every cluster-wide Secret / ACME / shim / CSR right with
+#     rbac.yaml's: Roles in cnpg-system and cert-manager, the webhook
+#     configurations by name.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - upstream/cert-manager-v1.21.3.yaml
+  - rbac.yaml
+images:
+  - name: quay.io/jetstack/cert-manager-controller
+    newTag: v1.21.3
+    digest: sha256:9f4f96a33c7774cef24466fcd85031997531a03a8d117f151126baa8d1290dcc
+  - name: quay.io/jetstack/cert-manager-cainjector
+    newTag: v1.21.3
+    digest: sha256:083d0e906f8eb44e255fe4ff817ae54e49f9ed82e22f1011bb4e9e4f4b8a641f
+  - name: quay.io/jetstack/cert-manager-webhook
+    newTag: v1.21.3
+    digest: sha256:055ac8e9de6a0ba6763794838fe38944acc650f68ebe1b01dd8be079e580f458
+patches:
+  # The namespace is the CLI's (PSA labels, ownership).
+  - patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Namespace
+      metadata: {name: cert-manager}
+  # Every cluster-wide role but the webhook's SubjectAccessReview and the
+  # approver's signers/approve (both name no object), and the kube-system
+  # leader-election Roles: rbac.yaml replaces them.
+  - target: {kind: "ClusterRole|ClusterRoleBinding", name: "cert-manager-cainjector|cert-manager-controller-(issuers|clusterissuers|certificates|orders|challenges|ingress-shim|certificatesigningrequests)"}
+    patch: |-
+      $patch: delete
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata: {name: unused}
+  - target: {kind: "Role|RoleBinding", namespace: kube-system}
+    patch: |-
+      $patch: delete
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata: {name: unused}
+  - target: {kind: Deployment, name: cert-manager}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/args
+        value:
+          - --v=2
+          - --namespace=cnpg-system
+          - --cluster-resource-namespace=$(POD_NAMESPACE)
+          - --leader-election-namespace=$(POD_NAMESPACE)
+          - --controllers=issuers,certificaterequests-issuer-ca,certificaterequests-issuer-selfsigned,certificaterequests-approver,certificates-trigger,certificates-issuing,certificates-key-manager,certificates-request-manager,certificates-readiness,certificates-revision-manager
+  - target: {kind: Deployment, name: cert-manager-cainjector}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/args
+        value:
+          - --v=2
+          - --namespace=$(POD_NAMESPACE)
+          - --leader-election-namespace=$(POD_NAMESPACE)
+          - --enable-apiservices-injectable=false
+          - --enable-customresourcedefinitions-injectable=false
+  - target: {kind: Deployment}
+    patch: |-
+      - op: add
+        path: /spec/template/spec/priorityClassName
+        value: portcullis-core

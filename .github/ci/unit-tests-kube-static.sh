@@ -11,6 +11,8 @@ cd "$(dirname "$0")/../.."
 # Pinned tools (sha256 of the linux-amd64 release archives).
 HELM_VERSION=v4.3.1
 HELM_SHA256=0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
+KUBECTL_VERSION=v1.37.2
+KUBECTL_SHA256=c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
 KUBECONFORM_VERSION=v0.8.0
 KUBECONFORM_SHA256=9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
 # yannh/kubernetes-json-schema at a fixed commit, the API floor's schemas.
@@ -28,6 +30,12 @@ if [ -z "${HELM:-}" ]; then
   tar -xzf "$TOOLS/helm.tgz" -C "$TOOLS" --strip-components=1 linux-amd64/helm
   HELM="$TOOLS/helm"
 fi
+# kubectl: its kustomize renders the HA installs (ha_render, plan Task 24).
+if [ -z "${KUBECTL:-}" ]; then
+  fetch "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl" "$KUBECTL_SHA256" "$TOOLS/kubectl"
+  chmod +x "$TOOLS/kubectl"
+  KUBECTL="$TOOLS/kubectl"
+fi
 if [ -z "${KUBECONFORM:-}" ]; then
   fetch "https://github.com/yannh/kubeconform/releases/download/$KUBECONFORM_VERSION/kubeconform-linux-amd64.tar.gz" "$KUBECONFORM_SHA256" "$TOOLS/kubeconform.tgz"
   tar -xzf "$TOOLS/kubeconform.tgz" -C "$TOOLS" kubeconform
@@ -40,7 +48,9 @@ if [ -z "${PY:-}" ]; then
   fi
   PY=/tmp/k8s-venv/bin/python
 fi
-export HELM
+export HELM KUBECTL
+PATH="$(dirname "$HELM"):$(dirname "$KUBECTL"):$PATH"
+export PATH
 
 echo "::group::helm lint"
 "$HELM" lint charts/portcullis -f tests/k8s-ci-values.yaml -f <("$PY" -c 'import sys; sys.path.insert(0, "tests"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))')
@@ -56,10 +66,21 @@ echo "9df3f074ecaa8af10277ad155899470618ea9a565d7c7c48187bdc7887655960  kube/ha/
 "$HELM" template cnpg kube/ha/cnpg/cloudnative-pg-0.29.2.tgz -n cnpg-system -f kube/ha/cnpg/values.yaml > "$TOOLS/cnpg.yaml"
 echo "::endgroup::"
 
-# The Traefik and CloudNativePG CRDs as JSON schemas (strict: unknown fields refused).
+# The HA infrastructure as ha_install_* applies it (plan Task 24:
+# ha_render — helm template of the pinned Longhorn chart, kubectl
+# kustomize of each overlay); their CRDs join the schemas (fencing's
+# config.yaml is SNR / NHC objects).
+echo "::group::HA infrastructure renders (kube/ha/{longhorn,snapshotter,fencing,cert-manager})"
+for c in longhorn snapshotter fencing certmanager; do
+  bash -c 'source scripts/lib/common.sh; ha_pins_ok "$1" || { echo "FAIL: $1: $_K_ERR"; exit 1; }; ha_render "$1" "10.1.0.4" "10.215.0.1"' _ "$c" > "$TOOLS/ha-$c.yaml"
+done
+cp kube/ha/snapshotter/upstream/crds.yaml "$TOOLS/ha-snapshotter-crds.yaml"
+echo "::endgroup::"
+
+# The Traefik, CloudNativePG and HA CRDs as JSON schemas (strict: unknown fields refused).
 SCHEMAS="$TOOLS/crd-schemas"
 rm -rf "$SCHEMAS" && mkdir -p "$SCHEMAS"
-"$PY" - charts/portcullis/crds/*.yaml "$TOOLS/cnpg.yaml" "$SCHEMAS" <<'PY'
+"$PY" - charts/portcullis/crds/*.yaml "$TOOLS/cnpg.yaml" "$TOOLS"/ha-*.yaml "$SCHEMAS" <<'PY'
 import json, pathlib, sys, yaml
 *files, out = sys.argv[1:]
 def strict(s):
@@ -117,6 +138,11 @@ done
   -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$K8S_SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json" \
   -schema-location "$SCHEMAS/{{ .Group }}/{{ .ResourceKind }}_{{ .ResourceAPIVersion }}.json" \
   "$TOOLS/cnpg.yaml"
+# The HA renders (CRDs skipped: their schemas are above) and fencing's CRs.
+"$KUBECONFORM" -strict -summary -skip CustomResourceDefinition -kubernetes-version "$K8S_VERSION" \
+  -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$K8S_SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json" \
+  -schema-location "$SCHEMAS/{{ .Group }}/{{ .ResourceKind }}_{{ .ResourceAPIVersion }}.json" \
+  "$TOOLS"/ha-longhorn.yaml "$TOOLS"/ha-snapshotter.yaml "$TOOLS"/ha-fencing.yaml "$TOOLS"/ha-certmanager.yaml kube/ha/fencing/config.yaml
 # The CLI-applied manifests (probe, storage, admission; not the template of
 # the params' keys).
 KUBE_FILES=()

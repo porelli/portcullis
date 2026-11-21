@@ -1,0 +1,28 @@
+# Longhorn after `helm template` (ha_install_longhorn writes the render
+# here as rendered.yaml in a temporary copy of this directory). This overlay
+# only removes and narrows:
+#   - the PriorityClass longhorn-critical (every pod names portcullis-core);
+#   - the UI (Deployment, Service, ServiceAccount, its policy): not served;
+#   - the ClusterRole longhorn-role and its binding: rbac.yaml's
+#     portcullis-longhorn replaces them (no Secret, ConfigMap or Service
+#     read outside longhorn-system, no CRD / ClusterRole / ClusterRoleBinding
+#     write, Nodes read-only, the webhook configurations written by name);
+#   - longhorn-support-bundle's binding to cluster-admin (no support bundles).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rendered.yaml
+  - rbac.yaml
+patches:
+  - target: {kind: "PriorityClass|ClusterRole|ClusterRoleBinding", name: "longhorn-critical|longhorn-role|longhorn-bind|longhorn-support-bundle"}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Unused
+      metadata: {name: unused}
+  - target: {name: "longhorn-ui|longhorn-frontend|longhorn-ui-service-account|longhorn-ui-frontend"}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Unused
+      metadata: {name: unused}

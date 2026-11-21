@@ -1,0 +1,59 @@
+# Fencing's configuration (plan Task 24, Amendment 1 S3), applied by
+# ha_install_fencing once the managers run:
+#   - SelfNodeRemediationConfig (the one SNR accepts, its fixed name):
+#     the watchdog /dev/watchdog; API check 10 s, timeout 5 s, 2 errors
+#     (SNR's minimum safe time 90 s); the safe time 150 s = 90 + 60 s for
+#     the upstream bug that drops the watchdog term (T_fence = 150 s); the
+#     agent on small nodes too (portcullis.io/small) and on a node nodeadm
+#     hasn't labelled yet;
+#   - the remediation template: OutOfServiceTaint (SNR itself puts
+#     node.kubernetes.io/out-of-service once the node is assumed rebooted;
+#     nothing else ever force-deletes);
+#   - the NodeHealthCheck: every node, Ready False / Unknown for 30 s,
+#     at least 51 % healthy (a partition's minority never remediates the
+#     majority).
+apiVersion: self-node-remediation.medik8s.io/v1alpha1
+kind: SelfNodeRemediationConfig
+metadata:
+  name: self-node-remediation-config
+  namespace: portcullis-fencing
+spec:
+  watchdogFilePath: /dev/watchdog
+  safeTimeToAssumeNodeRebootedSeconds: 150
+  apiCheckInterval: 10s
+  apiServerTimeout: 5s
+  maxApiErrorThreshold: 2
+  isSoftwareRebootEnabled: true
+  customDsTolerations:
+    - {key: portcullis.io/small, operator: Exists, effect: NoSchedule}
+    - {key: nodeadm.portcullis/unlabelled, operator: Exists, effect: NoSchedule}
+---
+apiVersion: self-node-remediation.medik8s.io/v1alpha1
+kind: SelfNodeRemediationTemplate
+metadata:
+  name: portcullis-out-of-service
+  namespace: portcullis-fencing
+  annotations:
+    remediation.medik8s.io/multiple-templates-support: "true"
+spec:
+  template:
+    spec:
+      remediationStrategy: OutOfServiceTaint
+---
+apiVersion: remediation.medik8s.io/v1alpha1
+kind: NodeHealthCheck
+metadata:
+  name: portcullis-nodes
+spec:
+  selector:
+    matchExpressions:
+      - {key: kubernetes.io/os, operator: In, values: [linux]}
+  minHealthy: 51%
+  unhealthyConditions:
+    - {type: Ready, status: "False", duration: 30s}
+    - {type: Ready, status: Unknown, duration: 30s}
+  remediationTemplate:
+    apiVersion: self-node-remediation.medik8s.io/v1alpha1
+    kind: SelfNodeRemediationTemplate
+    name: portcullis-out-of-service
+    namespace: portcullis-fencing

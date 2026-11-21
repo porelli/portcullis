@@ -1,0 +1,57 @@
+# external-snapshotter v8.7.0 (plan Task 24): the VolumeSnapshot CRDs
+# (upstream/crds.yaml = `kubectl kustomize client/config/crd` at the tag,
+# sha256 pinned in scripts/lib/ha.sh) and the snapshot-controller in
+# kube-system (upstream/{rbac,setup}-snapshot-controller.yaml at commit
+# 9cc6050a…, verbatim). This overlay pins the image (the v8.7.0 deploy
+# file still names v8.6.0: Amendment 1), names our class and narrows the
+# leader-election Role to its one Lease. The CRDs are applied first, on
+# their own (ha_install_snapshotter).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - upstream/rbac-snapshot-controller.yaml
+  - upstream/setup-snapshot-controller.yaml
+images:
+  - name: registry.k8s.io/sig-storage/snapshot-controller
+    newTag: v8.7.0
+    digest: sha256:8511f417d0072efcd937aedd7cc79a937d5066e64ee17beb6097301c92742f19
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: snapshot-controller, namespace: kube-system}
+      spec:
+        template:
+          spec:
+            priorityClassName: portcullis-core
+            automountServiceAccountToken: true
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65532
+              runAsGroup: 65532
+              seccompProfile: {type: RuntimeDefault}
+            containers:
+              - name: snapshot-controller
+                args: ["--v=2", "--leader-election=true"]
+                resources:
+                  requests: {memory: 32Mi}
+                  limits: {memory: 128Mi}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities: {drop: [ALL]}
+  # Leases in kube-system: create (RBAC can't name a create) and the rest on
+  # its own Lease only (lock name snapshot-controller-leader,
+  # cmd/snapshot-controller/main.go) — never another component's Lease.
+  - target: {kind: Role, name: snapshot-controller-leaderelection}
+    patch: |-
+      - op: replace
+        path: /rules
+        value:
+          - apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            verbs: [create]
+          - apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            resourceNames: [snapshot-controller-leader]
+            verbs: [get, watch, list, delete, update]

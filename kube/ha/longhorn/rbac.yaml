@@ -1,0 +1,97 @@
+# Longhorn manager's cluster-wide rights (replacing the chart's
+# longhorn-role; tests/k8s_hardening.py check_longhorn derives the delta
+# from the chart's render). Read from longhorn-manager v1.13.0's source:
+#   - its Secret / ConfigMap / Service / Endpoints / ServiceAccount / Role
+#     informers are filtered to longhorn-system (the chart's Role covers
+#     them): no cluster-wide read of any of them (only an encrypted volume
+#     or a backing image would read another namespace's Secret: unused);
+#   - CRDs: read (wrangler's CRD cache lists them) and update only its own
+#     by name (the conversion webhook's CA, webhook/server/server.go);
+#   - Nodes: read only (it never writes a Node);
+#   - no ClusterRole / ClusterRoleBinding right (only its system restore
+#     makes them: unused);
+#   - its two webhook configurations (wrangler's apply lists and creates:
+#     list / create can't be named) get / patch / delete by name.
+# Residual: create on webhook configurations, pods delete in any namespace
+# (it deletes a workload pod whose volume detached unexpectedly), PV / PVC /
+# VolumeAttachment / StorageClass writes (its CSI role).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-longhorn
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch]
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    resourceNames: [backingimagedatasources.longhorn.io, backingimagemanagers.longhorn.io, backingimages.longhorn.io, backupbackingimages.longhorn.io, backups.longhorn.io, backuptargets.longhorn.io, backupvolumes.longhorn.io, enginefrontends.longhorn.io, engineimages.longhorn.io, engines.longhorn.io, instancemanagers.longhorn.io, instancemanagerupgradecontrols.longhorn.io, instancemanagerupgrades.longhorn.io, nodes.longhorn.io, orphans.longhorn.io, recurringjobs.longhorn.io, replicas.longhorn.io, settings.longhorn.io, shardgroups.longhorn.io, shards.longhorn.io, sharemanagers.longhorn.io, snapshotgroups.longhorn.io, snapshots.longhorn.io, supportbundles.longhorn.io, systembackups.longhorn.io, systemrestores.longhorn.io, volumeattachments.longhorn.io, volumes.longhorn.io]
+    verbs: [update]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [persistentvolumes, persistentvolumeclaims, persistentvolumeclaims/status]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [daemonsets, statefulsets, deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch]
+  - apiGroups: [scheduling.k8s.io]
+    resources: [priorityclasses]
+    verbs: [watch, list]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, volumeattachments, volumeattachments/status, volumeattributesclasses, csinodes, csidrivers, csistoragecapacities]
+    verbs: ["*"]
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshotclasses, volumesnapshots, volumesnapshotcontents, volumesnapshotcontents/status]
+    verbs: ["*"]
+  - apiGroups: [groupsnapshot.storage.k8s.io]
+    resources: [volumegroupsnapshotclasses, volumegroupsnapshots, volumegroupsnapshotcontents, volumegroupsnapshotcontents/status]
+    verbs: ["*"]
+  - apiGroups: [longhorn.io]
+    resources: [volumes, volumes/status, enginefrontends, enginefrontends/status, engines, engines/status, replicas, replicas/status, settings, settings/status, engineimages, engineimages/status, nodes, nodes/status, instancemanagers, instancemanagers/status, sharemanagers, sharemanagers/status, backingimages, backingimages/status, backingimagemanagers, backingimagemanagers/status, backingimagedatasources, backingimagedatasources/status, backuptargets, backuptargets/status, backupvolumes, backupvolumes/status, backups, backups/status, recurringjobs, recurringjobs/status, orphans, orphans/status, snapshots, snapshots/status, supportbundles, supportbundles/status, systembackups, systembackups/status, systemrestores, systemrestores/status, volumeattachments, volumeattachments/status, backupbackingimages, backupbackingimages/status, shards, shards/status, shardgroups, shardgroups/status, snapshotgroups, snapshotgroups/status, instancemanagerupgrades, instancemanagerupgrades/status, instancemanagerupgradecontrols, instancemanagerupgradecontrols/status]
+    verbs: ["*"]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+  - apiGroups: [apiregistration.k8s.io]
+    resources: [apiservices]
+    verbs: [list, watch]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [mutatingwebhookconfigurations, validatingwebhookconfigurations]
+    verbs: [list, create]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [mutatingwebhookconfigurations, validatingwebhookconfigurations]
+    resourceNames: [longhorn-webhook-mutator, longhorn-webhook-validator]
+    verbs: [get, patch, delete]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-longhorn
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: portcullis-longhorn}
+subjects:
+  - {kind: ServiceAccount, name: longhorn-service-account, namespace: longhorn-system}
