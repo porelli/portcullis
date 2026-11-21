@@ -233,11 +233,18 @@ _backup_check_layout() {
   [ -f "$dir/MANIFEST.json" ] || fail "$dir has no MANIFEST.json — not a Portcullis backup."
   [ "$(jq -r .format "$dir/MANIFEST.json" 2>/dev/null)" = "$BACKUP_FORMAT" ] \
     || fail "$dir: unsupported backup format (want $BACKUP_FORMAT)."
-  # secrets/lldap/key-seed: LLDAP's stored passwords are bound to it (a
-  # users.db without its seed refuses to start).
-  for f in .env vault.snap postgres.dump secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/lldap/key-seed; do
+  # secrets/lldap/key-seed and lldap_data.tar.gz: LLDAP's stored passwords
+  # are bound to the seed (a users.db without its seed refuses to start).
+  # Backups made before the seed existed are refused (no back-compat).
+  for f in .env vault.snap postgres.dump secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/lldap/key-seed lldap_data.tar.gz; do
     [ -s "$dir/$f" ] || fail "$dir lacks $f — incomplete backup."
   done
+  # The seed and the users.db it protects travel together: a restore never
+  # pairs this host's users.db with the backup's seed, or a seed LLDAP
+  # can't use (users.sh lldap_key_seed_problem).
+  local p
+  p="$(lldap_key_seed_problem "$dir/secrets/lldap/key-seed")"
+  [ -z "$p" ] || fail "$dir: in the backup, $p — refusing to restore it."
   jq -e '.root_token and (.unseal_keys_b64 | length == 1)' "$dir/secrets/vault-init.json" >/dev/null 2>&1 \
     || fail "$dir/secrets/vault-init.json has no root token / unseal key."
 }
