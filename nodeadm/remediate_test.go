@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -494,5 +495,21 @@ func TestManagerRuleJudgesEveryNodeSpecField(t *testing.T) {
 		if !strings.Contains(rule, "object.spec."+name) {
 			t.Errorf("the manager's rule doesn't judge spec.%s (NodeSpec of the vendored k8s.io/api)", name)
 		}
+	}
+}
+
+// TestSecretStoreFreshStateMaps (round 5, found in the live failover): the
+// CLI creates nodeadm-state empty; nodeadm's first back-off record or
+// maintenance mark on that state must not panic (newState makes every map).
+func TestSecretStoreFreshStateMaps(t *testing.T) {
+	kube := fake.NewSimpleClientset(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: stateSecret, Namespace: coreNS}})
+	st, _, err := (&secretStore{kube: kube, ns: coreNS}).Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Remediations["n1"] = vecNow
+	st.Maintenance["n1"] = true
+	if st.Codes == nil || st.Nodes == nil || st.Ops == nil || st.PendingRevokes == nil {
+		t.Fatalf("a nil map in a fresh state: %+v", st)
 	}
 }

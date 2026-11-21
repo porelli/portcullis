@@ -118,9 +118,13 @@ type pendingRevoke struct {
 	QueuedAt time.Time `json:"queued_at"`
 }
 
+// newState: every map made (round 5, found live: the Secret store's Load
+// decodes into it, and a state saved without remediations / maintenance —
+// omitempty — left those maps nil, so the first back-off record or
+// maintenance mark panicked nodeadm).
 func newState() *nodeadmState {
 	return &nodeadmState{V: 1, Codes: map[string]*codeRecord{}, Nodes: map[string]*nodeRecord{}, Ops: map[string]*revokeOp{},
-		PendingRevokes: map[string]*pendingRevoke{}}
+		PendingRevokes: map[string]*pendingRevoke{}, Remediations: map[string]time.Time{}, Maintenance: map[string]bool{}}
 }
 
 func (st *nodeadmState) clone() *nodeadmState {
