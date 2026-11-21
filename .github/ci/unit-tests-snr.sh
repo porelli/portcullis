@@ -12,6 +12,15 @@ commit="$(sed -n 's/^ARG SNR_COMMIT=//p' "$D/Dockerfile" | head -n1)"
 want="$(sed -n 's/^ARG PATCH_SHA256=//p' "$D/Dockerfile" | head -n1)"
 got="$(sha256sum "$D/0001-secret-cache-own-namespace.patch" | cut -d' ' -f1)"
 [ "$got" = "$want" ] || { echo "FAIL: the patch's sha256 is $got, the Dockerfile pins $want"; exit 1; }
+# Only when the build's inputs changed (round 3 nit): snr-patch/** or this
+# script, against SNR_BASE (the PR's base / the push's before). No base, a
+# new branch (all zeros), an unreadable base or SNR_FORCE=1 → the build runs.
+if [ "${SNR_FORCE:-}" != 1 ] && [ -n "${SNR_BASE:-}" ] && [ -n "${SNR_BASE//0/}" ] \
+   && { git cat-file -e "$SNR_BASE^{commit}" 2>/dev/null || git fetch -q --depth=1 origin "$SNR_BASE" 2>/dev/null; } \
+   && git diff --quiet "$SNR_BASE" HEAD -- "$D" .github/ci/unit-tests-snr.sh 2>/dev/null; then
+  echo "SKIP: our SNR build (no change to $D or this script since ${SNR_BASE:0:12}; the patch's sha256 is pinned)"
+  exit 0
+fi
 W="${RUNNER_TEMP:-/tmp}/snr-src"
 rm -rf "$W"
 git clone -q --depth 1 --branch "$tag" https://github.com/medik8s/self-node-remediation.git "$W"

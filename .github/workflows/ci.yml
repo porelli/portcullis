@@ -544,6 +544,8 @@ jobs:
       # cross-compile, the image builds (no push: snr.yml pushes on main).
       - name: Our SNR build (no push)
         timeout-minutes: 20
+        env:
+          SNR_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: bash .github/ci/unit-tests-snr.sh
       - name: mailctl unit tests (config, the Hub API guard, the JMAP envelope, the schema snapshot, spam rules; contract §19)
         working-directory: mailctl
