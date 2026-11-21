@@ -1044,6 +1044,34 @@ kube_backup_values() {
     && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" || fail "could not write the backup destination's values"
 }
 
+# kube_backup_after_release — after the release, with the archive on
+# (backup.cnpg.enabled): the first base backup, once the Cluster archives
+# (≤ KUBE_PG_ARCHIVE_WAIT, 300 s) and no plugin Backup is completed or
+# running — the ScheduledBackup isn't immediate (found in e2e-k3s: an
+# immediate one raced the instances' restart with the plugin's sidecar and
+# failed "requested plugin is not available"). A Backup object; status
+# shows its result (LastBackupSucceeded). Never fails the up.
+kube_backup_after_release() {
+  local i a n f
+  [ "$(jq -r '.backup.cnpg.enabled // false' "$(kube_values_file)" 2>/dev/null)" = true ] || return 0
+  for ((i = 0; i < "${KUBE_PG_ARCHIVE_WAIT:-300}"; i += 5)); do
+    a="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null \
+      | jq -r '([.status.conditions[]? | select(.type == "ContinuousArchiving")][0].status // "") + " " + ((.status.readyInstances // 0) == (.spec.instances // -1) | tostring)' 2>/dev/null || true)"
+    [ "$a" = "True true" ] && break
+    sleep 5
+  done
+  [ "$a" = "True true" ] || { warn "CloudNativePG isn't archiving to the backup destination yet: no first base backup (see ./portcullis status)"; return 0; }
+  n="$(kube_ctl -n "$KUBE_CNPG_NS" get backups.postgresql.cnpg.io -o json 2>/dev/null \
+    | jq -r '[.items[] | select(.spec.method == "plugin" and ((.status.phase // "pending") | IN("completed", "running", "started", "pending", "")))] | length' 2>/dev/null || echo x)"
+  [ "$n" = 0 ] || return 0
+  f="$(mktemp)"
+  NS="$KUBE_CNPG_NS" N="portcullis-pg-base-$(date -u +%Y%m%d%H%M%S)" jq -n '{apiVersion: "postgresql.cnpg.io/v1", kind: "Backup",
+      metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
+      spec: {method: "plugin", pluginConfiguration: {name: "barman-cloud.cloudnative-pg.io"}, cluster: {name: "portcullis-pg"}}}' > "$f"
+  if kube_ctl create -f "$f" >/dev/null 2>&1; then info "CloudNativePG: the first base backup to the destination started"; else warn "could not start CloudNativePG's first base backup (see ./portcullis status)"; fi
+  rm -f "$f"
+}
+
 # kube_pg_server_name — the archive's serverName (review I1):
 # portcullis-pg-<the install id's first 8 hex>. The install id is a host key
 # a restore keeps (RESTORE_KUBE_KEY_NAMES), so a re-made or restored

@@ -7162,6 +7162,21 @@ OUT="$(kt "_kube_restore_volume() { :; }; _kube_volume_exists() { :; }; _kube_em
 expect_eq "instance-backup move: pod to pod (hub-state's tar → hub-backups' tar), nothing unpacked on the host, a symlink member can't reach a host path" \
   "$(printf '%s' "$OUT" | tail -n1):$(grep -c 'exec src-pod -- tar -cf - -C /vol/backups .' "$MV/calls"):$(grep -c 'exec -i dst-pod -- tar -xf - -C /vol' "$MV/calls"):$(cat "$MV/streamed"):$(test -e "$MV/outside/pwn" && echo PWNED || echo clean):$(declare -f _kube_restore_volume_t26 | grep -c 'tar -x[a-z]*f "\$dir' || true)" \
   "rc=0:1:1:TARSTREAM:clean:0"
+# The first base backup after the release (found in e2e-k3s: not immediate).
+kbar() { kt "KBAR_VF=\$(mktemp); echo '{\"backup\":{\"cnpg\":{\"enabled\":$1}}}' > \$KBAR_VF; kube_values_file() { echo \$KBAR_VF; }; KUBE_PG_ARCHIVE_WAIT=5
+  kube_ctl() { echo \"K \$*\" >> '$BD/kbar'; case \"\$*\" in *'get cluster.postgresql.cnpg.io'*) echo '{\"spec\":{\"instances\":1},\"status\":{\"readyInstances\":1,\"conditions\":[{\"type\":\"ContinuousArchiving\",\"status\":\"$2\"}]}}' ;;
+    *'get backups'*) echo '{\"items\":$3}' ;; 'create -f '*) jq -c . \"\${@: -1}\" >> '$BD/kbar' ;; esac; }; kube_backup_after_release"; }
+rm -f "$BD/kbar"; OUT="$(kbar true True '[{"spec":{"method":"plugin"},"status":{"phase":"failed"}}]')"
+expect_eq "kube_backup_after_release: archiving and no completed / running plugin Backup → one Backup (method plugin) made" \
+  "$(grep -c '^{"apiVersion":"postgresql.cnpg.io/v1","kind":"Backup".*"spec":{"method":"plugin","pluginConfiguration":{"name":"barman-cloud.cloudnative-pg.io"},"cluster":{"name":"portcullis-pg"}}}$' "$BD/kbar"):$(printf '%s' "$OUT" | tail -n1)" "1:rc=0"
+rm -f "$BD/kbar"; OUT="$(kbar true True '[{"spec":{"method":"plugin"},"status":{"phase":"completed"}}]')"
+expect_eq "kube_backup_after_release: a completed plugin Backup → none made" "$(grep -c '"kind":"Backup"' "$BD/kbar" || true)" 0
+rm -f "$BD/kbar"; OUT="$(kbar true False '[]')"
+case "$OUT" in *"isn't archiving to the backup destination yet"*"rc=0") t_pass "kube_backup_after_release: not archiving → a warning, no Backup, up goes on" ;; *) t_fail "after release not archiving: $OUT" ;; esac
+rm -f "$BD/kbar"; OUT="$(kbar false True '[]')"
+expect_eq "kube_backup_after_release: no archive → nothing asked" "$(test -e "$BD/kbar" && echo asked || echo none)" none
+expect_eq "rt_up: the first base backup after the release (and Vault's voters)" \
+  "$(declare -f _rtk_up | awk '/kube_helm upgrade/ {h=NR} /kube_backup_after_release/ {b=NR} END {print (h && b > h) ? "after" : "no"}')" after
 # Security review: empty / invalid API endpoints or node addresses refuse.
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCULLIS_KUBE_API_ENDPOINTS=; backup_dest_cidrs")"
 case "$OUT" in *"PORTCULLIS_KUBE_API_ENDPOINTS unknown: the backup destination can't be checked (refused)"*"rc=1") t_pass "backup_dest_cidrs: no API endpoints → refused" ;; *) t_fail "no api: $OUT" ;; esac

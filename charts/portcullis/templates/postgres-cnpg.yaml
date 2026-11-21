@@ -182,7 +182,10 @@ metadata:
     app.kubernetes.io/managed-by: portcullis
 spec:
   schedule: {{ $bk.schedule | quote }}
-  immediate: true
+  {{- /* Not immediate: the CLI starts the first base backup once the
+  Cluster archives (ha.sh kube_backup_after_release); an immediate one
+  raced the instances' restart with the plugin's sidecar. */}}
+  immediate: false
   backupOwnerReference: self
   method: plugin
   pluginConfiguration:

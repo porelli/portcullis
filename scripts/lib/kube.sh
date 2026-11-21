@@ -1776,7 +1776,7 @@ _rtk_up() {
     return "$rc"
   fi
   (umask 077 && printf '%s\n' "$_K_IMAGES" > "$(kube_digests_file)")
-  kube_vault_shrink_finish
+  kube_vault_shrink_finish; kube_backup_after_release  # ha.sh: Vault's voters, CNPG's first base backup
   kube_cluster_check
   kube_forward_core
 }
