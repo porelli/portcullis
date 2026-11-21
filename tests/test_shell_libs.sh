@@ -4471,15 +4471,22 @@ case "$url" in
 esac
 VCURL
 chmod +x "$VS/bin/curl"
+# The kubectl stub's port-forward (the real _kube_with_forward runs it as its
+# own child): pod/vault-<n> → local port 701<n>, then held open.
+cat > "$VS/pf.sh" <<'VPF'
+case "$*" in
+  "port-forward --address 127.0.0.1 pod/vault-"[0-9]" :8200")
+    t="${*#*pod/vault-}"; echo "pod/vault-${t%% *}" >> "$VS_DIR/fwd"; echo "Forwarding from 127.0.0.1:701${t%% *} -> 8200"; exec sleep 47 ;;
+esac
+VPF
 vsnap() { # vsnap <vault-0's status json> <vault-1's> <vault-2's> [extra code]
   rm -f "$VS"/leader-* "$VS/fwd" "$VS/snap-ports" "$VS/curl-args" "$VS/out.snap" "$VS"/st-*
   printf '%s' "$1" > "$VS/st-vault-0"; printf '%s' "$2" > "$VS/st-vault-1"; printf '%s' "$3" > "$VS/st-vault-2"
   for i in 0 1 2; do cp "$VS/st-vault-$i" "$VS/leader-701$i"; done
   kt "export VS_DIR='$VS' VS_SNAP='$WORK/good.snap' PATH='$VS/bin':\$PATH VAULT_TOKEN=s.vsnap-token-1234 KUBE_VAULT_SNAPSHOT_TRIES=2 KUBE_VAULT_SNAPSHOT_WAIT=0
     kube_vault_voters() { printf 'vault-0\nvault-1\nvault-2\n'; }
+    export STUB_KUBE_SCRIPT='$VS/pf.sh'
     kube_ctl() { case \"\$*\" in *' exec vault-'[0-9]' -c vault -- vault status -format=json') p=\"\${*#* exec }\"; cat \"$VS/st-\${p%% *}\" ;; *) return 1 ;; esac; }
-    _kube_forward() { echo \"\$1\" >> '$VS/fwd'; case \"\$1\" in pod/vault-0) echo 7010 ;; pod/vault-1) echo 7011 ;; pod/vault-2) echo 7012 ;; *) return 1 ;; esac; }
-    _kube_forward_stop() { :; }
     ${4:-}
     _backup_vault_snapshot '$VS/out.snap'"
 }
@@ -4493,6 +4500,19 @@ case "$OUT" in *"no Vault leader answers"*"rc=1") t_pass "backup: the leader's o
 OUT="$(vsnap "$S" "$S" '')"
 case "$OUT" in *"no leader answered in 2 tries"*"rc=1") t_pass "backup: no Vault leader anywhere (one voter unreachable) → refused after the tries, nothing written" ;; *) t_fail "vault snapshot without a leader: $OUT" ;; esac
 [ ! -s "$VS/snap-ports" ] && t_pass "backup: no snapshot asked of a voter that isn't the leader" || t_fail "a snapshot was taken from a non-leader: $(cat "$VS/snap-ports")"
+# Security review: no forward record on disk to plant. Planted records
+# (symlinks, a file naming another process) in TMPDIR are never followed,
+# written or acted on; the forwards end (no kubectl left running).
+sleep 300 & VICTIM=$!
+printf 'keep' > "$VS/planted-target"
+for pfx in "${TMPDIR:-/tmp}/.portcullis-fwd-" "$VS/.portcullis-fwd-"; do
+  ln -sf "$VS/planted-target" "${pfx}1-7011"; printf '7011' > "${pfx}$$-$VICTIM"
+done
+OUT="$(TMPDIR="$VS" vsnap "$S" "$L" "$S")"
+expect_eq "backup: a planted forward record / symlink neither kills its process nor gets written; no record made" \
+  "$(printf '%s' "$OUT" | tail -n1):$(kill -0 "$VICTIM" 2>/dev/null && echo alive):$(cat "$VS/planted-target"):$(find "$VS" -maxdepth 1 -name '.portcullis-fwd-*' -newer "$VS/planted-target" | wc -l | tr -d ' ')" "rc=0:alive:keep:0"
+kill "$VICTIM" 2>/dev/null; rm -f "${TMPDIR:-/tmp}"/.portcullis-fwd-1-7011 "${TMPDIR:-/tmp}/.portcullis-fwd-$$-$VICTIM" "$VS"/.portcullis-fwd-*
+expect_eq "backup: the snapshot's port-forwards end with it (no stub kubectl left running)" "$(pgrep -fx 'sleep 47' | grep -c . || true)" 0
 OUT="$(kt "kube_ctl() { case \"\$*\" in *' exec vault-1 '*) echo '{\"ha_enabled\":true,\"is_self\":true}' ;; *' get statefulset vault '*) echo 3 ;; *) return 1 ;; esac; }; kube_vault_pod_set; kube_ctl() { return 1; }; kube_vault_pod; echo \"cached=\$_K_VAULT_POD\"")"
 expect_eq "kube_vault_pod: the leader (asked once, kept for the run)" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "vault-1 cached=vault-1 "
 t0="$(date +%s)"; OUT="$(kt "_kube_bounded 1 sh -c 'sleep 30; echo late' | cat; echo after")"

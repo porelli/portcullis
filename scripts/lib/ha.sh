@@ -1246,29 +1246,30 @@ kube_vault_pod_set() {
 }
 kube_vault_pod() { kube_vault_pod_set; echo "${_K_VAULT_POD:-vault-0}"; }
 
+# _kube_vault_snapshot_get <out> — through KUBE_FWD_PORT: "not-leader"
+# unless that Vault still says is_self, else the snapshot GET's status.
+_kube_vault_snapshot_get() {
+  curl -s --max-time 5 "http://127.0.0.1:$KUBE_FWD_PORT/v1/sys/leader" 2>/dev/null | jq -e '.is_self == true' >/dev/null 2>&1 || { echo not-leader; return 0; }
+  _backup_vault_fetch "http://127.0.0.1:$KUBE_FWD_PORT" "$1"
+}
+
 # _kube_vault_snapshot <out> — the raft snapshot from the leader
 # (Amendment 2: every voter asked, kube_vault_leader), through a
 # port-forward to that pod, which must still say is_self; 5 tries 15 s
 # apart (a leader's node lost: the election and its stale endpoints).
 # Validated like the compose one.
 _kube_vault_snapshot() {
-  local out="$1" i pf leader code
+  local out="$1" i leader code
   for ((i = 1; i <= ${KUBE_VAULT_SNAPSHOT_TRIES:-5}; i++)); do
-    pf=""
+    code=""
     if leader="$(kube_vault_leader)"; then
-      pf="$(_kube_forward "pod/$leader" 8200 2>/dev/null)" || pf=""
-      if [ -n "$pf" ] && ! curl -s --max-time 5 "http://127.0.0.1:$pf/v1/sys/leader" 2>/dev/null | jq -e '.is_self == true' >/dev/null 2>&1; then
-        _kube_forward_stop "$pf"; pf=""
-      fi
+      code="$(_kube_with_forward "pod/$leader" 8200 _kube_vault_snapshot_get "$out" 2>/dev/null)" || code=""
     fi
-    if [ -n "$pf" ]; then
-      code="$(_backup_vault_fetch "http://127.0.0.1:$pf" "$out")"
-      _kube_forward_stop "$pf"
-      if [ "$code" = 200 ]; then _backup_vault_check "$out"; return; fi
-      warn "Vault raft snapshot from $leader: HTTP ${code:-none} (try $i)"
-    else
-      warn "no Vault leader answers (try $i)"
-    fi
+    case "$code" in
+      200) _backup_vault_check "$out"; return ;;
+      ""|not-leader) warn "no Vault leader answers (try $i)" ;;
+      *) warn "Vault raft snapshot from $leader: HTTP $code (try $i)" ;;
+    esac
     [ "$i" -ge "${KUBE_VAULT_SNAPSHOT_TRIES:-5}" ] || sleep "${KUBE_VAULT_SNAPSHOT_WAIT:-15}"
   done
   fail "Vault raft snapshot failed: no leader answered in ${KUBE_VAULT_SNAPSHOT_TRIES:-5} tries"
@@ -1295,18 +1296,32 @@ _rtk_replicas() {
   esac
 }
 
-# _kube_forward_stop <local port> — ends a forward of this CLI before it exits.
-# (_kube_forward records <tmp>/.portcullis-fwd-<CLI pid>-<forward pid> =
-# its port; its watcher removes the file.)
-_kube_forward_stop() {
-  local f pid
-  for f in "${TMPDIR:-/tmp}/.portcullis-fwd-$$-"*; do
-    [ -f "$f" ] && [ "$(cat "$f" 2>/dev/null)" = "$1" ] || continue
-    pid="${f##*-}"
-    [[ "$pid" =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null
-    rm -f "$f"
+# _kube_with_forward <target> <remote port> <command…> — the command with
+# KUBE_FWD_PORT = a local port forwarded to <target> (pod/<name> or
+# svc/<name>) by a kubectl port-forward this shell starts as its own child
+# ($!) and ends itself after the command, whatever it returns. No record on
+# disk (security review: a predictable record file could be planted and
+# name another process to kill); the forward's output goes to a mktemp
+# file, removed once its port is read.
+_kube_with_forward() {
+  local target="$1" port="$2" log pid i lp="" rc=0
+  shift 2
+  [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || fail "PORTCULLIS_KUBE_CONTEXT is not set in .env: CONTAINER_RUNTIME=kubernetes never uses the current context"
+  log="$(mktemp)" || return 1
+  # kubectl itself (not the kube_ctl function) is the background child, so
+  # $! is the process to end.
+  kubectl --context "$PORTCULLIS_KUBE_CONTEXT" -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$port" >"$log" 2>&1 &
+  pid=$!
+  for ((i = 0; i < 100; i++)); do
+    lp="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> .*/\1/p' "$log" | head -n1)"
+    [ -z "$lp" ] || break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
   done
-  return 0
+  rm -f "$log"
+  if [ -n "$lp" ]; then KUBE_FWD_PORT="$lp" "$@" || rc=$?; else rc=1; fi
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  return "$rc"
 }
 
 # _kube_empty_vault — every voter's PVC (data-vault-<n>, StatefulSet vault;

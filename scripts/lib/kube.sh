@@ -1879,8 +1879,7 @@ _kube_forward() {
   log="$(mktemp)"
   kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$2" >"$log" 2>&1 &
   pid=$!
-  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null
-    rm -f "${TMPDIR:-/tmp}/.portcullis-fwd-$parent-$pid" ) >/dev/null 2>&1 &
+  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   for ((i = 0; i < 100; i++)); do
     lp="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> .*/\1/p' "$log" | head -n1)"
     [ -z "$lp" ] || break
@@ -1889,7 +1888,6 @@ _kube_forward() {
   done
   rm -f "$log"
   [ -n "$lp" ] || { kill "$pid" 2>/dev/null; return 1; }
-  (umask 077 && printf '%s' "$lp" > "${TMPDIR:-/tmp}/.portcullis-fwd-$parent-$pid")
   echo "$lp"
 }
 
