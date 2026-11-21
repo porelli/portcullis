@@ -13,7 +13,11 @@
 //     copy Traefik deletes) holds the admin group;
 //   - a session: only POST /portcullis/open with a single-use ticket the
 //     Hub's audited Open action minted for this admin (≤ 60 s, its own
-//     per-install key, spent nonces kept on disk) starts one;
+//     per-install key, spent nonces kept on disk) starts one, posted
+//     same-origin by the start page (GET /portcullis/open, which gets the
+//     ticket from the Hub's page by postMessage over a MessageChannel:
+//     never a URL, never a cross-host POST a coalesced HTTP/2 connection
+//     could answer 421 to);
 //     it ends after 30 min idle or 8 h; a visit without one gets a page
 //     saying to open the view from Portcullis.
 //
@@ -341,13 +345,11 @@ func (p *Proxy) admitted(r *http.Request) bool {
 }
 
 // originOK is the cross-origin check (ux2 nit N-a), Go's
-// CrossOriginProtection's rule with one same-site exception: a request
-// that changes something (POST, and the sign-out GET) must be
-// same-origin by Sec-Fetch-Site, else its Origin must be this host; only
-// /portcullis/open may also come from the Hub's own origin (hub.<the
-// view's parent domain>: the Hub page posts the ticket from there). A
-// request with neither header is a non-browser client and passes (the
-// gate and the session still apply).
+// CrossOriginProtection's rule: a request that changes something (POST,
+// and the sign-out GET) must be same-origin by Sec-Fetch-Site, else its
+// Origin must be this host — the ticket POST included: the start page
+// posts it from this origin. A request with neither header is a
+// non-browser client and passes (the gate and the session still apply).
 func (p *Proxy) originOK(r *http.Request) bool {
 	changes := r.Method != http.MethodGet && r.Method != http.MethodHead || r.URL.Path == "/auth/logout"
 	if !changes {
@@ -360,14 +362,12 @@ func (p *Proxy) originOK(r *http.Request) bool {
 	if sfs == "same-origin" || sfs == "none" {
 		return origin == "" || strings.EqualFold(origin, "https://"+p.host)
 	}
-	if r.URL.Path == "/portcullis/open" && sfs == "same-site" {
-		return strings.EqualFold(origin, p.hubOrigin())
-	}
 	return sfs == "" && strings.EqualFold(origin, "https://"+p.host)
 }
 
 // hubOrigin is the Hub's origin for the view's host: mail-admin.<d> →
-// https://hub.<d> (contract §19.13).
+// https://hub.<d> (contract §19.13): the only sender the start page
+// takes a ticket from.
 func (p *Proxy) hubOrigin() string {
 	_, parent, ok := strings.Cut(p.host, ".")
 	if !ok {
@@ -424,12 +424,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if path == "/portcullis/open" {
 		// The ticket comes in a POST body only (never a URL: no access
-		// log or history holds it); a GET is told to open from Portcullis.
-		if r.Method == http.MethodPost {
+		// log or history holds it), posted same-origin by the start page
+		// a GET serves.
+		switch {
+		case r.Method == http.MethodPost:
 			p.open(w, r)
-		} else {
-			openFromPortcullis(w, "This page opens only from Portcullis.")
+		case get:
+			p.startPage(w)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+		return
+	}
+	if path == startScriptPath && get {
+		startScript(w)
 		return
 	}
 	s, why := p.session(r)
@@ -467,6 +475,75 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// startScriptPath is the start page's script (same origin: the page's
+// CSP runs no inline script).
+const startScriptPath = "/portcullis/open.js"
+
+// startPage is GET /portcullis/open, where the Hub's page navigates its
+// new tab (a GET: a browser retries a GET that a coalesced HTTP/2
+// connection answered 421, on a connection of this host's own). Its script
+// waits for the Hub's page (only https://hub.<parent>) to offer a
+// MessageChannel, answers "ready" on it, takes the ticket over it and
+// posts it here, same-origin. Without a ticket within 15 s it says to
+// open the view from Portcullis.
+func (p *Proxy) startPage(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// same-origin, never no-referrer: a no-referrer page's POST carries
+	// Origin: null, which the cross-origin check refuses.
+	w.Header().Set("Referrer-Policy", "same-origin")
+	fmt.Fprintf(w, `<!doctype html><html data-hub-origin="%s"><meta charset="utf-8"><title>Opening the mail server's admin screen</title>`+
+		`<h1>Opening the mail server's read-only admin screen…</h1>`+
+		`<form id="portcullis-open" method="post" action="/portcullis/open"><input type="hidden" name="t"></form>`+
+		`<p id="portcullis-wait" hidden>Nothing arrived from Portcullis. Open the mail server's read-only admin screen from Portcullis: Settings → Mail, <strong>Open … admin (read-only)</strong>.</p>`+
+		`<noscript><p>This page needs JavaScript to receive the link from Portcullis.</p></noscript>`+
+		`<script src="%s"></script></html>`,
+		html.EscapeString(p.hubOrigin()), startScriptPath)
+}
+
+// startJS is the start page's script (see startPage).
+const startJS = `(function () {
+  'use strict';
+  var hub = document.documentElement.getAttribute('data-hub-origin');
+  var taken = false;
+  var ticketRe = /^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+  window.addEventListener('message', function (e) {
+    if (taken || e.origin !== hub || !e.data || e.data.type !== 'portcullis-mail-admin-hello' || !e.ports || e.ports.length !== 1) {
+      return;
+    }
+    taken = true;
+    var port = e.ports[0];
+    port.onmessage = function (m) {
+      var t = m.data && m.data.ticket;
+      port.onmessage = null;
+      port.close();
+      if (typeof t !== 'string' || !ticketRe.test(t)) {
+        document.getElementById('portcullis-wait').hidden = false;
+        return;
+      }
+      var f = document.getElementById('portcullis-open');
+      f.elements.t.value = t;
+      f.submit();
+    };
+    port.postMessage({ type: 'portcullis-mail-admin-ready' });
+  });
+  setTimeout(function () {
+    if (!taken) {
+      document.getElementById('portcullis-wait').hidden = false;
+    }
+  }, 15000);
+})();
+`
+
+func startScript(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	fmt.Fprint(w, startJS)
 }
 
 // openFromPortcullis is the answer without a session.
