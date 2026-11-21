@@ -151,7 +151,7 @@ func assertNoViewerLeak(t *testing.T, f *fake.Server, secret string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sf, err := stalwart.SecretFieldNames(schema)
+	ty, err := stalwart.ParseTypes(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,14 +160,14 @@ func assertNoViewerLeak(t *testing.T, f *fake.Server, secret string) {
 		if b, _ := json.Marshal(w.Fields); strings.Contains(string(b), secret) {
 			seen = true
 		}
-		if l := stalwart.ViewerSecretLeaks(w.Object, w.Fields, secret, sf); len(l) > 0 {
+		if l := stalwart.ViewerSecretLeaks(ty, w.Object, w.Fields, secret); len(l) > 0 {
 			t.Errorf("a secret reaches the viewer: %v", l)
 		}
 	}
 	for st, objs := range f.Stores() {
 		obj, _, _ := strings.Cut(st, "@")
 		for _, o := range objs {
-			if l := stalwart.ViewerSecretLeaks(obj, o, secret, sf); len(l) > 0 {
+			if l := stalwart.ViewerSecretLeaks(ty, obj, o, secret); len(l) > 0 {
 				t.Errorf("a stored secret reaches the viewer: %v", l)
 			}
 		}

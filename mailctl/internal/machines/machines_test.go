@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -771,8 +770,11 @@ func TestDMARCNeverBelowFloor(t *testing.T) {
 	}
 }
 
-// TestDKIMKeysNeverReachViewer (security review N4, data flow): the DKIM
-// private keys mailctl makes are written only into masked secret fields.
+// TestDKIMKeysNeverReachViewer (security review N4, R2-M1, data flow):
+// the DKIM private keys mailctl makes are written only into masked secret
+// fields. The sentinel is a slice of each generated key's own body (an
+// un-armoured copy anywhere would match), checked in every write and
+// every stored object.
 func TestDKIMKeysNeverReachViewer(t *testing.T) {
 	e := newEnv(t, nil)
 	e.step(t)
@@ -780,20 +782,37 @@ func TestDKIMKeysNeverReachViewer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sf, err := stalwart.SecretFieldNames(schema)
+	ty, err := stalwart.ParseTypes(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
-	seen := false
+	var bodies []string
 	for _, w := range e.f.Written {
-		if b, _ := json.Marshal(w.Fields); strings.Contains(string(b), "PRIVATE KEY") {
-			seen = true
-		}
-		if l := stalwart.ViewerSecretLeaks(w.Object, w.Fields, "PRIVATE KEY", sf); len(l) > 0 {
-			t.Errorf("a private key reaches the viewer: %v", l)
+		pk, _ := w.Fields["privateKey"].(map[string]any)
+		pem, _ := pk["secret"].(string)
+		for _, ln := range strings.Split(pem, "\n") {
+			if len(ln) >= 40 && !strings.HasPrefix(ln, "-----") {
+				bodies = append(bodies, ln[8:40])
+				break
+			}
 		}
 	}
-	if !seen {
-		t.Fatal("no private key was written: the check proves nothing")
+	if len(bodies) < 2 {
+		t.Fatalf("%d DKIM keys written: the check proves nothing", len(bodies))
+	}
+	for _, b := range bodies {
+		for _, w := range e.f.Written {
+			if l := stalwart.ViewerSecretLeaks(ty, w.Object, w.Fields, b); len(l) > 0 {
+				t.Errorf("a private key reaches the viewer: %v", l)
+			}
+		}
+		for st, objs := range e.f.Stores() {
+			obj, _, _ := strings.Cut(st, "@")
+			for _, o := range objs {
+				if l := stalwart.ViewerSecretLeaks(ty, obj, o, b); len(l) > 0 {
+					t.Errorf("a stored private key reaches the viewer: %v", l)
+				}
+			}
+		}
 	}
 }

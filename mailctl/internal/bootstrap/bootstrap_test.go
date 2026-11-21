@@ -732,9 +732,10 @@ func TestResetViewerWithoutViewer(t *testing.T) {
 	}
 }
 
-// TestViewerPasswordNeverReachesViewer (security review N4, data flow):
-// the passwords the plan sets (the viewer's, mailctl's) sit only in masked
-// secret fields.
+// TestViewerPasswordNeverReachesViewer (security review N4, R2-M1, data
+// flow): every secret the plan writes — the viewer's password, mailctl's
+// account password (every Password credential secret the job sent) —
+// sits only in masked secret fields of whatever the job wrote.
 func TestViewerPasswordNeverReachesViewer(t *testing.T) {
 	f := newFake()
 	p := params()
@@ -744,19 +745,38 @@ func TestViewerPasswordNeverReachesViewer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sf, _ := stalwart.SecretFieldNames(schema)
-	seen := false
-	for obj, objs := range f.objs {
-		for _, o := range objs {
-			if b, _ := json.Marshal(o); strings.Contains(string(b), res.ViewerPassword) {
-				seen = true
-			}
-			if l := stalwart.ViewerSecretLeaks(obj, o, res.ViewerPassword, sf); len(l) > 0 {
-				t.Errorf("the viewer password reaches the viewer: %v", l)
+	ty, err := stalwart.ParseTypes(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets := []string{res.ViewerPassword}
+	for _, o := range f.objs["Account"] {
+		creds, _ := o["credentials"].(map[string]any)
+		for _, c := range creds {
+			if cm, ok := c.(map[string]any); ok {
+				if sec, _ := cm["secret"].(string); len(sec) >= 16 && sec != res.ViewerPassword {
+					secrets = append(secrets, sec)
+				}
 			}
 		}
 	}
-	if !seen {
-		t.Fatal("the viewer password was never stored: the check proves nothing")
+	if len(secrets) < 2 {
+		t.Fatalf("secrets %d: mailctl's account password wasn't found", len(secrets))
+	}
+	for _, sec := range secrets {
+		seen := false
+		for obj, objs := range f.objs {
+			for _, o := range objs {
+				if b, _ := json.Marshal(o); strings.Contains(string(b), sec) {
+					seen = true
+				}
+				if l := stalwart.ViewerSecretLeaks(ty, obj, o, sec); len(l) > 0 {
+					t.Errorf("a password reaches the viewer: %v", l)
+				}
+			}
+		}
+		if !seen {
+			t.Fatal("a password was never stored: the check proves nothing")
+		}
 	}
 }

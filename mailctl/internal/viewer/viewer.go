@@ -256,6 +256,12 @@ func New(upstream, host, secretFile string, spkis []string, gate Gate, tk Ticket
 		Transport: tr,
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Header.Del("Set-Cookie")
+			// The view answers its own origin only: never Stalwart's CORS.
+			for k := range resp.Header {
+				if strings.HasPrefix(strings.ToLower(k), "access-control-") {
+					resp.Header.Del(k)
+				}
+			}
 			// Never a browser password prompt (a mail password is never
 			// typed into a web page, P11).
 			resp.Header.Del("WWW-Authenticate")
@@ -334,6 +340,42 @@ func (p *Proxy) admitted(r *http.Request) bool {
 	return false
 }
 
+// originOK is the cross-origin check (ux2 nit N-a), Go's
+// CrossOriginProtection's rule with one same-site exception: a request
+// that changes something (POST, and the sign-out GET) must be
+// same-origin by Sec-Fetch-Site, else its Origin must be this host; only
+// /portcullis/open may also come from the Hub's own origin (hub.<the
+// view's parent domain>: the Hub page posts the ticket from there). A
+// request with neither header is a non-browser client and passes (the
+// gate and the session still apply).
+func (p *Proxy) originOK(r *http.Request) bool {
+	changes := r.Method != http.MethodGet && r.Method != http.MethodHead || r.URL.Path == "/auth/logout"
+	if !changes {
+		return true
+	}
+	sfs, origin := r.Header.Get("Sec-Fetch-Site"), r.Header.Get("Origin")
+	if sfs == "" && origin == "" {
+		return true
+	}
+	if sfs == "same-origin" || sfs == "none" {
+		return origin == "" || strings.EqualFold(origin, "https://"+p.host)
+	}
+	if r.URL.Path == "/portcullis/open" && sfs == "same-site" {
+		return strings.EqualFold(origin, p.hubOrigin())
+	}
+	return sfs == "" && strings.EqualFold(origin, "https://"+p.host)
+}
+
+// hubOrigin is the Hub's origin for the view's host: mail-admin.<d> →
+// https://hub.<d> (contract §19.13).
+func (p *Proxy) hubOrigin() string {
+	_, parent, ok := strings.Cut(p.host, ".")
+	if !ok {
+		return ""
+	}
+	return "https://hub." + parent
+}
+
 // canonicalPath: a path the proxy will look at (no dot segments, no
 // doubled or encoded slashes or dots, no backslash).
 func canonicalPath(r *http.Request) bool {
@@ -376,6 +418,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.URL.Path
 	get := r.Method == http.MethodGet || r.Method == http.MethodHead
+	if !p.originOK(r) {
+		http.Error(w, "forbidden: cross-origin request", http.StatusForbidden)
+		return
+	}
 	if path == "/portcullis/open" {
 		// The ticket comes in a POST body only (never a URL: no access
 		// log or history holds it); a GET is told to open from Portcullis.

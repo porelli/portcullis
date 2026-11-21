@@ -28,6 +28,7 @@ type upstream struct {
 	seen      []*http.Request
 	body      []string
 	unmasked  bool // SystemSettings includeSecrets
+	cors      bool // answer Access-Control-* headers
 	readCount int
 }
 
@@ -42,6 +43,10 @@ func (u *upstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	u.seen = append(u.seen, r.Clone(r.Context()))
 	u.body = append(u.body, string(b))
+	if u.cors {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
 	w.Header().Set("Set-Cookie", "s=1")
 	w.Header().Set("WWW-Authenticate", `Basic realm="x"`)
 	w.Write([]byte(`{"ok":true}`))
@@ -650,5 +655,49 @@ func TestTicketPostAndReplayAcrossRestart(t *testing.T) {
 	}
 	if _, err := New(e.p.upstream.String(), "h", e.sf, []string{strings.Repeat("ab", 32)}, testGate, Tickets{Secret: []byte("short"), UsedFile: used}, nil, nil); err == nil {
 		t.Fatal("a short ticket secret accepted")
+	}
+}
+
+// Cross-origin (nit N-a): POSTs and the sign-out must be same-origin, the
+// ticket POST may also come from the Hub's origin (same-site); another
+// site, or a sibling app's origin, is refused. Stalwart's CORS headers are
+// stripped (N-b).
+func TestOriginChecks(t *testing.T) {
+	e := setup(t)
+	tk := func() string { return e.ticket("root", 50*time.Second) }
+	for name, hdr := range map[string]map[string]string{
+		"a sibling app":    {"Sec-Fetch-Site": "same-site", "Origin": "https://evil.example.org"},
+		"another site":     {"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.test"},
+		"origin only, bad": {"Origin": "https://evil.test"},
+	} {
+		if resp := e.open(t, tk(), hdr); resp.StatusCode != http.StatusForbidden || len(resp.Cookies()) != 0 {
+			t.Errorf("%s: %d", name, resp.StatusCode)
+		}
+	}
+	if resp := e.open(t, tk(), map[string]string{"Sec-Fetch-Site": "same-site", "Origin": "https://hub.example.org"}); resp.StatusCode != http.StatusFound {
+		t.Fatalf("from the Hub: %d", resp.StatusCode)
+	}
+	e.openSession(t)
+	for name, c := range map[string][3]string{
+		"jmap from a sibling":   {"POST", "/jmap/", "same-site"},
+		"token from a sibling":  {"POST", "/auth/token", "same-site"},
+		"logout from a sibling": {"GET", "/auth/logout", "same-site"},
+		"open from a sibling":   {"POST", "/auth/revoke", "cross-site"},
+	} {
+		if resp := e.do(t, c[0], c[1], read, map[string]string{"Sec-Fetch-Site": c[2], "Origin": "https://shop.example.org"}); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: %d", name, resp.StatusCode)
+		}
+	}
+	if resp := e.do(t, "GET", "/admin/", "", nil); resp.StatusCode != 200 {
+		t.Fatalf("still signed in: %d", resp.StatusCode)
+	}
+	if resp := e.do(t, "POST", "/jmap/", read, map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "https://mail-admin.example.org"}); resp.StatusCode != 200 {
+		t.Fatalf("same-origin read: %d", resp.StatusCode)
+	}
+	e.up.mu.Lock()
+	e.up.cors = true
+	e.up.mu.Unlock()
+	if resp := e.do(t, "GET", "/admin/", "", nil); resp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("Stalwart's CORS header reached the browser")
 	}
 }
