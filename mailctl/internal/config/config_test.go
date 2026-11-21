@@ -160,13 +160,15 @@ func TestServerURLsStrict(t *testing.T) {
 // upstream that isn't https to an IPv4 address.
 func TestLoadAdminView(t *testing.T) {
 	good := map[string]string{"PORTCULLIS_MAIL_ADMIN_HOST": "mail-admin.example.org", "MAILCTL_VIEWER_SECRET_FILE": "/run/portcullis/viewer-key/viewer-password",
-		"PORTCULLIS_MAIL_TLS_SPKI": strings.Repeat("ab", 32)}
+		"PORTCULLIS_MAIL_TLS_SPKI": strings.Repeat("ab", 32), "PORTCULLIS_MAIL_ADMIN_TRAEFIK_IP": "172.31.250.2",
+		"PORTCULLIS_MAIL_ADMIN_ROUTE_KEY": strings.Repeat("aB3", 16)}
 	a, err := LoadAdminView(func(k string) string { return good[k] })
 	if err != nil || a.Addr != ":8090" || a.Upstream != "https://172.31.255.2:8443" || len(a.SPKIs) != 1 {
 		t.Fatalf("%+v %v", a, err)
 	}
 	for k, v := range map[string]string{"PORTCULLIS_MAIL_ADMIN_HOST": "", "MAILCTL_VIEWER_SECRET_FILE": "rel/path", "PORTCULLIS_MAIL_TLS_SPKI": " ",
-		"MAILCTL_ADMINVIEW_UPSTREAM": "http://172.31.255.2:8443", "MAILCTL_ADMINVIEW_ADDR": "nope"} {
+		"MAILCTL_ADMINVIEW_UPSTREAM": "http://172.31.255.2:8443", "MAILCTL_ADMINVIEW_ADDR": "nope",
+		"PORTCULLIS_MAIL_ADMIN_TRAEFIK_IP": "", "PORTCULLIS_MAIL_ADMIN_ROUTE_KEY": "short"} {
 		env := map[string]string{}
 		for kk, vv := range good {
 			env[kk] = vv

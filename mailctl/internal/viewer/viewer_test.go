@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -51,7 +53,7 @@ func setup(t *testing.T) (*upstream, *httptest.Server, string) {
 	dir := t.TempDir()
 	sf := filepath.Join(dir, "viewer-password")
 	os.WriteFile(sf, []byte("0123456789abcdef0123456789abcdef\n"), 0o640)
-	p, err := New(us.URL, "mail-admin.example.org", sf, []string{spkiOf(us.Certificate())}, func(string, ...any) {})
+	p, err := New(us.URL, "mail-admin.example.org", sf, []string{spkiOf(us.Certificate())}, testGate, func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +69,13 @@ func noRedirect() *http.Client {
 func do(t *testing.T, method, u, body string, hdr map[string]string) *http.Response {
 	t.Helper()
 	req, _ := http.NewRequest(method, u, strings.NewReader(body))
+	req.Header.Set(RouteKeyHeader, testKey)
 	for k, v := range hdr {
-		req.Header.Set(k, v)
+		if v == "" {
+			req.Header.Del(k)
+		} else {
+			req.Header.Set(k, v)
+		}
 	}
 	resp, err := noRedirect().Do(req)
 	if err != nil {
@@ -262,6 +269,13 @@ func TestCanonicalJMAPSmuggling(t *testing.T) {
 		"call with extra element":            `{"using":[],"methodCalls":[["x:Account/get",{},"0","x:Account/set"]]}`,
 		"name not a string":                  `{"using":[],"methodCalls":[[["x:Account/set"],{},"0"]]}`,
 		"top not an object":                  `[{"using":[],"methodCalls":` + get + `}]`,
+		"queued messages":                    `{"using":[],"methodCalls":[["x:QueuedMessage/get",{},"0"]]}`,
+		"queue query":                        `{"using":[],"methodCalls":[["x:QueuedMessage/query",{},"0"]]}`,
+		"DMARC reports":                      `{"using":[],"methodCalls":[["x:DmarcExternalReport/get",{},"0"]]}`,
+		"ARF reports":                        `{"using":[],"methodCalls":[["x:ArfExternalReport/query",{},"0"]]}`,
+		"TLS reports":                        `{"using":[],"methodCalls":[["x:TlsInternalReport/changes",{},"0"]]}`,
+		"mail itself":                        `{"using":[],"methodCalls":[["Email/get",{},"0"]]}`,
+		"a read hidden after an allowed one": `{"using":[],"methodCalls":[["x:Account/get",{},"0"],["x:QueuedMessage/get",{},"1"]]}`,
 	} {
 		if _, why := canonicalJMAP([]byte(body)); why == "" {
 			t.Errorf("%s: accepted", name)
@@ -292,6 +306,11 @@ func TestJMAPForwardsCanonical(t *testing.T) {
 	}
 }
 
+// The tests' proxy is reached over loopback: Traefik's address there.
+const testKey = "0123456789abcdefghijklmnopqrstuvwxyzABCDEF"
+
+var testGate = Gate{TraefikIP: netip.MustParseAddr("127.0.0.1"), Key: testKey}
+
 func spkiOf(c *x509.Certificate) string {
 	h := sha256.Sum256(c.RawSubjectPublicKeyInfo)
 	return hex.EncodeToString(h[:])
@@ -309,7 +328,7 @@ func TestUpstreamPinned(t *testing.T) {
 	// A pin that isn't the server's key (as a certificate other than the
 	// mail certificate would be).
 	wrong := strings.Repeat("ab", 32)
-	p, err := New(us.URL, "mail-admin.example.org", sf, []string{wrong}, func(string, ...any) {})
+	p, err := New(us.URL, "mail-admin.example.org", sf, []string{wrong}, testGate, func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,15 +343,93 @@ func TestUpstreamPinned(t *testing.T) {
 		t.Fatalf("a request (the viewer's password included: %v) reached a server with an unpinned certificate", up.auth != nil)
 	}
 	// Two pins (a rollover): the right one among them passes.
-	p2, _ := New(us.URL, "mail-admin.example.org", sf, []string{wrong, spkiOf(us.Certificate())}, func(string, ...any) {})
+	p2, _ := New(us.URL, "mail-admin.example.org", sf, []string{wrong, spkiOf(us.Certificate())}, testGate, func(string, ...any) {})
 	ps2 := httptest.NewServer(p2)
 	defer ps2.Close()
 	if resp := do(t, "GET", ps2.URL+"/admin/", "", nil); resp.StatusCode != 200 {
 		t.Fatalf("pinned rollover: %d", resp.StatusCode)
 	}
 	for _, pins := range [][]string{nil, {}, {"xyz"}, {strings.Repeat("AB", 32)}, {wrong, wrong + "00"}, {wrong, strings.Repeat("cd", 32), strings.Repeat("ef", 32)}} {
-		if _, err := New(us.URL, "mail-admin.example.org", sf, pins, nil); err == nil {
+		if _, err := New(us.URL, "mail-admin.example.org", sf, pins, testGate, nil); err == nil {
 			t.Errorf("pins %v accepted", pins)
 		}
+	}
+}
+
+// The gate (security review): without the route key, with a wrong or a
+// doubled one, or from anywhere but Traefik's address, every path is 403
+// and nothing reaches the mail server: no sign-in, no viewer credential.
+func TestGate(t *testing.T) {
+	up, ps, sf := setup(t)
+	read := `{"using":[],"methodCalls":[["x:Account/get",{},"0"]]}`
+	for name, hdr := range map[string]map[string]string{
+		"no key":    {RouteKeyHeader: ""},
+		"wrong key": {RouteKeyHeader: strings.Repeat("x", len(testKey))},
+		"prefix":    {RouteKeyHeader: testKey[:20]},
+		"longer":    {RouteKeyHeader: testKey + "x"},
+	} {
+		for _, c := range [][3]string{{"GET", "/login?state=s", ""}, {"POST", "/jmap/", read}, {"GET", "/admin/", ""}, {"GET", "/api/account", ""}} {
+			if resp := do(t, c[0], ps.URL+c[1], c[2], hdr); resp.StatusCode != http.StatusForbidden {
+				t.Errorf("%s: %s %s = %d", name, c[0], c[1], resp.StatusCode)
+			}
+		}
+	}
+	req, _ := http.NewRequest("GET", ps.URL+"/admin/", nil)
+	req.Header.Add(RouteKeyHeader, testKey)
+	req.Header.Add(RouteKeyHeader, "other")
+	if resp, err := noRedirect().Do(req); err != nil || resp.StatusCode != http.StatusForbidden {
+		t.Errorf("two keys: %v %v", resp, err)
+	}
+	// From another address than Traefik's: refused even with the key.
+	p, _ := New(strings.Replace(ps.URL, "http://", "https://", 1), "mail-admin.example.org", sf, []string{strings.Repeat("ab", 32)},
+		Gate{TraefikIP: netip.MustParseAddr("172.31.250.2"), Key: testKey}, func(string, ...any) {})
+	other := httptest.NewServer(p)
+	defer other.Close()
+	if resp := do(t, "POST", other.URL+"/jmap/", read, nil); resp.StatusCode != http.StatusForbidden {
+		t.Errorf("not Traefik's address: %d", resp.StatusCode)
+	}
+	if len(up.seen) != 0 || up.auth != nil {
+		t.Fatalf("%d requests reached the mail server through a closed gate", len(up.seen))
+	}
+	// The healthcheck answers loopback without the key, and only /healthz.
+	if resp := do(t, "GET", other.URL+"/healthz", "", map[string]string{RouteKeyHeader: ""}); resp.StatusCode != 200 {
+		t.Errorf("healthz: %d", resp.StatusCode)
+	}
+	// The key never reaches the mail server.
+	do(t, "GET", ps.URL+"/admin/", "", nil)
+	if len(up.seen) != 1 || up.seen[0].Header.Get(RouteKeyHeader) != "" {
+		t.Fatalf("the route key was forwarded: %v", up.seen)
+	}
+	// No gate, no proxy.
+	for _, g := range []Gate{{}, {TraefikIP: netip.MustParseAddr("172.31.250.2")}, {TraefikIP: netip.MustParseAddr("172.31.250.2"), Key: "short"}} {
+		if _, err := New("https://172.31.255.2:8443", "mail-admin.example.org", sf, []string{strings.Repeat("ab", 32)}, g, nil); err == nil {
+			t.Errorf("gate %+v accepted", g)
+		}
+	}
+}
+
+// The proxy listens only on Traefik's network: the address of the
+// interface whose subnet holds Traefik's, never the internal network,
+// loopback or a wildcard; none is an error.
+func TestBindAddr(t *testing.T) {
+	mk := func(cidrs ...string) []net.Addr {
+		var out []net.Addr
+		for _, c := range cidrs {
+			ip, n, _ := net.ParseCIDR(c)
+			n.IP = ip
+			out = append(out, n)
+		}
+		return out
+	}
+	tr := netip.MustParseAddr("172.31.250.2")
+	got, err := bindAddrIn(mk("127.0.0.1/8", "172.31.255.5/28", "172.31.250.37/24"), tr)
+	if err != nil || got != netip.MustParseAddr("172.31.250.37") {
+		t.Fatalf("%v %v", got, err)
+	}
+	if _, err := bindAddrIn(mk("127.0.0.1/8", "172.31.255.5/28"), tr); err == nil {
+		t.Fatal("bound without Traefik's network")
+	}
+	if _, err := bindAddrIn(mk("172.31.250.2/24"), tr); err == nil {
+		t.Fatal("bound to Traefik's own address")
 	}
 }

@@ -512,15 +512,22 @@ func adminViewCmd(args []string, env func(string) string, stderr io.Writer) int 
 		return 1
 	}
 	logger := logx.New(stderr)
-	p, err := viewer.New(cfg.Upstream, cfg.Host, cfg.SecretFile, cfg.SPKIs, logger.Printf)
+	logx.AddSecret(cfg.RouteKey)
+	p, err := viewer.New(cfg.Upstream, cfg.Host, cfg.SecretFile, cfg.SPKIs, viewer.Gate{TraefikIP: cfg.TraefikIP, Key: cfg.RouteKey}, logger.Printf)
 	if err != nil {
 		fmt.Fprintf(stderr, "mailctl admin-view: %v\n", err)
 		return 1
 	}
+	_, port, _ := net.SplitHostPort(cfg.Addr)
+	bind, err := viewer.BindAddr(cfg.TraefikIP)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl admin-view: refusing to start: %v\n", err)
+		return 1
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	logger.Printf("admin-view: serving the read-only mail admin view for %s on %s", cfg.Host, cfg.Addr)
-	if err := viewer.Serve(ctx, cfg.Addr, p); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	logger.Printf("admin-view: serving the read-only mail admin view for %s on %s:%s (Traefik %s only)", cfg.Host, bind, port, cfg.TraefikIP)
+	if err := viewer.Serve(ctx, bind, port, p); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(stderr, "mailctl admin-view: %v\n", err)
 		return 1
 	}

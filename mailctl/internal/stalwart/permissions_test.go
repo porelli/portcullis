@@ -114,3 +114,41 @@ func TestViewerRoleReadOnlyExact(t *testing.T) {
 		seen[p] = true
 	}
 }
+
+// Messages and their envelopes stay out of the viewer's reach (security
+// review): the queue and every received or sent report is denied in the
+// role, and ViewerDeniedObject (the admin view proxy's second layer)
+// refuses exactly the denied objects and their kin, never an allowed one.
+func TestViewerNoMessagesOrEnvelopes(t *testing.T) {
+	has := map[string]bool{}
+	for _, p := range ViewerRolePermissions {
+		has[p] = true
+	}
+	for _, o := range []string{"QueuedMessage", "ArfExternalReport", "DmarcExternalReport", "DmarcInternalReport", "TlsExternalReport", "TlsInternalReport",
+		"SpamTrainingSample", "ArchivedItem", "MaskedEmail", "SieveUserScript", "ApiKey", "AppPassword", "AccountPassword", "Log", "Trace"} {
+		for _, v := range []string{"Get", "Query"} {
+			if has["sys"+o+v] {
+				t.Errorf("viewer holds sys%s%s", o, v)
+			}
+		}
+		for _, m := range []string{"x:" + o + "/get", "x:" + o + "/query", "x:" + o + "/changes"} {
+			if !ViewerDeniedObject(m) {
+				t.Errorf("proxy allows %s", m)
+			}
+		}
+	}
+	for _, p := range ViewerRolePermissions {
+		obj, ok := strings.CutSuffix(strings.TrimPrefix(p, "sys"), "Get")
+		if !ok {
+			continue
+		}
+		if ViewerDeniedObject("x:" + obj + "/get") {
+			t.Errorf("the proxy refuses x:%s/get, which the role allows", obj)
+		}
+	}
+	for _, m := range []string{"x:QueuedMessageV2/get", "x:FooReport/get", "Email/get", "Mailbox/query", "x:SomeSecret/get", "x:queuedmessage/get"} {
+		if !ViewerDeniedObject(m) {
+			t.Errorf("proxy allows the new kin %s", m)
+		}
+	}
+}

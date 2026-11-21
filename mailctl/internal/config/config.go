@@ -321,6 +321,11 @@ type AdminView struct {
 	// values (comma-separated hex, the Hub's override): the hop to
 	// Stalwart is pinned to them.
 	SPKIs []string
+	// TraefikIP (PORTCULLIS_MAIL_ADMIN_TRAEFIK_IP) and RouteKey
+	// (PORTCULLIS_MAIL_ADMIN_ROUTE_KEY), from the Hub's override: the only
+	// client and the per-install key its router sets.
+	TraefikIP netip.Addr
+	RouteKey  string
 }
 
 // LoadAdminView reads the admin view's configuration; every value is
@@ -357,6 +362,14 @@ func LoadAdminView(env func(string) string) (AdminView, error) {
 	}
 	if len(a.SPKIs) == 0 {
 		return a, errors.New("PORTCULLIS_MAIL_TLS_SPKI is required (the Hub's override sets the mail certificate's SPKI): the hop to the mail server is pinned to it")
+	}
+	tip := strings.TrimSpace(env("PORTCULLIS_MAIL_ADMIN_TRAEFIK_IP"))
+	if a.TraefikIP, err = netip.ParseAddr(tip); err != nil || !a.TraefikIP.Is4() {
+		return a, fmt.Errorf("PORTCULLIS_MAIL_ADMIN_TRAEFIK_IP=%q is not Traefik's IPv4 address (the Hub's override sets it)", tip)
+	}
+	a.RouteKey = strings.TrimSpace(env("PORTCULLIS_MAIL_ADMIN_ROUTE_KEY"))
+	if len(a.RouteKey) < 32 || strings.Trim(a.RouteKey, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") != "" {
+		return a, errors.New("PORTCULLIS_MAIL_ADMIN_ROUTE_KEY is required: 32+ letters and digits (the Hub's override sets it)")
 	}
 	return a, nil
 }

@@ -20,6 +20,11 @@
 //  3. the viewer's role holds reads only (stalwart.ViewerRolePermissions):
 //     Stalwart refuses every write itself.
 //
+// Nothing is served (and no credential is injected) unless the request
+// comes from Traefik's address with the per-install route key the Hub's
+// admin view router sets after forward-auth admitted a full
+// administrator (Gate); the proxy listens only on Traefik's network.
+//
 // Only an allowlist of paths is forwarded (anything else is 404 here, so
 // Stalwart's scan bans never see a stray path), never the browser's
 // Authorization (the reads are authenticated as the viewer by the proxy:
@@ -32,6 +37,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -42,11 +48,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/portcullis/mailctl/internal/stalwart"
 )
 
 // Viewer is the viewer account's login (bootstrap.ViewerName).
@@ -63,6 +72,7 @@ var readMethod = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9:]*/(get|query|changes|q
 
 // Proxy is the admin view's handler.
 type Proxy struct {
+	gate     Gate
 	upstream *url.URL
 	host     string                 // the admin view's hostname (Stalwart's trusted host)
 	secret   func() (string, error) // the viewer's password, read on every sign-in
@@ -80,7 +90,10 @@ type Proxy struct {
 // servers), so the hop is pinned instead of chain-checked: the peer's leaf
 // must have one of spkis, or the connection fails (verifyPinned). The
 // password and the browser's token never reach anything else.
-func New(upstream, host, secretFile string, spkis []string, logf func(string, ...any)) (*Proxy, error) {
+func New(upstream, host, secretFile string, spkis []string, gate Gate, logf func(string, ...any)) (*Proxy, error) {
+	if !gate.TraefikIP.Is4() || len(gate.Key) < 32 {
+		return nil, errors.New("admin view: Traefik's address and the per-install route key are required: nothing reaches the proxy without them")
+	}
 	u, err := url.Parse(upstream)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, fmt.Errorf("admin view: upstream %q is not https://<ip>:<port>", upstream)
@@ -102,7 +115,7 @@ func New(upstream, host, secretFile string, spkis []string, logf func(string, ..
 		MaxIdleConns:          16,
 		IdleConnTimeout:       90 * time.Second,
 	}
-	p := &Proxy{upstream: u, host: host, logf: logf,
+	p := &Proxy{gate: gate, upstream: u, host: host, logf: logf,
 		secret: func() (string, error) {
 			b, err := os.ReadFile(secretFile)
 			if err != nil {
@@ -122,7 +135,7 @@ func New(upstream, host, secretFile string, spkis []string, logf func(string, ..
 			r.SetURL(u)
 			// Stalwart judges its trusted host by Host (STALWART_PUBLIC_URL).
 			r.Out.Host = host
-			for _, h := range []string{"Cookie", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "X-Real-Ip"} {
+			for _, h := range []string{"Cookie", RouteKeyHeader, "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "X-Real-Ip"} {
 				r.Out.Header.Del(h)
 			}
 			for k := range r.Out.Header {
@@ -188,13 +201,45 @@ func verifyPinned(cs tls.ConnectionState, pins map[[32]byte]bool) error {
 	return nil
 }
 
-// ServeHTTP is the allowlist (contract §19.13).
+// RouteKeyHeader carries the per-install route key the Hub's admin view
+// router sets after forward-auth admitted a full administrator (Traefik
+// overwrites any client copy; contract §19.13).
+const RouteKeyHeader = "X-Portcullis-Mail-Admin-Key"
+
+// Gate is who may reach the proxy: Traefik's address on portcullis-proxy
+// and the route key its router sets. A request without both is 403 and
+// nothing (no credential) is sent upstream.
+type Gate struct {
+	TraefikIP netip.Addr
+	Key       string
+}
+
+// admitted: the request came from Traefik's address with the route key.
+func (p *Proxy) admitted(r *http.Request) bool {
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil || ap.Addr().Unmap() != p.gate.TraefikIP {
+		return false
+	}
+	got := r.Header.Get(RouteKeyHeader)
+	return len(r.Header.Values(RouteKeyHeader)) == 1 && subtle.ConstantTimeCompare([]byte(got), []byte(p.gate.Key)) == 1
+}
+
+// ServeHTTP is the gate, then the allowlist (contract §19.13).
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	get := r.Method == http.MethodGet || r.Method == http.MethodHead
+	if path == "/healthz" && get {
+		// The container's own healthcheck, on loopback only.
+		if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil && ap.Addr().IsLoopback() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
+	if !p.admitted(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	switch {
-	case path == "/healthz" && get:
-		w.WriteHeader(http.StatusOK)
 	case path == "/" && get:
 		http.Redirect(w, r, "/admin/", http.StatusFound)
 	case (path == "/admin" || strings.HasPrefix(path, "/admin/")) && get,
@@ -373,6 +418,11 @@ func canonicalJMAP(b []byte) ([]byte, string) {
 		if !readMethod.MatchString(name) {
 			return nil, "Refused: " + name + "."
 		}
+		// Messages, envelopes, reports and credentials: never, even as a
+		// read (the role holds none of them either).
+		if stalwart.ViewerDeniedObject(name) {
+			return nil, "Refused: " + name + " (messages, envelopes, reports and credentials stay out of the admin view)."
+		}
 		args, ok := strictValue(call[1])
 		if _, isObj := args.(map[string]any); !ok || !isObj {
 			return nil, errNotJMAP
@@ -490,18 +540,63 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte) {
 	p.rp.ServeHTTP(w, r2)
 }
 
-// Serve runs the proxy on addr until ctx ends.
-func Serve(ctx context.Context, addr string, h http.Handler) error {
-	srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second,
-		WriteTimeout: 120 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
+// BindAddr is the one local address to listen on: this container's
+// address on the network Traefik's address is on (portcullis-proxy),
+// never the template's internal network or the wildcard. None: an error
+// (fail closed).
+func BindAddr(traefik netip.Addr) (netip.Addr, error) {
+	ifs, err := net.InterfaceAddrs()
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	return bindAddrIn(ifs, traefik)
+}
+
+func bindAddrIn(addrs []net.Addr, traefik netip.Addr) (netip.Addr, error) {
+	for _, a := range addrs {
+		n, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		pfx, err := netip.ParsePrefix(n.String())
+		if err != nil || !pfx.Addr().Is4() || pfx.Addr().IsLoopback() {
+			continue
+		}
+		if pfx.Masked().Contains(traefik) && pfx.Addr() != traefik {
+			return pfx.Addr(), nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("admin view: no address of this container is on Traefik's network (%s): refusing to listen", traefik)
+}
+
+// Serve runs the proxy on bind:port (Traefik's network only) and its
+// health answer on 127.0.0.1:port until ctx ends.
+func Serve(ctx context.Context, bind netip.Addr, port string, h http.Handler) error {
+	mk := func(addr string, hh http.Handler) *http.Server {
+		return &http.Server{Addr: addr, Handler: hh, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second,
+			WriteTimeout: 120 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10}
+	}
+	health := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	srvs := []*http.Server{mk(net.JoinHostPort(bind.String(), port), h), mk(net.JoinHostPort("127.0.0.1", port), health)}
+	errc := make(chan error, len(srvs))
+	for _, s := range srvs {
+		go func(s *http.Server) { errc <- s.ListenAndServe() }(s)
+	}
+	var err error
 	select {
 	case <-ctx.Done():
-		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return srv.Shutdown(sctx)
-	case err := <-errc:
-		return err
+	case err = <-errc:
 	}
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, s := range srvs {
+		_ = s.Shutdown(sctx)
+	}
+	return err
 }

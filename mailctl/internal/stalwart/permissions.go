@@ -1,5 +1,7 @@
 package stalwart
 
+import "strings"
+
 // Permission lists (contract §19.4, §19.6, §19.11; the names are Stalwart
 // v1.1.0's `Permission` enum, checked against the schema snapshot).
 
@@ -96,14 +98,12 @@ var ViewerRolePermissions = []string{
 	"authenticate",
 	"sysAccountGet", "sysAccountQuery", "sysAccountSettingsGet", "sysAcmeProviderGet", "sysAcmeProviderQuery",
 	"sysAddressBookGet", "sysAiModelGet", "sysAiModelQuery", "sysAlertGet", "sysAlertQuery", "sysAllowedIpGet",
-	"sysAllowedIpQuery", "sysApplicationGet", "sysApplicationQuery", "sysArfExternalReportGet",
-	"sysArfExternalReportQuery", "sysAsnGet", "sysAuthenticationGet", "sysBlobStoreGet", "sysBlockedIpGet",
-	"sysBlockedIpQuery", "sysCacheGet", "sysCalendarGet", "sysCalendarAlarmGet", "sysCalendarSchedulingGet",
-	"sysCertificateGet", "sysCertificateQuery", "sysClusterNodeGet", "sysClusterNodeQuery",
-	"sysClusterRoleGet", "sysClusterRoleQuery", "sysCoordinatorGet", "sysDataRetentionGet", "sysDataStoreGet",
-	"sysDirectoryGet", "sysDirectoryQuery", "sysDkimReportSettingsGet", "sysDkimSignatureGet",
-	"sysDkimSignatureQuery", "sysDmarcExternalReportGet", "sysDmarcExternalReportQuery",
-	"sysDmarcInternalReportGet", "sysDmarcInternalReportQuery", "sysDmarcReportSettingsGet",
+	"sysAllowedIpQuery", "sysApplicationGet", "sysApplicationQuery", "sysAsnGet", "sysAuthenticationGet",
+	"sysBlobStoreGet", "sysBlockedIpGet", "sysBlockedIpQuery", "sysCacheGet", "sysCalendarGet",
+	"sysCalendarAlarmGet", "sysCalendarSchedulingGet", "sysCertificateGet", "sysCertificateQuery",
+	"sysClusterNodeGet", "sysClusterNodeQuery", "sysClusterRoleGet", "sysClusterRoleQuery",
+	"sysCoordinatorGet", "sysDataRetentionGet", "sysDataStoreGet", "sysDirectoryGet", "sysDirectoryQuery",
+	"sysDkimReportSettingsGet", "sysDkimSignatureGet", "sysDkimSignatureQuery", "sysDmarcReportSettingsGet",
 	"sysDnsResolverGet", "sysDnsServerGet", "sysDnsServerQuery", "sysDomainGet", "sysDomainQuery",
 	"sysDsnReportSettingsGet", "sysEmailGet", "sysEncryptionGet", "sysEventTracingLevelGet",
 	"sysEventTracingLevelQuery", "sysExternalPublicKeyGet", "sysExternalPublicKeyQuery", "sysFileStorageGet",
@@ -121,27 +121,62 @@ var ViewerRolePermissions = []string{
 	"sysMtaStageRcptGet", "sysMtaStsGet", "sysMtaTlsStrategyGet", "sysMtaTlsStrategyQuery",
 	"sysMtaVirtualQueueGet", "sysMtaVirtualQueueQuery", "sysNetworkListenerGet", "sysNetworkListenerQuery",
 	"sysOAuthClientGet", "sysOAuthClientQuery", "sysOidcProviderGet", "sysPublicKeyGet", "sysPublicKeyQuery",
-	"sysQueuedMessageGet", "sysQueuedMessageQuery", "sysReportSettingsGet", "sysRoleGet", "sysRoleQuery",
-	"sysSearchGet", "sysSearchStoreGet", "sysSecurityGet", "sysSenderAuthGet", "sysSharingGet",
-	"sysSieveSystemInterpreterGet", "sysSieveSystemScriptGet", "sysSieveSystemScriptQuery",
-	"sysSieveUserInterpreterGet", "sysSmimeTrustAnchorGet", "sysSmimeTrustAnchorQuery", "sysSpamAiGet",
-	"sysSpamClassifierGet", "sysSpamDnsblServerGet", "sysSpamDnsblServerQuery", "sysSpamDnsblSettingsGet",
-	"sysSpamFileExtensionGet", "sysSpamFileExtensionQuery", "sysSpamPyzorGet", "sysSpamRuleGet",
-	"sysSpamRuleQuery", "sysSpamSettingsGet", "sysSpamTagGet", "sysSpamTagQuery", "sysSpfReportSettingsGet",
-	"sysStoreLookupGet", "sysStoreLookupQuery", "sysSystemSettingsGet", "sysTaskGet", "sysTaskQuery",
-	"sysTaskManagerGet", "sysTenantGet", "sysTenantQuery", "sysTlsExternalReportGet",
-	"sysTlsExternalReportQuery", "sysTlsInternalReportGet", "sysTlsInternalReportQuery",
-	"sysTlsReportSettingsGet", "sysTracerGet", "sysTracerQuery", "sysTracingStoreGet", "sysWebDavGet",
-	"sysWebHookGet", "sysWebHookQuery",
+	"sysReportSettingsGet", "sysRoleGet", "sysRoleQuery", "sysSearchGet", "sysSearchStoreGet",
+	"sysSecurityGet", "sysSenderAuthGet", "sysSharingGet", "sysSieveSystemInterpreterGet",
+	"sysSieveSystemScriptGet", "sysSieveSystemScriptQuery", "sysSieveUserInterpreterGet",
+	"sysSmimeTrustAnchorGet", "sysSmimeTrustAnchorQuery", "sysSpamAiGet", "sysSpamClassifierGet",
+	"sysSpamDnsblServerGet", "sysSpamDnsblServerQuery", "sysSpamDnsblSettingsGet", "sysSpamFileExtensionGet",
+	"sysSpamFileExtensionQuery", "sysSpamPyzorGet", "sysSpamRuleGet", "sysSpamRuleQuery", "sysSpamSettingsGet",
+	"sysSpamTagGet", "sysSpamTagQuery", "sysSpfReportSettingsGet", "sysStoreLookupGet", "sysStoreLookupQuery",
+	"sysSystemSettingsGet", "sysTaskGet", "sysTaskQuery", "sysTaskManagerGet", "sysTenantGet",
+	"sysTenantQuery", "sysTlsReportSettingsGet", "sysTracerGet", "sysTracerQuery", "sysTracingStoreGet",
+	"sysWebDavGet", "sysWebHookGet", "sysWebHookQuery",
 }
 
 // ViewerDenied are the management objects whose reads the viewer never
 // gets: credentials and their metadata (AccountPassword, ApiKey,
 // AppPassword, Passkey, OAuthGrant, Bootstrap, SymmetricKey, Enterprise),
 // people's data (SpamTrainingSample, ArchivedItem, MaskedEmail,
-// SieveUserScript) and the server's logs and traces (Log, Trace).
+// SieveUserScript), messages and their envelopes (QueuedMessage, the
+// queue; the received and sent DMARC, TLS and ARF reports, which carry
+// senders, recipients, headers or whole messages) and the server's logs
+// and traces (Log, Trace). The admin view's proxy refuses their methods
+// too (ViewerDeniedObject).
 var ViewerDenied = []string{"AccountPassword", "ApiKey", "AppPassword", "Passkey", "OAuthGrant", "Bootstrap", "SymmetricKey",
-	"Enterprise", "SpamTrainingSample", "ArchivedItem", "MaskedEmail", "SieveUserScript", "Log", "Trace"}
+	"Enterprise", "SpamTrainingSample", "ArchivedItem", "MaskedEmail", "SieveUserScript",
+	"QueuedMessage", "ArfExternalReport", "DmarcExternalReport", "DmarcInternalReport", "TlsExternalReport", "TlsInternalReport",
+	"Log", "Trace"}
+
+// ViewerDeniedObject reports a JMAP method's object (x:<Object>/…) that
+// the viewer may never read: ViewerDenied's, and anything whose name says
+// it holds messages, reports, envelopes or credentials (a later schema's
+// new kin is refused before it is judged).
+func ViewerDeniedObject(method string) bool {
+	mgmt := strings.HasPrefix(method, "x:")
+	obj, _, _ := strings.Cut(strings.TrimPrefix(method, "x:"), "/")
+	for _, d := range ViewerDenied {
+		if strings.EqualFold(obj, d) {
+			return true
+		}
+	}
+	lo := strings.ToLower(obj)
+	for _, w := range []string{"message", "report", "envelope", "queue", "email", "mailbox", "blob", "password", "apikey", "secret", "key", "token", "credential", "log", "trace", "sample", "archived"} {
+		if strings.Contains(lo, w) && !(mgmt && viewerAllowedKin[obj]) {
+			return true
+		}
+	}
+	return false
+}
+
+// viewerAllowedKin are management objects (x:) whose names match
+// ViewerDeniedObject's words but hold settings only (no message, report
+// or secret value).
+var viewerAllowedKin = map[string]bool{
+	"DkimReportSettings": true, "DmarcReportSettings": true, "DsnReportSettings": true, "SpfReportSettings": true,
+	"TlsReportSettings": true, "ReportSettings": true, "MtaQueueQuota": true, "MtaVirtualQueue": true, "Email": true,
+	"MemoryLookupKey": true, "MemoryLookupKeyValue": true, "ExternalPublicKey": true, "PublicKey": true, "IndexQueueStatus": true,
+	"BlobStore": true, "MtaStageMail": true, "Tracer": true,
+}
 
 func init() {
 	for _, l := range [][]string{MailPasswordPermissions, ExportPermissions, MailctlRolePermissions, ViewerRolePermissions} {
