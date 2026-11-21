@@ -108,6 +108,10 @@ services:
       - {type: bind, source: ./secrets/domains/certs-endpoint/server.crt, target: /run/portcullis/domains/certs-endpoint/server.crt, read_only: true, bind: {selinux: Z}}
       - {type: bind, source: ./secrets/domains/certs-endpoint/server.key, target: /run/portcullis/domains/certs-endpoint/server.key, read_only: true, bind: {selinux: Z}}
 
+  lldap:
+    volumes:
+      - {type: bind, source: ./secrets/lldap/key-seed, target: /run/portcullis/lldap/key-seed, read_only: true, bind: {selinux: Z}}
+
   mcp-gate:
     volumes:
       - {type: bind, source: ./secrets/mcp-gate/age.key, target: /run/portcullis/mcp-gate/age.key, read_only: true, bind: {selinux: Z}}

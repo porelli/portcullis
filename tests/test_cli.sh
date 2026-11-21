@@ -288,7 +288,7 @@ expect_eq "mail enable on podman with port start 80 → refused naming net.ipv4.
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
 # --rawfile / env.X) ── lines marked "secret-argv-ok" are reviewed exceptions.
-ARGV_RE='--from-literal|--set(-string|-json)?[ =][^ ]*(secrets/|\$\(cat|PASSWORD|SECRET|TOKEN)|--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat |K3S_TOKEN=|--new-token|--agent-token[ =]'
+ARGV_RE='--from-literal|--set(-string|-json)?[ =][^ ]*(secrets/|\$\(cat|PASSWORD|SECRET|TOKEN|SEED)|--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS|SEED)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN|SEED)=[^ ]*\$\(cat |(-e|--env)[ =]"?LLDAP_KEY_SEED=|LLDAP_KEY_SEED=[^ ]*\$|K3S_TOKEN=|--new-token|--agent-token[ =]'
 HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh "$HERE/../nodeadm/join.sh" | grep -v 'secret-argv-ok' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
 expect_eq "no secrets on argv in the CLI" "$HITS" ""
 # HA (Task 17): the grep covers the k3s installer (the token reaches k3s as
@@ -737,8 +737,8 @@ expect_eq "the rt_* lint catches a docker call in a function without the guard" 
          [ -n "$hit" ] || continue
          first="$(printf '%s\n' "$body" | sed -n '3,$p' | grep -vE '^[[:space:]]*(local|declare) ' | head -n1 | tr -d ' ;')"
          [ "$first" = _rt_docker_only ] || echo "$f"; done) 2>/dev/null)" "unguarded"
-case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' '  kube_ctl create secret generic x --from-literal=a=b' '  kube_helm upgrade --set hub.secret=$(cat secrets/hub/x)' '  helm upgrade --set-string pw=$POSTGRES_PASSWORD' | grep -cE -e "$ARGV_RE")" in
-  5) t_pass "argv secret pattern catches --arg \"\$(cat ...)\", secret variables, --from-literal and --set with a secret" ;; *) t_fail "argv secret pattern" ;; esac
+case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' '  kube_ctl create secret generic x --from-literal=a=b' '  kube_helm upgrade --set hub.secret=$(cat secrets/hub/x)' '  helm upgrade --set-string pw=$POSTGRES_PASSWORD' '  docker run -e LLDAP_KEY_SEED="$(cat "$f")" x' '  jq --arg s "$LLDAP_KEY_SEED" x' | grep -cE -e "$ARGV_RE")" in
+  7) t_pass "argv secret pattern catches --arg \"\$(cat ...)\", secret variables, --from-literal, --set with a secret and LLDAP's key seed" ;; *) t_fail "argv secret pattern" ;; esac
 
 # version and backup schedule work without .env (and without docker).
 run version

@@ -880,12 +880,12 @@ jobs:
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
-      - name: Start core services (without Traefik ACME)
-        run: docker compose up -d postgres lldap
-
-      - name: Initialize and unseal Vault (server mode)
+      - name: Initialize and unseal Vault (server mode), start Postgres and LLDAP (without Traefik ACME)
         run: |
+          # Vault first: its stack_prepare gives LLDAP's key seed (0600 from
+          # init --env-only) the lldap group before LLDAP starts.
           ./portcullis vault init
+          docker compose up -d postgres lldap
           test "$(stat -c %a secrets)" = 700 || { echo "FAIL: secrets/ is not 0700"; exit 1; }
           test -s secrets/vault-init.json && test "$(stat -c %a secrets/vault-init.json)" = 600 \
             || { echo "FAIL: secrets/vault-init.json missing or not 0600"; exit 1; }
@@ -927,7 +927,7 @@ jobs:
       - name: Wait for LLDAP
         run: |
           for i in $(seq 1 30); do
-            if docker compose exec -T lldap /app/lldap healthcheck --config-file /data/lldap_config.toml > /dev/null 2>&1; then
+            if docker compose exec -T lldap /app/lldap healthcheck --config-file /dev/null > /dev/null 2>&1; then
               echo "LLDAP is ready"; exit 0
             fi
             echo "Waiting for LLDAP... ($i/30)"
@@ -2046,7 +2046,7 @@ jobs:
           VAULT_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q vault)")"
           ./portcullis backup
           B=$(find backups -maxdepth 1 -type d -name '2*' | sort | tail -n1)
-          for f in MANIFEST.json .env secrets/vault-init.json secrets/vault-unseal/unseal-key certs/ca-chain.crt vault.snap postgres.dump lldap_data.tar.gz hub_data.tar.gz traefik_acme.tar.gz mcp_gate_data.tar.gz group_gate_data.tar.gz certs/yubikey-ca.crt certs/browser-ca.crt; do
+          for f in MANIFEST.json .env secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/lldap/key-seed certs/ca-chain.crt vault.snap postgres.dump lldap_data.tar.gz hub_data.tar.gz traefik_acme.tar.gz mcp_gate_data.tar.gz group_gate_data.tar.gz certs/yubikey-ca.crt certs/browser-ca.crt; do
             test -s "$B/$f" || { echo "FAIL: backup lacks $f"; ls -la "$B"; exit 1; }
           done
           test "$(stat -c %a "$B")" = 700 || { echo "FAIL: backup dir is not 0700"; exit 1; }
@@ -2233,8 +2233,8 @@ jobs:
 
       - name: Start the core stack (Vault, PKI, all services except the Hub)
         run: |
+          ./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
           docker compose up -d postgres lldap
-          ./portcullis vault init
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           # No ACME in CI: serve the Vault-issued wildcard cert.
@@ -2561,8 +2561,8 @@ jobs:
           PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
           cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
           chmod 644 /tmp/pebble.minica.pem
+          ./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
           docker compose up -d postgres lldap
-          ./portcullis vault init
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
@@ -2930,8 +2930,8 @@ jobs:
           PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
           cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
           chmod 644 /tmp/pebble.minica.pem
+          ./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
           docker compose up -d postgres lldap
-          ./portcullis vault init
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
@@ -3299,8 +3299,8 @@ jobs:
           PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
           cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
           chmod 644 /tmp/pebble.minica.pem
+          ./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
           docker compose up -d postgres lldap
-          ./portcullis vault init
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
@@ -3692,8 +3692,8 @@ jobs:
           PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
           cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
           chmod 644 /tmp/pebble.minica.pem
+          ./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
           docker compose up -d postgres lldap
-          ./portcullis vault init
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
@@ -3985,8 +3985,8 @@ jobs:
           PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
           cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
           chmod 644 /tmp/pebble.minica.pem
+          ./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
           docker compose up -d postgres lldap
-          ./portcullis vault init
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
@@ -4596,8 +4596,8 @@ jobs:
           PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
           cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
           chmod 644 /tmp/pebble.minica.pem
+          ./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
           docker compose up -d postgres lldap
-          ./portcullis vault init
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml

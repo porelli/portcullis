@@ -10,7 +10,8 @@
 #   .env, realm-export.json, docker-compose.override.yml,
 #   config/              whichever exist
 #   certs/               CA chain, server cert/key, revoked-serial list
-#   secrets/             Vault ROOT TOKEN + UNSEAL KEY, enroll AppRole, ...
+#   secrets/             Vault ROOT TOKEN + UNSEAL KEY, enroll AppRole, LLDAP's
+#                        key seed (lldap/key-seed), ...
 #   vault.snap           Vault raft snapshot (sys/storage/raft/snapshot)
 #   postgres.dump        pg_dump -Fc of the Keycloak database
 #   <volume>.tar.gz      lldap_data, hub_data, traefik_acme, domains_data (age-encrypted),
@@ -147,7 +148,7 @@ groups = c.execute("SELECT count(*) FROM groups").fetchone()[0]
 if users < 1:
     sys.exit("users.db has no users")
 print(f"users.db ok: {users} user(s), {groups} group(s)"
-      + ("" if "private_key" in names else " (no private_key file: LLDAP_KEY_SEED must be set)"))
+      + (" (WARNING: lldap_config.toml in the archive, LLDAP's key seed belongs in secrets/lldap/key-seed only)" if "lldap_config.toml" in names else ""))
 PY
 
 # Runs inside the python image with lldap_data mounted at BACKUP_PY_MOUNT (read-only):
@@ -232,7 +233,9 @@ _backup_check_layout() {
   [ -f "$dir/MANIFEST.json" ] || fail "$dir has no MANIFEST.json — not a Portcullis backup."
   [ "$(jq -r .format "$dir/MANIFEST.json" 2>/dev/null)" = "$BACKUP_FORMAT" ] \
     || fail "$dir: unsupported backup format (want $BACKUP_FORMAT)."
-  for f in .env vault.snap postgres.dump secrets/vault-init.json secrets/vault-unseal/unseal-key; do
+  # secrets/lldap/key-seed: LLDAP's stored passwords are bound to it (a
+  # users.db without its seed refuses to start).
+  for f in .env vault.snap postgres.dump secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/lldap/key-seed; do
     [ -s "$dir/$f" ] || fail "$dir lacks $f — incomplete backup."
   done
   jq -e '.root_token and (.unseal_keys_b64 | length == 1)' "$dir/secrets/vault-init.json" >/dev/null 2>&1 \

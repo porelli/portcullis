@@ -481,6 +481,14 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    # Not the image's entrypoint: it copies the upstream config template,
+    # whose key_seed is a PUBLIC default, into /data/lldap_config.toml.
+    # LLDAP is configured by env only (no config file) and derives the key
+    # protecting stored passwords from this install's secrets/lldap/key-seed
+    # (LLDAP_KEY_SEED_FILE; LLDAP_KEY_FILE empty, so a missing / empty /
+    # unreadable seed makes it refuse to start instead of writing a key).
+    entrypoint: ["tini", "--", "/app/lldap"]
+    command: ["run", "--config-file", "/dev/null"]
     environment:
       LLDAP_JWT_SECRET: ${LLDAP_JWT_SECRET:?LLDAP_JWT_SECRET is not set — run ./portcullis init}
       LLDAP_LDAP_USER_PASS: ${LLDAP_ADMIN_PASSWORD:?LLDAP_ADMIN_PASSWORD is not set — run ./portcullis init}
@@ -488,8 +496,12 @@ services:
       LLDAP_LDAP_USER_DN: admin
       LLDAP_LDAP_USER_EMAIL: admin@portcullis.local
       LLDAP_HTTP_URL: https://directory.${PORTCULLIS_DOMAIN:-portcullis.local}
+      LLDAP_DATABASE_URL: sqlite:///data/users.db?mode=rwc
+      LLDAP_KEY_SEED_FILE: /run/portcullis/lldap/key-seed
+      LLDAP_KEY_FILE: ""
     volumes:
       - lldap_data:/data
+      - ./secrets/lldap/key-seed:/run/portcullis/lldap/key-seed:ro
     networks:
       - portcullis
     labels:
@@ -508,7 +520,7 @@ services:
       traefik.http.middlewares.directory-redirect.redirectregex.replacement: https://people.${PORTCULLIS_DOMAIN:-portcullis.local}/
       traefik.http.services.lldap.loadbalancer.server.port: "17170"
     healthcheck:
-      test: ["CMD", "/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
+      test: ["CMD", "/app/lldap", "healthcheck", "--config-file", "/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 5

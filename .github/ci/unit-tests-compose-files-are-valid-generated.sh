@@ -94,7 +94,7 @@ binds() {  # <config json> — "service target read_only selinux" of every proje
 }
 [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
 NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
-[ "$NBINDS" = 51 ] || { echo "FAIL: expected 51 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
+[ "$NBINDS" = 52 ] || { echo "FAIL: expected 52 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
 diff <({ binds "$CFG_ALL" | grep -vx 'hub /project true -' | awk '{print $1, $2, $3}'; echo "hub /project/group-gate/group-gate-map.conf true"; } | sort) \
      <(binds "$OV_ALL" | awk '{print $1, $2, $3}' | sort) \
   || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind (but the Hub's /project root) with the same target / read_only, plus the Hub's map file"; exit 1; }

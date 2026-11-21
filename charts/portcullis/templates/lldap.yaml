@@ -2,11 +2,14 @@
 Task 23, D8: the HA shape on every install): the database lldap of the CNPG
 Cluster portcullis-pg (LLDAP_DATABASE_URL from the CLI's Secret
 portcullis-pg-lldap, never Helm), no lldap-data PVC (/data is an emptyDir:
-only the entrypoint's copy of the config template lives there). The server
-key (it protects the OPAQUE password files) is the CLI's Secret
-secrets-lldap-key, the same on every replica (LLDAP_KEY_FILE, read-only;
-LLDAP_KEY_SEED empty, or the template config's well-known seed would win;
-a key that doesn't match the database makes LLDAP refuse to start). The
+nothing lives there). As compose: not the image's entrypoint (it copies the
+upstream template, whose key_seed is a PUBLIC default, into
+/data/lldap_config.toml), configured by env only (--config-file /dev/null),
+the key protecting stored passwords derived from this install's seed: the
+CLI's Secret secrets-lldap (secrets/lldap/key-seed, the same on every
+replica and in the schema Job) through LLDAP_KEY_SEED_FILE, LLDAP_KEY_FILE
+empty (a missing / empty / unreadable seed = LLDAP refuses to start; a seed
+that doesn't match the database's passwords makes it refuse too). The
 schema is made or upgraded by the Job lldap-schema-<image hash> alone
 (plan Amendment 2: replicas racing on create_schema fail): it runs
 `lldap create_schema`, then records the image in portcullis_lldap_schema;
@@ -28,8 +31,10 @@ replicas (a PDB, spread). */ -}}
 {{- $s := dict
   "name" "lldap" "uid" .Values.uids.lldap "gid" .Values.uids.lldap "pin" true "fsGroup" .Values.uids.lldap
   "memory" "256Mi" "nets" (list "portcullis") "egress" true
-  "hashes" (list "portcullis-env" "secrets-lldap-key")
-  "health" (dict "test" (list "/app/lldap" "healthcheck" "--config-file" "/data/lldap_config.toml") "interval" 5 "timeout" 3 "retries" 5)
+  "hashes" (list "portcullis-env" "secrets-lldap")
+  "command" (list "tini" "--" "/app/lldap")
+  "args" (list "run" "--config-file" "/dev/null")
+  "health" (dict "test" (list "/app/lldap" "healthcheck" "--config-file" "/dev/null") "interval" 5 "timeout" 3 "retries" 5)
   "ports" (list (dict "name" "http" "port" 17170) (dict "name" "ldap" "port" 3890))
   "env" (list
     (dict "name" "LLDAP_JWT_SECRET" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "LLDAP_JWT_SECRET")))
@@ -39,16 +44,16 @@ replicas (a PDB, spread). */ -}}
     (dict "name" "LLDAP_LDAP_USER_EMAIL" "value" "admin@portcullis.local")
     (dict "name" "LLDAP_HTTP_URL" "value" (printf "https://directory.%s" (include "portcullis.domain" .)))
     (dict "name" "LLDAP_DATABASE_URL" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-pg-lldap" "key" "LLDAP_DATABASE_URL")))
-    (dict "name" "LLDAP_KEY_FILE" "value" "/run/lldap-key/server_key")
-    (dict "name" "LLDAP_KEY_SEED" "value" ""))
+    (dict "name" "LLDAP_KEY_SEED_FILE" "value" "/run/portcullis/lldap/key-seed")
+    (dict "name" "LLDAP_KEY_FILE" "value" ""))
   "mounts" (list
     (dict "name" "data" "mountPath" "/data")
     (dict "name" "tmp" "mountPath" "/tmp")
-    (dict "name" "key" "mountPath" "/run/lldap-key" "readOnly" true))
+    (dict "name" "key-seed" "mountPath" "/run/portcullis/lldap" "readOnly" true))
   "volumes" (list
     (dict "name" "data" "emptyDir" (dict "medium" "Memory" "sizeLimit" "16Mi"))
     (dict "name" "tmp" "emptyDir" (dict "medium" "Memory"))
-    (dict "name" "key" "secret" (dict "secretName" "secrets-lldap-key" "defaultMode" 288 "items" (list (dict "key" "server_key" "path" "server_key")))))
+    (dict "name" "key-seed" "secret" (dict "secretName" "secrets-lldap" "defaultMode" 288 "items" (list (dict "key" "key-seed" "path" "key-seed")))))
   "initContainers" (list (dict "name" "wait-schema" "image" $pgimg "imagePullPolicy" "IfNotPresent"
     "command" (list "sh" "-c" $wait) "env" $pgenv "resources" $small "securityContext" $sec))
 -}}
@@ -76,8 +81,8 @@ spec:
 # LLDAP's schema, made or upgraded once per LLDAP image (named after its
 # inputs: a Job's pod template is immutable, so a change is a new Job; Helm
 # removes the old one; no config-hash annotation for the same reason). Waits for Postgres,
-# runs create_schema (cwd /tmp: it writes nothing there with the key file
-# given), then records the image.
+# runs create_schema (cwd /tmp: it writes nothing there with the seed
+# given; --config-file /dev/null, as the Deployment), then records the image.
 {{- $pin := include "portcullis.sitePin" (dict "root" . "s" (dict "pin" true)) | trim }}
 apiVersion: batch/v1
 kind: Job
@@ -132,7 +137,7 @@ spec:
         - name: create-schema
           image: {{ $img }}
           imagePullPolicy: IfNotPresent
-          command: ["/app/lldap", "create_schema"]
+          command: ["/app/lldap", "create_schema", "--config-file", "/dev/null"]
           workingDir: /tmp
           env:
             - name: LLDAP_DATABASE_URL
@@ -152,9 +157,9 @@ spec:
                   key: LLDAP_ADMIN_PASSWORD
             - name: LLDAP_LDAP_BASE_DN
               value: {{ .Values.lldap.baseDN | quote }}
+            - name: LLDAP_KEY_SEED_FILE
+              value: /run/portcullis/lldap/key-seed
             - name: LLDAP_KEY_FILE
-              value: /run/lldap-key/server_key
-            - name: LLDAP_KEY_SEED
               value: ""
           resources:
             limits:
@@ -165,8 +170,8 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-            - name: key
-              mountPath: /run/lldap-key
+            - name: key-seed
+              mountPath: /run/portcullis/lldap
               readOnly: true
       containers:
         - name: record
@@ -180,10 +185,10 @@ spec:
         - name: tmp
           emptyDir:
             medium: Memory
-        - name: key
+        - name: key-seed
           secret:
-            secretName: secrets-lldap-key
+            secretName: secrets-lldap
             defaultMode: 288
             items:
-              - key: server_key
-                path: server_key
+              - key: key-seed
+                path: key-seed

@@ -745,6 +745,8 @@ secrets_fix_perms() {
   if declare -F ssh_fix_perms >/dev/null; then ssh_fix_perms; fi
   # secrets/mail/ (the CLI's own records: hostname, former-hostnames).
   [ ! -d "$s/mail" ] || chmod 700 "$s/mail"
+  # secrets/lldap/key-seed (scripts/lib/users.sh): LLDAP's key seed.
+  if declare -F lldap_key_seed_fix_perms >/dev/null; then lldap_key_seed_fix_perms; fi
 }
 
 # Core variables the Hub may copy into app .env files (templates reference
