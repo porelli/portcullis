@@ -402,17 +402,22 @@ func sessionsError(p *corev1.Pod) string {
 	all := append(append([]corev1.ContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...)
 	for _, cs := range all {
 		for _, t := range []*corev1.ContainerStateTerminated{cs.State.Terminated, cs.LastTerminationState.Terminated} {
-			if t != nil && strings.HasPrefix(t.Message, prefix) {
-				m := strings.Map(func(r rune) rune {
-					if r < 0x20 || r == 0x7f {
+			// Only a failed start: the guard's master fallback and
+			// sentinel-init's fallback exit 0 after naming what they did,
+			// and that pod is healthy (re-review 2 N-d).
+			if t != nil && t.ExitCode != 0 && strings.HasPrefix(t.Message, prefix) {
+				// C0, DEL and C1 (U+0080–U+009F, e.g. CSI) to spaces; cut
+				// at 200 runes, never inside one (re-review 2 N-b).
+				m := []rune(strings.Map(func(r rune) rune {
+					if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
 						return ' '
 					}
 					return r
-				}, strings.TrimSpace(strings.TrimPrefix(t.Message, prefix)))
+				}, strings.TrimSpace(strings.TrimPrefix(t.Message, prefix))))
 				if len(m) > 200 {
 					m = m[:200]
 				}
-				return "the session store: " + m
+				return "the session store: " + string(m)
 			}
 		}
 	}

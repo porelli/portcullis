@@ -4567,9 +4567,15 @@ expect_eq "_kube_bounded: a quick command returns at once (the watchdog holds no
 # removal, finished (wiped + deleted) after the chart; HA on refused while
 # it is there.
 VSH="$WORK/vshrink"; rm -rf "$VSH"; mkdir -p "$VSH"
+# vstate <map json> — autopilot's state: true = healthy, 3.2 ms since the
+# leader's last contact; false = unhealthy, 14.5 s; an object as given.
+vstate() {
+  printf '%s' "${1:-{\"vault-0\":true,\"vault-1\":true,\"vault-2\":true\}}" | jq -c '{data: {servers: (to_entries | map({key, value: (.value
+    | if type == "boolean" then {healthy: ., status: "voter", last_contact: (if . then "3.2ms" else "14.5s" end)} else . end)}) | from_entries)}}'
+}
 vshrink() { # vshrink <live replicas> <healthy map json> <extra code> [want: HA on = 3]
   rm -f "$VSH"/calls "$VSH"/peers "$VSH"/state "$VSH"/k "$VSH"/*.fail; printf 'vault-0\nvault-1\nvault-2\n' > "$VSH/peers"
-  printf '%s' "${2:-{\"vault-0\":true,\"vault-1\":true,\"vault-2\":true\}}" | jq -c '{data: {servers: (to_entries | map({key, value: {healthy: .value}}) | from_entries)}}' > "$VSH/state"
+  vstate "${2:-}" > "$VSH/state"; rm -f "$VSH/state.next"
   kt "export VAULT_TOKEN=s.shrink-tok KUBE_VAULT_REMOVE_WAIT=0 ${4:+PORTCULLIS_HA=on}
     kube_ctl() { echo \"\$*\" >> '$VSH/k'; case \"\$*\" in
       *'get statefulset vault -o jsonpath={.spec.replicas}') echo $1 ;;
@@ -4580,7 +4586,7 @@ vshrink() { # vshrink <live replicas> <healthy map json> <extra code> [want: HA 
     vexec() { echo \"\$* @\${_K_VAULT_POD:-}\" >> '$VSH/calls'; case \"\$1 \$2 \$3\" in
       'operator raft list-peers') [ ! -e '$VSH/list.fail' ] || return 1; jq -Rn '{data: {config: {servers: [inputs | {node_id: .}]}}}' < '$VSH/peers' ;;
       'read -format=json sys/storage/raft/autopilot/state') cat '$VSH/state' ;;
-      'operator raft remove-peer') [ ! -e '$VSH/remove.fail' ] || return 1; grep -vx \"\$4\" '$VSH/peers' > '$VSH/p.tmp'; mv '$VSH/p.tmp' '$VSH/peers' ;;
+      'operator raft remove-peer') [ ! -e '$VSH/remove.fail' ] || return 1; grep -vx \"\$4\" '$VSH/peers' > '$VSH/p.tmp'; mv '$VSH/p.tmp' '$VSH/peers'; [ ! -e '$VSH/state.next' ] || mv '$VSH/state.next' '$VSH/state' ;;
     esac; }
     ${3:-}
     kube_vault_shrink_prepare; echo \"shrink=\$_KUBE_VAULT_SHRINK\""
@@ -4592,6 +4598,15 @@ expect_eq "vault voters 3 → 1 (HA off), all healthy: vault-2 then vault-1 remo
 rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":true,"vault-1":false,"vault-2":true}')"
 expect_eq "vault voters 3 → 1 with vault-1 down (re-review I-a): the unhealthy vault-1 removed first, so {vault-0, vault-2} keeps its quorum" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(removals)" "rc=0:vault-1,vault-2"
+rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-1":{"healthy":true,"status":"voter","last_contact":"4.2s"},"vault-2":{"healthy":true,"status":"voter","last_contact":"850µs"}}')"
+expect_eq "vault voters 3 → 1 with vault-1 lost seconds ago (re-review 2 M-2): autopilot still says healthy, but 4.2 s since its last contact → counted down, removed first; the leader's 0s and 850µs count as up" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(removals)" "rc=0:vault-1,vault-2"
+rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":{"healthy":true,"status":"voter","last_contact":"1m2s"},"vault-1":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-2":true}')"
+case "$OUT" in *"would leave no quorum after removing vault-2 (down: vault-0), its failure tolerance below 0"*"rc=1") t_pass "vault voters 3 → 1, the kept vault-0 stale-healthy (1m2s since its last contact) → refused before any removal" ;; *) t_fail "shrink stale kept: $OUT" ;; esac
+vstate '{"vault-0":{"healthy":true,"status":"voter","last_contact":"9s"},"vault-1":true}' > "$VSH/state.after"
+rm -f "$VSH/rec"; OUT="$(vshrink 3 "" "cp '$VSH/state.after' '$VSH/state.next'")"
+case "$OUT" in *"Vault's HA off stopped part way: removing vault-1 would leave no quorum (down: vault-0)"*"rc=1") t_pass "vault voters 3 → 1, vault-0 goes stale after the first removal → the fresh read refuses the second (Vault keeps its quorum)" ;; *) t_fail "shrink midway: $OUT" ;; esac
+expect_eq "... vault-2 alone removed, the record kept for the next up" "$(removals):$(cat "$VSH/rec")" "vault-2:vault-2 vault-1"
 rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":false,"vault-1":true,"vault-2":true}')"
 case "$OUT" in *"would leave no quorum after removing vault-2 (down: vault-0)"*"rc=1") t_pass "vault voters 3 → 1 with the kept vault-0 down → refused before any removal, naming vault-0" ;; *) t_fail "shrink kept down: $OUT" ;; esac
 expect_eq "... and nothing removed, nothing recorded" "$(removals):$(test -e "$VSH/rec" && echo rec || echo none)" ":none"
@@ -4599,6 +4614,9 @@ rm -f "$VSH/rec"; OUT="$(vshrink 1)"
 expect_eq "vault voters unchanged, no record → no raft call" "$(printf '%s\n' "$OUT" | tail -n1):$(test -e "$VSH/calls" && echo calls || echo none)" "rc=0:none"
 printf 'vault-2 vault-1' > "$VSH/rec"; OUT="$(vshrink 1)"
 expect_eq "vault HA off interrupted after the chart (record left, voters already 1) → the next up owes the wipe (re-review M-a)" "$(printf '%s\n' "$OUT" | grep '^shrink=')" "shrink= vault-2 vault-1"
+printf 'vault-2 vault-1' > "$VSH/rec"; OUT="$(vshrink 3 "" "" ha)"
+case "$OUT" in *"Vault's HA off isn't finished: the volumes of vault-2 vault-1 are still to be wiped"*"rc=1") t_pass "vault HA off interrupted before the chart (3 replicas), then HA on → refused before helm (re-review 2 M-1)" ;; *) t_fail "shrink HA on cur 3 with record: $OUT" ;; esac
+expect_eq "... no raft call" "$(test -e "$VSH/calls" && echo calls || echo none)" "none"
 printf 'vault-2 vault-1' > "$VSH/rec"; OUT="$(vshrink 1 "" "" ha)"
 case "$OUT" in *"Vault's HA off isn't finished: the volumes of vault-2 vault-1 are still to be wiped"*"rc=1") t_pass "vault HA on while an HA off still owes its wipe → refused" ;; *) t_fail "shrink HA on with record: $OUT" ;; esac
 rm -f "$VSH/rec"; OUT="$(vshrink 3 "" "touch '$VSH/list.fail'")"
@@ -4608,11 +4626,17 @@ case "$OUT" in *"could not remove Vault's raft peer vault-2: refusing"*"rc=1") t
 rm -f "$VSH/rec"; OUT="$(vshrink 3 "" "printf 'vault-0\nvault-1\nstranger\n' > '$VSH/peers'")"
 case "$OUT" in *"a peer stranger that isn't a voter of this chart"*"rc=1") t_pass "vault voters: a raft peer the chart doesn't know → refused, never removed blindly" ;; *) t_fail "shrink stranger: $OUT" ;; esac
 rm -f "$VSH/k"; printf 'x' > "$VSH/rec"
-OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-2 vault-1'; kube_ctl() { echo \"\$*\" >> '$VSH/k'; case \"\$*\" in *' get pod vault-'*) return 1 ;; *' get pvc data-vault-'*) echo pvc ;; esac; }; _kube_helper_pod() { echo \"helper-\$1\"; }; _kube_helper_done() { echo \"done \$1\" >> '$VSH/k'; }; kube_vault_shrink_finish")"
+OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-2 vault-1'; kube_ctl() { echo \"\$*\" >> '$VSH/k'; case \"\$*\" in *' get pod vault-'*) echo 'Error from server (NotFound): pods \"x\" not found'; return 1 ;; *' get pvc data-vault-'*) echo pvc ;; esac; }; _kube_helper_pod() { echo \"helper-\$1\"; }; _kube_helper_done() { echo \"done \$1\" >> '$VSH/k'; }; kube_vault_shrink_finish")"
 expect_eq "vault voters lowered: each removed voter's PVC emptied once its pod is gone, then the record deleted" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(grep -cE 'wait --for=delete pod/vault-[12]' "$VSH/k"):$(grep -cE 'exec helper-data-vault-[12] -- find /vol' "$VSH/k"):$(grep -c 'delete configmap portcullis-vault-shrink' "$VSH/k")" "rc=0:2:2:1"
 OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-1'; kube_ctl() { case \"\$*\" in *' get pod vault-1 '*) echo pod/vault-1 ;; esac; }; kube_vault_shrink_finish")"
 case "$OUT" in *"the dropped voter vault-1 still runs"*"rc=1") t_pass "vault voters lowered, a dropped voter still running → its volume isn't touched, the record kept" ;; *) t_fail "shrink finish running: $OUT" ;; esac
+rm -f "$VSH/k"
+OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-1'; kube_ctl() { echo \"\$*\" >> '$VSH/k'; case \"\$*\" in *' get pod vault-1 '*) echo 'Error from server (NotFound)'; return 1 ;; *' get pvc data-vault-1 '*) echo 'Unable to connect to the server: connection refused'; return 1 ;; esac; }; kube_vault_shrink_finish")"
+case "$OUT" in *"can't read PVC data-vault-1: the removed voter's raft data is still to be wiped"*"rc=1") t_pass "vault voters lowered, the PVC unreadable (not NotFound) → refused, never counted as no PVC (re-review 2 N-a)" ;; *) t_fail "shrink finish pvc error: $OUT" ;; esac
+expect_eq "... the record kept" "$(grep -c 'delete configmap' "$VSH/k")" "0"
+OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-1'; kube_ctl() { case \"\$*\" in *' get pod vault-1 '*) echo 'Unable to connect to the server'; return 1 ;; esac; }; kube_vault_shrink_finish")"
+case "$OUT" in *"can't tell whether the dropped voter vault-1 still runs"*"rc=1") t_pass "vault voters lowered, the pod unreadable → refused, not counted as gone" ;; *) t_fail "shrink finish pod error: $OUT" ;; esac
 # The join listener's TLS (review M1): a private CA here, one server
 # certificate for every voter's name, the CA key never synced.
 JT="$WORK/jtls"; rm -rf "$JT"; mkdir -p "$JT/secrets"
@@ -5649,16 +5673,23 @@ expect_eq "kube_crashing_json: the crash-looping Hub and an app restarted 2 min 
   '[["portcullis","hub","CrashLoopBackOff"],["portcullis-apps","echo-k--web","restarted"]]'
 expect_eq "kube_crashing_json: an unreadable pod list → null (status counts it a problem)" "$(cj 'return 1' | head -n1)" "null"
 printf '%s' '{"items":[{"metadata":{"name":"sessions-1","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
-  "status":{"initContainerStatuses":[{"restartCount":3,"lastState":{"terminated":{"message":"portcullis-sessions: the Sentinels disagree on the master (x): refusing to start\n"}},"state":{"waiting":{"reason":"PodInitializing"}}}],
+  "status":{"initContainerStatuses":[{"restartCount":3,"lastState":{"terminated":{"exitCode":1,"message":"portcullis-sessions: the Sentinels disagree on the master (x): refusing to start\n"}},"state":{"waiting":{"reason":"PodInitializing"}}}],
             "containerStatuses":[{"restartCount":0,"state":{"waiting":{"reason":"PodInitializing"}}}]}}]}' > "$WORK/crash-sess.json"
 printf '%s' '{"items":[{"metadata":{"name":"echo-k--web-0","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
-  "status":{"containerStatuses":[{"restartCount":1,"ready":false,"lastState":{"terminated":{"message":"portcullis-sessions: spoofed by an app","finishedAt":"'"$REC"'"}},"state":{"running":{}}}]}}]}' > "$WORK/crash-spoof.json"
+  "status":{"containerStatuses":[{"restartCount":1,"ready":false,"lastState":{"terminated":{"exitCode":1,"message":"portcullis-sessions: spoofed by an app","finishedAt":"'"$REC"'"}},"state":{"running":{}}}]}}]}' > "$WORK/crash-spoof.json"
 expect_eq "kube_crashing_json: an apps-namespace pod writing the session store's prefix → its message is never the reason (security review)" \
   "$(kt "kube_ctl() { case \"\$*\" in *'-n portcullis get pods -o json'*) echo '{\"items\":[]}' ;; *'-n portcullis-apps get pods -o json'*) cat '$WORK/crash-spoof.json' ;; esac; }; kube_crashing_json" | head -n1 | jq -c '[.[] | .reason]')" '["restarted"]'
 printf '%s' '{"items":[{"metadata":{"name":"sessions-1","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
-  "status":{"initContainerStatuses":[{"restartCount":2,"lastState":{"terminated":{"message":"portcullis-sessions: line one\u001b[31m\nline two '"$(printf 'x%.0s' $(seq 1 300))"'"}},"state":{"waiting":{"reason":"PodInitializing"}}}]}}]}' > "$WORK/crash-long.json"
-expect_eq "kube_crashing_json: the named error stripped of control characters and capped at 200 characters" \
-  "$(cj "cat '$WORK/crash-long.json'" | head -n1 | jq -r '.[] | select(.namespace == "portcullis") | .reason' | awk '{ print length($0) ":" (index($0, "\033") == 0) }')" "200:1"
+  "status":{"initContainerStatuses":[{"restartCount":2,"lastState":{"terminated":{"exitCode":1,"message":"portcullis-sessions: line one\u001b[31m\u009b2J\nline two '"$(printf 'x%.0s' $(seq 1 300))"'"}},"state":{"waiting":{"reason":"PodInitializing"}}}]}}]}' > "$WORK/crash-long.json"
+expect_eq "kube_crashing_json: the named error stripped of C0, DEL and C1 control characters (CSI U+009B) and capped at 200 characters" \
+  "$(cj "cat '$WORK/crash-long.json'" | head -n1 | jq -r '.[] | select(.namespace == "portcullis") | .reason' | LC_ALL=C awk '{ print length($0) ":" (index($0, "\033") == 0) ":" (index($0, "\302\233") == 0) }')" "200:1:1"
+# The guard's master fallback names what it did and exits 0: that pod is
+# healthy and not listed (re-review 2 N-d); a failed start (exit 1) is.
+printf '%s' '{"items":[{"metadata":{"name":"sessions-0","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
+  "status":{"initContainerStatuses":[{"restartCount":0,"ready":false,"state":{"terminated":{"exitCode":0,"reason":"Completed","message":"portcullis-sessions: started as the master; the sessions were lost"}}}],
+            "containerStatuses":[{"restartCount":0,"ready":true,"state":{"running":{}}}]}}]}' > "$WORK/crash-fallback.json"
+expect_eq "kube_crashing_json: a sessions pod whose guard named its fallback and exited 0 → healthy, not listed" \
+  "$(cj "cat '$WORK/crash-fallback.json'" | head -n1 | jq -c '[.[] | select(.namespace == "portcullis")]')" '[]'
 expect_eq "kube_crashing_json: a StatefulSet's pod with the session store's named error → that error is the reason (review M-b)" \
   "$(cj "cat '$WORK/crash-sess.json'" | head -n1 | jq -c '[.[] | select(.namespace == "portcullis") | [.deployment, .reason]]')" \
   '[["sessions","portcullis-sessions: the Sentinels disagree on the master (x): refusing to start"]]'

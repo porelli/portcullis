@@ -793,8 +793,9 @@ kube_crashing_json() {
              | .lastState.terminated.finishedAt // empty | (try fromdateiso8601 catch 0)
              | select(. > ((env.NOW | tonumber) - 600))] | length > 0) as $recent
         | (if env.NS == env.CORE and $own.kind == "StatefulSet" and ($own.name == "sessions" or $own.name == "sessions-sentinel")
-           then [$cs[] | .state.terminated.message, .lastState.terminated.message | strings | select(startswith("portcullis-sessions:"))
-                 | gsub("[\u0000-\u001f\u007f]"; " ") | rtrimstr(" ") | .[0:200]] | first else null end) as $named
+           then [$cs[] | .state.terminated, .lastState.terminated | objects | select((.exitCode // 0) != 0) | .message | strings
+                 | select(startswith("portcullis-sessions:")) | gsub("[\u0000-\u001f\u007f-\u009f]"; " ") | rtrimstr(" ") | .[0:200]]
+                 | first else null end) as $named
         | select($wait != null or $recent or $named != null)
         | {namespace: env.NS, deployment: $dep, pod: $pod, reason: ($named // $wait // "restarted"),
            restarts: ([$cs[] | .restartCount // 0] | add // 0)}]' <<< "$pods" 2>/dev/null)" || { echo null; return 0; }

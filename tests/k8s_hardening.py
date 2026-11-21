@@ -172,6 +172,11 @@ def coredns_small_problems(docs):
     if sc.get("allowPrivilegeEscalation") is not False or sc.get("readOnlyRootFilesystem") is not True or sc.get("privileged") \
             or caps.get("drop") != ["ALL"] or caps.get("add") != ["NET_BIND_SERVICE"] or (sc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
         out.append("coredns small: container no escalation, read-only root, drop ALL plus NET_BIND_SERVICE alone, RuntimeDefault")
+    # A container-level override wins over the pod's (re-review 2 N-c).
+    if sc.get("runAsNonRoot", True) is not True or sc.get("runAsUser", 1) in (0, None) or sc.get("runAsGroup", 1) in (0, None):
+        out.append("coredns small: no container-level root override (runAsNonRoot false, runAsUser / runAsGroup 0)")
+    if any("hostPort" in pt or "hostIP" in pt for pt in c.get("ports", [])):
+        out.append("coredns small: no hostPort")
     if not re.fullmatch(r"docker\.io/rancher/mirrored-coredns-coredns:[0-9.]+@sha256:[0-9a-f]{64}", c.get("image", "")):
         out.append(f"coredns small: image {c.get('image')} (k3s's CoreDNS, by digest)")
     if sp.get("nodeSelector", {}).get("portcullis.io/class") != "small" or sp.get("nodeSelector", {}).get("portcullis.io/site") != "main" \
@@ -191,7 +196,10 @@ def check_coredns_small():
                    lambda d: ds(d)["securityContext"].pop("runAsNonRoot"),
                    lambda d: ds(d).__setitem__("hostNetwork", True),
                    lambda d: ds(d)["containers"][0].__setitem__("image", "docker.io/rancher/mirrored-coredns-coredns:1.14.7"),
-                   lambda d: ds(d)["volumes"].append({"name": "h", "hostPath": {"path": "/"}})):
+                   lambda d: ds(d)["volumes"].append({"name": "h", "hostPath": {"path": "/"}}),
+                   lambda d: ds(d)["containers"][0]["securityContext"].__setitem__("runAsNonRoot", False),
+                   lambda d: ds(d)["containers"][0]["securityContext"].__setitem__("runAsUser", 0),
+                   lambda d: ds(d)["containers"][0]["ports"][0].__setitem__("hostPort", 53)):
         bad = copy.deepcopy(docs)
         mutate(bad)
         if not coredns_small_problems(bad):

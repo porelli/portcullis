@@ -23,6 +23,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1071,7 +1072,13 @@ func TestSessionsNamedErrorInSnapshot(t *testing.T) {
 		// Not the session store's: the prefix alone is never trusted (security review).
 		{ObjectMeta: metav1.ObjectMeta{Name: "spoof", Namespace: coreNS}, Spec: corev1.PodSpec{NodeName: "n1"},
 			Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "x",
-				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: "portcullis-sessions: spoofed"}}}}}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: "portcullis-sessions: spoofed"}}}}}},
+		// The guard's master fallback names what it did and exits 0: a
+		// healthy pod, never listed (re-review 2 N-d).
+		{ObjectMeta: metav1.ObjectMeta{Name: "sessions-0", Namespace: coreNS, OwnerReferences: []metav1.OwnerReference{{Kind: "StatefulSet", Name: "sessions"}}}, Spec: corev1.PodSpec{NodeName: "n1"},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, InitContainerStatuses: []corev1.ContainerStatus{{Name: "guard",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Reason: "Completed",
+					Message: "portcullis-sessions: started as the master; the sessions were lost"}}}}}},
 	} {
 		if _, err := h.kube.CoreV1().Pods(coreNS).Create(ctx, p, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
@@ -1086,5 +1093,27 @@ func TestSessionsNamedErrorInSnapshot(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "pod sessions-1: the session store: the Sentinels disagree on the master (x): refusing to start" {
 		t.Fatalf("errors %q", got)
+	}
+}
+
+// TestSessionsErrorSanitised: C0, DEL and C1 (U+009B CSI) become spaces,
+// the cut is at 200 runes and never splits one, exit 0 is no error
+// (re-review 2 N-b, N-d).
+func TestSessionsErrorSanitised(t *testing.T) {
+	pod := func(code int32, msg string) *corev1.Pod {
+		return &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{Name: "guard",
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code, Message: msg}}}}}}
+	}
+	got := sessionsError(pod(1, "portcullis-sessions: a\x1b[31mb\u009b2Jc\x7fd"))
+	if got != "the session store: a [31mb 2Jc d" {
+		t.Fatalf("control characters: %q", got)
+	}
+	got = sessionsError(pod(1, "portcullis-sessions: "+strings.Repeat("a", 199)+"éééé"))
+	m := strings.TrimPrefix(got, "the session store: ")
+	if !utf8.ValidString(got) || utf8.RuneCountInString(m) != 200 || !strings.HasSuffix(m, "aé") {
+		t.Fatalf("cut: valid %v, %d runes, %q", utf8.ValidString(got), utf8.RuneCountInString(m), m[len(m)-4:])
+	}
+	if got := sessionsError(pod(0, "portcullis-sessions: started as the master; the sessions were lost")); got != "" {
+		t.Fatalf("exit 0 reported: %q", got)
 	}
 }
