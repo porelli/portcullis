@@ -7124,18 +7124,44 @@ OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCU
 case "$OUT" in *"isn't a uuid"*"rc=1") t_pass "kube_backup_values: no install id → refused (never a shared archive path)" ;; *) t_fail "serverName no id: $OUT" ;; esac
 # Review I3: rotating addresses → any public address on 443; stable → pinned.
 ROT="getent() { n=\$(cat '$BD/rot' 2>/dev/null || echo 0); echo \$((n + 1)) > '$BD/rot'; echo \"52.0.0.\$((n % 3 + 1)) STREAM\"; }"
-rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket; $ROT; backup_dest_egress_resolve; echo \"MODE=\$_BD_EGRESS_MODE\"; printf '%s\n' \"\$_BD_EGRESS_EXCEPT\"")"
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=; $ROT; backup_dest_egress_resolve")"
+case "$OUT" in *"addresses rotate"*"Refused; to allow TCP 443 to any public address from the backup pods, set it again with --allow-rotating-addresses"*"rc=1") t_pass "backup egress: a rotating name without the opt-in → refused naming --allow-rotating-addresses (never automatic)" ;; *) t_fail "rotating no opt-in: $OUT" ;; esac
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; $ROT; backup_dest_egress_resolve; echo \"MODE=\$_BD_EGRESS_MODE\"; printf '%s\n' \"\$_BD_EGRESS_EXCEPT\"")"
 expect_eq "backup egress: a rotating name → public, 5 lookups" "$(printf '%s\n' "$OUT" | grep -c '^MODE=public$'):$(cat "$BD/rot")" "1:5"
 expect_eq "backup egress (public): RFC 1918, CGNAT, link-local, loopback, the pod / service / mesh CIDRs, the nodes and API endpoints excepted" \
   "$(for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8 10.42.0.0/24 10.43.0.0/16 10.215.0.0/24 198.51.100.1/32 10.1.0.4/32; do printf '%s\n' "$OUT" | grep -qx "$c" || echo "missing $c"; done)" ""
-rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org:9000/pc-bucket; $ROT; backup_dest_egress_resolve")"
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org:9000/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; $ROT; backup_dest_egress_resolve")"
 case "$OUT" in *"addresses rotate"*"its port is 9000 (refused)"*"rc=1") t_pass "backup egress: rotating addresses on a port other than 443 → refused" ;; *) t_fail "rotating 9000: $OUT" ;; esac
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; backup_dest_egress_resolve; echo \"MODE=\$_BD_EGRESS_MODE \$_BD_EGRESS_CIDRS\"")"
 expect_eq "backup egress: a stable name → pinned /32s" "$(printf '%s\n' "$OUT" | grep '^MODE=')" "MODE=pinned 203.0.113.50/32"
-OUT="$(rm -f "$BD/rot"; bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket; $ROT; _ha_backup_egress longhorn-system backup-destination-manager '{\"matchLabels\":{\"app\":\"longhorn-manager\"}}'")"
+OUT="$(rm -f "$BD/rot"; bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; $ROT; _ha_backup_egress longhorn-system backup-destination-manager '{\"matchLabels\":{\"app\":\"longhorn-manager\"}}'")"
 expect_eq "_ha_backup_egress (public): the exact pods, 0.0.0.0/0 minus the private ranges, 443" \
   "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(.kind? == "NetworkPolicy") | [.spec.podSelector, .spec.egress[0].to[0].ipBlock.cidr, (.spec.egress[0].to[0].ipBlock.except | index("10.0.0.0/8") != null), .spec.egress[0].ports]')" \
   '[{"matchLabels":{"app":"longhorn-manager"}},"0.0.0.0/0",true,[{"protocol":"TCP","port":443}]]'
+# Security review: the opt-in is set's flag, stored in .env, shown by show and status.
+mkdir -p "$BD/root3/secrets"; printf 'CONTAINER_RUNTIME=kubernetes\n' > "$BD/root3/.env"
+rm -f "$BD/rot"; OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$BD_KEY" "$BD_SEC" | BD_ROOT="$BD/root3" bdk "$ROT; backup_dest_set https://s3.amazonaws.com/pc-bucket true; backup_dest_show")"
+expect_eq "backup destination set --allow-rotating-addresses: PORTCULLIS_BACKUP_ALLOW_ROTATING=true in .env, shown by show" \
+  "$(grep -c '^PORTCULLIS_BACKUP_ALLOW_ROTATING=true$' "$BD/root3/.env"):$(printf '%s\n' "$OUT" | grep -c 'rotating addresses: allowed'):$(printf '%s' "$OUT" | tail -n1)" "1:1:rc=0"
+rm -f "$BD/rot" "$BD/root3/secrets/backup-destination.env"; printf 'CONTAINER_RUNTIME=kubernetes\n' > "$BD/root3/.env"
+OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$BD_KEY" "$BD_SEC" | BD_ROOT="$BD/root3" bdk "$ROT; backup_dest_set https://s3.amazonaws.com/pc-bucket false")"
+expect_eq "backup destination set without the flag: a rotating destination refused, nothing written" \
+  "$(printf '%s' "$OUT" | grep -c 'with --allow-rotating-addresses'):$(test -e "$BD/root3/secrets/backup-destination.env" && echo file || echo nofile):$(grep -c BACKUP_S3_URL "$BD/root3/.env" || true)" "1:nofile:0"
+OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"public","allow_rotating":true,"cnpg":null,"longhorn":null}' ) )"
+expect_eq "status: the rotating opt-in is shown" "$(printf '%s\n' "$OUT" | grep -c 'rotating addresses allowed (PORTCULLIS_BACKUP_ALLOW_ROTATING=true')" 1
+# Security review: the instance-backup move never unpacks on the host (an
+# archive with a symlink member pointing outside, and a file through it).
+MV="$WORK/ibmove"; rm -rf "$MV"; mkdir -p "$MV/src/backups" "$MV/outside" "$MV/b"
+ln -s "$MV/outside" "$MV/src/backups/evil"; tar -czf "$MV/b/hub_data.tar.gz" -C "$MV/src" ./backups
+rm -rf "$MV/src"; mkdir -p "$MV/src2/backups/evil"; printf x > "$MV/src2/backups/evil/pwn"
+tar -czf "$MV/b/hub_data2.tar.gz" -C "$MV/src2" ./backups && cat "$MV/b/hub_data2.tar.gz" >> "$MV/b/hub_data.tar.gz"
+OUT="$(kt "_kube_restore_volume() { :; }; _kube_volume_exists() { :; }; _kube_empty_volume() { :; }; _kube_helper_done() { :; }
+  _kube_helper_pod() { case \"\$1\" in hub-state*) echo src-pod ;; *) echo dst-pod ;; esac; }
+  kube_ctl() { echo \"K \$*\" >> '$MV/calls'; case \"\$*\" in *'tar -cf -'*) printf TARSTREAM ;; *'tar -xf -'*) cat > '$MV/streamed' ;; esac; return 0; }
+  cd '$MV' && _kube_restore_volume_t26 '$MV/b' hub_data 10001 10001")"
+expect_eq "instance-backup move: pod to pod (hub-state's tar → hub-backups' tar), nothing unpacked on the host, a symlink member can't reach a host path" \
+  "$(printf '%s' "$OUT" | tail -n1):$(grep -c 'exec src-pod -- tar -cf - -C /vol/backups .' "$MV/calls"):$(grep -c 'exec -i dst-pod -- tar -xf - -C /vol' "$MV/calls"):$(cat "$MV/streamed"):$(test -e "$MV/outside/pwn" && echo PWNED || echo clean):$(declare -f _kube_restore_volume_t26 | grep -c 'tar -x[a-z]*f "\$dir' || true)" \
+  "rc=0:1:1:TARSTREAM:clean:0"
 # Security review: empty / invalid API endpoints or node addresses refuse.
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCULLIS_KUBE_API_ENDPOINTS=; backup_dest_cidrs")"
 case "$OUT" in *"PORTCULLIS_KUBE_API_ENDPOINTS unknown: the backup destination can't be checked (refused)"*"rc=1") t_pass "backup_dest_cidrs: no API endpoints → refused" ;; *) t_fail "no api: $OUT" ;; esac

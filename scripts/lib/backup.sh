@@ -705,7 +705,7 @@ _backup_dest_probe() {
 
 # backup_dest_set <url> — the credentials from stdin (see the help).
 backup_dest_set() {
-  local url="${1%/}" p line k f tmp n=0 id="" sec="" reg=""
+  local url="${1%/}" allow="${2:-false}" p line k f tmp n=0 id="" sec="" reg=""
   p="$(backup_dest_url_problem "$url")"
   [ -z "$p" ] || fail "$p"
   [ ! -t 0 ] || fail "backup destination set reads the credentials from stdin (AWS_ACCESS_KEY_ID=… / AWS_SECRET_ACCESS_KEY=… lines), never from an argument: pipe them in"
@@ -728,14 +728,18 @@ backup_dest_set() {
   PORTCULLIS_BACKUP_S3_URL="$url" backup_dest_parts
   _BD_AWS_ACCESS_KEY_ID="$id" _BD_AWS_SECRET_ACCESS_KEY="$sec" _BD_AWS_DEFAULT_REGION="${reg:-us-east-1}"
   PORTCULLIS_BACKUP_S3_URL="$url" _backup_dest_probe
-  PORTCULLIS_BACKUP_S3_URL="$url" backup_dest_egress_resolve || fail "the backup destination: see above (nothing was written)"
+  # The opt-in for a destination whose addresses rotate (security review:
+  # never automatic), in effect for this check and then stored.
+  local ar=""; [ "$allow" != true ] || ar=true
+  PORTCULLIS_BACKUP_ALLOW_ROTATING="$ar" PORTCULLIS_BACKUP_S3_URL="$url" backup_dest_egress_resolve || fail "the backup destination: see above (nothing was written)"
   f="$(backup_dest_file)"
   (umask 077 && mkdir -p "${f%/*}")
   tmp="$(umask 077 && mktemp "${f%/*}/.backup-destination.XXXXXX")"
   { printf 'AWS_ACCESS_KEY_ID=%s\n' "$id"; printf 'AWS_SECRET_ACCESS_KEY=%s\n' "$sec"; printf 'AWS_DEFAULT_REGION=%s\n' "${reg:-us-east-1}"; } > "$tmp"
   chmod 600 "$tmp" && mv -f "$tmp" "$f"
   env_set PORTCULLIS_BACKUP_S3_URL "$url"
-  export PORTCULLIS_BACKUP_S3_URL="$url"
+  env_set PORTCULLIS_BACKUP_ALLOW_ROTATING "$ar"
+  export PORTCULLIS_BACKUP_S3_URL="$url" PORTCULLIS_BACKUP_ALLOW_ROTATING="$ar"
   ok "Backup destination set: $url (credentials in $BACKUP_DEST_FILE_REL, 0600)."
   kube_backup_destination_sync || fail "could not sync the destination to the cluster (Secret backup-destination): run ./portcullis up"
   ha_longhorn_backup_target
@@ -758,6 +762,11 @@ backup_dest_show() {
   echo "  core archive (restic): s3:$(backup_dest_sub core)"
   echo "  CloudNativePG (barman-cloud, HA): s3://$_BD_BUCKET/${_BD_PREFIX:+$_BD_PREFIX/}cnpg"
   echo "  Longhorn (HA): s3://$_BD_BUCKET@<region>/${_BD_PREFIX:+$_BD_PREFIX/}longhorn"
+  if [ "${PORTCULLIS_BACKUP_ALLOW_ROTATING:-}" = true ]; then
+    echo "  rotating addresses: allowed (--allow-rotating-addresses: if they rotate, the backup pods reach any public address on 443)"
+  else
+    echo "  rotating addresses: not allowed (the endpoint's addresses must be stable: the backup pods reach exactly them)"
+  fi
   if [ -s "$f" ]; then
     backup_dest_read
     echo "  region: $_BD_AWS_DEFAULT_REGION"
@@ -771,7 +780,8 @@ backup_dest_show() {
 # (the bucket's contents are kept).
 backup_dest_unset() {
   env_set PORTCULLIS_BACKUP_S3_URL ""
-  PORTCULLIS_BACKUP_S3_URL=""
+  env_set PORTCULLIS_BACKUP_ALLOW_ROTATING ""
+  PORTCULLIS_BACKUP_S3_URL="" PORTCULLIS_BACKUP_ALLOW_ROTATING=""
   rm -f "$(backup_dest_file)"
   kube_backup_destination_sync || warn "could not remove the cluster's Secret backup-destination: delete it by hand"
   ha_longhorn_backup_target
@@ -785,8 +795,11 @@ cmd_backup_destination() {
     -h|--help) help_backup_destination; return 0 ;;
     "") usage_error "backup destination" "expected set, show, test or unset" ;;
     set) shift
-         case "${1:-}" in -h|--help) help_backup_destination; return 0 ;; "") usage_error "backup destination set" "expected <url> (the credentials come from stdin)" ;; esac
-         [ $# -eq 1 ] || usage_error "backup destination set" "only <url> is an argument: the credentials come from stdin, never argv" ;;
+         local allow=false
+         case "${1:-}" in -h|--help) help_backup_destination; return 0 ;; --allow-rotating-addresses) allow=true; shift ;; esac
+         case "${1:-}" in "") usage_error "backup destination set" "expected <url> (the credentials come from stdin)" ;; esac
+         [ "${2:-}" != --allow-rotating-addresses ] || { allow=true; set -- "$1"; }
+         [ $# -eq 1 ] || usage_error "backup destination set" "only <url> (and --allow-rotating-addresses) is an argument: the credentials come from stdin, never argv" ;;
     show|test|unset) shift
          case "${1:-}" in -h|--help) help_backup_destination; return 0 ;; "") ;; *) usage_error "backup destination $sub" "unknown argument: $1" ;; esac ;;
     *) usage_error "backup destination" "unknown subcommand: $sub (set, show, test, unset)" ;;
@@ -794,7 +807,7 @@ cmd_backup_destination() {
   need_env
   _rt_is_kube || fail "the backup destination is for Kubernetes installs (Docker / Podman: BACKUP_REPOSITORY with backup --offsite)"
   case "$sub" in
-    set) backup_dest_set "$1" ;;
+    set) backup_dest_set "$1" "$allow" ;;
     show) backup_dest_show ;;
     test) backup_dest_test ;;
     unset) backup_dest_unset ;;
@@ -1597,7 +1610,7 @@ EOF
 
 help_backup_destination() {
   cat <<'EOF'
-Usage: portcullis backup destination set <url> < credentials
+Usage: portcullis backup destination set [--allow-rotating-addresses] <url> < credentials
        portcullis backup destination show
        portcullis backup destination test
        portcullis backup destination unset
@@ -1628,6 +1641,16 @@ cnpg-system and, with Longhorn, in longhorn-system). For example:
   printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$K" "$S" \
     | ./portcullis backup destination set https://s3.example.org/bucket/portcullis
 Then ./portcullis up applies it to the release.
+
+The backup pods (Postgres' instances, Longhorn's manager and instance
+managers) may reach only the destination: set, test and every up resolve
+its name 5 times. Stable addresses: exactly those, on its port. Addresses
+that rotate between lookups (AWS S3, R2, B2 and most CDN-fronted S3) are
+refused unless set was given --allow-rotating-addresses (.env
+PORTCULLIS_BACKUP_ALLOW_ROTATING=true): then the backup pods reach any
+PUBLIC address on TCP 443 (never private, CGNAT, link-local or the
+cluster's ranges), and status says so. An IPv4 address in the URL is
+always stable.
 
 show    the URL, its parts, the region and whether credentials are set
         (never a key)

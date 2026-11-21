@@ -946,28 +946,32 @@ KUBE_BACKUP_EXTRA_VOLUMES="hub_backups:$CT_UID_HUB:$CT_UID_HUB"
 
 # _kube_restore_volume_t26 <dir> <key> <uid> <gid> — _kube_restore_volume,
 # then (queued item) a Docker / Podman backup's instance backups
-# (hub_data's ./backups: there they live inside hub_data) moved into the
+# (hub_data's backups/: there they live inside hub_data) moved into the
 # hub-backups PVC Kubernetes keeps them on (the Hub mounts it over
-# /data/backups, so in hub-state they'd be hidden): extracted on the host
-# into a 0700 temp dir, streamed into hub-backups as the Hub, removed from
-# hub-state. A Kubernetes backup has its own hub_backups.tar.gz.
+# /data/backups, so in hub-state they'd be hidden). Never extracted on the
+# host (security review: an archive's symlink or hard-link member could
+# reach host files): hub_data's own restore already unpacked it inside a
+# helper pod; a hub-state helper tars backups/ out and a hub-backups helper
+# unpacks it (pod to pod, both as the Hub, read-only roots), then hub-state's
+# copy is emptied (the directory stays: the Hub's mount point). A
+# Kubernetes backup has its own hub_backups.tar.gz.
 _kube_restore_volume_t26() {
-  local dir="$1" key="$2" tmp pod rc=0
+  local dir="$1" key="$2" src dst rc=0 ns
   _kube_restore_volume "$@" || return 1
   [ "$key" = hub_data ] && [ ! -f "$dir/hub_backups.tar.gz" ] && _kube_volume_exists hub_backups || return 0
-  tmp="$(mktemp -d)"; chmod 700 "$tmp"
-  if ! tar -xzf "$dir/hub_data.tar.gz" -C "$tmp" ./backups 2>/dev/null || [ ! -d "$tmp/backups" ]; then rm -rf "$tmp"; return 0; fi
+  ns="$(kube_ns)"
+  src="$(_kube_helper_pod "$(kube_pvc_name hub_data)" "$CT_UID_HUB:$CT_UID_HUB" rw "$PORTCULLIS_HELPER_IMAGE")" || return 1
+  if ! kube_ctl -n "$ns" exec "$src" -- sh -c '[ -d /vol/backups ] && [ ! -L /vol/backups ] && [ -n "$(ls -A /vol/backups)" ]' >/dev/null 2>&1; then
+    _kube_helper_done "$src"; return 0
+  fi
   info "Moving the instance backups from hub_data into hub-backups..."
-  _kube_empty_volume hub_backups "$CT_UID_HUB" "$CT_UID_HUB" || { rm -rf "$tmp"; return 1; }
-  pod="$(_kube_helper_pod "$(kube_pvc_name hub_backups)" "$CT_UID_HUB:$CT_UID_HUB" rw "$PORTCULLIS_HELPER_IMAGE")" || { rm -rf "$tmp"; return 1; }
-  tar -czf - -C "$tmp/backups" . | kube_ctl -n "$(kube_ns)" exec -i "$pod" -- tar -xzf - -C /vol || rc=1
-  _kube_helper_done "$pod"
-  rm -rf "$tmp"
-  [ "$rc" = 0 ] || return 1
-  pod="$(_kube_helper_pod "$(kube_pvc_name hub_data)" "$CT_UID_HUB:$CT_UID_HUB" rw "$PORTCULLIS_HELPER_IMAGE")" || return 1
+  _kube_empty_volume hub_backups "$CT_UID_HUB" "$CT_UID_HUB" || { _kube_helper_done "$src"; return 1; }
+  dst="$(_kube_helper_pod "$(kube_pvc_name hub_backups)" "$CT_UID_HUB:$CT_UID_HUB" rw "$PORTCULLIS_HELPER_IMAGE")" || { _kube_helper_done "$src"; return 1; }
+  kube_ctl -n "$ns" exec "$src" -- tar -cf - -C /vol/backups . | kube_ctl -n "$ns" exec -i "$dst" -- tar -xf - -C /vol || rc=1
+  _kube_helper_done "$dst"
   # The directory stays (the Hub's hub-backups mount point), its content goes.
-  kube_ctl -n "$(kube_ns)" exec "$pod" -- find /vol/backups -mindepth 1 -delete || rc=1
-  _kube_helper_done "$pod"
+  [ "$rc" != 0 ] || kube_ctl -n "$ns" exec "$src" -- find /vol/backups -mindepth 1 -delete || rc=1
+  _kube_helper_done "$src"
   return "$rc"
 }
 
@@ -1123,6 +1127,11 @@ backup_dest_egress_resolve() {
   if [ "$stable" = true ]; then
     _BD_EGRESS_MODE=pinned _BD_EGRESS_CIDRS="$(printf '%s/32\n' $ips)" _BD_EGRESS_EXCEPT=""
   else
+    # Security review: never automatic — the operator opts in with
+    # backup destination set --allow-rotating-addresses (.env
+    # PORTCULLIS_BACKUP_ALLOW_ROTATING=true).
+    [ "${PORTCULLIS_BACKUP_ALLOW_ROTATING:-}" = true ] \
+      || { echo "the backup destination's addresses rotate ($(printf '%s\n' $seen | LC_ALL=C sort -u | wc -l | tr -d ' ') seen): its pods' own lookups would miss a pinned policy. Refused; to allow TCP 443 to any public address from the backup pods, set it again with --allow-rotating-addresses" >&2; return 1; }
     port="$(backup_dest_port)"
     [ "$port" = 443 ] || { echo "the backup destination's addresses rotate: egress then goes to any public address on 443 only, and its port is $port (refused)" >&2; return 1; }
     _BD_EGRESS_MODE=public _BD_EGRESS_CIDRS="0.0.0.0/0"
@@ -1191,7 +1200,8 @@ kube_backup_status_json() {
   if kube_ctl get namespace "$KUBE_LONGHORN_NS" -o name >/dev/null 2>&1; then
     l="$(kube_ctl -n "$KUBE_LONGHORN_NS" get backuptargets.longhorn.io default -o json 2>/dev/null | jq -c '{available: (.status.available == true)}' 2>/dev/null || echo '{"available":false}')"
   fi
-  jq -nc --arg e "$e" --argjson c "${c:-null}" --argjson l "${l:-null}" '{egress: (if $e == "" then null else $e end), cnpg: $c, longhorn: $l}'
+  jq -nc --arg e "$e" --argjson c "${c:-null}" --argjson l "${l:-null}" --arg ar "${PORTCULLIS_BACKUP_ALLOW_ROTATING:-}" \
+    '{egress: (if $e == "" then null else $e end), allow_rotating: ($ar == "true"), cnpg: $c, longhorn: $l}'
 }
 
 # kube_backup_status_lines <json> — status' lines; exit 1 on a problem.
@@ -1215,6 +1225,7 @@ kube_backup_status_lines() {
     else _st_line fail "backup destination: Longhorn's backup target isn't available (kubectl -n longhorn-system get backuptargets default)"; rc=1; fi
   fi
   [ "$(printf '%s' "$j" | jq -r '.egress')" != public ] || _st_line warn "backup egress: any public address on 443 (the destination's addresses rotate)"
+  [ "$(printf '%s' "$j" | jq -r '.allow_rotating')" != true ] || _st_line warn "backup destination: rotating addresses allowed (PORTCULLIS_BACKUP_ALLOW_ROTATING=true, set with --allow-rotating-addresses)"
   return "$rc"
 }
 
