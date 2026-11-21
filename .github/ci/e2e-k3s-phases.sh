@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # e2e-k3s phases (ci.yml job e2e-k3s; each step runs one):
 #   docker   the Docker phase of the cross-runtime round trip (rootless P11):
-#            init on Docker, one LLDAP person, a backup copied to
+#            init on Docker, the LLDAP fixture made by LLDAP itself (rt-person,
+#            rt-alice and rt-bob with passwords, groups rt-g1 / rt-g2; plan
+#            Task 26), a backup copied to
 #            $RUNNER_TEMP/rt-backup (0700, never an artifact), the CA
 #            chain's sha256; then down and wiped
 #   init     .env for kubernetes (context ci, K1 local images), the CI TLS
@@ -16,9 +18,14 @@
 #   restore  test_restore_into_cnpg (plan Task 23): a Kubernetes backup
 #            (pg_dump keycloak + lldap from the CNPG primary) restored, LLDAP's
 #            person back and Keycloak signing in; then the Docker phase's
-#            backup restored onto k3s: the host's kubernetes keys kept, the
-#            CA chain the Docker phase's, Keycloak's database in CNPG (signs
-#            in), status clean; its SQLite LLDAP waits for Task 26
+#            backup restored onto k3s: first with a fault injected into the
+#            LLDAP conversion (test_lldap_convert_refuses_on_diff: refused,
+#            nothing switched, LLDAP's Deployment and database untouched),
+#            then for real (test_lldap_convert_keeps_uuids: LLDAP's SQLite
+#            converted into CNPG — the uuids, hashes and memberships the
+#            Docker phase's, the fixture's passwords bind, Keycloak links
+#            them by the same entryUUID); the host's kubernetes keys kept,
+#            the CA chain the Docker phase's, Keycloak signs in, status clean
 # Output goes through redact (setup links); no secret is printed.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -114,11 +121,44 @@ docker)
   COMPOSE_FILE=docker-compose.yml:docker-compose.ci.yml ./portcullis init --runtime docker --non-interactive --domain "$E2E_DOMAIN" \
     --email "ci@$E2E_DOMAIN" --dns-provider none --no-config-repo 2>&1 | redact
   bash .github/ci/lldap-create-person.sh rt-person
+  # The conversion's fixture (plan Task 26: 3 users, 2 groups, made by
+  # LLDAP itself): rt-alice and rt-bob with passwords (CI test values, in
+  # a 0600 file), rt-g1 = {rt-alice, rt-bob}, rt-g2 = {rt-bob, rt-person}.
+  for u in rt-alice rt-bob; do bash .github/ci/lldap-create-person.sh "$u"; done
+  (umask 077 && : > "$RUNNER_TEMP/rt-lldap.pw")
+  tok="$(lldap_token http://127.0.0.1:17170)"; echo "::add-mask::$tok" >&2
+  for u in rt-alice rt-bob; do
+    pw="$(openssl rand -hex 16)"; echo "::add-mask::$pw"; printf '%s %s\n' "$u" "$pw" >> "$RUNNER_TEMP/rt-lldap.pw"
+    # lldap_set_password takes the token on its argv only: inside the LLDAP
+    # container, a short-lived token of this CI stack.
+    printf '%s\n%s\n' "$tok" "$pw" | COMPOSE_FILE=docker-compose.yml:docker-compose.ci.yml docker compose exec -T lldap sh -c 'read -r T; read -r P; LLDAP_USER_PASSWORD="$P" exec /app/lldap_set_password -b http://127.0.0.1:17170 -t "$T" -u "$1"' _ "$u" >/dev/null \
+      || fail "could not set $u's password"
+  done
+  for g in rt-g1 rt-g2; do lldap_gql http://127.0.0.1:17170 "mutation { createGroup(name: \"$g\") { id } }" | jq -e '.data.createGroup.id' >/dev/null || fail "could not create $g"; done
+  gids="$(lldap_gql http://127.0.0.1:17170 '{ groups { id displayName } }')"
+  for m in rt-g1:rt-alice rt-g1:rt-bob rt-g2:rt-bob rt-g2:rt-person; do
+    gid="$(printf '%s' "$gids" | jq --arg g "${m%%:*}" '.data.groups[] | select(.displayName == $g) | .id')"
+    lldap_gql http://127.0.0.1:17170 "mutation { addUserToGroup(userId: \"${m#*:}\", groupId: $gid) { ok } }" | jq -e '.data.addUserToGroup.ok' >/dev/null || fail "could not add ${m#*:} to ${m%%:*}"
+  done
   COMPOSE_FILE=docker-compose.yml:docker-compose.ci.yml ./portcullis backup
   B="$(find backups -mindepth 1 -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
   jq -e '.runtime.name == "docker"' "$B/MANIFEST.json" >/dev/null || fail "the Docker backup's MANIFEST.json"
   (umask 077 && cp -r --preserve=mode,timestamps "$B" "$RUNNER_TEMP/rt-backup")
   chmod 700 "$RUNNER_TEMP/rt-backup"
+  # The source's uuids, hashes (sha256 of each) and memberships, from the
+  # backup's users.db (never the hashes themselves).
+  t="$(mktemp -d)"; tar -xzf "$B/lldap_data.tar.gz" -C "$t" ./users.db
+  python3 - "$t/users.db" > "$RUNNER_TEMP/rt-lldap-src.txt" <<'PY'
+import hashlib, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+for u, uu, h in db.execute("select user_id, uuid, password_hash from users order by user_id"):
+    print("U", u, uu, hashlib.sha256(h).hexdigest() if h else "-")
+for u, g in db.execute("select m.user_id, g.display_name from memberships m join groups g using (group_id) order by 1, 2"):
+    print("M", u, g)
+PY
+  rm -rf "$t"
+  grep -q '^U rt-alice [0-9a-f-]\{36\} [0-9a-f]\{64\}$' "$RUNNER_TEMP/rt-lldap-src.txt" && [ "$(grep -c '^M ' "$RUNNER_TEMP/rt-lldap-src.txt")" -ge 4 ] \
+    || fail "the Docker backup's users.db lacks the fixture"
   sha256sum certs/ca-chain.crt | cut -d' ' -f1 > "$RUNNER_TEMP/rt-ca.sha256"
   COMPOSE_FILE=docker-compose.yml:docker-compose.ci.yml ./portcullis down
   docker volume ls -q --filter label=com.docker.compose.project=portcullis | xargs -r docker volume rm
@@ -227,18 +267,54 @@ restore)
     || fail "the restore left keycloak/lldap _restore or _pre_restore databases"
   kc_signin || exit 1
   echo "PASS: test_restore_into_cnpg: a Kubernetes backup (pg_dump keycloak + lldap) restored into CNPG through <db>_restore and a rename; LLDAP has k8s-person again and its password binds, Keycloak signs in, no leftover database"
-  # The Docker phase's backup: Keycloak's dump into CNPG; its LLDAP is
-  # SQLite, whose conversion into Postgres is plan Task 26's restore step
-  # (until then LLDAP starts empty: --allow-empty-lldap).
-  ./portcullis restore --yes --allow-empty-lldap "$RUNNER_TEMP/rt-backup" 2>&1 | redact | tee "$RUNNER_TEMP/rt-restore.log"
-  grep -q "isn't converted into Postgres on Kubernetes yet" "$RUNNER_TEMP/rt-restore.log" || fail "restore didn't say the Docker backup's LLDAP isn't converted"
+  # The Docker phase's backup. test_lldap_convert_refuses_on_diff (plan
+  # Task 26): one row changed inside the conversion's transaction (the
+  # development hook, HUB_DEV=1) → refused before anything of the live
+  # install changes: LLDAP's Deployment as it was, the live database still
+  # k8s-person's, the Hub not stopped, no lldap_restore left.
+  ldgen="$(K -n portcullis get deploy lldap -o jsonpath='{.metadata.generation}/{.spec.replicas}')"
+  hubrep="$(K -n portcullis get deploy hub -o jsonpath='{.spec.replicas}')"
+  rc=0
+  HUB_DEV=1 PORTCULLIS_DEV_LLDAP_CONVERT_FAULT="UPDATE users SET uuid = '00000000-0000-4000-8000-000000000000' WHERE user_id = 'rt-alice';" \
+    ./portcullis restore --yes "$RUNNER_TEMP/rt-backup" > "$RUNNER_TEMP/rt-fault.log" 2>&1 || rc=$?
+  redact < "$RUNNER_TEMP/rt-fault.log" | tail -n 5
+  [ "$rc" != 0 ] && grep -q "LLDAP conversion changed the users' uuids: nothing was switched" "$RUNNER_TEMP/rt-fault.log" || fail "test_lldap_convert_refuses_on_diff: the faulty conversion wasn't refused (rc $rc)"
+  [ "$(K -n portcullis get deploy lldap -o jsonpath='{.metadata.generation}/{.spec.replicas}')" = "$ldgen" ] || fail "test_lldap_convert_refuses_on_diff: LLDAP's Deployment changed"
+  [ "$(K -n portcullis get deploy hub -o jsonpath='{.spec.replicas}')" = "$hubrep" ] || fail "test_lldap_convert_refuses_on_diff: the Hub was stopped"
+  pgp() { K -n cnpg-system exec -i "$(K -n cnpg-system get cluster portcullis-pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -XtAq "$@"; }
+  [ "$(pgp -c "select count(*) from pg_database where datname = 'lldap_restore'")" = 0 ] || fail "test_lldap_convert_refuses_on_diff: lldap_restore was left behind"
+  lport="$(pf_svc lldap 17170)"
+  lldap_has "http://127.0.0.1:$lport" k8s-person true || fail "test_lldap_convert_refuses_on_diff: the live LLDAP database changed (k8s-person gone)"
+  echo "PASS: test_lldap_convert_refuses_on_diff: a changed row refused (\"LLDAP conversion changed the users' uuids\"), LLDAP's Deployment, the Hub and the live database untouched, nothing left"
+  # test_lldap_convert_keeps_uuids: the real restore (no --allow-empty-lldap).
+  ./portcullis restore --yes "$RUNNER_TEMP/rt-backup" 2>&1 | redact | tee "$RUNNER_TEMP/rt-restore.log"
+  grep -qE "LLDAP: [0-9]+ user\(s\), [0-9]+ password hash\(es\); uuids, groups, memberships, hashes and attributes equal the backup's" "$RUNNER_TEMP/rt-restore.log" || fail "restore didn't convert the Docker backup's LLDAP"
   grep -qx 'CONTAINER_RUNTIME=kubernetes' .env && grep -qx 'PORTCULLIS_KUBE_CONTEXT=ci' .env || fail "restore didn't keep this host's kubernetes keys"
   status_wait 600
   [ "$(sha256sum certs/ca-chain.crt | cut -d' ' -f1)" = "$(cat "$RUNNER_TEMP/rt-ca.sha256")" ] || fail "the CA chain isn't the Docker phase's"
   kc_signin || exit 1
+  pgp -d lldap -c "select 'U ' || user_id || ' ' || uuid || ' ' || coalesce(encode(sha256(password_hash), 'hex'), '-') from users order by user_id" > "$RUNNER_TEMP/rt-lldap-dst.txt"
+  pgp -d lldap -c "select 'M ' || m.user_id || ' ' || g.display_name from memberships m join groups g using (group_id) order by 1" >> "$RUNNER_TEMP/rt-lldap-dst.txt"
+  # The fixture's rows (the CLI's own reconcile may rightly touch the Hub's
+  # account after the start; the conversion itself compared every row).
+  fx() { grep -E '^(U|M) rt-' "$1" | sort; }
+  diff <(fx "$RUNNER_TEMP/rt-lldap-src.txt") <(fx "$RUNNER_TEMP/rt-lldap-dst.txt") >/dev/null || fail "test_lldap_convert_keeps_uuids: LLDAP's users / uuids / hashes / memberships in CNPG differ from the Docker backup's"
   lport="$(pf_svc lldap 17170)"
-  lldap_has "http://127.0.0.1:$lport" rt-person false || fail "rt-person is in LLDAP: the SQLite conversion is Task 26's (update this check with it)"
-  echo "PASS: Docker → Kubernetes restore: host keys kept, status clean, the CA chain the Docker phase's, Keycloak's database restored into CNPG (signs in); LLDAP's SQLite waits for Task 26"
+  for u in rt-person rt-alice rt-bob; do lldap_has "http://127.0.0.1:$lport" "$u" true || fail "$u isn't in LLDAP after the Docker → Kubernetes restore"; done
+  while read -r u pw; do
+    lldap_login "http://127.0.0.1:$lport" "$u" "$pw" || fail "test_lldap_convert_keeps_uuids: $u's password doesn't bind after the conversion (the hash under the backup's seed)"
+  done < "$RUNNER_TEMP/rt-lldap.pw"
+  # Keycloak finds the fixture user through LDAP federation, linked by
+  # LLDAP's entryUUID: the uuid the Docker phase's users.db had.
+  kpw="$(grep '^KEYCLOAK_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$kpw"
+  kport="$(pf_svc keycloak 8080)"
+  ktok="$(PW="$kpw" jq -jn '"grant_type=password&client_id=admin-cli&username=admin&password=" + (env.PW | @uri)' \
+    | curl -sf --max-time 10 "http://127.0.0.1:$kport/realms/master/protocol/openid-connect/token" -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- | jq -r .access_token)"
+  echo "::add-mask::$ktok"
+  kid="$(curl -sf --max-time 20 -H @<(printf 'Authorization: Bearer %s\n' "$ktok") "http://127.0.0.1:$kport/admin/realms/portcullis/users?username=rt-alice&exact=true" | jq -r '.[0].attributes.LDAP_ID[0] // empty')"
+  [ "$kid" = "$(awk '$1 == "U" && $2 == "rt-alice" { print $3 }' "$RUNNER_TEMP/rt-lldap-src.txt")" ] || fail "test_lldap_convert_keeps_uuids: Keycloak's rt-alice has LDAP_ID '$kid', not the Docker backup's uuid"
+  [ "$(pgp -c "select count(*) from pg_database where datname like '%\_pre\_restore' or datname like '%\_restore'")" = 0 ] || fail "the restore left _restore / _pre_restore databases"
+  echo "PASS: test_lldap_convert_keeps_uuids: the Docker backup's LLDAP converted into CNPG (uuids, password hashes and memberships equal the source, rt-alice and rt-bob bind with their passwords, Keycloak links rt-alice by the same entryUUID); host keys kept, status clean, the CA chain the Docker phase's, Keycloak signs in"
   ;;
 *) echo "usage: $0 docker|init|seed|hub|vpn|restore" >&2; exit 2 ;;
 esac

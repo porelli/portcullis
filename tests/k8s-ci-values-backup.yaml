@@ -1,0 +1,10 @@
+# CI values (unit-tests-kube-static.sh, k8s_hardening.py): a backup
+# destination with the barman-cloud plugin installed (plan Task 26), on top
+# of k8s-ci-values-ha.yaml.
+backup:
+  destination: true
+  cnpg:
+    enabled: true
+    destinationPath: s3://ci-bucket/portcullis/cnpg
+    endpointURL: https://s3.example.org
+    port: 443

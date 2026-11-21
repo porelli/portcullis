@@ -1,0 +1,72 @@
+# The barman-cloud plugin's rights (plan Task 26), narrowed from the
+# release manifest's cluster-wide ClusterRole plugin-barman-cloud (and the
+# controller's kubebuilder markers, internal/controller/
+# objectstore_controller.go at v0.16.0) to cnpg-system, where its cache
+# watches (WATCH_NAMESPACE) and the Cluster portcullis-pg lives;
+# tests/k8s_hardening.py check_barman holds them:
+#   - Secrets read only (the ObjectStores' credentials; upstream also has
+#     create / delete, which nothing in the plugin's operator calls: its
+#     certificates are cert-manager's);
+#   - its ObjectStores (+ status, finalizers), CNPG Backups read,
+#     clusters/finalizers;
+#   - Roles / RoleBindings: the one pair it keeps per Cluster
+#     (specs.GetRBACName: portcullis-pg-barman-cloud, the instances' access
+#     to the ObjectStore and its Secrets) — create can't be named, every
+#     other write is by name; RBAC lets it grant only what it holds (no
+#     escalate / bind);
+#   - its leader-election Lease 822e3f5c.cnpg.io (manager.go) and events.
+# No metrics auth (TokenReview / SubjectAccessReview): its metrics listener
+# is off. The upstream objectstore editor / viewer ClusterRoles (aggregation
+# roles for people) are dropped.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-barman-cloud
+  namespace: cnpg-system
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [barmancloud.cnpg.io]
+    resources: [objectstores]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [barmancloud.cnpg.io]
+    resources: [objectstores/status]
+    verbs: [get, update, patch]
+  - apiGroups: [barmancloud.cnpg.io]
+    resources: [objectstores/finalizers]
+    verbs: [update]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [backups]
+    verbs: [get, list, watch]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters/finalizers]
+    verbs: [update]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
+    verbs: [get, list, watch, create]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
+    resourceNames: [portcullis-pg-barman-cloud]
+    verbs: [update, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [822e3f5c.cnpg.io]
+    verbs: [get, update, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-barman-cloud
+  namespace: cnpg-system
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: portcullis-barman-cloud}
+subjects:
+  - {kind: ServiceAccount, name: plugin-barman-cloud, namespace: cnpg-system}

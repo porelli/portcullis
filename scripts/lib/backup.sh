@@ -467,6 +467,7 @@ backup_list() {
 _backup_cred() { local o="BACKUP_$1"; printf '%s' "${!o:-${!1:-}}"; }
 
 _restic_require() {
+  backup_dest_restic
   [ -n "${BACKUP_REPOSITORY:-}" ] || fail "BACKUP_REPOSITORY is not set in .env (see docs/backups.md)"
   [ -n "${BACKUP_PASSWORD:-}" ] || fail "BACKUP_PASSWORD is not set in .env (./portcullis init generates it)"
   case "$BACKUP_REPOSITORY" in
@@ -545,6 +546,9 @@ backup_offsite() {
     --keep-daily "$d" --keep-weekly "$w" --keep-monthly "$m" --prune >/dev/null \
     || warn "restic forget/prune failed (the new snapshot is safe)"
   _backup_metrics offsite $(( $(date +%s) - t0 )) "$(_backup_size_bytes "$dir")"
+  # The Hub's backup_stale (contract §14.5): the last core backup that
+  # reached the destination (Kubernetes; a failure to record only warns).
+  if _rt_is_kube && [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then kube_backup_status_record || warn "could not record the backup's time for the Hub (ConfigMap portcullis-backup-status)"; fi
   ok "Off-host backup done ($BACKUP_REPOSITORY)."
 }
 
@@ -574,6 +578,209 @@ _restic_restore_to() {
     return 0
   fi
   printf '%s' "$target$BACKUP_SNAPSHOT_PATH"
+}
+
+# ── the backup destination (Kubernetes; spec §9.3, plan Task 26) ──
+#
+# PORTCULLIS_BACKUP_S3_URL in .env (the bucket path-style, no secret) and
+# secrets/backup-destination.env (0600: AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION), backed up with secrets/. The
+# credentials come from stdin only; they reach restic and curl by
+# environment / a config on stdin, the cluster as Secret backup-destination
+# (ha.sh kube_backup_destination_sync), never argv or a log.
+
+BACKUP_DEST_FILE_REL="secrets/backup-destination.env"
+BACKUP_DEST_KEYS="AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
+backup_dest_file() { printf '%s/%s' "$PORTCULLIS_ROOT" "$BACKUP_DEST_FILE_REL"; }
+
+# backup_dest_url_problem <url> — why the URL isn't a destination (one
+# line), or nothing. https only (http only with HUB_DEV=1: a local test
+# endpoint); a host, a bucket (S3 naming: 3–63 of [a-z0-9.-]), an optional
+# prefix of plain path segments; no userinfo, query, fragment or spaces.
+backup_dest_url_problem() {
+  local u="$1" rest host path bucket
+  case "$u" in
+    https://*) rest="${u#https://}" ;;
+    http://*) [ "${HUB_DEV:-}" = 1 ] || { echo "the destination must be https:// (its credentials sign every request)"; return 0; }; rest="${u#http://}" ;;
+    *) echo "the destination must be an https:// URL (path-style: https://<endpoint>/<bucket>[/<prefix>])"; return 0 ;;
+  esac
+  case "$rest" in *@*|*\?*|*\#*|*" "*|*"\\"*) echo "the destination URL has credentials, a query, a fragment or a space: give only https://<endpoint>/<bucket>[/<prefix>]"; return 0 ;; esac
+  host="${rest%%/*}"; path="${rest#"$host"}"; path="${path#/}"; path="${path%/}"
+  [[ "$host" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || { echo "the destination URL has no valid host"; return 0; }
+  bucket="${path%%/*}"
+  [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || { echo "the destination URL names no valid bucket (https://<endpoint>/<bucket>[/<prefix>])"; return 0; }
+  [ "$path" = "$bucket" ] || [[ "${path#"$bucket"/}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || { echo "the destination's prefix may hold only [A-Za-z0-9._-] segments"; return 0; }
+  case "/$path/" in */./*|*/../*) echo "the destination's prefix has . or .. segments"; return 0 ;; esac
+  return 0
+}
+
+# backup_dest_parts — splits PORTCULLIS_BACKUP_S3_URL (trailing / dropped)
+# into _BD_SCHEME, _BD_HOST (with port), _BD_BUCKET, _BD_PREFIX ("" or
+# "a/b"), _BD_ENDPOINT (scheme://host).
+backup_dest_parts() {
+  local u="${PORTCULLIS_BACKUP_S3_URL%/}" rest path
+  _BD_SCHEME="${u%%://*}"; rest="${u#*://}"
+  _BD_HOST="${rest%%/*}"; path="${rest#"$_BD_HOST"/}"
+  _BD_BUCKET="${path%%/*}"; _BD_PREFIX=""
+  [ "$path" = "$_BD_BUCKET" ] || _BD_PREFIX="${path#"$_BD_BUCKET"/}"
+  _BD_ENDPOINT="$_BD_SCHEME://$_BD_HOST"
+}
+
+# backup_dest_sub <name> — <url>/<name> (core, cnpg, longhorn): the key
+# prefix one mechanism writes under.
+backup_dest_sub() { printf '%s/%s' "${PORTCULLIS_BACKUP_S3_URL%/}" "$1"; }
+
+# backup_dest_read — the credentials file into _BD_AWS_ACCESS_KEY_ID,
+# _BD_AWS_SECRET_ACCESS_KEY, _BD_AWS_DEFAULT_REGION (shell variables, never
+# exported here); fails closed on a missing / malformed file.
+backup_dest_read() {
+  local f line k
+  f="$(backup_dest_file)"
+  [ -s "$f" ] || fail "the backup destination is set (PORTCULLIS_BACKUP_S3_URL) but $BACKUP_DEST_FILE_REL is missing: ./portcullis backup destination set"
+  _BD_AWS_ACCESS_KEY_ID="" _BD_AWS_SECRET_ACCESS_KEY="" _BD_AWS_DEFAULT_REGION=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    k="${line%%=*}"
+    case " $BACKUP_DEST_KEYS " in *" $k "*) ;; *) fail "$BACKUP_DEST_FILE_REL has an unknown line (only $BACKUP_DEST_KEYS)" ;; esac
+    printf -v "_BD_$k" '%s' "${line#*=}"
+  done < "$f"
+  [ -n "$_BD_AWS_ACCESS_KEY_ID" ] && [ -n "$_BD_AWS_SECRET_ACCESS_KEY" ] || fail "$BACKUP_DEST_FILE_REL lacks AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+  [ -n "$_BD_AWS_DEFAULT_REGION" ] || _BD_AWS_DEFAULT_REGION=us-east-1
+}
+
+# backup_dest_restic — with a destination (Kubernetes): restic's repository
+# is s3:<url>/core and its credentials the destination's, as BACKUP_AWS_*
+# shell variables (they win over Route53's AWS_*: _backup_cred). Another
+# BACKUP_REPOSITORY is refused (one destination, spec §9.3).
+backup_dest_restic() {
+  local want
+  [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ] || return 0
+  _rt_is_kube || fail "PORTCULLIS_BACKUP_S3_URL is for Kubernetes installs (Docker / Podman: BACKUP_REPOSITORY)"
+  want="s3:$(backup_dest_sub core)"
+  [ -z "${BACKUP_REPOSITORY:-}" ] || [ "$BACKUP_REPOSITORY" = "$want" ] \
+    || fail "BACKUP_REPOSITORY ($BACKUP_REPOSITORY) isn't the backup destination's $want: unset it (the destination is the one off-host copy)"
+  backup_dest_read
+  BACKUP_REPOSITORY="$want"
+  # shellcheck disable=SC2034  # read through _backup_cred's indirection
+  BACKUP_AWS_ACCESS_KEY_ID="$_BD_AWS_ACCESS_KEY_ID" BACKUP_AWS_SECRET_ACCESS_KEY="$_BD_AWS_SECRET_ACCESS_KEY" BACKUP_AWS_DEFAULT_REGION="$_BD_AWS_DEFAULT_REGION"
+}
+
+# _backup_dest_curl <method> <url> [curl args…] — one SigV4 request (curl
+# --aws-sigv4, curl ≥ 7.75): the key pair reaches curl as a config on stdin
+# (-K -), never argv; prints the HTTP status.
+_backup_dest_curl() {
+  local m="$1" u="$2"; shift 2
+  { printf 'user = "%s:%s"\n' "$_BD_AWS_ACCESS_KEY_ID" "$_BD_AWS_SECRET_ACCESS_KEY"
+    printf 'aws-sigv4 = "aws:amz:%s:s3"\n' "$_BD_AWS_DEFAULT_REGION"; } \
+    | curl -s -o /dev/null -w '%{http_code}' --max-time 60 -K - -X "$m" "$@" "$u" || true
+}
+
+# backup_dest_test — writes one object under <url>/ and deletes it.
+backup_dest_test() {
+  local key code t
+  require_cmd curl
+  [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ] || fail "no backup destination is set (./portcullis backup destination set)"
+  backup_dest_read
+  key="$(backup_dest_sub ".portcullis-test-$(date +%s)-$(openssl rand -hex 4)")"
+  t="$(mktemp)"; printf 'portcullis destination test %s\n' "$(date -u +%FT%TZ)" > "$t"
+  code="$(_backup_dest_curl PUT "$key" -H 'Content-Type: text/plain' -H "x-amz-content-sha256: $(_kube_sha "$t")" --data-binary @"$t")"
+  rm -f "$t"
+  case "$code" in 200|201|204) ;; *) fail "the backup destination refused a test write (HTTP ${code:-none} for PUT $key): check the URL, the bucket and the credentials" ;; esac
+  code="$(_backup_dest_curl DELETE "$key" -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")"
+  case "$code" in 200|202|204) ;; *) fail "the backup destination took the test object but refused its delete (HTTP ${code:-none}): $key is left there; the backups' retention needs delete rights" ;; esac
+  ok "Backup destination: wrote and deleted a test object under ${PORTCULLIS_BACKUP_S3_URL%/}/"
+}
+
+# backup_dest_set <url> — the credentials from stdin (see the help).
+backup_dest_set() {
+  local url="${1%/}" p line k f tmp n=0 id="" sec="" reg=""
+  p="$(backup_dest_url_problem "$url")"
+  [ -z "$p" ] || fail "$p"
+  [ ! -t 0 ] || fail "backup destination set reads the credentials from stdin (AWS_ACCESS_KEY_ID=… / AWS_SECRET_ACCESS_KEY=… lines), never from an argument: pipe them in"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [ -n "$line" ] || continue
+    n=$((n + 1)); [ "$n" -le 8 ] || fail "too many lines on stdin (the credentials only)"
+    k="${line%%=*}"
+    case "$k" in AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_DEFAULT_REGION) ;; *) fail "unknown line on stdin (only AWS_ACCESS_KEY_ID=, AWS_SECRET_ACCESS_KEY=, AWS_DEFAULT_REGION=)" ;; esac
+    [[ "${line#*=}" =~ ^[A-Za-z0-9+/=._~:-]{1,256}$ ]] || fail "the value of $k on stdin is empty, too long or has a character a credential doesn't"
+    case "$k" in
+      AWS_ACCESS_KEY_ID) id="${line#*=}" ;;
+      AWS_SECRET_ACCESS_KEY) sec="${line#*=}" ;;
+      AWS_DEFAULT_REGION) reg="${line#*=}"; [[ "$reg" =~ ^[a-z0-9-]{2,32}$ ]] || fail "AWS_DEFAULT_REGION on stdin isn't a region name" ;;
+    esac
+  done
+  [ -n "$id" ] && [ -n "$sec" ] || fail "stdin needs AWS_ACCESS_KEY_ID=… and AWS_SECRET_ACCESS_KEY=… lines"
+  f="$(backup_dest_file)"
+  (umask 077 && mkdir -p "${f%/*}")
+  tmp="$(umask 077 && mktemp "${f%/*}/.backup-destination.XXXXXX")"
+  { printf 'AWS_ACCESS_KEY_ID=%s\n' "$id"; printf 'AWS_SECRET_ACCESS_KEY=%s\n' "$sec"; printf 'AWS_DEFAULT_REGION=%s\n' "${reg:-us-east-1}"; } > "$tmp"
+  chmod 600 "$tmp" && mv -f "$tmp" "$f"
+  env_set PORTCULLIS_BACKUP_S3_URL "$url"
+  export PORTCULLIS_BACKUP_S3_URL="$url"
+  ok "Backup destination set: $url (credentials in $BACKUP_DEST_FILE_REL, 0600)."
+  backup_dest_test
+  kube_backup_destination_sync || fail "could not sync the destination to the cluster (Secret backup-destination): run ./portcullis up"
+  ha_longhorn_backup_target
+  info "Run ./portcullis up to apply it to the release (the Hub's HUB_BACKUP_DESTINATION; in HA CloudNativePG's archive and Longhorn's backup target)."
+}
+
+# backup_dest_show — the URL, its parts, the region and whether the
+# credentials are set; never a key or a part of one.
+backup_dest_show() {
+  local f
+  f="$(backup_dest_file)"
+  if [ -z "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
+    echo "Backup destination: not set (./portcullis backup destination set <url> < credentials)"
+    [ ! -e "$f" ] || warn "$BACKUP_DEST_FILE_REL exists without PORTCULLIS_BACKUP_S3_URL: run backup destination unset, or set it again"
+    return 0
+  fi
+  backup_dest_parts
+  echo "Backup destination: ${PORTCULLIS_BACKUP_S3_URL%/}"
+  echo "  endpoint: $_BD_ENDPOINT  bucket: $_BD_BUCKET  prefix: ${_BD_PREFIX:-(none)}"
+  echo "  core archive (restic): s3:$(backup_dest_sub core)"
+  echo "  CloudNativePG (barman-cloud, HA): s3://$_BD_BUCKET/${_BD_PREFIX:+$_BD_PREFIX/}cnpg"
+  echo "  Longhorn (HA): s3://$_BD_BUCKET@<region>/${_BD_PREFIX:+$_BD_PREFIX/}longhorn"
+  if [ -s "$f" ]; then
+    backup_dest_read
+    echo "  region: $_BD_AWS_DEFAULT_REGION"
+    echo "  credentials: set ($BACKUP_DEST_FILE_REL, mode $(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f"))"
+  else
+    echo "  credentials: MISSING ($BACKUP_DEST_FILE_REL)"
+  fi
+}
+
+# backup_dest_unset — the URL, the file and the cluster's copies removed
+# (the bucket's contents are kept).
+backup_dest_unset() {
+  env_set PORTCULLIS_BACKUP_S3_URL ""
+  PORTCULLIS_BACKUP_S3_URL=""
+  rm -f "$(backup_dest_file)"
+  kube_backup_destination_sync || warn "could not remove the cluster's Secret backup-destination: delete it by hand"
+  ha_longhorn_backup_target
+  ok "Backup destination removed (the bucket's contents are kept). Run ./portcullis up to apply it to the release."
+}
+
+cmd_backup_destination() {
+  local sub="${1:-}"
+  case "$sub" in
+    -h|--help) help_backup_destination; return 0 ;;
+    "") usage_error "backup destination" "expected set, show, test or unset" ;;
+    set) shift
+         case "${1:-}" in -h|--help) help_backup_destination; return 0 ;; "") usage_error "backup destination set" "expected <url> (the credentials come from stdin)" ;; esac
+         [ $# -eq 1 ] || usage_error "backup destination set" "only <url> is an argument: the credentials come from stdin, never argv" ;;
+    show|test|unset) shift
+         case "${1:-}" in -h|--help) help_backup_destination; return 0 ;; "") ;; *) usage_error "backup destination $sub" "unknown argument: $1" ;; esac ;;
+    *) usage_error "backup destination" "unknown subcommand: $sub (set, show, test, unset)" ;;
+  esac
+  need_env
+  _rt_is_kube || fail "the backup destination is for Kubernetes installs (Docker / Podman: BACKUP_REPOSITORY with backup --offsite)"
+  case "$sub" in
+    set) backup_dest_set "$1" ;;
+    show) backup_dest_show ;;
+    test) backup_dest_test ;;
+    unset) backup_dest_unset ;;
+  esac
 }
 
 # ── verify ─────────────────────────────────────────────────
@@ -1274,7 +1481,7 @@ backup_schedule_systemd() {
   else
     after="network-online.target docker.service" requires="docker.service" user_line="User=$user" wanted="timers.target"
   fi
-  [ -z "${BACKUP_REPOSITORY:-}" ] || offsite=" --offsite"
+  [ -z "${BACKUP_REPOSITORY:-}${PORTCULLIS_BACKUP_S3_URL:-}" ] || offsite=" --offsite"
   [ "$PORTCULLIS_ROOT" = "$PORTCULLIS_HOME" ] || env_line="Environment=PORTCULLIS_ROOT=$PORTCULLIS_ROOT"
   svc="$(cat <<EOF
 # portcullis-backup.service — generated by ./portcullis backup schedule --systemd
@@ -1365,8 +1572,51 @@ Options:
   --list      list local backups (with --offsite: the restic snapshots;
               --json for restic's JSON)
 
-Subcommands: verify, schedule (see 'portcullis backup <sub> --help').
+Subcommands: verify, schedule, destination (see 'portcullis backup <sub> --help').
 See docs/backups.md.
+EOF
+}
+
+help_backup_destination() {
+  cat <<'EOF'
+Usage: portcullis backup destination set <url> < credentials
+       portcullis backup destination show
+       portcullis backup destination test
+       portcullis backup destination unset
+
+Kubernetes only (spec §9.3): the install's one backup destination, an
+S3-compatible bucket outside the cluster. Every core mechanism writes
+there, each under its own prefix of <url>:
+  core/      the `backup --offsite` archive (restic; BACKUP_REPOSITORY must
+             then be unset or equal s3:<url>/core)
+  cnpg/      Postgres WAL and base backups (CloudNativePG's barman-cloud
+             plugin, in HA)
+  longhorn/  Longhorn backups of the replicated volumes (in HA)
+HA can't be turned on without it.
+
+<url> is the bucket, path-style: https://<endpoint>[:port]/<bucket>[/<prefix>]
+(AWS: https://s3.<region>.amazonaws.com/<bucket>/...). No credentials,
+query or fragment in it.
+
+set reads the credentials from STDIN ONLY (never an argument), one per
+line:
+  AWS_ACCESS_KEY_ID=...
+  AWS_SECRET_ACCESS_KEY=...
+  AWS_DEFAULT_REGION=...      (optional, default us-east-1)
+writes PORTCULLIS_BACKUP_S3_URL into .env and the credentials into
+secrets/backup-destination.env (0600; backed up with secrets/), runs
+`test`, then syncs them to the cluster (Secret backup-destination in
+cnpg-system and, with Longhorn, in longhorn-system). For example:
+  printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$K" "$S" \
+    | ./portcullis backup destination set https://s3.example.org/bucket/portcullis
+Then ./portcullis up applies it to the release.
+
+show    the URL, its parts, the region and whether credentials are set
+        (never a key)
+test    writes one object under <url>/ and deletes it again (curl SigV4,
+        curl >= 7.75; the key pair on curl's stdin)
+unset   removes the URL, the credentials file and the cluster's copies (the
+        bucket's contents are kept)
 EOF
 }
 
@@ -1452,6 +1702,7 @@ cmd_backup() {
   local offsite=false list=false json=false sub="" snap="" ldir="" local_only=false systemd=false cal="*-*-* 03:15:00" out=""
   case "${1:-}" in
     verify|schedule) sub="$1"; shift ;;
+    destination) shift; cmd_backup_destination "$@"; return ;;
   esac
   while [ $# -gt 0 ]; do
     case "$sub:$1" in

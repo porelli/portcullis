@@ -130,7 +130,7 @@ done
 # LLDAP_KEY_SEED_FILE, LLDAP_KEY_FILE empty, no plain LLDAP_KEY_SEED), and
 # another seed is refused at start (the stored passwords are bound to it).
 K -n "$NS" get deploy lldap -o json | jq -e '.spec.template.spec.containers[0].env | (map(select(.name == "LLDAP_KEY_SEED")) == [])
-    and (map(select(.name == "LLDAP_KEY_FILE"))[0].value // "x") == ""
+    and (map(select(.name == "LLDAP_KEY_FILE")) | length == 1 and (.[0].value // "") == "" and (.[0] | has("valueFrom") | not))
     and (map(select(.name == "LLDAP_KEY_SEED_FILE"))[0].value // "") == "/run/portcullis/lldap/key-seed"' >/dev/null \
   || fail "LLDAP isn't on its seed file (LLDAP_KEY_SEED_FILE, LLDAP_KEY_FILE empty, no LLDAP_KEY_SEED)"
 LIMG="$(K -n "$NS" get deploy lldap -o jsonpath='{.spec.template.spec.containers[0].image}')"

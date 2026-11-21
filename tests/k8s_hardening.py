@@ -1441,14 +1441,15 @@ def check_ha_infra():
     import hashlib
     ha_sh = (K.ROOT / "scripts" / "lib" / "ha.sh").read_text()
     pins = re.findall(r"([a-z-]+/upstream/[A-Za-z0-9._-]+) ([0-9a-f]{64})", ha_sh)
-    if len(pins) != 8:
-        F.add(f"ha.sh _ha_pins: {len(pins)} pins (want the 8 upstream files)")
+    if len(pins) != 9:
+        F.add(f"ha.sh _ha_pins / _ha_barman_pins: {len(pins)} pins (want the 9 upstream files)")
     for f, want in pins:
         got = hashlib.sha256((K.ROOT / "kube" / "ha" / f).read_bytes()).hexdigest()
         if got != want:
             F.add(f"kube/ha/{f}: sha256 {got} != the pin {want}")
     renders = {c: ha_render(c) for c in ("longhorn", "snapshotter", "fencing", "certmanager")}
     renders["snapshotter-crds"] = [d for d in yaml.safe_load_all((K.ROOT / "kube/ha/snapshotter/upstream/crds.yaml").read_text()) if d]
+    renders["barman"] = barman_render()
     for c, docs in renders.items():
         for p in ha_image_problems(c, docs):
             F.add(p)
@@ -1724,6 +1725,8 @@ def check_ha_infra():
     args = pod_spec_of(ctrl)["containers"][0]["args"]
     if f"--namespace={K.CNPG_NS}" not in args or any("acme" in a for a in args):
         F.add(f"certmanager: the controller's args {args} (--namespace={K.CNPG_NS}, no ACME)")
+    for p in barman_problems(renders["barman"]):
+        F.add(p)
     # The StorageClass.
     sc = yaml.safe_load((K.ROOT / "kube/storage/storageclass-replicated.yaml").read_text())
     if (sc["metadata"]["name"], sc["provisioner"], sc["reclaimPolicy"], sc["parameters"].get("numberOfReplicas"), sc["parameters"].get("dataLocality")) \
@@ -1739,6 +1742,62 @@ def check_ha_infra():
 
 
 K_LONGHORN_NS, K_FENCING_NS, K_CERTMANAGER_NS = "longhorn-system", "portcullis-fencing", "cert-manager"
+
+
+def barman_render():
+    """kubectl kustomize kube/ha/barman-cloud (ha_install_barman's render)."""
+    env = dict(os.environ)
+    kc = env.get("KUBECTL") or "kubectl"
+    out = subprocess.run([kc, "kustomize", str(K.ROOT / "kube/ha/barman-cloud")], check=True, capture_output=True, text=True, env=env).stdout
+    return [d for d in yaml.safe_load_all(out) if d]
+
+
+def barman_problems(docs):
+    """Plan Task 26: the barman-cloud plugin's rights end at cnpg-system
+    (WATCH_NAMESPACE; no ClusterRole / ClusterRoleBinding at all), Secrets
+    read only, RBAC writes only its Cluster's pair by name (create aside),
+    its Lease by name; the sidecar image pinned; no upstream Secret."""
+    out = []
+    for d in docs:
+        k, n, ns = d.get("kind"), d["metadata"]["name"], d["metadata"].get("namespace")
+        if k in ("ClusterRole", "ClusterRoleBinding"):
+            out.append(f"barman: renders {k} {n} (its rights are Roles in {K.CNPG_NS})")
+        if k not in ("CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding") and ns != K.CNPG_NS:
+            out.append(f"barman: {k} {n} outside {K.CNPG_NS} ({ns})")
+        if k == "Secret":
+            out.append(f"barman: renders the Secret {n} (the sidecar image is pinned in the Deployment)")
+    for _, r in rules_of(docs, "Role"):
+        res, verbs, named = set(r.get("resources", [])), set(r.get("verbs", [])), r.get("resourceNames")
+        if "" in r.get("apiGroups", []) and "secrets" in res and verbs - {"get", "list", "watch"}:
+            out.append(f"barman: Secrets {sorted(verbs)} (read only)")
+        if res & {"roles", "rolebindings"} and (verbs - {"get", "list", "watch", "create"}) and named != ["portcullis-pg-barman-cloud"]:
+            out.append(f"barman: RBAC {sorted(verbs)} on {sorted(res)} not by the Cluster's name")
+        if "leases" in res and (verbs - {"create"}) and named != ["822e3f5c.cnpg.io"]:
+            out.append(f"barman: Leases {sorted(verbs)} not by its name")
+        if "*" in verbs or "*" in res or "escalate" in verbs or "bind" in verbs:
+            out.append(f"barman: a wildcard / escalate / bind rule {r}")
+    dep = next((d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"] == "barman-cloud"), None)
+    if dep is None:
+        return out + ["barman: no Deployment barman-cloud"]
+    # Mutation: the rule checks bite (a Secret write, an unnamed RBAC
+    # patch, a ClusterRole).
+    if docs and docs[0].get("metadata", {}).get("name") != "m":
+        mut = [{"kind": "Role", "metadata": {"name": "m", "namespace": K.CNPG_NS}, "rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get", "create"]},
+                {"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles"], "verbs": ["patch"]}]},
+               {"kind": "ClusterRole", "metadata": {"name": "c"}, "rules": []}]
+        if len([p for p in barman_problems(mut) if "no Deployment" not in p]) != 3:
+            out.append(f"barman_problems misses a mutation: {barman_problems(mut)}")
+    c = pod_spec_of(dep)["containers"][0]
+    env = {e["name"]: e.get("value") for e in c.get("env", [])}
+    if env.get("WATCH_NAMESPACE") != K.CNPG_NS:
+        out.append(f"barman: WATCH_NAMESPACE {env.get('WATCH_NAMESPACE')} (want {K.CNPG_NS})")
+    if not re.match(r"^ghcr\.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0\.16\.0@sha256:[0-9a-f]{64}$", env.get("SIDECAR_IMAGE") or ""):
+        out.append(f"barman: SIDECAR_IMAGE {env.get('SIDECAR_IMAGE')} (the pinned sidecar by digest)")
+    sc = c.get("securityContext") or {}
+    if sc.get("allowPrivilegeEscalation") is not False or sc.get("readOnlyRootFilesystem") is not True or (sc.get("capabilities") or {}).get("drop") != ["ALL"]:
+        out.append(f"barman: the plugin container's securityContext {sc}")
+    return out
+
 
 if __name__ == "__main__":
     sys.exit(main())

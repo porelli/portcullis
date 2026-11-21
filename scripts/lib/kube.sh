@@ -1557,9 +1557,7 @@ kube_sync_secrets() {
   [ "${1:-}" = --full ] || [ "${KUBE_SYNC_FULL:-}" = 1 ] && full=true
   ns="$(kube_ns)"
   kube_nodeadm_prepare
-  # LLDAP's key seed (users.sh, made by init): synced as secrets-lldap
-  # with secrets/lldap/; never synced without a usable one (fail closed).
-  lldap_key_seed_require
+  kube_sync_prepare_t26  # LLDAP's seed required; the backup destination's Secret (ha.sh)
   kube_sessions_ha_prepare  # the session store's HA configs (ha.sh)
   kube_vault_join_tls_prepare  # Vault's join listener TLS (ha.sh)
   kube_sync_stage
@@ -1698,7 +1696,7 @@ kube_render_values() {
      cnpg: {nodesAtPrimary: $pgn, minInstances: $pgmin},
      dnsProvider: (if ($dnsname | test("^[a-z0-9-]{1,32}$")) then $dnsname else "" end)}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
     || fail "could not write $f"
-  kube_nodeadm_values "$f"
+  kube_nodeadm_values "$f"; kube_backup_values "$f"  # nodeadm (node.sh), the backup destination (ha.sh)
 }
 
 # ── the release ──
@@ -2011,7 +2009,7 @@ _backup_create_kube() {
   # every runtime shares), LLDAP's as lldap.dump (no lldap_data volume here).
   printf '  %-26s' "postgres (pg_dump)"; _kube_pg_dump keycloak "$work/postgres.dump"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
   printf '  %-26s' "lldap (pg_dump)"; _kube_pg_dump lldap "$work/lldap.dump"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
-  for spec in $BACKUP_FILE_VOLUMES; do
+  for spec in $BACKUP_FILE_VOLUMES $KUBE_BACKUP_EXTRA_VOLUMES; do
     IFS=: read -r key uid gid <<< "$spec"
     _kube_volume_exists "$key" || continue
     printf '  %-26s' "$key"
@@ -2138,6 +2136,7 @@ _backup_restore_kube() {
     confirm "Continue with restore?" || { echo "Cancelled."; return 0; }
   fi
   [ -n "$RESTORE_RUNTIME" ] || restore_runtime_from_host
+  kube_lldap_convert_preflight "$dir"  # a Docker / Podman backup's LLDAP first (lldap_convert.sh)
   # Every later sync of this run puts every object (never compared).
   export KUBE_SYNC_FULL=1
   info "Stopping the Hub..."
@@ -2176,7 +2175,7 @@ _backup_restore_kube() {
   _kube_restore_pg "$dir" "$pre"
   _kube_empty_vault || fail "could not empty Vault's PVCs"
   _kube_restore_vault "$dir"
-  for spec in $BACKUP_FILE_VOLUMES; do
+  for spec in $BACKUP_FILE_VOLUMES $KUBE_BACKUP_EXTRA_VOLUMES; do
     IFS=: read -r key uid gid <<< "$spec"
     [ -f "$dir/$key.tar.gz" ] || continue
     # LLDAP is on Postgres here: no lldap_data volume (see _kube_restore_pg).

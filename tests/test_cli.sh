@@ -143,6 +143,11 @@ backup schedule|--systemd is required
 backup schedule --systemd --on-calendar|--on-calendar needs a value
 backup schedule --cron|unknown argument: --cron
 restore|expected <backup-dir> or --from-offsite
+backup destination|expected set, show, test or unset
+backup destination bogus|unknown subcommand: bogus
+backup destination set|expected <url> (the credentials come from stdin)
+backup destination set https://s3.example.org/b AKIASECRET|the credentials come from stdin, never argv
+backup destination show extra|unknown argument: extra
 restore a b|unexpected argument: b
 restore --frob|unknown option: --frob
 version --bogus|unknown argument: --bogus
@@ -740,6 +745,10 @@ expect_eq "the rt_* lint catches a docker call in a function without the guard" 
 case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' '  kube_ctl create secret generic x --from-literal=a=b' '  kube_helm upgrade --set hub.secret=$(cat secrets/hub/x)' '  helm upgrade --set-string pw=$POSTGRES_PASSWORD' '  docker run -e LLDAP_KEY_SEED="$(cat "$f")" x' '  jq --arg s "$LLDAP_KEY_SEED" x' | grep -cE -e "$ARGV_RE")" in
   7) t_pass "argv secret pattern catches --arg \"\$(cat ...)\", secret variables, --from-literal, --set with a secret and LLDAP's key seed" ;; *) t_fail "argv secret pattern" ;; esac
 
+# Task 26: the backup destination's help; the credentials from stdin only.
+run backup destination --help
+expect_eq "backup destination --help exits 0" "$RC" 0
+case "$OUT" in *"STDIN ONLY"*"AWS_ACCESS_KEY_ID="*"never a key"*) t_pass "backup destination --help: credentials from stdin, show never prints a key" ;; *) t_fail "backup destination --help: $OUT" ;; esac
 # version and backup schedule work without .env (and without docker).
 run version
 expect_eq "version without .env exits 0" "$RC" 0
@@ -1456,7 +1465,14 @@ DI="$WORK/docker-init"; rm -rf "$DI"; mkdir -p "$DI/a" "$DI/b/certs" "$DI/b/secr
     # shellcheck disable=SC1091
     . "$HERE/../scripts/lib/common.sh"
     # shellcheck disable=SC1091
+    # LLDAP's key seed (users.sh, from main): init makes it, as the CLI
+    # does; the stubs below then replace users.sh's account / invite steps.
+    # shellcheck disable=SC1091
+    . "$HERE/../scripts/lib/users.sh"
+    # shellcheck disable=SC1091
     . "$WORK/test-init-stub.sh"
+    # The stub engine answers every volume as present: no old users.db here.
+    lldap_key_seed_new_on_old_data() { :; }
     # shellcheck disable=SC1091
     . "$HERE/../scripts/lib/stack.sh"
     # shellcheck disable=SC2034  # read by init_run

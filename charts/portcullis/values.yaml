@@ -178,6 +178,22 @@ cnpg:
   nodesAtPrimary: 0
   minInstances: 0
 
+# The backup destination (plan Task 26, spec §9.3; ha.sh kube_backup_values):
+# destination = PORTCULLIS_BACKUP_S3_URL is set (the Hub's
+# HUB_BACKUP_DESTINATION); cnpg = CloudNativePG's WAL archive and base
+# backups through the barman-cloud plugin (only with the plugin installed:
+# ha_install_barman), its keys under <url>/cnpg, the credentials the CLI's
+# Secret backup-destination in cnpg-system.
+backup:
+  destination: false
+  cnpg:
+    enabled: false
+    destinationPath: ""
+    endpointURL: ""
+    port: 443
+    retention: 30d
+    schedule: "0 15 3 * * *"
+
 # The measured memory peaks, MiB (user ruling 2026-11-19, plan Amendment 2):
 # the higher of the test server's `docker stats` (spike-cluster.md, "H7")
 # and the k3d cluster's `kubectl top` working set under load

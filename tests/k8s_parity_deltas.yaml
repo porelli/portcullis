@@ -52,6 +52,7 @@ env-missing:
 
 env-extra:
   - {service: hub, item: HUB_DNS_PROVIDER, reason: "Kubernetes: the main domain's DNS provider name for the HA page (Hub Task 15); on Docker the Hub reads core.env's DNS_PROVIDER; a name only, never a credential"}
+  - {service: hub, item: HUB_BACKUP_DESTINATION, reason: "Kubernetes (plan Task 26, Hub Task 15): set when the CLI has a backup destination (PORTCULLIS_BACKUP_S3_URL), its presence only; Docker / Podman have no destination (BACKUP_REPOSITORY)"}
   - {service: hub, item: HUB_TRAEFIK_PEER, reason: "Kubernetes: the routed apps' NetworkPolicy peer, = the admission params' traefik (kube_traefik_peer; Hub Task 13)"}
   - {service: vault, item: VAULT_RAFT_NODE_ID, reason: "Kubernetes (plan Task 25): node_id = the pod name (downward API: vault-0…); compose renders the template's default portcullis-vault-1"}
   - {service: vault, item: VAULT_API_ADDR, reason: "Kubernetes (plan Task 25): <pod>.vault-internal:8200, each voter's own address; compose's default http://vault:8200"}

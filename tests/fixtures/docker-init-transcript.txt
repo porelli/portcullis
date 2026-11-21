@@ -11,6 +11,7 @@
 ==> Generated HUB_PROXY_SECRET in .env
 ==> Generated HUB_CLI_PROXY_SECRET in .env
 ==> Generated BACKUP_PASSWORD in .env
+==> Generated secrets/lldap/key-seed (protects LLDAP's stored passwords; backed up with secrets/).
 ==> .env is ready. Review it, then run ./portcullis init to set up the stack.
 rc=0
 == init_run (stubbed), runtime docker
@@ -26,6 +27,7 @@ rc=0
 ==> Generated HUB_PROXY_SECRET in .env
 ==> Generated HUB_CLI_PROXY_SECRET in .env
 ==> Generated BACKUP_PASSWORD in .env
+==> Generated secrets/lldap/key-seed (protects LLDAP's stored passwords; backed up with secrets/).
 ==> Skipping DNS record setup.
 ==> Initialising Vault...
 ==> Starting services...

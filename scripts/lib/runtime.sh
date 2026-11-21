@@ -670,9 +670,12 @@ source "$PORTCULLIS_LIB/kube.sh"
 # cluster addresses; plan R8).
 # shellcheck source=kube_install.sh
 source "$PORTCULLIS_LIB/kube_install.sh"
-# Postgres on CloudNativePG, LLDAP's key and Postgres Secrets (plan Task 23).
+# Postgres on CloudNativePG, LLDAP's Postgres Secrets (plan Task 23).
 # shellcheck source=ha.sh
 source "$PORTCULLIS_LIB/ha.sh"
+# LLDAP SQLite → Postgres on a Docker / Podman backup's restore (Task 26).
+# shellcheck source=lldap_convert.sh
+source "$PORTCULLIS_LIB/lldap_convert.sh"
 # nodeadm's objects, `kube params-sync` and its timer, the per-node host
 # checks (plan R8).
 # shellcheck source=node.sh

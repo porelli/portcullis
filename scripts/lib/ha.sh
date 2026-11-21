@@ -290,10 +290,11 @@ _kube_pg_drop_pre_restore() {
 #      unreadable → nothing changed);
 #   2. each dump pg_restore'd into <db>_restore, owned by its role
 #      (--no-owner --role, one transaction, the first error stops it); lldap
-#      from lldap.dump (a Kubernetes backup), else an empty lldap_restore
-#      (a Docker / Podman backup's LLDAP is SQLite: its conversion is plan
-#      Task 26's restore step) — any failure drops the half-made copies
-#      and refuses, the live pair untouched;
+#      from lldap.dump (a Kubernetes backup), else the lldap_restore the
+#      restore's pre-flight converted from the SQLite users.db of a Docker /
+#      Podman backup (lldap_convert.sh, KUBE_LLDAP_CONVERTED; kept as it
+#      is) — any failure drops the half-made copies and refuses, the live
+#      pair untouched;
 #   3. _kube_pg_swap; then LLDAP's schema Jobs deleted (the release makes
 #      them again) and the restored roles' passwords waited for.
 _kube_restore_pg() {
@@ -304,19 +305,19 @@ _kube_restore_pg() {
   _kube_pg_dump lldap "$pre/lldap.dump"
   for db in keycloak lldap; do
     dump="$dir/postgres.dump"; [ "$db" = keycloak ] || dump="$dir/lldap.dump"
+    # The converted LLDAP (the pre-flight's lldap_restore) stays as it is.
+    [ "$db" = keycloak ] || [ "${KUBE_LLDAP_CONVERTED:-false}" != true ] || continue
     if ! _kube_pg_fresh_db "${db}_restore" "$db"; then
       _kube_pg_exec dropdb --if-exists --force keycloak_restore >/dev/null 2>&1 || true
       fail "could not make the database ${db}_restore: the live databases are untouched"
     fi
-    [ "$db" = keycloak ] || [ -s "$dump" ] || continue
+    [ "$db" = keycloak ] || [ -s "$dump" ] || fail "the backup has no LLDAP database to restore (lldap.dump, or lldap_data.tar.gz converted first)"
     if ! _kube_pg_exec pg_restore -d "${db}_restore" --no-owner --no-privileges --role="$db" --exit-on-error --single-transaction < "$dump"; then
       _kube_pg_exec dropdb --if-exists --force keycloak_restore >/dev/null 2>&1 || true
       _kube_pg_exec dropdb --if-exists --force lldap_restore >/dev/null 2>&1 || true
       fail "pg_restore of ${dump##*/} failed: the live databases are untouched (their dumps before this restore: $pre/postgres.dump, $pre/lldap.dump)"
     fi
   done
-  [ -s "$dir/lldap.dump" ] || [ ! -f "$dir/lldap_data.tar.gz" ] \
-    || warn "This backup's LLDAP is SQLite (lldap_data.tar.gz, made on Docker / Podman): it isn't converted into Postgres on Kubernetes yet, so LLDAP starts empty."
   _kube_pg_swap || fail "could not put the restored databases in place (the live ones are untouched; dumps in $pre)"
   kube_ctl -n "$(kube_ns)" delete job -l portcullis.io/component=lldap-schema --ignore-not-found >/dev/null \
     || fail "could not remove LLDAP's schema Jobs"
@@ -851,6 +852,9 @@ $n probe fail no answer from the node's check"
   _ha_wait 600 "Longhorn's manager (DaemonSet longhorn-manager)" _ha_ds_ready "$KUBE_LONGHORN_NS" longhorn-manager
   _ha_wait 600 "Longhorn's CSI driver" _ha_longhorn_csi_ready
   _kube_apply_files "$PORTCULLIS_HOME/$KUBE_REPLICATED_SC" || fail "could not apply the StorageClass portcullis-core-replicated"
+  # The backup destination as Longhorn's backup target (Task 26; none set:
+  # an empty target).
+  ha_longhorn_backup_target
   _kube_applied_set ha.longhorn "$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/longhorn"/*.yaml "$PORTCULLIS_HOME/$HA_DIR/longhorn/upstream"/* "$PORTCULLIS_HOME/$KUBE_REPLICATED_SC")"
 }
 
@@ -911,6 +915,203 @@ ha_install_certmanager() {
 # refused).
 _ha_certmanager_webhook_ready() {
   kube_ctl get validatingwebhookconfiguration cert-manager-webhook -o json 2>/dev/null | jq -e '[.webhooks[].clientConfig.caBundle // ""] | all(length > 0)' >/dev/null
+}
+
+# ══ The backup destination in the cluster (plan Task 26, spec §9.3, R5) ══
+#
+# The destination itself is backup.sh's (PORTCULLIS_BACKUP_S3_URL +
+# secrets/backup-destination.env). Here:
+#   - kube_backup_destination_sync: the Secret backup-destination in
+#     cnpg-system (barman-cloud's ObjectStore) and, with Longhorn, in
+#     longhorn-system (its backup target) — AWS_ACCESS_KEY_ID,
+#     AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION and AWS_ENDPOINTS (Longhorn's
+#     custom endpoint), built from 0600 files (--from-file), never argv;
+#     removed from both when the destination is unset;
+#   - kube_backup_values: the chart's backup.* (the Hub's presence flag;
+#     CloudNativePG's archive only with the plugin installed);
+#   - ha_install_barman: the barman-cloud plugin (needs cert-manager: HA
+#     only, as the other Task 24 installs: `ha enable` calls it);
+#   - ha_longhorn_backup_target: Longhorn's BackupTarget default = <url>/
+#     longhorn, and its pods' egress to the destination's port;
+#   - kube_backup_status_record: the last core backup that reached the
+#     destination, for the Hub's backup_stale (ConfigMap
+#     portcullis-backup-status, the Hub's core Role reads it by name).
+
+KUBE_BACKUP_STATUS_CM="portcullis-backup-status"
+# Kubernetes keeps the Hub's instance backups on their own PVC hub-backups
+# (contract §20.1; on Docker they are inside hub_data): the core backup
+# carries it too (Task 19 review M9).
+# shellcheck disable=SC2034  # read by kube.sh (_backup_create_kube, _backup_restore_kube)
+KUBE_BACKUP_EXTRA_VOLUMES="hub_backups:$CT_UID_HUB:$CT_UID_HUB"
+
+# kube_sync_prepare_t26 — kube_sync_secrets' first steps from Task 26: LLDAP's
+# key seed (users.sh, made by init; synced as secrets-lldap with
+# secrets/lldap/) required before anything is synced (fail closed), then
+# the backup destination's Secret.
+kube_sync_prepare_t26() {
+  lldap_key_seed_require
+  kube_backup_destination_sync || fail "could not sync the backup destination's Secret backup-destination"
+}
+KUBE_BARMAN_NS="$KUBE_CNPG_NS"
+
+# kube_backup_destination_sync — the Secret backup-destination as described
+# above (idempotent: put when it differs, deleted when unset).
+kube_backup_destination_sync() {
+  local st ns f rc=0
+  if [ -z "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
+    for ns in "$KUBE_CNPG_NS" "$KUBE_LONGHORN_NS"; do
+      kube_ctl -n "$ns" delete secret backup-destination --ignore-not-found >/dev/null 2>&1 || rc=1
+    done
+    return "$rc"
+  fi
+  backup_dest_read
+  backup_dest_parts
+  st="$(mktemp -d)"; chmod 700 "$st"
+  (umask 077 && mkdir -p "$st/s"
+   printf '%s' "$_BD_AWS_ACCESS_KEY_ID" > "$st/s/AWS_ACCESS_KEY_ID"
+   printf '%s' "$_BD_AWS_SECRET_ACCESS_KEY" > "$st/s/AWS_SECRET_ACCESS_KEY"
+   printf '%s' "$_BD_AWS_DEFAULT_REGION" > "$st/s/AWS_DEFAULT_REGION"
+   printf '%s' "$_BD_ENDPOINT" > "$st/s/AWS_ENDPOINTS")
+  for ns in "$KUBE_CNPG_NS" "$KUBE_LONGHORN_NS"; do
+    kube_ctl get namespace "$ns" -o name >/dev/null 2>&1 || continue
+    f="$st/$ns.json"
+    kube_ctl -n "$ns" create secret generic backup-destination --from-file="$st/s" --dry-run=client -o json \
+      | jq '.metadata.labels["app.kubernetes.io/managed-by"] = "portcullis"' > "$f" && _kube_put "$f" || rc=1
+  done
+  rm -rf "$st"
+  return "$rc"
+}
+
+# _kube_barman_ready — the plugin runs in cnpg-system (its Deployment
+# available): only then may the Cluster name it.
+_kube_barman_ready() { _ha_deploy_ready "$KUBE_BARMAN_NS" barman-cloud >/dev/null 2>&1; }
+
+# kube_backup_values <values file> — backup.* (see the header): destination
+# = the URL is set; cnpg.* only when the plugin is ready too.
+kube_backup_values() {
+  local f="$1" dest=false cnpg=false path="" ep="" port=443
+  if [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
+    dest=true
+    backup_dest_parts
+    path="s3://$_BD_BUCKET/${_BD_PREFIX:+$_BD_PREFIX/}cnpg" ep="$_BD_ENDPOINT"
+    case "$_BD_HOST" in *:*) port="${_BD_HOST##*:}" ;; *) [ "$_BD_SCHEME" = https ] || port=80 ;; esac
+    ! _kube_barman_ready || cnpg=true
+  fi
+  (umask 077 && jq --argjson d "$dest" --argjson c "$cnpg" --arg p "$path" --arg e "$ep" --argjson port "$port" \
+    '.backup = {destination: $d, cnpg: {enabled: $c, destinationPath: $p, endpointURL: $e, port: $port, retention: "30d", schedule: "0 15 3 * * *"}}' "$f" > "$f.tmp") \
+    && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" || fail "could not write the backup destination's values"
+}
+
+# kube_backup_status_record — ConfigMap portcullis-backup-status in the core
+# namespace: last_success (RFC 3339, UTC) of the core backup that just
+# reached the destination (the Hub's backup_stale, contract §14.5; no
+# secret in it).
+kube_backup_status_record() {
+  local f rc=0
+  f="$(mktemp)"
+  NS="$(kube_ns)" N="$KUBE_BACKUP_STATUS_CM" T="$(date -u +%Y-%m-%dT%H:%M:%SZ)" jq -n '
+    {apiVersion: "v1", kind: "ConfigMap", metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
+     data: {last_success: env.T, what: "core"}}' > "$f" && _kube_put "$f" || rc=1
+  rm -f "$f"
+  return "$rc"
+}
+
+# _ha_backup_egress <namespace> <name> <pod selector json> — a CLI-owned
+# NetworkPolicy: the pods reach the destination's port anywhere but the
+# cluster's ranges (the pod / service CIDRs, link-local, the node mesh, the
+# nodes and the API endpoints: egress-internet's except list).
+_ha_backup_egress() {
+  local port=443 nodes
+  backup_dest_parts
+  case "$_BD_HOST" in *:*) port="${_BD_HOST##*:}" ;; *) [ "$_BD_SCHEME" = https ] || port=80 ;; esac
+  nodes="${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}"
+  [ -n "${PORTCULLIS_POD_CIDR:-}" ] && [ -n "${PORTCULLIS_SERVICE_CIDR:-}" ] && [ -n "$nodes" ] || { echo "the cluster's ranges are unknown: no egress policy for the destination" >&2; return 1; }
+  NS="$1" N="$2" SEL="$3" PORT="$port" POD="$PORTCULLIS_POD_CIDR" SVC="$PORTCULLIS_SERVICE_CIDR" MESH="$KUBE_MESH_CIDR" \
+    NODES="$nodes" API="${PORTCULLIS_KUBE_API_ENDPOINTS:-}" jq -n '
+    def words: split(" ") | map(select(. != ""));
+    {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy",
+     metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
+     spec: {podSelector: (env.SEL | fromjson), policyTypes: ["Egress"],
+       egress: [{to: [{ipBlock: {cidr: "0.0.0.0/0", except: ([env.POD, env.SVC, "169.254.0.0/16", env.MESH]
+                   + ((env.NODES | words) + (env.API | words | map(split(":")[0])) | unique | map(. + "/32")))}}],
+                 ports: [{protocol: "TCP", port: (env.PORT | tonumber)}]}]}}' | _ha_apply
+}
+
+# _ha_pins barmancloud: the plugin's release asset (Amendment 1).
+_ha_barman_pins() { echo "barman-cloud/upstream/plugin-barman-cloud-v0.16.0.yaml aee614683892dd4b44ff9f7afaca55254f1c28de17abbaa0552bf2e1228f7155"; }
+
+# ha_barman_policies — cnpg-system's flows for the plugin (CLI-owned, as
+# ha_cnpg_policies): the plugin (app=barman-cloud) takes :9090 from the CNPG
+# operator only and reaches the API endpoints; the operator reaches it.
+ha_barman_policies() {
+  NS="$KUBE_BARMAN_NS" API="${PORTCULLIS_KUBE_API_ENDPOINTS:-}" jq -n '
+    def words: split(" ") | map(select(. != ""));
+    def meta($n): {name: $n, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}};
+    def op: {matchLabels: {"app.kubernetes.io/name": "cloudnative-pg"}};
+    def plugin: {matchLabels: {app: "barman-cloud"}};
+    {apiVersion: "v1", kind: "List", items: [
+      {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: meta("barman-cloud"),
+       spec: {podSelector: plugin, policyTypes: ["Ingress", "Egress"],
+              ingress: [{from: [{podSelector: op}], ports: [{protocol: "TCP", port: 9090}]}],
+              egress: [env.API | words | .[] | split(":") as $p | {to: [{ipBlock: {cidr: ($p[0] + "/32")}}], ports: [{protocol: "TCP", port: ($p[1] | tonumber)}]}]}},
+      {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: meta("cnpg-operator-barman"),
+       spec: {podSelector: op, policyTypes: ["Egress"],
+              egress: [{to: [{podSelector: plugin}], ports: [{protocol: "TCP", port: 9090}]}]}}]}'
+}
+
+# ha_install_barman — the barman-cloud plugin v0.16.0 in cnpg-system (plan
+# Task 26; Amendment 2: its certificates are cert-manager's, so after
+# ha_install_certmanager): pins checked, its flows first, the render
+# applied server-side, then its certificates and the Deployment waited for.
+# Refused (nothing installed) without cnpg-system or cert-manager.
+ha_install_barman() {
+  local t f want got
+  read -r f want <<< "$(_ha_barman_pins)"
+  [ -f "$PORTCULLIS_HOME/$HA_DIR/$f" ] || fail "$HA_DIR/$f is missing (nothing installed)"
+  got="$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/$f")"
+  [ "$got" = "$want" ] || fail "$HA_DIR/$f has sha256 $got, not the pinned $want (nothing installed)"
+  kube_ctl get namespace "$KUBE_BARMAN_NS" -o name >/dev/null 2>&1 || fail "no namespace $KUBE_BARMAN_NS: the plugin serves CloudNativePG there (nothing installed)"
+  _ha_deploy_ready "$KUBE_CERTMANAGER_NS" cert-manager cert-manager-webhook >/dev/null 2>&1 && _ha_certmanager_webhook_ready \
+    || fail "cert-manager isn't ready (ha_install_certmanager first): the plugin's certificates are its (nothing installed)"
+  [ -n "${PORTCULLIS_KUBE_API_ENDPOINTS:-}" ] || fail "no kube API endpoint (PORTCULLIS_KUBE_API_ENDPOINTS): the plugin's policy would reach nothing (nothing installed)"
+  ha_barman_policies | _ha_apply || fail "could not apply the plugin's NetworkPolicies (nothing installed)"
+  info "HA: CloudNativePG's barman-cloud plugin v0.16.0 ($KUBE_BARMAN_NS)..."
+  t="$(mktemp)"
+  kubectl kustomize "$PORTCULLIS_HOME/$HA_DIR/barman-cloud" > "$t" || { rm -f "$t"; fail "could not render the barman-cloud plugin (kubectl kustomize)"; }
+  _ha_apply < "$t" || { rm -f "$t"; fail "could not apply the barman-cloud plugin (see above)"; }
+  _ha_crds_established "$t" || { rm -f "$t"; fail "the ObjectStore CRD isn't established"; }
+  rm -f "$t"
+  _ha_wait 300 "the plugin's certificates (cert-manager)" _ha_barman_certs_ready
+  _ha_wait 300 "the barman-cloud plugin" _ha_deploy_ready "$KUBE_BARMAN_NS" barman-cloud
+  _kube_applied_set ha.barman "$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/barman-cloud"/*.yaml "$PORTCULLIS_HOME/$HA_DIR/barman-cloud/upstream"/*)"
+}
+
+# _ha_barman_certs_ready — both plugin certificates issued (their Secrets).
+_ha_barman_certs_ready() {
+  kube_ctl -n "$KUBE_BARMAN_NS" get secret barman-cloud-server-tls barman-cloud-client-tls -o name >/dev/null 2>&1
+}
+
+# ha_longhorn_backup_target — with a destination and Longhorn: the Secret
+# (kube_backup_destination_sync), the pods' egress to it, and Longhorn's
+# BackupTarget default = s3://<bucket>@<region>/<prefix>/longhorn with that
+# Secret (server-side apply of spec only; the manager keeps its status).
+# Without a destination: the target emptied and the egress removed.
+ha_longhorn_backup_target() {
+  local f url=""
+  kube_ctl get namespace "$KUBE_LONGHORN_NS" -o name >/dev/null 2>&1 || return 0
+  if [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
+    backup_dest_read; backup_dest_parts
+    kube_backup_destination_sync || fail "could not sync the destination's Secret into $KUBE_LONGHORN_NS"
+    _ha_backup_egress "$KUBE_LONGHORN_NS" backup-destination '{}' || fail "could not apply Longhorn's egress to the backup destination"
+    url="s3://$_BD_BUCKET@$_BD_AWS_DEFAULT_REGION/${_BD_PREFIX:+$_BD_PREFIX/}longhorn"
+  else
+    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy backup-destination --ignore-not-found >/dev/null 2>&1 || true
+  fi
+  f="$(mktemp)"
+  NS="$KUBE_LONGHORN_NS" U="$url" jq -n '{apiVersion: "longhorn.io/v1beta2", kind: "BackupTarget", metadata: {name: "default", namespace: env.NS},
+      spec: {backupTargetURL: env.U, credentialSecret: (if env.U == "" then "" else "backup-destination" end), pollInterval: "5m0s"}}' > "$f"
+  _ha_apply < "$f" || { rm -f "$f"; fail "could not set Longhorn's backup target"; }
+  rm -f "$f"
 }
 
 # _ha_fencing_cert — the managers' webhook serving certificate (Secret

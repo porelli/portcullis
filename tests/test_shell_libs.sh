@@ -5471,6 +5471,8 @@ expect_eq "admission fileMiddlewares = the CLI's KUBE_FILE_NAMES = the params ex
 # ── Task 15: sync, values, the release, one-shots, restore, VPN, revocation ──
 # shellcheck source=../scripts/lib/signin.sh
 source "$HERE/../scripts/lib/signin.sh"
+# shellcheck source=../scripts/lib/users.sh
+source "$HERE/../scripts/lib/users.sh"
 K15="$WORK/k15"
 k15_root() {
   rm -rf "$K15"; mkdir -p "$K15/secrets/hub/lldap" "$K15/secrets/wg" "$K15/secrets/domains/certs-endpoint" "$K15/secrets/kube" "$K15/certs/revocation" "$K15/certs/truststore"
@@ -6573,7 +6575,7 @@ expect_eq "kube_pg_sync_secrets: the roles' Secrets carry cnpg.io/reload (the op
 expect_eq "kube: no LLDAP keygen pod or server key file left (the seed is secrets-lldap)" \
   "$(grep -c 'kube_lldap_server_key\|lldap-key\|secrets-lldap-key' "$HERE"/../scripts/lib/*.sh "$HERE"/../charts/portcullis/templates/*.yaml | awk -F: '{s += $2} END {print s}')" 0
 expect_eq "kube_sync_secrets requires LLDAP's seed before anything is synced" \
-  "$(declare -f kube_sync_secrets | awk '/lldap_key_seed_require/ {r=NR} /kube_sync_stage/ {s=NR} END {print (r && s > r) ? "first" : "no"}')" first
+  "$(declare -f kube_sync_prepare_t26 | grep -c lldap_key_seed_require):$(declare -f kube_sync_secrets | awk '/kube_sync_prepare_t26/ {r=NR} /kube_sync_stage/ {s=NR} END {print (r && s > r) ? "first" : "no"}')" 1:first
 PGX="$WORK/pgx"; rm -rf "$PGX"; mkdir -p "$PGX/b1" "$PGX/b2" "$PGX/pre"
 printf 'PGDMPkc' > "$PGX/b1/postgres.dump"; printf 'PGDMPll' > "$PGX/b1/lldap.dump"
 printf 'PGDMPkc' > "$PGX/b2/postgres.dump"; printf 'tar' > "$PGX/b2/lldap_data.tar.gz"
@@ -6622,8 +6624,56 @@ OUT="$(kt "SW='$SW'; . '$SW/pg.sh'; sleep() { :; }; _kube_pg_swap && echo SWAPPE
 expect_eq "_kube_pg_swap (re-review N1): the second rename refused → refused, both live databases and both copies still there" \
   "$(printf '%s\n' "$OUT" | grep -c '^REFUSED$'):$(sort "$SW/dbs" | tr '\n' ' ')" "1:keycloak keycloak_restore lldap lldap_restore "
 rm -f "$PGX/calls" "$PGX/swap.sql"; OUT="$(pgx "$PGX/b2")"
-case "$OUT" in *"This backup's LLDAP is SQLite (lldap_data.tar.gz, made on Docker / Podman): it isn't converted into Postgres on Kubernetes yet, so LLDAP starts empty."*"rc=0") t_pass "_kube_restore_pg: a Docker backup → Keycloak restored, LLDAP an empty lldap_restore swapped in, with a warning (the conversion is Task 26)" ;; *) t_fail "restore pg docker backup: $OUT" ;; esac
-expect_eq "_kube_restore_pg: a Docker backup's lldap volume never restored into Postgres here" "$(grep -c 'pg_restore -d lldap' "$PGX/calls" || true):$(grep -c '^alter database' "$PGX/swap.sql")" "0:4"
+case "$OUT" in *"the backup has no LLDAP database to restore"*"rc=1") t_pass "_kube_restore_pg: a Docker backup not converted first is refused (never an empty LLDAP)" ;; *) t_fail "restore pg docker backup unconverted: $OUT" ;; esac
+rm -f "$PGX/calls" "$PGX/swap.sql"; OUT="$(KUBE_LLDAP_CONVERTED=true pgx "$PGX/b2")"
+case "$OUT" in *"rc=0") t_pass "_kube_restore_pg: a converted Docker backup → Keycloak restored, the converted lldap_restore swapped in" ;; *) t_fail "restore pg docker backup converted: $OUT" ;; esac
+expect_eq "_kube_restore_pg: the converted lldap_restore is kept as it is (never re-made, never pg_restore'd)" \
+  "$(grep -c 'pg_restore -d lldap\|createdb -O lldap lldap_restore\|dropdb --if-exists --force lldap_restore$' "$PGX/calls" || true):$(grep -c '^alter database' "$PGX/swap.sql")" "0:4"
+# ── Task 26: LLDAP SQLite → Postgres (lldap_convert.sh) ──
+LC="$WORK/lconv"; rm -rf "$LC"; mkdir -p "$LC"
+printf 'SQLite format 3\000rest' > "$LC/users.db"
+printf 'postgres://lldap:SECRET-LLPW-42@h:5432/lldap_restore' > "$LC/url"
+SUMS='users 3
+uuids aa
+groups bb
+memberships cc
+hash_count 2
+hashes dd
+attributes ee'
+# The fakes: _kube_pg_exec answers the emptiness check ($LC_TABLES), the
+# columns, the dump (kept), the target summary ($LC_DST); the Python and
+# create_schema are stubbed.
+lconv() { kt "_lldap_convert_schema() { echo \"SCHEMA \$(cat \"\$1\" | wc -c)\" >> '$LC/calls'; }
+  _lldap_convert_py() { echo \"PY \$1\" >> '$LC/calls'; case \"\$1\" in sql) printf 'BEGIN;\nINSERT 1;\nCOMMIT;\n' ;; summary) printf '%s\n' \"\$LC_SRC\" ;; esac; }
+  _kube_pg_exec() { echo \"PG \$*\" >> '$LC/calls'; case \"\$*\" in *pg_tables*) echo \"\${LC_TABLES:-0}\" ;; *information_schema*) echo '{\"users\":{\"uuid\":\"text\"}}' ;;
+      'psql -X -q -v ON_ERROR_STOP=1 -d lldap_restore -f -') cat > '$LC/dump.sql' ;;
+      'psql -XtAq -d lldap_restore -f -') cat > '$LC/cleanup.sql' ;; *'-f -') cat > /dev/null; printf '%s\n' \"\$LC_DST\" ;; esac; }
+  lldap_convert_sqlite_to_pg '$LC/users.db' '$LC/url'" 2>&1; }
+rm -f "$LC/calls"; OUT="$(LC_SRC="$SUMS" LC_DST="$SUMS" lconv)"
+case "$OUT" in *"3 user(s), 2 password hash(es)"*"rc=0") t_pass "lldap_convert: equal summaries → converted" ;; *) t_fail "lldap_convert ok: $OUT" ;; esac
+expect_eq "lldap_convert: create_schema, the dump into the target, then both summaries (in that order)" \
+  "$(grep -o '^SCHEMA\|^PY sql\|^PY summary\|ON_ERROR_STOP=1 -d lldap_restore -f -' "$LC/calls" | tr '\n' ';')" "SCHEMA;PY sql;ON_ERROR_STOP=1 -d lldap_restore -f -;PY summary;ON_ERROR_STOP=1 -d lldap_restore -f -;"
+for k in users uuids groups memberships hash_count hashes attributes; do
+  rm -f "$LC/calls"; OUT="$(LC_SRC="$SUMS" LC_DST="$(printf '%s\n' "$SUMS" | sed "s/^$k .*/$k XX/")" lconv)"
+  case "$OUT" in *"LLDAP conversion changed $(_lldap_convert_what "$k"): nothing was switched"*"rc=1") t_pass "lldap_convert: a different $k → refused naming it" ;; *) t_fail "lldap_convert diff $k: $OUT" ;; esac
+done
+expect_ok "lldap_convert: a refusal empties the target again (public recreated for its owner)" grep -q "drop schema public cascade'; EXECUTE 'create schema public authorization ' || quote_ident((SELECT pg_get_userbyid(datdba)" "$LC/cleanup.sql"
+rm -f "$LC/calls"; OUT="$(LC_TABLES=4 LC_SRC="$SUMS" LC_DST="$SUMS" lconv)"
+case "$OUT" in *"the target database lldap_restore isn't empty (4)"*"rc=1") t_pass "lldap_convert: a target with tables is refused before anything is written" ;; *) t_fail "lldap_convert non-empty: $OUT" ;; esac
+expect_eq "lldap_convert: nothing written into a non-empty target" "$(grep -c '^SCHEMA\|^PY' "$LC/calls" || true)" 0
+rm -f "$LC/calls"; OUT="$(PORTCULLIS_DEV_LLDAP_CONVERT_FAULT='select 1;' LC_SRC="$SUMS" LC_DST="$SUMS" lconv)"
+case "$OUT" in *"for development only (HUB_DEV=1)"*"rc=1") t_pass "lldap_convert: the fault hook is refused without HUB_DEV=1" ;; *) t_fail "lldap_convert fault hook: $OUT" ;; esac
+rm -f "$LC/calls"; OUT="$(HUB_DEV=1 PORTCULLIS_DEV_LLDAP_CONVERT_FAULT='UPDATE users SET uuid = 1;' LC_SRC="$SUMS" LC_DST="$SUMS" lconv)"
+expect_eq "lldap_convert: the dev fault goes inside the transaction, just before COMMIT" "$(tr '\n' ';' < "$LC/dump.sql")" "BEGIN;;INSERT 1;;UPDATE users SET uuid = 1;;COMMIT;;"
+expect_eq "lldap_convert: the target URL (its password) never on argv or in output" \
+  "$(cat "$LC/calls" | grep -c 'SECRET-LLPW-42' || true):$(printf '%s' "$OUT" | grep -c 'SECRET-LLPW-42' || true)" "0:0"
+printf 'not sqlite' > "$LC/bad.db"
+OUT="$(kt "lldap_convert_sqlite_to_pg '$LC/bad.db' '$LC/url'" 2>&1)"
+case "$OUT" in *"is not a SQLite database"*"rc=1") t_pass "lldap_convert: a non-SQLite file refused" ;; *) t_fail "lldap_convert bad db: $OUT" ;; esac
+expect_eq "lldap_convert: the create_schema pod gets the URL from a temporary Secret (--from-file), labelled lldap-schema, its log cut of credentials" \
+  "$(declare -f _lldap_convert_schema | grep -c -- '--from-file="$st/s"'):$(declare -f _lldap_convert_schema | grep -c '"portcullis.io/component": "lldap-schema"'):$(declare -f _lldap_convert_schema | grep -c "s#://\[^/@ \]\*@#://\*\*\*@#g")" "1:1:1"
+expect_eq "kube restore: the conversion runs before the Hub is stopped (a refusal changes nothing)" \
+  "$(declare -f _backup_restore_kube | awk '/kube_lldap_convert_preflight/ {c=NR} /Stopping the Hub/ {h=NR} END {print (c && h > c) ? "first" : "no"}')" first
 expect_eq "kube restore: the replaced databases dropped only after the stack is healthy" \
   "$(declare -f _backup_restore_kube | awk '/wait_healthy 300/ {w=NR} /_kube_pg_drop_pre_restore/ {d=NR} END {print (w && d > w) ? "after" : "no"}')" after
 # Review I1: CNPG's instances follow the labelled nodes, never readiness;
@@ -6728,7 +6778,9 @@ case "$OUT" in *"node m1: /var/lib/longhorn is on a ZFS dataset"*"rc=1") t_pass 
 OUT="$(h24 ha_install_longhorn)"
 expect_eq "ha_install_longhorn: namespace (PSA longhorn) → deny policies → node checks → render (API + initiator sources) → apply → waits → StorageClass" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;"
+  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;K get namespace longhorn-system -o name;K -n longhorn-system delete networkpolicy backup-destination --ignore-not-found;K apply;"
+expect_eq "ha_install_longhorn: then its backup target (Task 26; no destination here → an empty target, no egress policy)" \
+  "$(grep -v '^---$' "$WORK/h24-applied" 2>/dev/null | jq -c 'select(.kind? == "BackupTarget") | .spec' 2>/dev/null | tail -n1)" '{"backupTargetURL":"","credentialSecret":"","pollInterval":"5m0s"}'
 expect_eq "ha_install_longhorn: the namespace is longhorn-system with namespaces.json's longhorn levels; applied.json records ha.longhorn" \
   "$(grep '^NS' "$WORK/h24-calls"):$(jq -r 'has("ha.longhorn")' "$WORK/h24root/secrets/kube/applied.json")" "NS longhorn-system $(jq -r '.longhorn[0]' "$HERE/../charts/portcullis/namespaces.json"):true"
 # Fix round 1: Longhorn's webhook configurations are the CLI's (no create
@@ -6947,6 +6999,72 @@ expect_eq "compose lldap: the seed by file, no key file, no plain seed, no image
 expect_eq "the SELinux overlay labels the seed for LLDAP alone (Z)" \
   "$(grep -c 'source: ./secrets/lldap/key-seed, target: /run/portcullis/lldap/key-seed, read_only: true, bind: {selinux: Z}' "$HERE/../docker-compose.podman-selinux.yml")" 1
 expect_eq "nothing else mounts LLDAP's seed" "$(grep -c '^ *- \./secrets/lldap' "$CY")" 1
+
+# ── Task 26: the backup destination (backup.sh, ha.sh) ──
+BD="$WORK/bdest"; rm -rf "$BD"; mkdir -p "$BD/root/secrets" "$BD/bin"
+printf 'CONTAINER_RUNTIME=kubernetes\n' > "$BD/root/.env"
+# curl stub: argv and stdin (curl's -K - config) logged apart; the status
+# from STUB_CURL_PUT / STUB_CURL_DEL.
+cat > "$BD/bin/curl" <<'CSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BD_DIR/curl-argv"
+cat >> "$BD_DIR/curl-stdin"
+case "$*" in *"-X PUT"*) printf '%s' "${STUB_CURL_PUT:-200}" ;; *"-X DELETE"*) printf '%s' "${STUB_CURL_DEL:-204}" ;; *) printf 000 ;; esac
+CSTUB
+chmod +x "$BD/bin/curl"
+BD_KEY="AKIATESTKEY0000SECRET1" BD_SEC="wJalrXUtnFEMI/K7MDENG/bPxRfiCYsecretKEY99"
+bdk() { rm -f "$BD/curl-argv" "$BD/curl-stdin"; k_fixtures; : > "$KS/kube/ns-cnpg-system.json"
+  kt "export PORTCULLIS_ROOT='$BD/root' BD_DIR='$BD' PATH='$BD/bin':\$PATH; env_load 2>/dev/null || true; $1"; }
+OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_DEFAULT_REGION=eu-west-1\n' "$BD_KEY" "$BD_SEC" \
+  | bdk "backup_dest_set https://s3.example.org/pc-bucket/site-a")"
+case "$OUT" in *"Backup destination set: https://s3.example.org/pc-bucket/site-a"*"wrote and deleted a test object"*"rc=0") t_pass "backup destination set: stored, tested, synced" ;; *) t_fail "backup destination set: $OUT" ;; esac
+expect_eq "backup destination set: credentials never on argv (stdin only) — not in curl's or kubectl's argv, nor in the output" \
+  "$(cat "$BD/curl-argv" "$KS/kubectl-calls" 2>/dev/null | grep -c "$BD_KEY\|$BD_SEC" || true):$(printf '%s' "$OUT" | grep -c "$BD_KEY\|$BD_SEC" || true)" "0:0"
+expect_eq "backup destination set: the key pair reaches curl on its stdin config (-K -), SigV4 with the region" \
+  "$(grep -c "^user = \"$BD_KEY:$BD_SEC\"$" "$BD/curl-stdin"):$(grep -c '^aws-sigv4 = "aws:amz:eu-west-1:s3"$' "$BD/curl-stdin"):$(grep -c -- '-K - -X PUT' "$BD/curl-argv")" "2:2:1"
+expect_eq "backup destination test: one PUT and one DELETE of the same test object under <url>/" \
+  "$(grep -o -- '-X [A-Z]*' "$BD/curl-argv" | tr '\n' ' '):$(grep -o 'https://s3.example.org/pc-bucket/site-a/\.portcullis-test-[0-9]*-[0-9a-f]*$' "$BD/curl-argv" | sort -u | wc -l | tr -d ' ')" "-X PUT -X DELETE :1"
+expect_eq "backup destination set: secrets/backup-destination.env 0600, the URL in .env" \
+  "$(file_mode "$BD/root/secrets/backup-destination.env"):$(grep -c '^PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket/site-a$' "$BD/root/.env")" "600:1"
+expect_eq "backup destination set: the Secret backup-destination from files (base64 in its data), never a literal" \
+  "$(grep -c -- '--from-literal' "$KS/kubectl-calls" || true):$(grep -c "$(printf '%s' "$BD_SEC" | base64 | tr -d '\n')" "$KS/kubectl-stdin"):$(grep -c "$BD_SEC" "$KS/kubectl-stdin" || true)" "0:1:0"
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket/site-a; backup_dest_show")"
+case "$OUT" in *"credentials: set"*"region: eu-west-1"*) t_pass "backup destination show: URL, parts, region, credentials set" ;; *"region: eu-west-1"*"credentials: set"*) t_pass "backup destination show: URL, parts, region, credentials set" ;; *) t_fail "backup destination show: $OUT" ;; esac
+expect_eq "backup destination show: no secret in output (not the key, not the secret, not a prefix of either)" \
+  "$(printf '%s' "$OUT" | grep -c "${BD_KEY:0:8}\|${BD_SEC:0:8}" || true)" 0
+for u in "http://s3.example.org/b1b/p|must be https" "https://AKIA:pw@s3.example.org/bkt|credentials, a query" "https://s3.example.org/bkt?x=1|a query" \
+         "https://s3.example.org/B|no valid bucket" "https://s3.example.org/bkt/../x|. or .." "s3://bkt/p|https:// URL"; do
+  case "$(backup_dest_url_problem "${u%%|*}")" in *"${u#*|}"*) t_pass "backup destination: ${u%%|*} refused" ;; *) t_fail "backup destination url ${u%%|*}: $(backup_dest_url_problem "${u%%|*}")" ;; esac
+done
+expect_eq "backup destination: an https bucket with a prefix is fine; http only with HUB_DEV=1" \
+  "$(backup_dest_url_problem https://s3.eu.example.org:9000/pc-bkt/a/b):$(HUB_DEV=1 backup_dest_url_problem http://10.0.0.5:9000/pc-bkt)" ":"
+OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SESSION_TOKEN=x\n' "$BD_KEY" | bdk "backup_dest_set https://s3.example.org/pc-bucket")"
+case "$OUT" in *"unknown line on stdin"*"rc=1") t_pass "backup destination set: an unknown stdin line refused" ;; *) t_fail "backup destination unknown line: $OUT" ;; esac
+OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$BD_KEY" "$BD_SEC" | STUB_CURL_PUT=403 bdk "backup_dest_set https://s3.example.org/pc-bucket")"
+case "$OUT" in *"refused a test write (HTTP 403"*"rc=1") t_pass "backup destination set: a refused test write fails (nothing synced)" ;; *) t_fail "backup destination 403: $OUT" ;; esac
+# restic: the destination is the repository (s3:<url>/core), its keys BACKUP_AWS_*.
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket/site-a BACKUP_PASSWORD=x; _restic_require; echo \"REPO=\$BACKUP_REPOSITORY\"; [ \"\$BACKUP_AWS_SECRET_ACCESS_KEY\" = '$BD_SEC' ] && echo KEYS-OK")"
+case "$OUT" in *"REPO=s3:https://s3.example.org/pc-bucket/site-a/core"*"KEYS-OK"*) t_pass "restic: with a destination the repository is s3:<url>/core with its keys (BACKUP_AWS_*)" ;; *) t_fail "restic destination: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket/site-a BACKUP_PASSWORD=x BACKUP_REPOSITORY=/srv/elsewhere; _restic_require")"
+case "$OUT" in *"isn't the backup destination's"*"rc=1") t_pass "restic: another BACKUP_REPOSITORY next to the destination is refused" ;; *) t_fail "restic two repositories: $OUT" ;; esac
+# The chart's values and the Hub's record.
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org:9000/pc-bucket/site-a; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 0; }; kube_backup_values \$f; jq -c .backup \$f")"
+case "$OUT" in *'{"destination":true,"cnpg":{"enabled":true,"destinationPath":"s3://pc-bucket/site-a/cnpg","endpointURL":"https://s3.example.org:9000","port":9000,'*) t_pass "kube_backup_values: the destination, CNPG's path and endpoint under <url>/cnpg" ;; *) t_fail "kube_backup_values: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 1; }; kube_backup_values \$f; jq -c '.backup | [.destination, .cnpg.enabled]' \$f")"
+case "$OUT" in *'[true,false]'*) t_pass "kube_backup_values: no CNPG archive while the plugin isn't ready" ;; *) t_fail "kube_backup_values no plugin: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=; f=\$(mktemp); echo '{}' > \$f; kube_backup_values \$f; jq -c '.backup | [.destination, .cnpg.enabled]' \$f")"
+case "$OUT" in *'[false,false]'*) t_pass "kube_backup_values: no destination → nothing" ;; *) t_fail "kube_backup_values none: $OUT" ;; esac
+OUT="$(bdk "kube_backup_status_record")"
+expect_eq "kube_backup_status_record: ConfigMap portcullis-backup-status with last_success (RFC 3339 UTC)" \
+  "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -r 'select(.metadata.name? == "portcullis-backup-status") | .data.last_success' | grep -cE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')" 1
+expect_eq "backup --offsite records the time for the Hub only after the upload (Kubernetes with a destination)" \
+  "$(declare -f backup_offsite | awk '/restic backup failed/ {u=NR} /kube_backup_status_record/ {r=NR} END {print (u && r > u) ? "after" : "no"}')" after
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=; kube_backup_destination_sync")"
+expect_eq "kube_backup_destination_sync: no destination → the Secret deleted in cnpg-system and longhorn-system" \
+  "$(grep -c 'delete secret backup-destination --ignore-not-found' "$KS/kubectl-calls")" 2
+expect_eq "the chart's Hub: HUB_BACKUP_DESTINATION from backup.destination only (never the URL)" \
+  "$(grep -c '"HUB_BACKUP_DESTINATION" "value" (ternary "set" "" (.Values.backup.destination | default false))' "$HERE/../charts/portcullis/templates/hub.yaml"):$(grep -c 'destinationPath\|endpointURL\|backup-destination' "$HERE/../charts/portcullis/templates/hub.yaml" || true)" "1:0"
+expect_eq "kube_sync_secrets syncs the destination's Secret" "$(declare -f kube_sync_prepare_t26 | grep -c 'kube_backup_destination_sync')" 1
 
 echo ""
 echo "$PASS passed, $FAIL failed"

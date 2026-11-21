@@ -14,7 +14,9 @@ no reader mounts it), hub-secrets, hub-backups (instance backups, at
 HA (portcullis.pvcName). In HA the Hub mounts no node-local volume (it
 would pin the Hub to that node): vpn-doc is an emptyDir there (the Hub
 rewrites vpn.json at every change and refresh and publishes it, §16.1).
-HUB_HA=on in HA (§20.1 "HA mode"). */ -}}
+HUB_HA=on in HA (§20.1 "HA mode"). HUB_BACKUP_DESTINATION=set when the
+CLI has a backup destination (PORTCULLIS_BACKUP_S3_URL, plan Task 26): its
+presence only, never the URL or a credential (Hub Task 15). */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $s := dict
   "name" "hub" "uid" .Values.uids.hub "gid" .Values.uids.hub "groups" (list .Values.uids.vpnDoc .Values.uids.mailProvider) "pin" true
@@ -32,6 +34,7 @@ HUB_HA=on in HA (§20.1 "HA mode"). */ -}}
     (dict "name" "HUB_APPS_NAMESPACE" "value" .Values.appsNamespace)
     (dict "name" "HUB_TRAEFIK_PEER" "value" (include "portcullis.traefikPeerParam" .))
     (dict "name" "HUB_DNS_PROVIDER" "value" (include "portcullis.dnsProvider" .))
+    (dict "name" "HUB_BACKUP_DESTINATION" "value" (ternary "set" "" (.Values.backup.destination | default false)))
     (dict "name" "PORTCULLIS_DOMAIN" "value" $d)
     (dict "name" "DEFAULT_TEMPLATES_URL" "value" "https://github.com/porelli/portcullis-templates.git")
     (dict "name" "PORTAL_DISPLAY_NAME" "value" .Values.hub.portalDisplayName)

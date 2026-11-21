@@ -75,6 +75,9 @@ for c in longhorn snapshotter fencing certmanager; do
   bash -c 'source scripts/lib/common.sh; ha_pins_ok "$1" || { echo "FAIL: $1: $_K_ERR"; exit 1; }; ha_render "$1" "10.1.0.4" "10.215.0.1"' _ "$c" > "$TOOLS/ha-$c.yaml"
 done
 cp kube/ha/snapshotter/upstream/crds.yaml "$TOOLS/ha-snapshotter-crds.yaml"
+# The barman-cloud plugin as ha_install_barman applies it (plan Task 26).
+bash -c 'source scripts/lib/common.sh; read -r f want <<< "$(_ha_barman_pins)"; [ "$(_kube_sha "kube/ha/$f")" = "$want" ] || { echo "FAIL: kube/ha/$f is not its pinned release asset"; exit 1; }'
+"$KUBECTL" kustomize kube/ha/barman-cloud > "$TOOLS/ha-barman.yaml"
 echo "::endgroup::"
 
 # The Traefik, CloudNativePG and HA CRDs as JSON schemas (strict: unknown fields refused).
@@ -119,7 +122,8 @@ for combo in "--set renderNamespaces=true" \
              "--set renderNamespaces=true --set ha.enabled=true --set nodeadm.enabled=true --set nodeadm.image=ghcr.io/porelli/portcullis-nodeadm@sha256:4444444444444444444444444444444444444444444444444444444444444444" \
              "--set renderNamespaces=true -f tests/k8s-ci-values-ha.yaml" \
              "--set renderNamespaces=true -f tests/k8s-ci-values-ha.yaml -f tests/k8s-ci-values-ha-sites.yaml" \
-             "-f tests/k8s-ci-values-ha.yaml --set ha.nonSmallNodesAtPrimary=3 --set ha.gateReplicas=3 --set wg.enabled=false --set monitoring.enabled=false"; do
+             "-f tests/k8s-ci-values-ha.yaml --set ha.nonSmallNodesAtPrimary=3 --set ha.gateReplicas=3 --set wg.enabled=false --set monitoring.enabled=false" \
+             "--set renderNamespaces=true -f tests/k8s-ci-values-ha.yaml -f tests/k8s-ci-values-backup.yaml"; do
   # shellcheck disable=SC2086  # the combo's flags
   "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" $combo > "$TOOLS/rendered.yaml"
   "$KUBECONFORM" -strict -summary -kubernetes-version "$K8S_VERSION" \
@@ -142,7 +146,7 @@ done
 "$KUBECONFORM" -strict -summary -skip CustomResourceDefinition -kubernetes-version "$K8S_VERSION" \
   -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$K8S_SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json" \
   -schema-location "$SCHEMAS/{{ .Group }}/{{ .ResourceKind }}_{{ .ResourceAPIVersion }}.json" \
-  "$TOOLS"/ha-longhorn.yaml "$TOOLS"/ha-snapshotter.yaml "$TOOLS"/ha-fencing.yaml "$TOOLS"/ha-certmanager.yaml kube/ha/fencing/config.yaml
+  "$TOOLS"/ha-longhorn.yaml "$TOOLS"/ha-snapshotter.yaml "$TOOLS"/ha-fencing.yaml "$TOOLS"/ha-certmanager.yaml "$TOOLS"/ha-barman.yaml kube/ha/fencing/config.yaml
 # The CLI-applied manifests (probe, storage, admission; not the template of
 # the params' keys).
 KUBE_FILES=()

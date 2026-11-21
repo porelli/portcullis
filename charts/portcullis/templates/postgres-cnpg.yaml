@@ -24,7 +24,16 @@ outside cnpg-system). Here, in cnpg-system:
     to-postgres). The namespace's default deny, kube-dns and the operator's
     flows are the CLI's (ha.sh ha_cnpg_policies, applied before the
     operator: review I4; they outlive this release).
+  - with backup.cnpg.enabled (plan Task 26: a destination set and the
+    barman-cloud plugin installed, ha_install_barman): the plugin as the
+    Cluster's WAL archiver, the ObjectStore portcullis-backup (the keys
+    under <destination>/cnpg, path-style, the credentials from the CLI's
+    Secret backup-destination, gzip, retention backup.cnpg.retention), a
+    daily ScheduledBackup through the plugin, and the instances' egress to
+    the destination's port outside the cluster's ranges (as
+    egress-internet).
 Kept on uninstall (helm.sh/resource-policy keep: the data). */ -}}
+{{- $bk := .Values.backup.cnpg -}}
 {{- $cns := .Values.cnpg.namespace -}}
 {{- $n := include "portcullis.pgInstances" . | int -}}
 {{- $ps := dict "pin" true -}}
@@ -60,6 +69,14 @@ spec:
       method: any
       number: 1
       dataDurability: {{ ternary "required" "preferred" (ge $n 3) }}
+  {{- end }}
+  {{- if $bk.enabled }}
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      enabled: true
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: portcullis-backup
   {{- end }}
   bootstrap:
     initdb:
@@ -121,6 +138,90 @@ spec:
   ensure: present
   cluster:
     name: portcullis-pg
+{{- if $bk.enabled }}
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: portcullis-backup
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  retentionPolicy: {{ $bk.retention | quote }}
+  configuration:
+    destinationPath: {{ required "backup.cnpg.destinationPath is required" $bk.destinationPath | quote }}
+    endpointURL: {{ required "backup.cnpg.endpointURL is required" $bk.endpointURL | quote }}
+    s3AddressingStyle: path
+    s3Credentials:
+      accessKeyId:
+        name: backup-destination
+        key: AWS_ACCESS_KEY_ID
+      secretAccessKey:
+        name: backup-destination
+        key: AWS_SECRET_ACCESS_KEY
+      region:
+        name: backup-destination
+        key: AWS_DEFAULT_REGION
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: portcullis-pg-daily
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  schedule: {{ $bk.schedule | quote }}
+  immediate: true
+  backupOwnerReference: self
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+  cluster:
+    name: portcullis-pg
+---
+# The instances' archive and base backups (the plugin's sidecar in each
+# instance pod) reach the destination: its port, anywhere but the cluster's
+# own ranges (egress-internet's except list).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: portcullis-pg-backup
+  namespace: {{ $cns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: portcullis-pg
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - {{ required "podCIDR is required" .Values.podCIDR }}
+              - {{ required "serviceCIDR is required" .Values.serviceCIDR }}
+              - 169.254.0.0/16
+              - {{ .Values.ha.meshCIDR }}
+              {{- range .Values.nodeAddresses }}
+              - {{ . }}/32
+              {{- end }}
+              {{- range .Values.apiEndpoints }}
+              {{- $a := index (splitList ":" .) 0 }}
+              {{- if not (has $a $.Values.nodeAddresses) }}
+              - {{ $a }}/32
+              {{- end }}
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $bk.port | int }}
+{{- end }}
 ---
 # The instances (and the operator's initdb / join Job pods, labelled with
 # the cluster too): each other, the API server; Postgres from Keycloak,
