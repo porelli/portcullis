@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -118,6 +119,11 @@ type Ref struct{ Name, Type, Value string }
 type Spec struct {
 	Name       string
 	IPv4, IPv6 netip.Addr
+	// HA (§12.4, NEW HA): the address set follows the front door — the
+	// values the front door publishes, per owned name; non-nil replaces
+	// IPv4 / IPv6 (unused then). An empty HAAddrs = the front door's set
+	// isn't known yet (every address item unknown, nothing written).
+	HA *HAAddrs
 	// CAA: the caa set is on; Issuer "" = unknown CA (nothing written,
 	// nothing judged).
 	CAA        bool
@@ -148,6 +154,45 @@ type Spec struct {
 	// NoWild: the CAA entries are issue only, no issuewild (mail-cert's
 	// pin at MAIL_HOSTNAME, a single-name certificate).
 	NoWild bool
+}
+
+// HAAddrs are the front door's addresses (frontdoor-status): Apex for
+// <d> (and any other owned name, e.g. a mail host), Wild for *.<d>.
+type HAAddrs struct{ Apex, Wild []netip.Addr }
+
+// addrsFor are the wanted addresses at owned name n of d (FQDN or bare
+// alike): HA's per name, else the server's IPv4 / IPv6.
+func (s Spec) addrsFor(n, d string) []netip.Addr {
+	if s.HA != nil {
+		if bare(n) == "*."+bare(d) {
+			return s.HA.Wild
+		}
+		return s.HA.Apex
+	}
+	var out []netip.Addr
+	for _, ip := range []netip.Addr{s.IPv4, s.IPv6} {
+		if ip.IsValid() {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+// addrsKnown: the wanted addresses are known (the IPv4, or in HA an
+// IPv4 at both names from the front door).
+func (s Spec) addrsKnown() bool {
+	if s.HA == nil {
+		return s.IPv4.IsValid()
+	}
+	has4 := func(as []netip.Addr) bool {
+		for _, a := range as {
+			if a.Is4() {
+				return true
+			}
+		}
+		return false
+	}
+	return has4(s.HA.Apex) && has4(s.HA.Wild)
 }
 
 // Provider is what the plan needs from a libdns provider.
@@ -205,10 +250,8 @@ func Wanted(s Spec) map[string][]libdns.Record {
 	d := fqdn(s.Name)
 	out := map[string][]libdns.Record{}
 	for _, n := range addressNames(s, d) {
-		for _, ip := range []netip.Addr{s.IPv4, s.IPv6} {
-			if ip.IsValid() {
-				out[SetAddress] = append(out[SetAddress], libdns.Address{Name: n, TTL: TTLAddress, IP: ip})
-			}
+		for _, ip := range s.addrsFor(n, d) {
+			out[SetAddress] = append(out[SetAddress], libdns.Address{Name: n, TTL: TTLAddress, IP: ip})
 		}
 	}
 	if s.CAA && s.Issuer != "" {
@@ -531,21 +574,27 @@ func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func
 		for _, t := range []struct {
 			typ string
 			qt  uint16
-			ip  netip.Addr
-		}{{"A", dns.TypeA, s.IPv4}, {"AAAA", dns.TypeAAAA, s.IPv6}} {
+		}{{"A", dns.TypeA}, {"AAAA", dns.TypeAAAA}} {
 			it := Item{Set: SetAddress, Name: n, Type: t.typ, Want: []string{}, Live: []string{}, Steps: []string{}}
-			if t.ip.IsValid() {
-				it.Want = []string{t.ip.String()}
+			for _, ip := range s.addrsFor(n, d) {
+				if ip.Is4() == (t.typ == "A") {
+					it.Want = append(it.Want, ip.String())
+				}
 			}
+			sort.Strings(it.Want)
 			// Without the IPv4 the server's addresses are unknown (the
 			// service gets none until a domain is enrolled): A and AAAA
 			// alike can't be judged — an IPv6 published by hand isn't
-			// "wrong" just because the service doesn't know it.
-			if !s.IPv4.IsValid() {
+			// "wrong" just because the service doesn't know it. In HA:
+			// the front door's set isn't known yet.
+			if !s.addrsKnown() {
 				it.Want = []string{}
 				// Info, not Warning: nothing failed (never a failed lookup).
 				it.Status, it.Severity, it.Fix = StatusUnknown, SevInfo, FixNone
 				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
+				if s.HA != nil {
+					it.Steps = []string{"the front door's addresses are unknown (frontdoor-status isn't readable yet): high availability publishes one address per healthy ingress node"}
+				}
 				out = append(out, it)
 				continue
 			}
@@ -814,7 +863,7 @@ func foreignItems(ctx context.Context, in Input, d string, live []liveRec) []Ite
 			continue // A/AAAA judged by the address items, CNAME there too
 		case t == "A" || t == "AAAA":
 			ip, err := netip.ParseAddr(l.rr.Data)
-			if err == nil && (ip == in.Spec.IPv4 || ip == in.Spec.IPv6) {
+			if err == nil && (slices.Contains(in.Spec.addrsFor(d, d), ip) || slices.Contains(in.Spec.addrsFor("*."+d, d), ip)) {
 				continue
 			}
 			it.Severity = SevInfo
@@ -1058,6 +1107,14 @@ sets:
 					errs = append(errs, fmt.Errorf("a CNAME %s → %s exists: remove it first (Portcullis doesn't put A/AAAA records next to a CNAME)", bare(n), c[0].Data))
 					continue sets
 				}
+			}
+			if s.HA != nil {
+				// In HA the address set follows the front door one change
+				// per name per 60 s, never leaving a type empty (the
+				// domains service's follower, ha.go): never a whole-set
+				// sync here.
+				errs = append(errs, errors.New("in high availability the address set follows the front door (frontdoor-status), one change at a time: not applied as a whole"))
+				continue sets
 			}
 			if !s.IPv4.IsValid() {
 				errs = append(errs, errors.New("the server's public IPv4 is unknown (./portcullis up detects it — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)"))

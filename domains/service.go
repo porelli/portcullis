@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/portcullis/domains/frontdoor"
 	"github.com/portcullis/domains/internal/dnsplan"
 	"github.com/portcullis/domains/internal/dnssec"
 )
@@ -75,6 +76,12 @@ type Config struct {
 	// read-only main plan's address set owns MAIL_HOSTNAME's A / AAAA too
 	// (the dns tool's does with mail_hostname).
 	MailOn bool
+	// HA: PORTCULLIS_HA=on (the chart, contract §20.1): the added
+	// domains' address sets follow the front door (ha.go), read from
+	// FrontdoorStatusFile; only addresses AddrPolicy admits are written.
+	HA                  bool
+	FrontdoorStatusFile string
+	AddrPolicy          frontdoor.AddrPolicy
 	// ACMEHTTPClient overrides lego's HTTP client (tests: Pebble's TLS).
 	ACMEHTTPClient *http.Client
 	Now            func() time.Time
@@ -107,6 +114,9 @@ type Service struct {
 	// runCtx: Run's context (guarded by mu), the parent of detached
 	// builds, so a shutdown ends them.
 	runCtx context.Context
+
+	// ha: the front door's sets (HA only; guarded by mu), haRefresh.
+	ha haSets
 
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
@@ -147,7 +157,8 @@ func NewService(cfg Config, store *Store) (*Service, error) {
 	for _, d := range doc.Domains {
 		// An unknown IPv4 (a failed lookup) is no address change: the
 		// records set before stay and renewals go on (work).
-		if d.AppliedIPv4 == "" || d.State != StateReady || !cfg.IPv4.IsValid() {
+		// In HA the address set follows the front door instead (ha.go).
+		if cfg.HA || d.AppliedIPv4 == "" || d.State != StateReady || !cfg.IPv4.IsValid() {
 			continue
 		}
 		if d.AppliedIPv4 != addrString(cfg.IPv4) || d.AppliedIPv6 != addrString(cfg.IPv6) {
@@ -486,6 +497,11 @@ func copyDomain(d *Domain) *Domain {
 		c.Credentials[k] = v
 	}
 	c.SetGens = maps.Clone(d.SetGens)
+	c.HAAddrs = make(map[string][]string, len(d.HAAddrs))
+	for n, as := range d.HAAddrs {
+		c.HAAddrs[n] = append([]string(nil), as...)
+	}
+	c.HAChanged = maps.Clone(d.HAChanged)
 	c.Records = make(map[string][]RecordRef, len(d.Records))
 	for z, refs := range d.Records {
 		c.Records[z] = append([]RecordRef(nil), refs...)
@@ -530,6 +546,11 @@ func (s *Service) Run(ctx context.Context) {
 	s.mu.Lock()
 	s.runCtx = ctx
 	s.mu.Unlock()
+	if s.cfg.HA {
+		s.haRefresh()
+		// Not in wg (Wait is for work): it ends with ctx.
+		go s.haWatch(ctx)
+	}
 	t := time.NewTicker(s.cfg.Tick)
 	defer t.Stop()
 	for {
@@ -558,7 +579,7 @@ func (s *Service) dueLocked(d *Domain, now time.Time) bool {
 	}
 	if d.State == StateReady {
 		return s.needsCert(d, now) || now.Sub(d.RecordsCheckedAt) >= s.cfg.RecheckEvery ||
-			s.caaDueLocked(d, s.accountURILocked()) || len(d.DueSets) > 0 || d.SignRequested
+			s.caaDueLocked(d, s.accountURILocked()) || len(d.DueSets) > 0 || d.SignRequested || s.haDueLocked(d, now)
 	}
 	return true
 }
@@ -736,12 +757,26 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 	// The server's IPv4 unknown (./portcullis up couldn't detect it) but
 	// records were set before: keep them and go on (a renewal must not
 	// stall on an address lookup); the check compares with what was set.
-	keepRecords := !s.cfg.IPv4.IsValid() && snap.AppliedIPv4 != ""
-	recordsStep := !(snap.State == StateReady && !needCert) || caaDue || len(snap.DueSets) > 0 || snap.SignRequested
+	keepRecords := !s.cfg.HA && !s.cfg.IPv4.IsValid() && snap.AppliedIPv4 != ""
+	// HA: the address set follows the front door (ha.go), one change per
+	// name per 60 s, in the records step but never through dnsplan.Apply.
+	s.mu.Lock()
+	ha := s.ha
+	haDue := s.haDueLocked(snap, now)
+	s.mu.Unlock()
+	haStep := s.cfg.HA && (haDue || snap.State != StateReady || contains(snap.DueSets, dnsplan.SetAddress))
+	// Only the follower's change is due on a ready domain: no records
+	// check after it (the resolvers keep the old set for its TTL; the
+	// hourly re-check judges them).
+	haOnly := s.cfg.HA && haDue && snap.State == StateReady && !needCert && !caaDue && len(snap.DueSets) == 0 && !snap.SignRequested &&
+		now.Sub(snap.RecordsCheckedAt) < s.cfg.RecheckEvery
+	recordsStep := !(snap.State == StateReady && !needCert) || caaDue || len(snap.DueSets) > 0 || snap.SignRequested || haDue
 	if recordsStep {
 		var sets []string
 		for _, set := range dnsplan.Sets {
 			switch {
+			case set == dnsplan.SetAddress && s.cfg.HA:
+				// haStep below.
 			case set == dnsplan.SetAddress && keepRecords:
 				s.logf("domain %s: the server's public IPv4 is unknown: keeping the records set for %s (records step skipped)", name, snap.AppliedIPv4)
 			case set == dnsplan.SetAddress:
@@ -769,9 +804,28 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		rctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		var written, removed []RecordRef
 		var zone string
-		if len(sets) > 0 {
-			written, removed, zone, err = s.applySets(rctx, p, snap, sets, uri)
+		var har haResult
+		var haErr error
+		if haStep {
+			if zone, err = s.zoneOf(p, name); err != nil {
+				haErr = fmt.Errorf("finding the DNS zone of %s: %w", name, err)
+				zone = ""
+			} else {
+				har, haErr = s.haStep(rctx, p, snap, zone, ha, now)
+				written, removed = har.written, har.removed
+			}
+			err = nil
 		}
+		if len(sets) > 0 {
+			var w, r []RecordRef
+			var z string
+			w, r, z, err = s.applySets(rctx, p, snap, sets, uri)
+			written, removed = append(written, w...), append(removed, r...)
+			if z != "" {
+				zone = z
+			}
+		}
+		err = errors.Join(haErr, err)
 		// CAA off: the CAA entries recorded in other zones (the zone found
 		// changed) are removed there too, best effort, and dropped.
 		var otherZones []string
@@ -823,6 +877,9 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 				}
 				if err == nil && contains(sets, dnsplan.SetAddress) {
 					d.AppliedIPv4, d.AppliedIPv6 = addrString(s.cfg.IPv4), addrString(s.cfg.IPv6)
+				}
+				if haStep && har.addrs != nil {
+					d.HAAddrs, d.HAChanged = har.addrs, har.changed
 				}
 			})
 		}
@@ -887,6 +944,11 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 			return
 		}
 		s.logf("domain %s: certificate valid until %s", name, notAfter.Format(time.RFC3339))
+	}
+	if haOnly {
+		// The follower's change alone: no records check now (above).
+		s.update(name, gen, func(d *Domain) { d.State, d.LastError, d.Failures, d.NextAttempt = StateReady, "", 0, time.Time{} })
+		return
 	}
 	err = s.waitRecords(ctx, name)
 	s.update(name, gen, func(d *Domain) { d.RecordsOK, d.RecordsCheckedAt = err == nil, s.cfg.Now() })
@@ -1187,6 +1249,10 @@ var errMainUnavailable = errors.New("the main domain's DNS plan isn't ready yet:
 func (s *Service) buildMainPlan(ctx context.Context) dnsplan.Plan {
 	sp := dnsplan.Spec{Name: s.cfg.MainDomain, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
 		AccountURI: s.cfg.MainAccountURI, IODEF: s.cfg.CAAIODEF, Main: true}
+	if s.cfg.HA {
+		// The main domain's set is the front door's (it writes it).
+		sp.HA = s.haSpecAddrs()
+	}
 	if s.cfg.MailOn {
 		sp.MailHost = s.cfg.MailHostname
 		if sp.MailHost == "" {
@@ -1414,8 +1480,13 @@ func (s *Service) wantAddrs(name string) (netip.Addr, netip.Addr) {
 func (s *Service) waitRecords(ctx context.Context, name string) error {
 	deadline := time.Now().Add(s.cfg.RecordsWait)
 	for {
-		v4, v6 := s.wantAddrs(name)
-		err := s.checkRecords(ctx, name, v4, v6)
+		var err error
+		if s.cfg.HA {
+			err = s.checkRecordsHA(ctx, name, s.haAllowed(name))
+		} else {
+			v4, v6 := s.wantAddrs(name)
+			err = s.checkRecords(ctx, name, v4, v6)
+		}
 		if err == nil || time.Now().Add(s.cfg.RecordsPoll).After(deadline) {
 			return err
 		}

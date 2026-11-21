@@ -318,6 +318,21 @@ func run() error {
 		MailHostname:   strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAINS_MAIL_HOSTNAME")), ".")),
 		MailOn:         strings.TrimSpace(os.Getenv("DOMAINS_MAIL")) == "on",
 	}
+	// High availability (contract §12.4): the added domains' address sets
+	// follow frontdoor-status; only public addresses outside the cluster's
+	// networks are written (FRONTDOOR_EXCLUDED_CIDRS, required: fail closed).
+	switch v := os.Getenv("PORTCULLIS_HA"); v {
+	case "on":
+		pol, err := frontdoorPolicy(os.Getenv("FRONTDOOR_EXCLUDED_CIDRS"))
+		if err != nil {
+			return err
+		}
+		cfg.HA, cfg.AddrPolicy = true, pol
+		cfg.FrontdoorStatusFile = env("DOMAINS_FRONTDOOR_STATUS", "/run/portcullis/frontdoor-status/status.json")
+	case "", "off":
+	default:
+		return fmt.Errorf("PORTCULLIS_HA=%q: on or off", v)
+	}
 	if u := cfg.MainAccountURI; u != "" && !dnsplan.ValidAccountURI(u) {
 		return fmt.Errorf("DOMAINS_MAIN_ACME_ACCOUNT_URI=%q is not an ACME account URI (secrets/domains/main-domain.env)", u)
 	}
