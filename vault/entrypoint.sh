@@ -2,7 +2,8 @@
 #
 # Portcullis Vault entrypoint (mounted read-only at /vault/portcullis/).
 #
-# Starts Vault in server mode with vault/vault.hcl and then unseals it
+# Starts Vault in server mode with vault/vault.hcl.tmpl (rendered into
+# /tmp/vault.hcl; `entrypoint.sh render` prints it and exits) and then unseals it
 # automatically, on EVERY container start (docker compose up, restart,
 # host reboot), using the unseal key that ./portcullis vault init wrote to
 # ./secrets/vault-unseal/unseal-key (mounted read-only at /vault/unseal/).
@@ -19,11 +20,53 @@
 # Remove the mount and unseal manually if you need that stronger property.
 
 KEY_FILE="${PORTCULLIS_UNSEAL_KEY_FILE:-/vault/unseal/unseal-key}"
-CONFIG_FILE="${PORTCULLIS_VAULT_CONFIG:-/vault/portcullis/vault.hcl}"
+TEMPLATE="${PORTCULLIS_VAULT_TEMPLATE:-/vault/portcullis/vault.hcl.tmpl}"
+CONFIG_FILE="${PORTCULLIS_VAULT_CONFIG:-/tmp/vault.hcl}"
 DATA_DIR="${PORTCULLIS_VAULT_DATA:-/vault/file}"
 export VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
 
 log() { echo "portcullis-vault: $*" >&2; }
+
+# render — vault.hcl.tmpl with its placeholders filled (see the template's
+# header) on stdout. Every value is checked first, so nothing a variable
+# holds can add HCL: a bad one exits 1.
+#   VAULT_RAFT_NODE_ID  raft node id (default portcullis-vault-1: compose's
+#                       single node; on Kubernetes the pod name)
+#   VAULT_API_ADDR / VAULT_CLUSTER_ADDR  http://<host>:<port> (default
+#                       http://vault:8200 / :8201)
+#   VAULT_RAFT_PEERS    the voters' host names, space separated; this node
+#                       (its node id, alone or as the first label) left out
+render() {
+  node_id="${VAULT_RAFT_NODE_ID:-portcullis-vault-1}"
+  api_addr="${VAULT_API_ADDR:-http://vault:8200}"
+  cluster_addr="${VAULT_CLUSTER_ADDR:-http://vault:8201}"
+  printf '%s\n' "$node_id" | grep -Eqx '[a-z0-9][a-z0-9-]{0,62}' || { log "VAULT_RAFT_NODE_ID $node_id: [a-z0-9-] only"; return 1; }
+  for a in "$api_addr" "$cluster_addr"; do
+    printf '%s\n' "$a" | grep -Eqx 'http://[a-z0-9][a-z0-9.-]{0,252}:[0-9]{1,5}' || { log "address $a: http://<host>:<port> only"; return 1; }
+  done
+  joins=""
+  for p in ${VAULT_RAFT_PEERS:-}; do
+    printf '%s\n' "$p" | grep -Eqx '[a-z0-9][a-z0-9.-]{0,252}' || { log "VAULT_RAFT_PEERS entry $p: a host name only"; return 1; }
+    case "$p" in "$node_id" | "$node_id".*) continue ;; esac
+    joins="$joins  retry_join {
+    leader_api_addr = \"http://$p:8200\"
+  }
+"
+  done
+  [ -r "$TEMPLATE" ] || { log "no template at $TEMPLATE"; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      @RETRY_JOIN@) printf '%s' "$joins" ;;
+      *) printf '%s\n' "$line" | sed -e "s|@NODE_ID@|$node_id|g" -e "s|@API_ADDR@|$api_addr|g" -e "s|@CLUSTER_ADDR@|$cluster_addr|g" ;;
+    esac
+  done < "$TEMPLATE"
+}
+
+if [ "${1:-}" = render ]; then
+  render
+  exit
+fi
+render > "$CONFIG_FILE.tmp" && mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE" || { log "could not render $CONFIG_FILE"; exit 1; }
 
 # Raft needs a data dir owned by the vault user. The image runs as that
 # user (non-root) and the vault_data volume is mounted at /vault/file, which

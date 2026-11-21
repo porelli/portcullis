@@ -160,7 +160,7 @@ seed)
   # stdin, never argv); its serial for the revocation SLA.
   root="$(jq -r .root_token secrets/vault-init.json)"; echo "::add-mask::$root"
   # shellcheck disable=SC2016  # expanded by the pod's sh
-  serial="$(printf '%s\n' "$root" | K -n portcullis exec -i deploy/vault -c vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" VAULT_ADDR=http://127.0.0.1:8200 exec vault write -format=json pki_int/issue/client-cert common_name=rt-revoke ttl=1h' | jq -r '.data.serial_number')"
+  serial="$(printf '%s\n' "$root" | K -n portcullis exec -i pod/vault-0 -c vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" VAULT_ADDR=http://127.0.0.1:8200 exec vault write -format=json pki_int/issue/client-cert common_name=rt-revoke ttl=1h' | jq -r '.data.serial_number')"
   [[ "$serial" =~ ^[0-9a-f:]+$ ]] || fail "could not issue a certificate to revoke"
   echo "E2E_REVOKE_SERIAL=$serial" >> "$GITHUB_ENV"
   echo "PASS: the Hub's template source (echo, folder-writer) seeded; $E2E_FOLDER ready; certificate $serial issued"

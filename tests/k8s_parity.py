@@ -13,8 +13,10 @@ applies fails too (the list can't rot).
 
   python3 tests/k8s_parity.py
 """
+import copy
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -614,7 +616,8 @@ def check_sites():
         for p in site_problems(docs, ha):
             F.add(f"{label}: {p}")
         names = set(K.placement_specs(docs))
-        want = K.SITE_PINNED | (K.SITE_FREE if ha else {"traefik", "nodeadm"})  # frontdoor: HA only
+        # frontdoor and the Sentinels: HA only.
+        want = (K.SITE_PINNED | (K.SITE_FREE if ha else {"traefik", "nodeadm"})) - (set() if ha else {"sessions-sentinel"})
         if not want <= names:
             F.add(f"{label}: not rendered {sorted(want - names)} (the site check would pass vacuously)")
     # The check bites (mutation tests): a pin removed, a site term on frontdoor.
@@ -771,6 +774,179 @@ def check_postgres():
             F.add("pg_problems misses a mutated Cluster (mutation test)")
 
 
+SENTINEL_URLS = ",".join(f"redis://sessions-sentinel-{i}.sessions-sentinel:26379" for i in range(3))
+SMALL_TOL = {"key": "portcullis.io/small", "operator": "Exists", "effect": "NoSchedule"}
+
+
+def _wl(docs, kind, name):
+    return next((d for d in docs if d.get("kind") == kind and d["metadata"]["name"] == name), None)
+
+
+def _spread(spec):
+    return [(c.get("topologyKey"), c.get("whenUnsatisfiable"), c.get("maxSkew")) for c in spec.get("topologySpreadConstraints", [])]
+
+
+def _pdb(docs, name):
+    p = _wl(docs, "PodDisruptionBudget", name)
+    return p and p["spec"].get("minAvailable")
+
+
+def _headless(docs, name, component):
+    s = _wl(docs, "Service", name)
+    return bool(s) and s["spec"].get("clusterIP") == "None" and s["spec"].get("publishNotReadyAddresses") is True \
+        and s["spec"].get("selector") == {"portcullis.io/component": component}
+
+
+def sessions_problems(docs, ha):
+    """Plan Task 25 on one render. HA ("ha: sentinel quorum 2, three
+    sentinels, tolerate small"): StatefulSet sessions-sentinel × 3 (headless
+    sessions-sentinel, spread DoNotSchedule on the hostname, the small taint
+    tolerated, PDB minAvailable 2) whose start monitors portcullis-sessions
+    with quorum 2; StatefulSet sessions × 2 (headless sessions-pods, never a
+    small node and no small toleration, DoNotSchedule, the init guard, the
+    replication readiness, minReadySeconds 10); each oauth2-proxy's args =
+    its alpha config + --redis-use-sentinel=true
+    --redis-sentinel-master-name=portcullis-sessions
+    --redis-sentinel-connection-urls=<the three Sentinels>, its Sentinel
+    password env from its own portcullis-env key (never argv), no
+    connection URL. Without HA: the Deployment sessions, no Sentinel, the
+    oauth2-proxies on redis://sessions:6379."""
+    out = []
+    tag = "ha: " if ha else "non-ha: "
+    sent, sts, dep = _wl(docs, "StatefulSet", "sessions-sentinel"), _wl(docs, "StatefulSet", "sessions"), _wl(docs, "Deployment", "sessions")
+    if ha:
+        if not sent or not sts or dep:
+            return [f"{tag}sentinel quorum 2, three sentinels, tolerate small: StatefulSets sessions-sentinel and sessions, no Deployment sessions"]
+        ts, vs = sent["spec"]["template"]["spec"], sts["spec"]["template"]["spec"]
+        cm = next((d for d in docs if d.get("kind") == "ConfigMap" and d["metadata"]["name"].startswith("sessions-ha-scripts-")), None)
+        init = (cm or {}).get("data", {}).get("sentinel-init.sh", "")
+        if sent["spec"].get("replicas") != 3 or sent["spec"].get("serviceName") != "sessions-sentinel" or not _headless(docs, "sessions-sentinel", "sessions-sentinel"):
+            out.append(f"{tag}sentinel quorum 2, three sentinels, tolerate small: replicas {sent['spec'].get('replicas')} (3), the headless sessions-sentinel")
+        if "MASTER_NAME=portcullis-sessions" not in init or 'echo "sentinel monitor $MASTER_NAME $m 6379 2"' not in init:
+            out.append(f"{tag}sentinel quorum 2, three sentinels, tolerate small: the Sentinels' start doesn't monitor portcullis-sessions with quorum 2")
+        if SMALL_TOL not in ts.get("tolerations", []) or _spread(ts) != [("kubernetes.io/hostname", "DoNotSchedule", 1)] or _pdb(docs, "sessions-sentinel") != 2:
+            out.append(f"{tag}sentinel quorum 2, three sentinels, tolerate small: the small toleration, the hostname spread DoNotSchedule, PDB minAvailable 2")
+        if sts["spec"].get("replicas") != 2 or sts["spec"].get("serviceName") != "sessions-pods" or sts["spec"].get("minReadySeconds") != 10 \
+                or not _headless(docs, "sessions-pods", "sessions"):
+            out.append(f"{tag}sessions: 2 replicas, the headless sessions-pods, minReadySeconds 10")
+        cls = {"key": "portcullis.io/class", "operator": "NotIn", "values": ["small"]}
+        if SMALL_TOL in vs.get("tolerations", []) or not all(cls in t.get("matchExpressions", []) for t in K.node_terms(vs)) or not K.node_terms(vs) \
+                or _spread(vs) != [("kubernetes.io/hostname", "DoNotSchedule", 1)]:
+            out.append(f"{tag}sessions: never on a small node (class NotIn small, no small toleration), spread DoNotSchedule")
+        c = vs["containers"][0]
+        if [i["name"] for i in vs.get("initContainers", [])] != ["guard"] or c.get("readinessProbe", {}).get("exec", {}).get("command") != ["sh", "/scripts/ready.sh"]:
+            out.append(f"{tag}sessions: the init guard and the replication readiness")
+    else:
+        if sent or sts or not dep or _wl(docs, "Service", "sessions-pods"):
+            out.append(f"{tag}sessions: one Deployment, no Sentinel")
+    for fa, key in (("forward-auth", "FORWARD_AUTH_REDIS_PASSWORD"), ("forward-auth-ext", "FORWARD_AUTH_EXT_REDIS_PASSWORD")):
+        c = _wl(docs, "Deployment", fa)["spec"]["template"]["spec"]["containers"][0]
+        env = {e["name"]: e for e in c.get("env", [])}
+        want = ["--alpha-config=/etc/oauth2-proxy/alpha.yaml"]
+        if ha:
+            want += ["--redis-use-sentinel=true", "--redis-sentinel-master-name=portcullis-sessions", f"--redis-sentinel-connection-urls={SENTINEL_URLS}"]
+        if c.get("args") != want:
+            out.append(f"{tag}{fa}: args {c.get('args')} (want {want})")
+        sp = env.get("OAUTH2_PROXY_REDIS_SENTINEL_PASSWORD")
+        if ha and (not sp or sp.get("valueFrom") != {"secretKeyRef": {"name": "portcullis-env", "key": key}} or "value" in sp
+                   or "OAUTH2_PROXY_REDIS_CONNECTION_URL" in env):
+            out.append(f"{tag}{fa}: OAUTH2_PROXY_REDIS_SENTINEL_PASSWORD from portcullis-env {key} (env, never argv), no connection URL")
+        if not ha and (sp or env.get("OAUTH2_PROXY_REDIS_CONNECTION_URL", {}).get("value") != "redis://sessions:6379"):
+            out.append(f"{tag}{fa}: redis://sessions:6379, no Sentinel password")
+        if any("pass" in a.lower() and a != "--redis-use-sentinel=true" for a in c.get("args", [])):
+            out.append(f"{tag}{fa}: a password flag on argv")
+    return out
+
+
+def render_vault_hcl(env, pod):
+    """vault/entrypoint.sh render with a voter's env (the chart's values,
+    $(VAULT_RAFT_NODE_ID) as the kubelet expands it)."""
+    e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PORTCULLIS_VAULT_TEMPLATE": str(K.ROOT / "vault" / "vault.hcl.tmpl")}
+    for k, v in env.items():
+        e[k] = pod if v.get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") == "metadata.name" else \
+            K.NS if v.get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") == "metadata.namespace" else \
+            str(v.get("value", "")).replace("$(VAULT_RAFT_NODE_ID)", pod)
+    r = subprocess.run(["sh", str(K.ROOT / "vault" / "entrypoint.sh"), "render"], env=e, capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def vault_problems(docs, ha):
+    """Plan Task 25 on one render ("ha: vault 3 voters, retry_join lists the
+    other two"; "non-ha: vault 1 voter, node_id vault-0"): StatefulSet vault
+    of 3 voters in HA (1 without), the headless vault-internal, a data PVC
+    per voter, spread DoNotSchedule on the hostname, the small taint
+    tolerated (the third voter), PDB minAvailable 2 in HA (none for one);
+    each voter's rendered vault.hcl: node_id = its pod name (the downward
+    API), api / cluster address <pod>.vault-internal, retry_join exactly
+    the other voters, and no service_registration (it blocks a new leader
+    on the API, found live); no ServiceAccount token, no Role, no Service
+    vault-active (the CLI asks the voters for the leader)."""
+    out = []
+    n = 3 if ha else 1
+    tag = "ha: vault 3 voters, retry_join lists the other two" if ha else "non-ha: vault 1 voter, node_id vault-0"
+    v = _wl(docs, "StatefulSet", "vault")
+    if not v or _wl(docs, "Deployment", "vault") or _wl(docs, "PersistentVolumeClaim", "vault-data"):
+        return [f"{tag}: a StatefulSet vault, no Deployment, no vault-data PVC"]
+    sp = v["spec"]["template"]["spec"]
+    if v["spec"].get("replicas") != n or v["spec"].get("serviceName") != "vault-internal" or not _headless(docs, "vault-internal", "vault"):
+        out.append(f"{tag}: replicas {v['spec'].get('replicas')} (want {n}), the headless vault-internal")
+    if [c["metadata"]["name"] for c in v["spec"].get("volumeClaimTemplates", [])] != ["data"]:
+        out.append(f"{tag}: one data PVC per voter")
+    if SMALL_TOL not in sp.get("tolerations", []) or _spread(sp) != [("kubernetes.io/hostname", "DoNotSchedule", 1)]:
+        out.append(f"{tag}: the voters spread DoNotSchedule on the hostname and tolerate the small taint")
+    if _pdb(docs, "vault") != (2 if ha else None):
+        out.append(f"{tag}: PDB minAvailable {_pdb(docs, 'vault')} (want {2 if ha else 'none'})")
+    env = {e["name"]: e for e in sp["containers"][0].get("env", [])}
+    for i in range(n):
+        pod = f"vault-{i}"
+        hcl = render_vault_hcl(env, pod)
+        if hcl is None:
+            out.append(f"{tag}: {pod}'s vault.hcl doesn't render")
+            continue
+        joins = re.findall(r'leader_api_addr = "http://([a-z0-9.-]+):8200"', hcl)
+        want = [f"vault-{j}.vault-internal" for j in range(n) if j != i]
+        if f'node_id = "{pod}"' not in hcl or joins != want:
+            out.append(f"{tag}: {pod}: node_id / retry_join {joins} (want node_id {pod}, retry_join {want})")
+        if f'api_addr     = "http://{pod}.vault-internal:8200"' not in hcl or f'cluster_addr = "http://{pod}.vault-internal:8201"' not in hcl \
+                or re.search(r"^\s*service_registration\b", hcl, re.M):
+            out.append(f"{tag}: {pod}: api / cluster address on vault-internal, no service_registration")
+    if env.get("VAULT_RAFT_NODE_ID", {}).get("valueFrom") != {"fieldRef": {"fieldPath": "metadata.name"}}:
+        out.append(f"{tag}: VAULT_RAFT_NODE_ID from the pod name (downward API)")
+    if sp.get("automountServiceAccountToken") is not False or sp.get("serviceAccountName") not in (None, "default") \
+            or _wl(docs, "Role", "vault") or _wl(docs, "ServiceAccount", "vault") or _wl(docs, "Service", "vault-active"):
+        out.append(f"{tag}: no ServiceAccount token, Role, ServiceAccount or Service vault-active (no service registration)")
+    return out
+
+
+def check_sessions_vault():
+    """Plan Task 25, without and with HA, and the checks bite (mutation
+    tests)."""
+    vals = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    for ha, docs in ((False, K.render()), (True, K.render(vals))):
+        for p in sessions_problems(docs, ha) + vault_problems(docs, ha):
+            F.add(p)
+    docs = K.render(vals)
+    def sts(d, n):
+        return _wl(d, "StatefulSet", n)
+    muts = [
+        (sessions_problems, lambda d: sts(d, "sessions-sentinel")["spec"].__setitem__("replicas", 2)),
+        (sessions_problems, lambda d: sts(d, "sessions-sentinel")["spec"]["template"]["spec"]["tolerations"].remove(SMALL_TOL)),
+        (sessions_problems, lambda d: next(x for x in d if x.get("kind") == "ConfigMap" and x["metadata"]["name"].startswith("sessions-ha-scripts-"))["data"].__setitem__(
+            "sentinel-init.sh", "MASTER_NAME=portcullis-sessions\necho \"sentinel monitor $MASTER_NAME $m 6379 1\"\n")),
+        (sessions_problems, lambda d: _wl(d, "Deployment", "forward-auth")["spec"]["template"]["spec"]["containers"][0]["args"].append("--redis-sentinel-password=x")),
+        (vault_problems, lambda d: sts(d, "vault")["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "VAULT_RAFT_PEERS", "value": "vault-0.vault-internal"})),
+        (vault_problems, lambda d: sts(d, "vault")["spec"].__setitem__("replicas", 2)),
+        (vault_problems, lambda d: sts(d, "vault")["spec"]["template"]["spec"].__setitem__("automountServiceAccountToken", True)),
+    ]
+    if sessions_problems(docs, True) or vault_problems(docs, True):
+        return  # the render already fails: the mutations would prove nothing
+    for fn, mutate in muts:
+        bad = copy.deepcopy(docs)
+        mutate(bad)
+        if not fn(bad, True):
+            F.add(f"{fn.__name__} misses a mutated render (mutation test)")
+
+
 def main():
     comp = K.compose()
     docs = K.render()
@@ -784,6 +960,7 @@ def main():
     check_ha()
     check_sites()
     check_postgres()
+    check_sessions_vault()
     for kind, items in D.items():
         for e in items:
             if (kind, e.get("service"), str(e.get("item"))) not in USED:

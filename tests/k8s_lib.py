@@ -147,7 +147,9 @@ def by_kind(docs, kind):
 
 
 def deployments(docs):
-    return {d["metadata"]["name"]: d for d in by_kind(docs, "Deployment")}
+    """{name: workload}: the Deployments and StatefulSets (Vault is one in
+    both modes, plan Task 25)."""
+    return {d["metadata"]["name"]: d for d in docs if d.get("kind") in ("Deployment", "StatefulSet")}
 
 
 def pod_specs(docs):
@@ -243,7 +245,7 @@ def values():
 # site term either.
 PRIMARY_SITE = "main"
 SITE_KEY = "portcullis.io/site"
-SITE_PINNED = {"postgres", "vault", "sessions", "hub", "domains", "keycloak", "forward-auth", "forward-auth-ext",
+SITE_PINNED = {"postgres", "vault", "sessions", "sessions-sentinel", "hub", "domains", "keycloak", "forward-auth", "forward-auth-ext",
                "group-gate", "enroll", "mcp-gate", "wg", "lldap", "oneshot-hub", "lldap-schema"}
 SITE_FREE = {"traefik", "frontdoor", "nodeadm"}
 

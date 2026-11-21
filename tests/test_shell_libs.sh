@@ -1630,6 +1630,76 @@ expect_ok "sessions: ... with the new hash" grep -qF "#$(printf '%s' "$SP1" | op
 expect_eq "sessions: no temp file left" "$(find "$SR/secrets/sessions" -name '.valkey.conf.*' | wc -l | tr -d ' ')" 0
 rc=0; (PATH="$WORK/sessbin:$PATH" PORTCULLIS_ROOT="$SR" FORWARD_AUTH_REDIS_PASSWORD='' FORWARD_AUTH_EXT_REDIS_PASSWORD="$SP2" sessions_prepare) >/dev/null 2>&1 || rc=$?
 expect_eq "sessions: a missing password fails (never a default)" "$rc" 1
+# HA (plan Task 25): secrets/sessions-ha/ for the Valkey pods and the
+# Sentinels (ha.sh kube_sessions_ha_prepare).
+sess eval 'kube_sessions_ha_prepare' >/dev/null 2>&1; expect_eq "sessions HA: kube_sessions_ha_prepare succeeds" "$?" 0
+SH="$SR/secrets/sessions-ha"
+expect_eq "sessions HA: secrets/sessions-ha 0700, its four files 0600" \
+  "$(file_mode "$SH") $(file_mode "$SH/internal") $(file_mode "$SH/valkey.conf") $(file_mode "$SH/sentinel.conf") $(file_mode "$SH/sentinel-monitor.conf")" "700 600 600 600 600"
+IPW="$(cat "$SH/internal")"; HI="$(printf '%s' "$IPW" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+HF1="$(printf '%s' "$SP1" | openssl dgst -sha256 -r | cut -d' ' -f1)"; HF2="$(printf '%s' "$SP2" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+expect_ok "sessions HA: the internal password is 40 alphanumerics" grep -qxE '[A-Za-z0-9]{40}' <<< "$IPW"
+expect_eq "sessions HA: valkey.conf = the base users + the replica's link user + the Sentinels' user, masteruser / masterauth" \
+  "$(grep -c '^user ' "$SH/valkey.conf"):$(grep '^user sessions-repl ' "$SH/valkey.conf"):$(grep -c "^masteruser sessions-repl$" "$SH/valkey.conf"):$(grep -cxF "masterauth $IPW" "$SH/valkey.conf")" \
+  "5:user sessions-repl on resetpass resetkeys resetchannels -@all +psync +replconf +ping #$HI:1:1"
+expect_eq "sessions HA: the Sentinels' user on Valkey = what a Sentinel sends (valkey 9.1.3 src/sentinel.c), its hello channel, no key" \
+  "$(grep '^user sessions-admin ' "$SH/valkey.conf")" \
+  "user sessions-admin on resetpass resetkeys resetchannels -@all +multi +exec +slaveof +replicaof +failover +ping +info +role +config|rewrite +client|setname +client|kill +script|kill +subscribe +publish &__sentinel__:hello #$HI"
+expect_eq "sessions HA: the Sentinels' default user = both oauth2-proxies' passwords, only go-redis's failover commands and channels" \
+  "$(grep '^user default ' "$SH/sentinel.conf")" \
+  "user default on resetpass resetkeys resetchannels &+switch-master &+replica-reconf-done -@all +ping +subscribe +sentinel|get-master-addr-by-name +sentinel|sentinels +sentinel|replicas #$HF1 #$HF2"
+if grep '^user default ' "$SH/sentinel.conf" | grep -qiE '\+sentinel( |$)|\+sentinel\|(failover|set|monitor|remove|reset|flushconfig|config|debug)|\+@all|allchannels|nopass|>'; then
+  t_fail "sessions HA: the Sentinels' default user may fail over / reconfigure"
+else t_pass "sessions HA: the Sentinels' default user can't fail over, set, monitor, remove or reset"; fi
+expect_eq "sessions HA: the peers / guard user and the Sentinel names (hostnames)" \
+  "$(grep -cE "^(user sessions-admin on resetpass resetkeys allchannels \+@all #$HI|sentinel sentinel-user sessions-admin|sentinel sentinel-pass $IPW|sentinel resolve-hostnames yes|sentinel announce-hostnames yes|port 26379)$" "$SH/sentinel.conf")" 6
+expect_eq "sessions HA: the monitor tail: master portcullis-sessions, auth, 5 s down-after, 60 s failover timeout" \
+  "$(paste -sd'|' "$SH/sentinel-monitor.conf")" \
+  "sentinel auth-user portcullis-sessions sessions-admin|sentinel auth-pass portcullis-sessions $IPW|sentinel down-after-milliseconds portcullis-sessions 5000|sentinel failover-timeout portcullis-sessions 60000|sentinel parallel-syncs portcullis-sessions 1"
+case "$(cat "$SH"/*.conf)" in *"$SP1"*|*"$SP2"*) t_fail "sessions HA: an oauth2-proxy's password in the HA configs" ;; *) t_pass "sessions HA: the oauth2-proxies' passwords only as hashes" ;; esac
+sess eval 'kube_sessions_ha_prepare' >/dev/null 2>&1
+expect_eq "sessions HA: the internal password is made once (kept on the next run)" "$(cat "$SH/internal")" "$IPW"
+printf 'short' > "$SH/internal"
+sess eval 'kube_sessions_ha_prepare' >/dev/null 2>&1
+expect_ok "sessions HA: a malformed internal password is replaced" grep -qxE '[A-Za-z0-9]{40}' "$SH/internal"
+expect_eq "sessions HA: no temp file left" "$(find "$SH" -name '.*' -type f | wc -l | tr -d ' ')" 0
+# HA (plan Task 25, Amendment 2): the session store's init guard
+# (charts/portcullis/files/sessions-ha/guard.sh) never elects itself.
+GD="$WORK/guard"; rm -rf "$GD"; mkdir -p "$GD/bin"
+cat > "$GD/bin/valkey-cli" <<'GSTUB'
+#!/bin/sh
+# Sentinel answers from $GD_DIR: master (its name, or empty), replicas, after-failover.
+echo "$*" >> "$GD_DIR/calls"
+case "$*" in
+  *"sentinel get-master-addr-by-name portcullis-sessions") [ -s "$GD_DIR/master" ] || exit 0; if [ -e "$GD_DIR/failed-over" ]; then cat "$GD_DIR/after"; else cat "$GD_DIR/master"; echo; fi; echo 6379 ;;
+  *"-p 6379 info replication") [ -s "$GD_DIR/peer" ] || exit 1; cat "$GD_DIR/peer" ;;
+  *"sentinel failover portcullis-sessions") [ -e "$GD_DIR/no-failover" ] || touch "$GD_DIR/failed-over"; echo OK ;;
+esac
+GSTUB
+printf '#!/bin/sh\nexit 0\n' > "$GD/bin/sleep"
+chmod +x "$GD/bin/valkey-cli" "$GD/bin/sleep"
+guard() { # guard <master answer> <the other pod's INFO replication ("" = unreachable)> [after-failover master]
+  rm -f "$GD/calls" "$GD/failed-over" "$GD/conf"; printf '%s' "$1" > "$GD/master"; printf '%s' "$2" > "$GD/peer"; printf '%s\n' "${3:-}" > "$GD/after"
+  ( export PATH="$GD/bin:$PATH" GD_DIR="$GD" POD_NAMESPACE=portcullis POD_NAME=sessions-1 GUARD_WAIT=4 GUARD_CONF="$GD/conf"
+    sh "$HERE/../charts/portcullis/files/sessions-ha/guard.sh" ) >/dev/null 2>&1; echo "rc=$?"
+}
+P0=sessions-0.sessions-pods.portcullis.svc.cluster.local P1=sessions-1.sessions-pods.portcullis.svc.cluster.local
+REP0="$(printf '# Replication\r\nrole:slave\r\nmaster_link_status:down\r\nmaster_repl_offset:133960\r\n')"
+expect_eq "sessions guard: the Sentinels name another master → this pod replicates from it" \
+  "$(guard "$P0" "")$(grep -c "^replicaof $P0 6379$" "$GD/conf")$(grep -c '^include /etc/valkey-ha/valkey.conf$' "$GD/conf")" "rc=011"
+expect_eq "sessions guard: named itself (a fast restart, empty), the other pod a replica holding data (asked directly; its link down) → SENTINEL FAILOVER first, then a replica of the new master" \
+  "$(guard "$P1" "$REP0" "$P0")$(grep -c 'sentinel failover portcullis-sessions' "$GD/calls")$(grep -c "^replicaof $P0 6379$" "$GD/conf")" "rc=011"
+expect_eq "sessions guard: named itself, the Sentinels never fail over (a replica they refuse) → asked first, then the master after the wait (sign-in over the sessions)" \
+  "$(touch "$GD/no-failover"; guard "$P1" "$REP0" "$P0"; rm -f "$GD/no-failover")$(grep -c 'sentinel failover portcullis-sessions' "$GD/calls")$(grep -c '^replicaof' "$GD/conf")$(grep -c '^include ' "$GD/conf")" "rc=0101"
+expect_eq "sessions guard: named itself, the other pod unreachable or never replicated → the master (nothing to lose)" \
+  "$(guard "$P1" "")$(grep -c '^replicaof' "$GD/conf")$(guard "$P1" "$(printf '%s' "$REP0" | sed 's/:133960/:0/')")$(grep -c '^replicaof' "$GD/conf")" "rc=00rc=00"
+expect_eq "sessions guard: named itself while the other pod is a master with data → refused (exit 1), never two masters" \
+  "$(guard "$P1" "$(printf '%s' "$REP0" | sed 's/role:slave/role:master/')")$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
+expect_eq "sessions guard: no Sentinel answers → refused (exit 1: never a second master), no config written" \
+  "$(guard "" "")$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
+expect_eq "sessions guard: a Sentinel naming a host that isn't one of the two Valkey pods is ignored (refused)" \
+  "$(guard "evil.example.org" "")" "rc=1"
+expect_eq "sessions guard: the password never on valkey-cli's argv (VALKEYCLI_AUTH only)" "$(grep -c -- ' -a \| --pass ' "$GD/calls" || true)" 0
 # Restart only a running store, only when its config changed, before compose up.
 : > "$STUB_DIR/sess-calls"; rm -f "$STUB_DIR/sess-running"
 sess eval 'SESSIONS_CONF_CHANGED=true; sessions_restart_if_changed' >/dev/null 2>&1
@@ -4384,6 +4454,54 @@ kt() {
     ( eval "$1" ); echo "rc=$?" ) 2>&1
 }
 
+# The Vault raft snapshot on Kubernetes (plan Task 25, Amendment 2): from
+# the voter whose own Vault says is_self (asked in each pod; no label
+# decides), through a port-forward to that pod, retried, the token never
+# on argv.
+VS="$WORK/vsnap"; rm -rf "$VS"; mkdir -p "$VS/bin"
+cat > "$VS/bin/curl" <<'VCURL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$VS_DIR/curl-args"
+out="" url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; http*) url="$1" ;; esac; shift; done
+port="${url#http://127.0.0.1:}"; port="${port%%/*}"
+case "$url" in
+  */v1/sys/leader) cat "$VS_DIR/leader-$port" 2>/dev/null || echo '{}' ;;
+  */v1/sys/storage/raft/snapshot) echo "$port" >> "$VS_DIR/snap-ports"; cp "$VS_SNAP" "$out"; printf 200 ;;
+esac
+VCURL
+chmod +x "$VS/bin/curl"
+vsnap() { # vsnap <vault-0's status json> <vault-1's> <vault-2's> [extra code]
+  rm -f "$VS"/leader-* "$VS/fwd" "$VS/snap-ports" "$VS/curl-args" "$VS/out.snap" "$VS"/st-*
+  printf '%s' "$1" > "$VS/st-vault-0"; printf '%s' "$2" > "$VS/st-vault-1"; printf '%s' "$3" > "$VS/st-vault-2"
+  for i in 0 1 2; do cp "$VS/st-vault-$i" "$VS/leader-701$i"; done
+  kt "export VS_DIR='$VS' VS_SNAP='$WORK/good.snap' PATH='$VS/bin':\$PATH VAULT_TOKEN=s.vsnap-token-1234 KUBE_VAULT_SNAPSHOT_TRIES=2 KUBE_VAULT_SNAPSHOT_WAIT=0
+    kube_vault_voters() { printf 'vault-0\nvault-1\nvault-2\n'; }
+    kube_ctl() { case \"\$*\" in *' exec vault-'[0-9]' -c vault -- vault status -format=json') p=\"\${*#* exec }\"; cat \"$VS/st-\${p%% *}\" ;; *) return 1 ;; esac; }
+    _kube_forward() { echo \"\$1\" >> '$VS/fwd'; case \"\$1\" in pod/vault-0) echo 7010 ;; pod/vault-1) echo 7011 ;; pod/vault-2) echo 7012 ;; *) return 1 ;; esac; }
+    _kube_forward_stop() { :; }
+    ${4:-}
+    _backup_vault_snapshot '$VS/out.snap'"
+}
+L='{"ha_enabled":true,"is_self":true}' S='{"ha_enabled":true,"is_self":false}'
+OUT="$(vsnap "$S" "$L" "$S")"
+expect_eq "backup: vault snapshot taken through the leader (the voter that says is_self, by its own pod)" \
+  "$(printf '%s' "$OUT" | tail -n1):$(paste -sd, "$VS/fwd"):$(paste -sd, "$VS/snap-ports"):$(cmp -s "$VS/out.snap" "$WORK/good.snap" && echo same)" "rc=0:pod/vault-1:7011:same"
+expect_eq "backup: the Vault token never on curl's argv" "$(grep -c 's.vsnap-token-1234' "$VS/curl-args")" 0
+OUT="$(vsnap "$L" "$S" "$S" "printf '%s' '$S' > '$VS/leader-7010'")"
+case "$OUT" in *"no Vault leader answers"*"rc=1") t_pass "backup: the leader's own API no longer says is_self (it stepped down) → no snapshot from it" ;; *) t_fail "vault snapshot stepped-down leader: $OUT" ;; esac
+OUT="$(vsnap "$S" "$S" '')"
+case "$OUT" in *"no leader answered in 2 tries"*"rc=1") t_pass "backup: no Vault leader anywhere (one voter unreachable) → refused after the tries, nothing written" ;; *) t_fail "vault snapshot without a leader: $OUT" ;; esac
+[ ! -s "$VS/snap-ports" ] && t_pass "backup: no snapshot asked of a voter that isn't the leader" || t_fail "a snapshot was taken from a non-leader: $(cat "$VS/snap-ports")"
+OUT="$(kt "kube_ctl() { case \"\$*\" in *' exec vault-1 '*) echo '{\"ha_enabled\":true,\"is_self\":true}' ;; *' get statefulset vault '*) echo 3 ;; *) return 1 ;; esac; }; kube_vault_pod_set; kube_ctl() { return 1; }; kube_vault_pod; echo \"cached=\$_K_VAULT_POD\"")"
+expect_eq "kube_vault_pod: the leader (asked once, kept for the run)" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "vault-1 cached=vault-1 "
+t0="$(date +%s)"; OUT="$(kt "_kube_bounded 1 sh -c 'sleep 30; echo late' | cat; echo after")"
+expect_eq "_kube_bounded: a hung command (and its child holding the pipe) is cut at the bound" "$(printf '%s\n' "$OUT" | head -n1):$(( $(date +%s) - t0 < 10 ))" "after:1"
+t0="$(date +%s)"; OUT="$(kt "_kube_bounded 20 echo quick | cat")"
+expect_eq "_kube_bounded: a quick command returns at once (the watchdog holds no pipe)" "$(printf '%s\n' "$OUT" | head -n1):$(( $(date +%s) - t0 < 10 ))" "quick:1"
+OUT="$(kt "kube_ctl() { return 1; }; kube_vault_pod")"
+expect_eq "kube_vault_pod: no leader (not initialised, or none answers) → vault-0" "$(printf '%s\n' "$OUT" | head -n1)" "vault-0"
+
 # The cluster check's refresh (final review I4): `kube check`, the
 # portcullis-kube-check.timer init installs (every 6 h), status at 20 / 24 h.
 KCT="$WORK/kct"; rm -rf "$KCT"; mkdir -p "$KCT/bin"
@@ -5185,7 +5303,7 @@ k15_root() {
   printf 'cert' > "$K15/certs/ca-chain.crt"; printf 'KEY' > "$K15/certs/server.key"; printf '1a\n' > "$K15/certs/revocation/revoked-serials.txt"
   echo "PORTCULLIS_DOMAIN=k.example.org" > "$K15/.env"
 }
-K15_ENV="export PORTCULLIS_ROOT='$K15' POSTGRES_PASSWORD=PG-SECRET-777 HUB_PROXY_SECRET=HUB-PROXY-SECRET-555 HUB_CLI_PROXY_SECRET=HUB-CLI-SECRET-666 KEYCLOAK_ADMIN_PASSWORD=KC-SECRET PORTCULLIS_DOMAIN=k.example.org PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22"
+K15_ENV="export PORTCULLIS_ROOT='$K15' FORWARD_AUTH_REDIS_PASSWORD=FA-REDIS-SECRET-111 FORWARD_AUTH_EXT_REDIS_PASSWORD=FAX-REDIS-SECRET-222 POSTGRES_PASSWORD=PG-SECRET-777 HUB_PROXY_SECRET=HUB-PROXY-SECRET-555 HUB_CLI_PROXY_SECRET=HUB-CLI-SECRET-666 KEYCLOAK_ADMIN_PASSWORD=KC-SECRET PORTCULLIS_DOMAIN=k.example.org PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22"
 k_fixtures; k15_root; rm -f "$KS/order"
 OUT="$(kt "set -euo pipefail; $K15_ENV; kube_sync_secrets" </dev/null)"
 expect_eq "sync: every object applied (under set -euo pipefail)" "$(printf '%s\n' "$OUT" | tail -n1)" "rc=0"
@@ -5193,6 +5311,8 @@ expect_eq "sync: no secret on argv (kubectl / helm argv recorded)" \
   "$(cat "$KS/kubectl-calls" "$KS/helm-calls" 2>/dev/null | grep -cE 'SECRET-LLDAP-PW-123|PG-SECRET-777|HUB-PROXY-SECRET-555|KC-SECRET|ROOT-TOKEN-XYZ|CA-KEY-SECRET' || true)" 0
 expect_eq "sync: Secrets from secrets/ dirs (--from-file), portcullis-env, ConfigMaps; never vault-init.json or the endpoint CA key" \
   "$(grep -cE 'create secret generic secrets-hub-lldap .*--from-file=|create secret generic portcullis-env .*--from-file=|create configmap certs-revocation .*--from-file=|create secret generic secrets-certs .*--from-file=' "$KS/kubectl-calls"):$(grep -rlE 'ROOT-TOKEN-XYZ|CA-KEY-SECRET' "$KS/kubectl-stdin" 2>/dev/null | wc -l | tr -d ' ')" "4:0"
+expect_eq "sync: the session store's HA configs (plan Task 25) as the Secret secrets-sessions-ha, the oauth2-proxies' passwords never on argv or in it" \
+  "$(grep -cE 'create secret generic secrets-sessions-ha .*--from-file=' "$KS/kubectl-calls"):$(cat "$KS/kubectl-calls" "$K15/secrets/sessions-ha"/* | grep -cE 'FA-REDIS-SECRET-111|FAX-REDIS-SECRET-222' || true)" "1:0"
 expect_eq "sync: the hub-proxy-secret Middleware from stdin (jq), its secret not on argv" \
   "$(grep -c '"X-Portcullis-Proxy-Secret": "HUB-PROXY-SECRET-555"' "$KS/kubectl-stdin"):$(grep -c 'HUB-PROXY-SECRET-555' "$KS/kubectl-calls" || true)" "1:0"
 expect_eq "sync: the hub-cli-proxy-secret Middleware from stdin (jq), its secret not on argv" \

@@ -528,7 +528,7 @@ _rtk_health() {
   local pods dep
   # Postgres is the CNPG Cluster's primary (ha.sh, plan Task 23).
   [ "$1" != postgres ] || { _kube_pg_health; return 0; }
-  dep="$(kube_ctl -n "$(kube_ns)" get deploy "$1" -o json 2>/dev/null)" || { echo missing; return 0; }
+  dep="$(kube_ctl -n "$(kube_ns)" get "$(_rtk_kind "$1")" "$1" -o json 2>/dev/null)" || { echo missing; return 0; }
   if ! printf '%s' "$dep" | jq -e '(.status.observedGeneration // 0) >= .metadata.generation
       and (.status.updatedReplicas // 0) == (.spec.replicas // 1) and (.status.replicas // 0) == (.status.updatedReplicas // 0)' >/dev/null 2>&1; then
     echo starting; return 0
@@ -571,7 +571,9 @@ _rtk_exec() {
   [ "${1:-}" != -- ] || shift
   # Postgres: the CNPG primary's postgres container (ha.sh).
   [ "$svc" != postgres ] || { _kube_pg_exec "$@"; return; }
-  kube_ctl -n "$(kube_ns)" exec -i "deploy/$svc" -c "$svc" -- "$@" \
+  # Vault: the leader's pod, else vault-0 (ha.sh kube_vault_pod_set).
+  [ "$svc" != vault ] || kube_vault_pod_set
+  kube_ctl -n "$(kube_ns)" exec -i "$(if [ "$svc" = vault ]; then echo "pod/${_K_VAULT_POD:-vault-0}"; else _rtk_ref "$svc"; fi)" -c "$svc" -- "$@" \
     2> >(awk '!/^command terminated with exit code [0-9]+$/ { print; fflush() }' >&2)
 }
 
@@ -591,7 +593,7 @@ _rtk_logs() {
     esac
     shift
   done
-  kube_ctl -n "$(kube_ns)" logs "deploy/$svc" -c "$svc" ${opts[@]+"${opts[@]}"}
+  kube_ctl -n "$(kube_ns)" logs "$(_rtk_ref "$svc")" -c "$svc" ${opts[@]+"${opts[@]}"}
 }
 
 # _rtk_rolled_running <service> — its Deployment rolled out (as
@@ -600,7 +602,7 @@ _rtk_logs() {
 _rtk_rolled_running() {
   local dep pods
   [ "$1" != postgres ] || { [ "$(_kube_pg_health)" = healthy ]; return; }
-  dep="$(kube_ctl -n "$(kube_ns)" get deploy "$1" -o json 2>/dev/null)" || return 1
+  dep="$(kube_ctl -n "$(kube_ns)" get "$(_rtk_kind "$1")" "$1" -o json 2>/dev/null)" || return 1
   printf '%s' "$dep" | jq -e '(.status.observedGeneration // 0) >= .metadata.generation
       and (.status.updatedReplicas // 0) == (.spec.replicas // 1) and (.status.replicas // 0) == (.status.updatedReplicas // 0)' >/dev/null 2>&1 || return 1
   pods="$(_rtk_pods_json "$1")" || return 1
@@ -627,7 +629,7 @@ _rtk_wait_ready() {
 _rtk_restart() {
   local svc
   for svc in "$@"; do
-    kube_ctl -n "$(kube_ns)" rollout restart "deploy/$svc" >/dev/null || return 1
+    kube_ctl -n "$(kube_ns)" rollout restart "$(_rtk_ref "$svc")" >/dev/null || return 1
   done
   _rtk_wait_ready "$@"
 }
@@ -636,7 +638,7 @@ _rtk_restart() {
 _rtk_stop() {
   local svc
   for svc in "$@"; do
-    kube_ctl -n "$(kube_ns)" scale "deploy/$svc" --replicas=0 >/dev/null || return 1
+    kube_ctl -n "$(kube_ns)" scale "$(_rtk_ref "$svc")" --replicas=0 >/dev/null || return 1
     kube_ctl -n "$(kube_ns)" wait --for=delete pod -l "$_KUBE_COMPONENT=$svc" --timeout=180s >/dev/null 2>&1 || true
   done
 }
@@ -644,7 +646,7 @@ _rtk_stop() {
 _rtk_start() {
   local svc
   for svc in "$@"; do
-    kube_ctl -n "$(kube_ns)" scale "deploy/$svc" --replicas=1 >/dev/null || return 1
+    kube_ctl -n "$(kube_ns)" scale "$(_rtk_ref "$svc")" --replicas="$(_rtk_replicas "$svc")" >/dev/null || return 1
   done
   _rtk_wait_ready "$@"
 }
@@ -827,20 +829,23 @@ _rtk_started_at() {
 }
 
 _rtk_services() {
-  kube_ctl -n "$(kube_ns)" get deployments -o json 2>/dev/null | jq -r '.items[].metadata.name' 2>/dev/null
+  kube_ctl -n "$(kube_ns)" get deployments,statefulsets -o json 2>/dev/null | jq -r '.items[].metadata.name' 2>/dev/null
 }
 
 _rtk_require_tools() {
   require_cmd kubectl helm jq
 }
 
-# _rtk_down — every Deployment of both namespaces scaled to 0 (never `helm
-# uninstall`: the release, its PVCs and Secrets stay).
+# _rtk_down — every Deployment of both namespaces and the core one's
+# StatefulSets scaled to 0 (never `helm uninstall`: the release, its PVCs
+# and Secrets stay).
 _rtk_down() {
   local ns
   for ns in "$(kube_ns)" "$(kube_apps_ns)"; do
     kube_ctl -n "$ns" scale deployment --all --replicas=0 >/dev/null || fail "could not scale the Deployments in $ns to 0"
   done
+  [ -z "$(kube_ctl -n "$(kube_ns)" get statefulsets -o name 2>/dev/null)" ] \
+    || kube_ctl -n "$(kube_ns)" scale statefulset --all --replicas=0 >/dev/null || fail "could not scale the StatefulSets in $(kube_ns) to 0"
 }
 
 # kube_init_cluster — init / up / upgrade under kubernetes, before anything
@@ -1549,6 +1554,7 @@ kube_sync_secrets() {
   kube_nodeadm_prepare
   # LLDAP's server key (ha.sh): made once, synced as secrets-lldap-key.
   kube_lldap_server_key
+  kube_sessions_ha_prepare  # the session store's HA configs (ha.sh)
   kube_sync_stage
   _K_HASHES='{}'
   live="$_K_STAGE/.live" want="$_K_STAGE/.live/want.json"
@@ -1858,7 +1864,9 @@ kube_forward_core() {
   for svc in vault:8200:VAULT_ADDR keycloak:8080:KEYCLOAK_URL; do
     IFS=: read -r svc port var <<< "$svc"
     rt_running "$svc" || continue
-    pf="$(_kube_forward "$svc" "$port")" || { warn "no port-forward to $svc:$port"; continue; }
+    # Vault: the leader's pod, else vault-0 (ha.sh kube_vault_pod_set).
+    [ "$svc" != vault ] || kube_vault_pod_set
+    pf="$(_kube_forward "$([ "$svc" != vault ] || echo "pod/${_K_VAULT_POD:-vault-0}")${svc#vault}" "$port")" || { warn "no port-forward to $svc:$port"; continue; }
     export "$var=http://127.0.0.1:$pf"
   done
 }
@@ -1866,11 +1874,13 @@ kube_forward_core() {
 # _kube_forward <service> <port> — a port-forward that lives as long as this
 # shell; prints the local port.
 _kube_forward() {
-  local log i lp="" pid parent=$$
+  local log i lp="" pid parent=$$ target="$1"
+  case "$target" in */*) ;; *) target="svc/$target" ;; esac
   log="$(mktemp)"
-  kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "svc/$1" ":$2" >"$log" 2>&1 &
+  kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$2" >"$log" 2>&1 &
   pid=$!
-  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null
+    rm -f "${TMPDIR:-/tmp}/.portcullis-fwd-$parent-$pid" ) >/dev/null 2>&1 &
   for ((i = 0; i < 100; i++)); do
     lp="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> .*/\1/p' "$log" | head -n1)"
     [ -z "$lp" ] || break
@@ -1879,8 +1889,10 @@ _kube_forward() {
   done
   rm -f "$log"
   [ -n "$lp" ] || { kill "$pid" 2>/dev/null; return 1; }
+  (umask 077 && printf '%s' "$lp" > "${TMPDIR:-/tmp}/.portcullis-fwd-$parent-$pid")
   echo "$lp"
 }
+
 
 # ── backup / restore on kubernetes (Task 15; spec §9) ─────
 
@@ -2060,7 +2072,7 @@ _kube_restore_stop_secret_apps() {
 }
 
 # _kube_scale <svc> <n> — scale without waiting for readiness.
-_kube_scale() { kube_ctl -n "$(kube_ns)" scale "deploy/$1" --replicas="$2" >/dev/null; }
+_kube_scale() { kube_ctl -n "$(kube_ns)" scale "$(_rtk_ref "$1")" --replicas="$2" >/dev/null; }
 
 # _kube_wait_running <svc> — a pod of the service is Running (not Ready).
 _kube_wait_running() { _rtk_wait_ready "$1"; }
@@ -2071,8 +2083,9 @@ _kube_wait_running() { _rtk_wait_ready "$1"; }
 _kube_restore_vault() {
   local dir="$1" init tmp_key tmp_root code pf
   unset VAULT_TOKEN
+  # vault-0 alone (every voter emptied, ha.sh), the others join it after.
   _kube_scale vault 1 && _kube_wait_running vault || fail "the fresh Vault doesn't start"
-  pf="$(_kube_forward vault 8200)" || fail "no port-forward to Vault"
+  pf="$(_kube_forward pod/vault-0 8200)" || fail "no port-forward to Vault"
   export VAULT_ADDR="http://127.0.0.1:$pf"
   init="$(vexec operator init -key-shares=1 -key-threshold=1 -format=json)" || fail "temporary vault init failed"
   tmp_key="$(printf '%s' "$init" | jq -r '.unseal_keys_b64[0]')"
@@ -2085,10 +2098,11 @@ _kube_restore_vault() {
   [ "$code" = 204 ] || [ "$code" = 200 ] || fail "Vault snapshot restore failed (HTTP ${code:-none})"
   _restore_secrets "$dir"
   kube_sync_secrets --full
-  kube_ctl -n "$(kube_ns)" rollout restart deploy/vault >/dev/null && _kube_wait_running vault || fail "could not restart Vault"
-  pf="$(_kube_forward vault 8200)" || fail "no port-forward to Vault"
+  kube_ctl -n "$(kube_ns)" rollout restart "$(_rtk_ref vault)" >/dev/null && _kube_wait_running vault || fail "could not restart Vault"
+  pf="$(_kube_forward pod/vault-0 8200)" || fail "no port-forward to Vault"
   export VAULT_ADDR="http://127.0.0.1:$pf"
   vault_wait_active 120 || fail "Vault did not unseal with the restored key (secrets/ and vault.snap from different installs?)"
+  _kube_scale vault "$(_rtk_replicas vault)" || fail "could not scale Vault back to its voters"
   ok "Vault restored and unsealed with the original key."
 }
 
@@ -2149,7 +2163,7 @@ _backup_restore_kube() {
   # fresh Vault (emptied in place, as its owner).
   kube_pg_sync_secrets
   _kube_restore_pg "$dir" "$pre"
-  _kube_empty_volume vault_data 100 1000 || fail "could not empty vault-data"
+  _kube_empty_vault || fail "could not empty Vault's PVCs"
   _kube_restore_vault "$dir"
   for spec in $BACKUP_FILE_VOLUMES; do
     IFS=: read -r key uid gid <<< "$spec"

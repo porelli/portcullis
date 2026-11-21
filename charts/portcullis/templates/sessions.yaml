@@ -1,4 +1,20 @@
-{{- /* sessions (compose: sessions): Valkey, memory only. */ -}}
+{{- /* sessions (compose: sessions): Valkey, memory only.
+HA (plan Task 25, Amendment 2; spike 2 Step 5): StatefulSet sessions × 2
+(one master, one replica; never on a small node, spread DoNotSchedule) and
+StatefulSet sessions-sentinel × 3 (Sentinel, master name
+portcullis-sessions, quorum 2; tolerating the small taint: the third on the
+small node), both pinned to the primary site, their headless Services
+(sessions-pods, sessions-sentinel: names also while not ready). The
+oauth2-proxies find the master through the Sentinels (forward-auth*.yaml).
+A Valkey pod never elects itself: its init guard
+(files/sessions-ha/guard.sh) asks the Sentinels, fails over first when they
+still name it (a fast restart comes back empty), and its readiness is the
+replication's (ready.sh), with minReadySeconds 10. The configs are the
+CLI's (Secret secrets-sessions-ha, ha.sh kube_sessions_ha_prepare: the ACL
+users as SHA-256, the replication and Sentinel users' password); the
+in-pod parts (announced names, replicaof, the monitor line) are written
+into a memory emptyDir at start. */ -}}
+{{- if not .Values.ha.enabled }}
 {{- $s := dict
   "name" "sessions" "uid" .Values.uids.sessions "gid" .Values.uids.sessionsGroup "pin" true
   "memory" "128Mi" "nets" (list "portcullis-sessions")
@@ -28,3 +44,103 @@ spec:
     - name: valkey
       port: 6379
       targetPort: 6379
+{{- else }}
+{{- $img := include "portcullis.image" (list . "sessions") }}
+{{- $pull := ternary "Never" "IfNotPresent" (hasPrefix "localhost/" $img) }}
+{{- $files := dict "guard.sh" (.Files.Get "files/sessions-ha/guard.sh") "ready.sh" (.Files.Get "files/sessions-ha/ready.sh") "sentinel-init.sh" (.Files.Get "files/sessions-ha/sentinel-init.sh") }}
+{{- $cm := printf "sessions-ha-scripts-%s" (toJson $files | sha256sum | trunc 10) }}
+{{- $env := list
+  (dict "name" "POD_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
+  (dict "name" "POD_NAMESPACE" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.namespace")))
+  (dict "name" "VALKEYCLI_AUTH" "valueFrom" (dict "secretKeyRef" (dict "name" "secrets-sessions-ha" "key" "internal"))) }}
+{{- $init := dict "image" $img "imagePullPolicy" $pull "env" $env
+  "resources" (dict "limits" (dict "memory" "32Mi") "requests" (dict "memory" "32Mi"))
+  "securityContext" (dict "allowPrivilegeEscalation" false "readOnlyRootFilesystem" true "capabilities" (dict "drop" (list "ALL"))) }}
+{{- $scriptsVol := dict "name" "scripts" "configMap" (dict "name" $cm "defaultMode" 365) }}
+{{- $scriptsMnt := dict "name" "scripts" "mountPath" "/scripts" "readOnly" true }}
+{{- $confMnt := dict "name" "conf" "mountPath" "/conf" }}
+{{- /* The Valkey pods. */}}
+{{- $guard := merge (dict "name" "guard" "command" (list "sh" "/scripts/guard.sh") "volumeMounts" (list $scriptsMnt $confMnt)) (deepCopy $init) }}
+{{- $s := dict
+  "name" "sessions" "uid" .Values.uids.sessions "gid" .Values.uids.sessionsGroup "pin" true
+  "memory" "128Mi" "nets" (list "portcullis-sessions")
+  "hashes" (list "secrets-sessions-ha")
+  "args" (list "valkey-server" "/conf/valkey.conf")
+  "ports" (list (dict "name" "valkey" "port" 6379))
+  "env" $env
+  "initContainers" (list $guard)
+  "probes" (dict
+    "readinessProbe" (dict "exec" (dict "command" (list "sh" "/scripts/ready.sh")) "periodSeconds" 2 "timeoutSeconds" 3 "failureThreshold" 2)
+    "livenessProbe" (dict "exec" (dict "command" (list "sh" "-c" "valkey-cli -h 127.0.0.1 ping 2>&1 | grep -q NOAUTH")) "periodSeconds" 5 "timeoutSeconds" 3 "failureThreshold" 20))
+  "mounts" (list
+    (dict "name" "data" "mountPath" "/data")
+    $confMnt
+    (dict "name" "base" "mountPath" "/etc/valkey-ha" "readOnly" true)
+    $scriptsMnt)
+  "volumes" (list
+    (dict "name" "data" "emptyDir" (dict "medium" "Memory"))
+    (dict "name" "conf" "emptyDir" (dict "medium" "Memory" "sizeLimit" "1Mi"))
+    (dict "name" "base" "secret" (dict "secretName" "secrets-sessions-ha" "defaultMode" 288 "items" (list (dict "key" "valkey.conf" "path" "valkey.conf"))))
+    $scriptsVol)
+  "statefulSet" (dict "replicas" 2 "serviceName" "sessions-pods" "minReadySeconds" 10)
+  "spread" "DoNotSchedule"
+  "nodeExpressions" (list (dict "key" "portcullis.io/class" "operator" "NotIn" "values" (list "small")))
+  "fsGroup" .Values.uids.sessionsGroup
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{- /* The Sentinels. */}}
+{{- $sinit := merge (dict "name" "sentinel-init" "command" (list "sh" "/scripts/sentinel-init.sh")
+  "volumeMounts" (list $scriptsMnt $confMnt (dict "name" "parts" "mountPath" "/etc/sessions-ha" "readOnly" true))) (deepCopy $init) }}
+{{- $t := dict
+  "name" "sessions-sentinel" "image" "sessions" "uid" .Values.uids.sessions "gid" .Values.uids.sessionsGroup "pin" true
+  "memory" "64Mi" "nets" (list "portcullis-sessions")
+  "hashes" (list "secrets-sessions-ha")
+  "args" (list "valkey-sentinel" "/conf/sentinel.conf")
+  "ports" (list (dict "name" "sentinel" "port" 26379))
+  "env" $env
+  "initContainers" (list $sinit)
+  "probes" (dict
+    "readinessProbe" (dict "exec" (dict "command" (list "sh" "-c" "valkey-cli --no-auth-warning -t 2 --user sessions-admin -h 127.0.0.1 -p 26379 ping | grep -qx PONG")) "periodSeconds" 5 "timeoutSeconds" 3 "failureThreshold" 3)
+    "livenessProbe" (dict "exec" (dict "command" (list "sh" "-c" "valkey-cli --no-auth-warning -t 2 --user sessions-admin -h 127.0.0.1 -p 26379 ping | grep -qx PONG")) "periodSeconds" 5 "timeoutSeconds" 3 "failureThreshold" 12))
+  "mounts" (list $confMnt (dict "name" "data" "mountPath" "/data"))
+  "volumes" (list
+    (dict "name" "conf" "emptyDir" (dict "medium" "Memory" "sizeLimit" "1Mi"))
+    (dict "name" "data" "emptyDir" (dict "medium" "Memory" "sizeLimit" "1Mi"))
+    (dict "name" "parts" "secret" (dict "secretName" "secrets-sessions-ha" "defaultMode" 288 "items" (list (dict "key" "sentinel.conf" "path" "sentinel.conf") (dict "key" "sentinel-monitor.conf" "path" "sentinel-monitor.conf"))))
+    $scriptsVol)
+  "statefulSet" (dict "replicas" 3 "serviceName" "sessions-sentinel")
+  "spread" "DoNotSchedule"
+  "tolerations" (list (dict "key" "portcullis.io/small" "operator" "Exists" "effect" "NoSchedule"))
+  "pdbMinAvailable" 2
+  "fsGroup" .Values.uids.sessionsGroup
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $t) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $cm }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+data:
+  {{- toYaml $files | nindent 2 }}
+{{- range $svc := list (dict "name" "sessions-pods" "component" "sessions" "port" 6379 "pname" "valkey") (dict "name" "sessions-sentinel" "component" "sessions-sentinel" "port" 26379 "pname" "sentinel") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc.name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    portcullis.io/component: {{ $svc.component }}
+  ports:
+    - name: {{ $svc.pname }}
+      port: {{ $svc.port }}
+      targetPort: {{ $svc.port }}
+{{- end }}
+{{- end }}

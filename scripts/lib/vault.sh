@@ -156,7 +156,8 @@ _vault_start_and_status() {
   # Kubernetes: the CLI's curl reaches Vault through a port-forward.
   if _rt_is_kube && [ -z "${_K_VAULT_FWD:-}" ]; then
     local pf
-    pf="$(_kube_forward vault 8200)" || fail "no port-forward to Vault"
+    kube_vault_pod_set
+    pf="$(_kube_forward "pod/${_K_VAULT_POD:-vault-0}" 8200)" || fail "no port-forward to Vault"
     export VAULT_ADDR="http://127.0.0.1:$pf" _K_VAULT_FWD=1
   fi
   info "Waiting for the Vault API..."

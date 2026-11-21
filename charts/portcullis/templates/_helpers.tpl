@@ -97,8 +97,15 @@ NEW (HA, Task 19; contract §20.1, spec §6 "Placement"):
     the same required term (never replacing it);
   - namespace (default the release's), daemonSet ({nodeSelector}): a
     DaemonSet instead (Traefik on the ingress nodes in HA), RollingUpdate
-    maxUnavailable 1 (its hostPorts can't surge).
-statefulSet ({replicas, serviceName?, claims: [{name, uid, gid, mode, size?, storageClass?}]}): a
+    maxUnavailable 1 (its hostPorts can't surge);
+  - tolerations ([Toleration], plan Task 25: the quorum pieces' third member
+    on a small node — Vault's voters, the Sentinels): added after the HA
+    ones, in both modes;
+  - pdbMinAvailable (default 1): the PodDisruptionBudget's minAvailable
+    (a quorum of 3 keeps 2);
+  - probes ({readinessProbe, livenessProbe, …}): kube-only probes as given,
+    for a shape compose doesn't have (HA's session store and Sentinels).
+statefulSet ({replicas, serviceName?, minReadySeconds?, claims: [{name, uid, gid, mode, size?, storageClass?}]}): a
 StatefulSet instead (HA's per-replica logs, contract §20.10; Keycloak's and
 Alertmanager's stable pod names in HA): `replicas` pods, each with its own
 PVC per claim (portcullis-core unless the claim says, the K3 owner
@@ -144,6 +151,9 @@ spec:
   names its headless Service (Keycloak's servers, Alertmanager's peers). */}}
   serviceName: {{ $sts.serviceName | default $s.name }}
   podManagementPolicy: Parallel
+  {{- with $sts.minReadySeconds }}
+  minReadySeconds: {{ . }}
+  {{- end }}
   updateStrategy:
     type: RollingUpdate
   persistentVolumeClaimRetentionPolicy:
@@ -227,10 +237,11 @@ spec:
       affinity:
         {{- . | nindent 8 }}
       {{- end }}
-      {{- if $root.Values.ha.enabled }}
-      {{- /* HA (contract §3.4, §20.1): a pod on a lost node is evicted after
-      30 s, not the cluster's 300 s. */}}
+      {{- if or $root.Values.ha.enabled $s.tolerations }}
       tolerations:
+        {{- if $root.Values.ha.enabled }}
+        {{- /* HA (contract §3.4, §20.1): a pod on a lost node is evicted after
+        30 s, not the cluster's 300 s. */}}
         - key: node.kubernetes.io/not-ready
           operator: Exists
           effect: NoExecute
@@ -239,6 +250,10 @@ spec:
           operator: Exists
           effect: NoExecute
           tolerationSeconds: 30
+        {{- end }}
+        {{- with $s.tolerations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       {{- if $spread }}
       topologySpreadConstraints:
@@ -316,6 +331,9 @@ spec:
           {{- with $s.health }}
           {{- include "portcullis.probes" . | nindent 10 }}
           {{- end }}
+          {{- with $s.probes }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
           {{- with $s.httpReady }}
           readinessProbe:
             httpGet:
@@ -335,7 +353,7 @@ spec:
       {{- end }}
 {{- if and (not $ds) (ge $n 2) }}
 ---
-{{ include "portcullis.pdb" (list $root $s.name) }}
+{{ include "portcullis.pdb" (list $root $s.name ($s.pdbMinAvailable | default 1)) }}
 {{- end }}
 {{- end }}
 
@@ -506,9 +524,10 @@ bound: netpol-gate-logs.yaml admits the Hub alone on the log port).
 {{- end }}
 
 {{/*
-portcullis.pdb <root> <name> — a PodDisruptionBudget keeping one pod of a
-replicated core service up (HA; only for 2 replicas or more: with one,
-minAvailable 1 would block every node drain).
+portcullis.pdb <root> <name> [minAvailable] — a PodDisruptionBudget keeping
+one pod (or minAvailable: a quorum's majority) of a replicated core service
+up (HA; only for 2 replicas or more: with one, minAvailable 1 would block
+every node drain).
 */}}
 {{- define "portcullis.pdb" -}}
 {{- $root := index . 0 -}}
@@ -520,7 +539,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: portcullis
 spec:
-  minAvailable: 1
+  minAvailable: {{ if gt (len .) 2 }}{{ index . 2 }}{{ else }}1{{ end }}
   selector:
     matchLabels:
       portcullis.io/component: {{ index . 1 }}
@@ -689,4 +708,42 @@ images.json's pin, used only when its digest is the resolved one.
 {{- end -}}
 {{- $pin -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+portcullis.sessionArgs — an oauth2-proxy's args (JSON list): its alpha
+config, and in HA (plan Task 25) the session store through the Sentinels:
+master name portcullis-sessions, the three Sentinels by name (their
+headless Service sessions-sentinel). No secret on argv: the passwords are
+env (portcullis.sessionEnv).
+*/}}
+{{- define "portcullis.sessionArgs" -}}
+{{- $a := list "--alpha-config=/etc/oauth2-proxy/alpha.yaml" -}}
+{{- if .Values.ha.enabled -}}
+{{- $urls := list -}}
+{{- range $i := until 3 }}{{ $urls = append $urls (printf "redis://sessions-sentinel-%d.sessions-sentinel:26379" $i) }}{{ end -}}
+{{- $a = concat $a (list "--redis-use-sentinel=true" "--redis-sentinel-master-name=portcullis-sessions" (printf "--redis-sentinel-connection-urls=%s" (join "," $urls))) -}}
+{{- end -}}
+{{- toJson $a -}}
+{{- end }}
+
+{{/*
+portcullis.sessionEnv <root> <password key> — an oauth2-proxy's session
+store env beyond its user and password (YAML list): the store's Service
+without HA; in HA the Sentinels' password, from the same key of
+portcullis-env (the Sentinels' default user accepts each oauth2-proxy's own
+password: oauth2-proxy v7.15.6 sends no Sentinel user name, ha.sh
+kube_sessions_ha_sentinel_conf).
+*/}}
+{{- define "portcullis.sessionEnv" -}}
+{{- if (index . 0).Values.ha.enabled }}
+- name: OAUTH2_PROXY_REDIS_SENTINEL_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: portcullis-env
+      key: {{ index . 1 }}
+{{- else }}
+- name: OAUTH2_PROXY_REDIS_CONNECTION_URL
+  value: redis://sessions:6379
+{{- end }}
 {{- end }}

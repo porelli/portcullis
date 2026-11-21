@@ -238,7 +238,9 @@ def check_ha_flows():
     """Task 19's HA flows (plan Amendments 2, 3; preflight P39), on the CI HA
     values: Keycloak ↔ Keycloak on 7800 / 57800 (Infinispan) and nothing
     else reaches those ports (every other core pod, an app pod, Traefik, the
-    internet); Alertmanager ↔ Alertmanager on 9094 TCP / UDP and no other
+    internet); the session store and its Sentinels (Task 25) on 6379 /
+    26379 among themselves and from the two oauth2-proxies only;
+    Alertmanager ↔ Alertmanager on 9094 TCP / UDP and no other
     core pod or app pod (review M1); Traefik's 8081 / 8444 / 8082 from no
     app pod nor the internet (M3); the Hub
     alone of the core pods (the front door and nodeadm aside, their own
@@ -267,6 +269,16 @@ def check_ha_flows():
             (pods["hub"], agent, 7443, "TCP", True), (pods["hub"], agent, 7444, "TCP", False), (pods["hub"], agent, 10250, "TCP", False),
             (tr, nodeadm, 8080, "TCP", True), (tr, ext, 443, "TCP", False), (tr, ext, 80, "TCP", False),
             (ext, tr, 8000, "TCP", True), (ext, tr, 8443, "TCP", True), (ext, tr, 8080, "TCP", False), (app, tr, 8080, "TCP", False)]
+    # Plan Task 25: the session store's master / replica and its Sentinels
+    # reach each other; the oauth2-proxies reach both; nothing else does.
+    ss, se = pods["sessions"], pods["sessions-sentinel"]
+    ss2, se2 = Peer("sessions-1", ss.ns, ss.labels), Peer("sessions-sentinel-1", se.ns, se.labels)
+    rows += [(ss, ss2, 6379, "TCP", True), (se, ss, 6379, "TCP", True), (ss, se, 26379, "TCP", True), (se, se2, 26379, "TCP", True),
+             (pods["forward-auth"], se, 26379, "TCP", True), (pods["forward-auth-ext"], se, 26379, "TCP", True),
+             (pods["forward-auth"], ss, 6379, "TCP", True), (app, se, 26379, "TCP", False), (ext, se, 26379, "TCP", False)]
+    for name, peer in sorted(pods.items()):
+        if name not in ("sessions", "sessions-sentinel", "forward-auth", "forward-auth-ext"):
+            rows += [(peer, se, 26379, "TCP", False), (peer, ss, 6379, "TCP", False)]
     # Review M3: Traefik's internal entrypoints from an app pod and the
     # internet (core pods: check_compose).
     for port in (8081, 8444, 8082):

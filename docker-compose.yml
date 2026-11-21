@@ -440,13 +440,14 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-    # Server mode with raft storage (vault/vault.hcl). The wrapper starts
+    # Server mode with raft storage (vault/vault.hcl.tmpl, rendered by the
+    # wrapper into the tmpfs /tmp: the single node portcullis-vault-1). The wrapper starts
     # Vault and auto-unseals it on every container start from
     # secrets/vault-unseal/unseal-key (written by ./portcullis vault init).
     entrypoint: ["/bin/sh", "/vault/portcullis/entrypoint.sh"]
     environment:
       VAULT_ADDR: "http://127.0.0.1:8200"
-      # disable_mlock = true in vault.hcl (recommended for raft) — no
+      # disable_mlock = true in vault.hcl.tmpl (recommended for raft) — no
       # IPC_LOCK capability needed, so skip the image's setcap step.
       SKIP_SETCAP: "true"
     ports:
@@ -456,7 +457,7 @@ services:
       - "127.0.0.1:8200:8200"
     volumes:
       # /vault/file: vault-owned in the image (it runs non-root), so the
-      # fresh named volume gets the right owner. See vault/vault.hcl.
+      # fresh named volume gets the right owner. See vault/vault.hcl.tmpl.
       - vault_data:/vault/file
       - ./vault:/vault/portcullis:ro
       - ./secrets/vault-unseal:/vault/unseal:ro

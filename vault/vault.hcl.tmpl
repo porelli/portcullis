@@ -1,12 +1,32 @@
-# Portcullis Vault server configuration (mounted read-only into the vault
-# container at /vault/portcullis/vault.hcl, see docker-compose.yml).
+# Portcullis Vault server configuration TEMPLATE (mounted read-only at
+# /vault/portcullis/vault.hcl.tmpl). vault/entrypoint.sh renders it into
+# /tmp/vault.hcl at every start (`entrypoint.sh render` prints it) and
+# starts Vault with that file; the placeholders are filled from the
+# environment, every value checked (a bad one refuses to start):
+#
+#   @NODE_ID@       VAULT_RAFT_NODE_ID (default portcullis-vault-1, the
+#                   compose node's raft id; on Kubernetes the pod name:
+#                   vault-0, vault-1, vault-2)
+#   @API_ADDR@      VAULT_API_ADDR (default http://vault:8200)
+#   @CLUSTER_ADDR@  VAULT_CLUSTER_ADDR (default http://vault:8201)
+#   @RETRY_JOIN@    one retry_join block per peer in VAULT_RAFT_PEERS (space
+#                   separated host names; this node itself left out); none
+#                   on compose (a single node)
+#
+# No service_registration (plan Task 25, found live): Vault v2.2.1's
+# "kubernetes" registration patches its pod's labels synchronously while
+# it takes leadership (vault/ha.go advertiseLeader → PatchPod, no dial
+# timeout, 10 retries), so a leader elected while an API server is down
+# stayed unable to serve for over a minute. The CLI asks the voters for
+# the leader instead (scripts/lib/ha.sh kube_vault_leader).
 #
 # - Integrated (raft) storage on the `vault_data` volume, so the PKI
 #   (root + intermediate CA keys, issued-cert records, CRL) survives
-#   restarts.
+#   restarts. On Kubernetes in HA, three voters (plan Task 25).
 # - Plain HTTP listener: Vault is only reachable on the internal
 #   `portcullis` Docker network and on 127.0.0.1:8200 on the host.
 #   Never publish 8200 on a non-loopback address without enabling TLS.
+#   (Raft's own traffic on 8201 is always mutual TLS, Vault's own certs.)
 # - disable_mlock = true is HashiCorp's recommendation for integrated
 #   storage (mlock + the memory-mapped raft DB can trigger OOM kills), so
 #   the container no longer needs CAP_IPC_LOCK. Make sure the host has
@@ -18,8 +38,8 @@
 ui            = true
 disable_mlock = true
 
-api_addr     = "http://vault:8200"
-cluster_addr = "http://vault:8201"
+api_addr     = "@API_ADDR@"
+cluster_addr = "@CLUSTER_ADDR@"
 
 # /vault/file exists in the image, owned by the `vault` user. The image runs
 # Vault as that non-root user, so a fresh named volume mounted here inherits
@@ -27,7 +47,8 @@ cluster_addr = "http://vault:8201"
 # mountpoint like /vault/data would be root-owned and raft could not write.
 storage "raft" {
   path    = "/vault/file"
-  node_id = "portcullis-vault-1"
+  node_id = "@NODE_ID@"
+@RETRY_JOIN@
 }
 
 listener "tcp" {

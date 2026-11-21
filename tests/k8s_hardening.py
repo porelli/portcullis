@@ -274,7 +274,17 @@ def ha_replicas(vals):
     return {"group-gate": ("StatefulSet", g), "mcp-gate": ("StatefulSet", g), "forward-auth": ("Deployment", g),
             "forward-auth-ext": ("Deployment", g), "keycloak": ("StatefulSet", kc), "alertmanager": ("StatefulSet", 2),
             # LLDAP on Postgres (plan Task 23, Amendment 2: 2 replicas are safe).
-            "lldap": ("Deployment", 2)}
+            "lldap": ("Deployment", 2),
+            # Plan Task 25: Vault's three raft voters; the session store's
+            # master + replica and its three Sentinels.
+            "vault": ("StatefulSet", 3), "sessions": ("StatefulSet", 2), "sessions-sentinel": ("StatefulSet", 3)}
+
+
+# Plan Task 25: a quorum of three keeps two through a drain.
+QUORUM_PDB = {"vault": 2, "sessions-sentinel": 2}
+# Plan Task 25: the quorum pieces' third member may run on the small node.
+SMALL_TOLERATION = {"key": "portcullis.io/small", "operator": "Exists", "effect": "NoSchedule"}
+SMALL_TOLERATED = {"vault", "sessions-sentinel"}
 
 
 def gate_shape_problems(docs, vals=None):
@@ -310,8 +320,8 @@ def gate_shape_problems(docs, vals=None):
         if name == "hub" and mounts_local(tpl, local):
             out.append(f"hub: mounts node-local {sorted(mounts_local(tpl, local))} (it would be pinned to that node)")
         replicated = isinstance(n, int) and n >= 2
-        if replicated and (pdbs.get(name) is None or pdbs[name].get("minAvailable") != 1):
-            out.append(f"{name}: no PodDisruptionBudget minAvailable 1")
+        if replicated and (pdbs.get(name) is None or pdbs[name].get("minAvailable") != QUORUM_PDB.get(name, 1)):
+            out.append(f"{name}: no PodDisruptionBudget minAvailable {QUORUM_PDB.get(name, 1)}")
         if not replicated and name in pdbs:
             out.append(f"{name}: a PodDisruptionBudget with {n} replica(s) blocks every drain")
         spread = tpl.get("topologySpreadConstraints") or []
@@ -330,7 +340,7 @@ def gate_shape_problems(docs, vals=None):
         if kind != "StatefulSet":
             continue
         claims = sp.get("volumeClaimTemplates") or []
-        want_claims = ["data"] if name in ("group-gate", "mcp-gate", "alertmanager") else []
+        want_claims = ["data"] if name in ("group-gate", "mcp-gate", "alertmanager", "vault") else []
         if [c["metadata"]["name"] for c in claims] != want_claims:
             out.append(f"{name}: per-replica PVCs {[c['metadata']['name'] for c in claims]} (want {want_claims})")
         for c in claims:
@@ -343,7 +353,8 @@ def gate_shape_problems(docs, vals=None):
             out.append(f"{name}: podManagementPolicy {sp.get('podManagementPolicy')} (want Parallel)")
         if name in ("group-gate", "mcp-gate", "keycloak", "alertmanager") and sp["template"]["metadata"]["labels"].get("portcullis.io/ingress") != "bound":
             out.append(f"{name}: not port-bound (portcullis.io/ingress: bound)")
-        heads = {"keycloak": "keycloak-pods", "alertmanager": "alertmanager-peers"}
+        heads = {"keycloak": "keycloak-pods", "alertmanager": "alertmanager-peers", "vault": "vault-internal",
+                 "sessions": "sessions-pods", "sessions-sentinel": "sessions-sentinel"}
         if name in heads:
             svc = [s for s in K.by_kind(docs, "Service") if s["metadata"]["name"] == heads[name]]
             if sp.get("serviceName") != heads[name] or len(svc) != 1 or svc[0]["spec"].get("clusterIP") != "None":
@@ -354,7 +365,7 @@ def gate_shape_problems(docs, vals=None):
     return out
 
 
-DO_NOT_SCHEDULE = {"group-gate", "mcp-gate", "alertmanager", "keycloak", "lldap"}
+DO_NOT_SCHEDULE = {"group-gate", "mcp-gate", "alertmanager", "keycloak", "lldap", "vault", "sessions", "sessions-sentinel"}
 
 
 def check_traefik_peer():
@@ -394,8 +405,9 @@ def check_ha_shape():
         for name, ns, labels, spec, ann in K.pod_specs(docs):
             if name == "nodeadm":
                 continue
-            if spec.get("tolerations") != HA_TOLERATIONS:
-                F.add(f"{label}: {name}: tolerations {spec.get('tolerations')} (want not-ready / unreachable at 30 s)")
+            want_t = HA_TOLERATIONS + ([SMALL_TOLERATION] if name in SMALL_TOLERATED else [])
+            if spec.get("tolerations") != want_t:
+                F.add(f"{label}: {name}: tolerations {spec.get('tolerations')} (want not-ready / unreachable at 30 s{', the small taint' if name in SMALL_TOLERATED else ''})")
         pvcs = {c["metadata"]["name"]: c["spec"].get("storageClassName") for c in K.by_kind(docs, "PersistentVolumeClaim")}
         for n in ("hub-state", "hub-secrets", "hub-backups", "domains-data", "wg-data"):
             if pvcs.get(n + "-r") != "portcullis-core-replicated" or n in pvcs:
@@ -409,14 +421,16 @@ def check_ha_shape():
                 F.add(f"{label}: wg-people externalTrafficPolicy {s['spec'].get('externalTrafficPolicy')} (want Cluster)")
     plain = K.render()
     for name, ns, labels, spec, ann in K.pod_specs(plain):
-        if spec.get("tolerations"):
+        if spec.get("tolerations") and spec["tolerations"] != ([SMALL_TOLERATION] if name in SMALL_TOLERATED else []):
             F.add(f"{name}: tolerations without ha.enabled")
     pvcs = {c["metadata"]["name"]: c["spec"].get("storageClassName") for c in K.by_kind(plain, "PersistentVolumeClaim")}
     for n in ("hub-state", "hub-secrets", "hub-backups", "domains-data", "wg-data"):
         if pvcs.get(n) != "portcullis-core":
             F.add(f"{n} must be on portcullis-core without HA: {pvcs.get(n)}")
-    if [d for d in plain if d.get("kind") in ("StatefulSet", "DaemonSet", "PodDisruptionBudget")]:
-        F.add("StatefulSets / DaemonSets / PDBs without ha.enabled")
+    # Vault is a StatefulSet of one voter in both modes (plan Task 25).
+    if [d for d in plain if d.get("kind") in ("StatefulSet", "DaemonSet", "PodDisruptionBudget")
+            and not (d["kind"] == "StatefulSet" and d["metadata"]["name"] == "vault" and d["spec"].get("replicas") == 1)]:
+        F.add("StatefulSets / DaemonSets / PDBs without ha.enabled (Vault's one voter aside)")
     for s in K.by_kind(plain, "Service"):
         if s["metadata"]["name"] == "wg-people" and s["spec"].get("externalTrafficPolicy") != "Local":
             F.add("wg-people externalTrafficPolicy must stay Local without HA")

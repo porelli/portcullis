@@ -239,12 +239,30 @@ _backup_check_layout() {
     || fail "$dir/secrets/vault-init.json has no root token / unseal key."
 }
 
+# _backup_vault_snapshot <out> — the raft snapshot (root token, API) into
+# <out>, checked. On Kubernetes from the raft leader (plan Task 25, ha.sh
+# _kube_vault_snapshot: the voter that says it leads, with retries); else
+# from VAULT_ADDR.
 _backup_vault_snapshot() {
   local out="$1" code
-  code="$(curl -s --max-time 300 -o "$out" -w '%{http_code}' \
-    -H @<(printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN") \
-    "${VAULT_ADDR:-http://127.0.0.1:8200}/v1/sys/storage/raft/snapshot" || true)"
+  if _rt_is_kube; then _kube_vault_snapshot "$out"; return; fi
+  code="$(_backup_vault_fetch "${VAULT_ADDR:-http://127.0.0.1:8200}" "$out")"
   [ "$code" = 200 ] || fail "Vault raft snapshot failed (HTTP ${code:-none})"
+  _backup_vault_check "$out"
+}
+
+# _backup_vault_fetch <vault address> <out> — GET the snapshot; prints the
+# HTTP status (the token on a header from a file descriptor, never argv).
+_backup_vault_fetch() {
+  curl -s --max-time 300 -o "$2" -w '%{http_code}' \
+    -H @<(printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN") \
+    "$1/v1/sys/storage/raft/snapshot" || true
+}
+
+# _backup_vault_check <file> — a raft snapshot (gzip tar with meta.json and
+# state.bin), else fail.
+_backup_vault_check() {
+  local out="$1"
   # List into a variable first: `tar -t | grep -q` under pipefail fails
   # whenever grep exits on the first entry (meta.json) and tar, still
   # listing state.bin / SHA256SUMS, dies of SIGPIPE.
