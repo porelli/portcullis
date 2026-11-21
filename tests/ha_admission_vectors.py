@@ -290,7 +290,13 @@ def vectors():
             ("a node", node_id, "adds a finalizer to its own Node", finalizer, "@NODE@"),
             ("SNR's manager", manager_id, "adds a finalizer to another Node", finalizer, "@NODE2@"),
             ("SNR's manager", manager_id, "adds an owner reference to another Node", owner, "@NODE2@")):
-        out.append({"policy": NL, "name": f"{who} {what}", "allowed": False, "node": True, "as": ident, "patch": patch, "target": target})
+        v = {"policy": NL, "name": f"{who} {what}", "allowed": False, "node": True, "as": ident, "patch": patch, "target": target}
+        if ident is node_id and patch is owner:
+            # NodeRestriction refuses a kubelet's ownerReferences change
+            # first on current releases (k3s 1.35: "is not allowed to modify
+            # ownerReferences"); the policy covers it where it doesn't.
+            v["also_refused_by"] = "is not allowed to modify ownerReferences"
+        out.append(v)
     out.append({"policy": NL, "name": "SNR's manager adds another NoExecute taint", "allowed": False, "node": True, "as": manager_id,
                 "taints_add": [{"key": "example.org/evict", "value": "x", "effect": "NoExecute"}]})
     out.append({"policy": NL, "name": "SNR's manager adds its remediation taint", "allowed": True, "node": True, "as": manager_id,

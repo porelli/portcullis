@@ -72,6 +72,8 @@ while IFS= read -r v; do
   fi
   if [ "$allowed" = true ] && [ "$got" = true ]; then echo "ok   - $name: admitted"
   elif [ "$allowed" = false ] && [ "$got" = false ] && grep -q "$policy" <<<"$out"; then echo "ok   - $name: refused by $policy"
+  elif [ "$allowed" = false ] && [ "$got" = false ] && also="$(jq -r '.also_refused_by // empty' <<<"$v")" && [ -n "$also" ] && grep -qF "$also" <<<"$out"; then
+    echo "ok   - $name: refused before $policy ($also)"
   else echo "FAIL - $name: allowed=$allowed got=$got: $(head -c 300 <<<"$out")"; fail=1; fi
 done < <(jq -c '.[]' tests/ha_admission_vectors.json)
 echo "$n vectors"

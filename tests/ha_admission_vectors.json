@@ -17889,6 +17889,7 @@
  },
  {
   "allowed": false,
+  "also_refused_by": "is not allowed to modify ownerReferences",
   "as": {
    "groups": [
     "system:nodes",
