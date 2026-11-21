@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 var remNow = time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
@@ -64,6 +66,17 @@ func TestPlanRemediationGuard(t *testing.T) {
 		{"flapping: down again 10 min after its last remediation → back-off", main3(with(rn("m2", "main", "home", false, 60, true), func(n *remediationNode) { n.LastRemediated = ago(10) })), nil,
 			remediationPlan{Hold: "nothing to remediate: m2: remediated less than 20m0s ago (back-off)"}},
 		{"flapping: down again 25 min after → remediated", main3(with(rn("m2", "main", "home", false, 60, true), func(n *remediationNode) { n.LastRemediated = ago(25) })), nil, remediationPlan{Create: "m2"}},
+		// Round 3 I1d: a remediation can't stall all fencing.
+		{"excluded while its remediation ran (SNR skips it, never Succeeded): stuck, the next node remediated",
+			[]remediationNode{with(rn("m1", "main", "cloud", false, 600, true), func(n *remediationNode) { n.Excluded = true }), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+			[]remediationCR{{Name: "m1", Created: ago(2)}}, remediationPlan{Create: "m2", Stuck: []string{"m1: excluded from remediation while it ran (SNR skips it)"}}},
+		{"not Succeeded 7 min after it started: stuck, the next node remediated",
+			[]remediationNode{rn("m1", "main", "cloud", false, 900, true), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+			[]remediationCR{{Name: "m1", Created: ago(8)}}, remediationPlan{Create: "m2", Stuck: []string{"m1: not Succeeded 7m0s after it started"}}},
+		{"6 min, not Succeeded: still in progress", main3(rn("m2", "main", "home", false, 400, true)), []remediationCR{{Name: "m2", Created: ago(6)}}, remediationPlan{}},
+		{"a back-off record in the future (beyond the skew) is ignored: remediated", main3(with(rn("m2", "main", "home", false, 60, true), func(n *remediationNode) { n.LastRemediated = remNow.Add(48 * time.Hour) })), nil, remediationPlan{Create: "m2"}},
+		{"a back-off record 30 s ahead (clock skew) still holds", main3(with(rn("m2", "main", "home", false, 60, true), func(n *remediationNode) { n.LastRemediated = remNow.Add(30 * time.Second) })), nil,
+			remediationPlan{Hold: "nothing to remediate: m2: remediated less than 20m0s ago (back-off)"}},
 		{"Ready again and Succeeded: CR removed", main3(rn("m2", "main", "home", true, 60, true)), []remediationCR{{Name: "m2", Created: ago(5), Succeeded: true}},
 			remediationPlan{Delete: []string{"m2"}}},
 		{"Ready again, not Succeeded yet: kept (in progress)", main3(rn("m2", "main", "home", true, 60, true)), []remediationCR{{Name: "m2", Created: ago(5)}}, remediationPlan{}},
@@ -74,7 +87,7 @@ func TestPlanRemediationGuard(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := planRemediation(c.nodes, c.crs, primarySite, remNow)
-		if got.Create != c.want.Create || got.Hold != c.want.Hold || strings.Join(got.Delete, ",") != strings.Join(c.want.Delete, ",") {
+		if got.Create != c.want.Create || got.Hold != c.want.Hold || strings.Join(got.Delete, ",") != strings.Join(c.want.Delete, ",") || strings.Join(got.Stuck, ",") != strings.Join(c.want.Stuck, ",") {
 			t.Errorf("%s: got %+v, want %+v", c.name, got, c.want)
 		}
 	}
@@ -124,9 +137,11 @@ func TestRemediateRounds(t *testing.T) {
 	if s, _, _ := unstructured.NestedString(cr.Object, "spec", "remediationStrategy"); cr.GetName() != "n2" || s != "OutOfServiceTaint" || cr.GetLabels()["app.kubernetes.io/managed-by"] != snrManagedBy {
 		t.Fatalf("the remediation: %v", cr.Object)
 	}
-	n2, _ := h.kube.CoreV1().Nodes().Get(ctx, "n2", metav1.GetOptions{})
-	if n2.Annotations[annRemediatedAt] != rfc3339(vecNow) {
-		t.Fatalf("the back-off record: %v", n2.Annotations)
+	if st := h.state(t); !st.Remediations["n2"].Equal(vecNow) {
+		t.Fatalf("the back-off record in nodeadm's state: %v", st.Remediations)
+	}
+	if n2, _ := h.kube.CoreV1().Nodes().Get(ctx, "n2", metav1.GetOptions{}); strings.Contains(fmt.Sprint(n2.Annotations), "nodeadm.portcullis/") {
+		t.Fatalf("the back-off must not live on the Node: %v", n2.Annotations)
 	}
 	if !strings.Contains(h.logs.String(), "remediation started") || !strings.Contains(h.logs.String(), "node=n2") {
 		t.Fatalf("not logged: %s", h.logs.String())
@@ -157,5 +172,43 @@ func TestRemediateRounds(t *testing.T) {
 	h.s.remediate(ctx)
 	if len(list()) != 1 {
 		t.Fatal("not remediated after the back-off")
+	}
+}
+
+// TestRemediateMaintenanceMark (round 3 I1b): a node cordoned without
+// nodeadm's mark (anyone's spec.unschedulable) is still remediated; one
+// cordoned through nodeadm's cordon API is skipped. A failed create leaves
+// no back-off record.
+func TestRemediateMaintenanceMark(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	n2, _ := h.kube.CoreV1().Nodes().Get(ctx, "n2", metav1.GetOptions{})
+	n2.Spec.Unschedulable = true
+	n2.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionUnknown, LastTransitionTime: metav1.NewTime(vecNow.Add(-time.Minute))}}
+	h.kube.CoreV1().Nodes().Update(ctx, n2, metav1.UpdateOptions{})
+	h.kube.CoreV1().Nodes().UpdateStatus(ctx, n2, metav1.UpdateOptions{})
+	d := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvrSNR: "SelfNodeRemediationList", gvrLonghornVolume: "VolumeList"})
+	h.s.dyn = d
+	// A failed create: no CR, no back-off record.
+	d.PrependReactor("create", "selfnoderemediations", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("refused")
+	})
+	h.s.remediate(ctx)
+	if st := h.state(t); !st.Remediations["n2"].IsZero() {
+		t.Fatal("a failed create recorded a back-off")
+	}
+	d.ReactionChain = d.ReactionChain[1:]
+	// The cordon API's mark: skipped.
+	h.putState(t, func(st *nodeadmState) { st.Maintenance["n2"] = true })
+	h.s.remediate(ctx)
+	if l, _ := d.Resource(gvrSNR).Namespace("portcullis-fencing").List(ctx, metav1.ListOptions{}); len(l.Items) != 0 {
+		t.Fatal("a node cordoned through nodeadm was remediated")
+	}
+	// spec.unschedulable without the mark: remediated.
+	h.putState(t, func(st *nodeadmState) { delete(st.Maintenance, "n2") })
+	h.s.remediate(ctx)
+	if l, _ := d.Resource(gvrSNR).Namespace("portcullis-fencing").List(ctx, metav1.ListOptions{}); len(l.Items) != 1 {
+		t.Fatal("a node cordoned by someone else (no nodeadm mark) wasn't remediated")
 	}
 }

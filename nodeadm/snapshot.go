@@ -124,6 +124,7 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 		s.metrics.nodeReady.WithLabelValues(c.Name).Set(b2f(c.Ready))
 		s.metrics.fencing.WithLabelValues(c.Name).Set(b2f(fencing[c.Name]))
 	}
+	snap.Errors = append(snap.Errors, s.remediationErrors()...)
 	ids := make([]string, 0, len(st.Nodes))
 	for id := range st.Nodes {
 		ids = append(ids, id)

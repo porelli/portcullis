@@ -96,6 +96,13 @@ type nodeadmState struct {
 	// dropped record never touches it); reconcile retries it until each is
 	// revoked.
 	PendingRevokes map[string]*pendingRevoke `json:"pending_revokes,omitempty"`
+	// Remediations: per node, when nodeadm last created its
+	// SelfNodeRemediation (remediate.go's back-off; nodeadm's own record,
+	// never one a node could write).
+	Remediations map[string]time.Time `json:"remediations,omitempty"`
+	// Maintenance: nodes cordoned through nodeadm's cordon API (an admin's
+	// mark: the storm guard skips a cordoned node only with it).
+	Maintenance map[string]bool `json:"maintenance,omitempty"`
 }
 
 type renewal struct {
@@ -131,6 +138,12 @@ func (st *nodeadmState) clone() *nodeadmState {
 	}
 	if out.PendingRevokes == nil {
 		out.PendingRevokes = map[string]*pendingRevoke{}
+	}
+	if out.Remediations == nil {
+		out.Remediations = map[string]time.Time{}
+	}
+	if out.Maintenance == nil {
+		out.Maintenance = map[string]bool{}
 	}
 	return out
 }

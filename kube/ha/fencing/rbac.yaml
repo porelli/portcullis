@@ -4,7 +4,8 @@
 # to this and to a subset of the CSV's). Our SNR image (snr-patch/) caches
 # one Secret only: its peers' certificate in portcullis-fencing, by name.
 #   - SNR's manager (a Deployment pinned to the primary site's non-small
-#     nodes): Nodes read and patched (the out-of-service taint), no Node
+#     nodes): Nodes read and patched (its taints only: RBAC can't narrow
+#     fields, portcullis-node-labels refuses any other change), no Node
 #     create / delete, no pod or VolumeAttachment deletion (the
 #     OutOfServiceTaint strategy: the taint makes Kubernetes delete them);
 #     its DaemonSet and its certificate Secret written in portcullis-fencing

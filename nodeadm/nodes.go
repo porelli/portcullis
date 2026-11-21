@@ -269,6 +269,19 @@ func (s *Server) handleCordon(on bool) func(http.ResponseWriter, *http.Request) 
 		if err := s.patchNode(r.Context(), id, map[string]any{"spec": map[string]any{"unschedulable": on}}); err != nil {
 			return err
 		}
+		// The maintenance mark (remediate.go): only a cordon made here
+		// keeps the node out of fencing — spec.unschedulable alone could be
+		// anyone's.
+		if err := s.mutate(r.Context(), func(st *nodeadmState) error {
+			if on {
+				st.Maintenance[id] = true
+			} else {
+				delete(st.Maintenance, id)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 		s.log.Info("node cordon", "node", id, "unschedulable", on)
 		w.WriteHeader(http.StatusNoContent)
 		return nil
@@ -359,6 +372,10 @@ func isDaemonSetPod(p *corev1.Pod) bool {
 // Timing.PDBRefusal is replica_minimum; at most Timing.DrainMax overall.
 func (s *Server) drain(ctx context.Context, id string) error {
 	if err := s.patchNode(ctx, id, map[string]any{"spec": map[string]any{"unschedulable": true}}); err != nil {
+		return err
+	}
+	// Planned maintenance (remediate.go): a drained node isn't fenced.
+	if err := s.mutate(ctx, func(st *nodeadmState) error { st.Maintenance[id] = true; return nil }); err != nil {
 		return err
 	}
 	start := time.Now()

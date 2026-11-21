@@ -38,10 +38,15 @@ const (
 	// of its last one starting (review M3: a flapping node isn't reset over
 	// and over, holding every other node back meanwhile).
 	remediationBackoff = 20 * time.Minute
-	snrManagedBy       = "portcullis-nodeadm"
-	// annRemediatedAt: the Node's last remediation start (RFC 3339), on the
-	// Node so a new leader keeps the back-off.
-	annRemediatedAt = "nodeadm.portcullis/remediated-at"
+	// remediationStuck: a remediation not Succeeded this long after its
+	// creation (2 × T_fence 150 s + 2 min to reattach) stops counting as in
+	// progress (review round 3 I1d: a node can't stall all fencing); it is
+	// kept, and reported in the snapshot's errors.
+	remediationStuck = 2*150*time.Second + 2*time.Minute
+	// clockSkew: a back-off record further in the future than this is
+	// ignored (never a hold forever).
+	clockSkew    = time.Minute
+	snrManagedBy = "portcullis-nodeadm"
 	// labelExclude: SNR's own opt-out label (its agent DaemonSet honours it).
 	labelExclude = "remediation.medik8s.io/exclude-from-remediation"
 )
@@ -57,10 +62,13 @@ type remediationNode struct {
 	// there — a workload that can move once the node is fenced (review M2:
 	// a node-local PVC can't, so it doesn't count).
 	Replicated bool
-	// Excluded: in planned maintenance — cordoned, SNR's
-	// exclude-from-remediation label, or nodeadm removing it (review M4).
+	// Excluded: in planned maintenance — cordoned through nodeadm (its
+	// mark AND spec.unschedulable), SNR's exclude-from-remediation label
+	// (an admin's: portcullis-node-labels refuses it from node identities
+	// and the fencing ServiceAccounts), or nodeadm removing it (review M4).
 	Excluded bool
-	// LastRemediated: its last remediation's start (zero = never).
+	// LastRemediated: its last remediation's start from nodeadm's own
+	// state (zero = never).
 	LastRemediated time.Time
 }
 
@@ -76,6 +84,10 @@ type remediationPlan struct {
 	Create string   // the node to remediate now ("" = none)
 	Delete []string // finished remediations to remove
 	Hold   string   // why nothing is created this round ("" = nothing needed or Create set)
+	// Stuck: remediations that no longer count as in progress although
+	// they never Succeeded (too old, or their node got excluded): kept,
+	// reported (the snapshot's errors, the Hub's doctor).
+	Stuck []string
 }
 
 // planRemediation is the storm guard (pure, unit-tested):
@@ -95,7 +107,11 @@ type remediationPlan struct {
 //     must not fence a live site), a small one only with a replicated
 //     volume attached;
 //   - never a node in planned maintenance (Excluded), nor one remediated
-//     less than remediationBackoff ago (flapping);
+//     less than remediationBackoff ago (flapping; a record in the future
+//     beyond clockSkew is ignored);
+//   - a remediation not Succeeded remediationStuck after it started, or
+//     whose node got excluded, no longer counts as in progress (Stuck:
+//     kept, reported);
 //   - otherwise the first node by name NotReady longer than remediateAfter.
 func planRemediation(nodes []remediationNode, crs []remediationCR, primary string, now time.Time) remediationPlan {
 	var p remediationPlan
@@ -116,11 +132,16 @@ func planRemediation(nodes []remediationNode, crs []remediationCR, primary strin
 			p.Delete = append(p.Delete, c.Name)
 		case c.Succeeded:
 			// Fenced and still down: kept, not in progress.
+		case known && n.Excluded:
+			p.Stuck = append(p.Stuck, c.Name+": excluded from remediation while it ran (SNR skips it)")
+		case now.Sub(c.Created) >= remediationStuck:
+			p.Stuck = append(p.Stuck, c.Name+": not Succeeded "+remediationStuck.String()+" after it started")
 		default:
 			inProgress = append(inProgress, c.Name)
 		}
 	}
 	sort.Strings(p.Delete)
+	sort.Strings(p.Stuck)
 	var main, mainDown int
 	var due []remediationNode
 	for _, n := range nodes {
@@ -156,7 +177,7 @@ func planRemediation(nodes []remediationNode, crs []remediationCR, primary strin
 			held = append(held, n.Name+": a small node holding no replicated volume")
 		case n.Excluded:
 			held = append(held, n.Name+": in maintenance (cordoned, excluded or being removed)")
-		case !n.LastRemediated.IsZero() && now.Sub(n.LastRemediated) < remediationBackoff:
+		case !n.LastRemediated.IsZero() && !n.LastRemediated.After(now.Add(clockSkew)) && now.Sub(n.LastRemediated) < remediationBackoff:
 			held = append(held, n.Name+": remediated less than "+remediationBackoff.String()+" ago (back-off)")
 		default:
 			p.Create = n.Name
@@ -195,10 +216,9 @@ func (s *Server) remediationInputs(ctx context.Context) ([]remediationNode, []re
 	for _, c := range cl {
 		rn := remediationNode{Name: c.Name, Site: c.Site, Class: c.Class, Ready: c.Ready, Replicated: replicated[c.Name]}
 		rec := st.Nodes[c.Name]
-		rn.Excluded = c.Node.Spec.Unschedulable || c.Node.Labels[labelExclude] == "true" || st.Ops[c.Name] != nil || (rec != nil && rec.Removed)
-		if t, err := time.Parse(time.RFC3339, c.Node.Annotations[annRemediatedAt]); err == nil {
-			rn.LastRemediated = t
-		}
+		rn.Excluded = (c.Node.Spec.Unschedulable && st.Maintenance[c.Name]) || c.Node.Labels[labelExclude] == "true" ||
+			st.Ops[c.Name] != nil || (rec != nil && rec.Removed)
+		rn.LastRemediated = st.Remediations[c.Name]
 		for _, cond := range c.Node.Status.Conditions {
 			if cond.Type == corev1.NodeReady {
 				rn.Since = cond.LastTransitionTime.Time
@@ -250,6 +270,14 @@ func (s *Server) remediate(ctx context.Context) {
 		}
 		s.log.Info("remediation finished: SelfNodeRemediation removed", "node", name)
 	}
+	s.remMu.Lock()
+	if strings.Join(p.Stuck, "|") != strings.Join(s.remStuck, "|") {
+		for _, x := range p.Stuck {
+			s.log.Warn("remediation stuck (not counted as in progress)", "why", x)
+		}
+	}
+	s.remStuck = p.Stuck
+	s.remMu.Unlock()
 	if p.Hold != "" {
 		if s.remHold != p.Hold {
 			s.log.Warn("remediation held", "why", p.Hold)
@@ -259,12 +287,6 @@ func (s *Server) remediate(ctx context.Context) {
 	}
 	s.remHold = ""
 	if p.Create == "" {
-		return
-	}
-	// The back-off's record first (a create that then fails is retried
-	// after the back-off, never twice in a row).
-	if err := s.patchNode(wctx, p.Create, map[string]any{"metadata": map[string]any{"annotations": map[string]any{annRemediatedAt: rfc3339(s.now())}}}); err != nil {
-		s.log.Warn("remediation: couldn't record the remediation on the Node (nothing created)", "node", p.Create, "err", redact(err.Error()))
 		return
 	}
 	cr := &unstructured.Unstructured{Object: map[string]any{
@@ -278,6 +300,12 @@ func (s *Server) remediate(ctx context.Context) {
 			s.log.Warn("remediation: couldn't create the SelfNodeRemediation", "node", p.Create, "err", redact(err.Error()))
 		}
 		return
+	}
+	// The back-off's record, after the create (a failed create is retried
+	// next round, not held): nodeadm's own state.
+	now := s.now()
+	if err := s.mutate(wctx, func(st *nodeadmState) error { st.Remediations[p.Create] = now; return nil }); err != nil {
+		s.log.Warn("remediation: created, but its back-off record wasn't saved", "node", p.Create, "err", redact(err.Error()))
 	}
 	s.metrics.failovers.WithLabelValues("fence").Inc()
 	s.log.Info("remediation started: SelfNodeRemediation created (SNR fences the node, then the out-of-service taint)", "node", p.Create)
@@ -295,4 +323,16 @@ func (s *Server) remediateLoop(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// remediationErrors: the stuck remediations, for the snapshot's errors
+// (the Hub's HA page and doctor).
+func (s *Server) remediationErrors() []string {
+	s.remMu.Lock()
+	defer s.remMu.Unlock()
+	out := make([]string, 0, len(s.remStuck))
+	for _, x := range s.remStuck {
+		out = append(out, "remediation of node "+x+": fencing that node needs an admin")
+	}
+	return out
 }

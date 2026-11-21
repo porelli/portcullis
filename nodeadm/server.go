@@ -128,6 +128,8 @@ type Server struct {
 	addrState addrPublished
 	kickCh    chan struct{}
 	remHold   string // the remediation round's last hold (logged on change)
+	remMu     sync.Mutex
+	remStuck  []string // the last round's stuck remediations (snapshot errors)
 }
 
 // pkiState holds the pki_node CA and nodeadm's own node-nodeadm
