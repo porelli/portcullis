@@ -427,8 +427,8 @@ dest)
   echo "PASS: the core offsite went to <url>/core (restic), recorded for the Hub's backup_stale"
   # Longhorn's node prerequisites (the CLI's own check stays the judge):
   # provided here only on a GitHub-hosted runner (a throwaway VM, never a
-  # shared host) — open-iscsi and nfs-common from apt, iscsi_tcp, and a
-  # multipathd blacklist drop-in for Longhorn's devices —, then checked on
+  # shared host) — open-iscsi and nfs-common from apt, iscsi_tcp, and
+  # multipathd's blacklist for Longhorn's devices —, then checked on
   # this node the way the CLI's probe checks them. On a GitHub-hosted
   # runner a failed install or a prerequisite still missing FAILS the step
   # (re-review R2-N3: never an unnoticed skip); elsewhere one missing → the
@@ -440,10 +440,15 @@ dest)
     if [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
       sudo apt-get install -y -qq open-iscsi nfs-common >/dev/null && sudo systemctl start iscsid && sudo modprobe iscsi_tcp \
         || fail "could not provide Longhorn's node prerequisites on this GitHub-hosted runner (open-iscsi, nfs-common, iscsi_tcp)"
+      # Longhorn's documented blacklist, in /etc/multipath.conf itself: the
+      # CLI's probe reads the node's files as nobody, and Ubuntu's
+      # /etc/multipath (conf.d's parent) is 0700 root (found in CI).
       if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
-        sudo mkdir -p /etc/multipath/conf.d
-        printf '%s\n' 'blacklist {' '    devnode "^sd[a-z0-9]+"' '}' | sudo tee /etc/multipath/conf.d/longhorn.conf >/dev/null \
-          && sudo systemctl restart multipathd || fail "could not set multipathd's blacklist for Longhorn on this GitHub-hosted runner"
+        grep -q '^[[:space:]]*devnode[[:space:]]*"\^sd\[a-z0-9\]+"' /etc/multipath.conf 2>/dev/null \
+          || printf '%s\n' 'blacklist {' '    devnode "^sd[a-z0-9]+"' '}' | sudo tee -a /etc/multipath.conf >/dev/null \
+          || fail "could not set multipathd's blacklist for Longhorn on this GitHub-hosted runner"
+        sudo chmod 0644 /etc/multipath.conf && sudo systemctl restart multipathd \
+          || fail "could not restart multipathd with Longhorn's blacklist on this GitHub-hosted runner"
       fi
     fi
     miss=""
