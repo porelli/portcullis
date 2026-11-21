@@ -19,26 +19,38 @@
 set -u
 NS="${POD_NAMESPACE:?}" ME="${POD_NAME:?}"
 MASTER_NAME=portcullis-sessions
-WAIT="${GUARD_WAIT:-60}" CONF="${GUARD_CONF:-/conf/valkey.conf}"
+WAIT="${GUARD_WAIT:-60}" CONF="${GUARD_CONF:-/conf/valkey.conf}" TERMLOG="${GUARD_TERMLOG:-/dev/termination-log}"
 SVC="sessions-pods.$NS.svc.cluster.local"
 me="$ME.$SVC"
 sentinels="sessions-sentinel-0.sessions-sentinel.$NS.svc.cluster.local sessions-sentinel-1.sessions-sentinel.$NS.svc.cluster.local sessions-sentinel-2.sessions-sentinel.$NS.svc.cluster.local"
 cli() { valkey-cli --no-auth-warning -t 2 --user sessions-admin "$@"; }
 log() { echo "sessions-guard: $*" >&2; }
+# named <message> — the error the status and nodeadm's snapshot (the HA
+# page) show: the container's termination message, "portcullis-sessions:"
+# first (review M-b).
+named() { log "$*"; printf 'portcullis-sessions: %s\n' "$*" > "$TERMLOG" 2>/dev/null || true; }
+# elapsed — seconds since $start (review N-2: a wait counts real seconds;
+# one round of questions can take 6 s).
+elapsed() { echo $(( $(date +%s) - start )); }
 # ours <host> — one of the two Valkey pods' names (a Sentinel's answer is
 # never trusted beyond that).
 ours() { case "$1" in "sessions-0.$SVC" | "sessions-1.$SVC") return 0 ;; esac; return 1; }
 # ask_master — the master at least two Sentinels name (quorum 2: a
 # restarted or partitioned Sentinel alone never steers this pod); exit 1
 # without two agreeing answers.
+ANSWERS=""
 ask_master() {
-  a=""
+  a="" ANSWERS=""
   for s in $sentinels; do
     x="$(cli -h "$s" -p 26379 sentinel get-master-addr-by-name "$MASTER_NAME" 2>/dev/null | head -n1)"
+    ANSWERS="$ANSWERS ${s%%.*}=${x:-none}"
     ours "$x" || continue
     case " $a " in *" $x "*) printf '%s\n' "$x"; return 0 ;; esac
     a="$a $x"
   done
+  # Two or more Sentinels answer, each naming another pod: they disagree.
+  set -- $a
+  [ $# -ge 2 ] && DISAGREE=1
   return 1
 }
 # peer_state — the other Valkey pod's own replication view, asked directly
@@ -53,16 +65,26 @@ peer_state() {
   [ "${off:-0}" -gt 0 ] 2>/dev/null || { echo none; return; }
   case "$(printf '%s\n' "$r" | sed -n 's/^role://p')" in slave) echo replica ;; master) echo master ;; *) echo none ;; esac
 }
-i=0
-until m="$(ask_master)"; do
-  i=$((i + 2))
-  [ "$i" -lt "$WAIT" ] || { log "no Sentinel named the master in $WAIT s: refusing to start (never a second master)"; exit 1; }
+start="$(date +%s)"
+while :; do
+  DISAGREE=""
+  ask_master > "$CONF.ask" && { m="$(cat "$CONF.ask")"; rm -f "$CONF.ask"; break; }
+  # ask_master ran in this shell (no $(…)), so DISAGREE / ANSWERS stick.
+  if [ "$(elapsed)" -ge "$WAIT" ]; then
+    rm -f "$CONF.ask"
+    if [ -n "$DISAGREE" ]; then
+      named "the Sentinels disagree on the master ($ANSWERS ): no two agree, refusing to start; recover by deleting the three Sentinel pods together (docs: HA, the session store)"
+    else
+      named "no two Sentinels named the master in $WAIT s ($ANSWERS ): refusing to start (never a second master)"
+    fi
+    exit 1
+  fi
   sleep 2
 done
 if [ "$m" = "$me" ]; then
   peer="$(peer_state)"
   if [ "$peer" = master ]; then
-    log "the Sentinels name this pod, but the other one is a master with data: not starting (the Sentinels settle it)"
+    named "the Sentinels name this pod, but the other one is a master with data: not starting (the Sentinels settle it)"
     exit 1
   fi
   if [ "$peer" = replica ]; then
@@ -71,21 +93,20 @@ if [ "$m" = "$me" ]; then
     # Until two Sentinels name another master. No answer is no reason to
     # start (review I1: a failed query used to end the wait with this pod
     # starting as the master): only the explicit timeout below does that.
-    i=0 last=""
+    start="$(date +%s)" last=""
     while :; do
       if n="$(ask_master)"; then last="$n"; [ "$n" = "$me" ] || { m="$n"; break; }; else last=""; fi
-      i=$((i + 2))
-      if [ "$i" -ge "$WAIT" ] && [ -z "$last" ]; then
-        log "no two Sentinels answer after the failover: refusing to start (never a master on silence)"
+      if [ "$(elapsed)" -ge "$WAIT" ] && [ -z "$last" ]; then
+        named "no two Sentinels answer after the failover: refusing to start (never a master on silence)"
         exit 1
       fi
-      if [ "$i" -ge "$WAIT" ]; then
+      if [ "$(elapsed)" -ge "$WAIT" ]; then
         # The Sentinels refuse a replica whose link was down longer than 10
         # × down-after (valkey src/sentinel.c sentinelSelectReplica: found
         # live after a long DNS outage): they'd never fail over, and this
         # pod would never start. The sessions are disposable (everyone signs
         # in again), sign-in isn't: start as the master.
-        log "the Sentinels didn't fail over in $WAIT s (no replica they accept): starting as the master; the sessions are lost (everyone signs in again)"
+        named "the Sentinels didn't fail over in $WAIT s (no replica they accept): started as the master; the sessions were lost (everyone signs in again)"
         m=""
         break
       fi

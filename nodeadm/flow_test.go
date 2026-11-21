@@ -1053,3 +1053,34 @@ func (r *racingStore) Load(ctx context.Context) (*nodeadmState, string, error) {
 	}
 	return r.memStore.Load(ctx)
 }
+
+// TestSessionsNamedErrorInSnapshot: a session-store pod whose init guard
+// ended with its named error shows in the snapshot's errors (the HA page);
+// another pod's termination message doesn't (review M-b).
+func TestSessionsNamedErrorInSnapshot(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	for _, p := range []*corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "sessions-1", Namespace: coreNS}, Spec: corev1.PodSpec{NodeName: "n1"},
+			Status: corev1.PodStatus{Phase: corev1.PodPending, InitContainerStatuses: []corev1.ContainerStatus{{Name: "guard",
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1,
+					Message: "portcullis-sessions: the Sentinels disagree on the master (x): refusing to start\n"}}}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: coreNS}, Spec: corev1.PodSpec{NodeName: "n1"},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "x",
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: "something else"}}}}}},
+	} {
+		if _, err := h.kube.CoreV1().Pods(coreNS).Create(ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snap, _ := h.s.snapshot(ctx)
+	var got []string
+	for _, e := range snap.Errors {
+		if strings.Contains(e, "session store") || strings.Contains(e, "something else") {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 || got[0] != "pod sessions-1: the session store: the Sentinels disagree on the master (x): refusing to start" {
+		t.Fatalf("errors %q", got)
+	}
+}

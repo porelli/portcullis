@@ -1685,7 +1685,8 @@ printf '#!/bin/sh\nexit 0\n' > "$GD/bin/sleep"
 chmod +x "$GD/bin/valkey-cli" "$GD/bin/sleep"
 guard() { # guard <master answer> <the other pod's INFO replication ("" = unreachable)> [after-failover master]
   rm -f "$GD/calls" "$GD/failed-over" "$GD/conf"; printf '%s' "$1" > "$GD/master"; printf '%s' "$2" > "$GD/peer"; printf '%s\n' "${3:-}" > "$GD/after"
-  ( export PATH="$GD/bin:$PATH" GD_DIR="$GD" POD_NAMESPACE=portcullis POD_NAME=sessions-1 GUARD_WAIT=4 GUARD_CONF="$GD/conf"
+  rm -f "$GD/term"
+  ( export PATH="$GD/bin:$PATH" GD_DIR="$GD" POD_NAMESPACE=portcullis POD_NAME=sessions-1 GUARD_WAIT=3 GUARD_CONF="$GD/conf" GUARD_TERMLOG="$GD/term"
     sh "$HERE/../charts/portcullis/files/sessions-ha/guard.sh" ) >/dev/null 2>&1; echo "rc=$?"
 }
 P0=sessions-0.sessions-pods.portcullis.svc.cluster.local P1=sessions-1.sessions-pods.portcullis.svc.cluster.local
@@ -1710,6 +1711,35 @@ expect_eq "sessions guard: one Sentinel alone names another master (the others s
   "$(printf '%s' - > "$GD/master-1"; printf '%s' - > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
 expect_eq "sessions guard: two of three Sentinels agree (the third names this pod) → the two decide: a replica of their master" \
   "$(printf '%s' "$P1" > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(grep -c "^replicaof $P0 6379$" "$GD/conf")" "rc=01"
+expect_eq "sessions guard: the three Sentinels disagree (two name different pods) → refused with the named error (the termination message the status and HA page show)" \
+  "$(printf '%s' "$P1" > "$GD/master-1"; printf '%s' - > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(grep -c '^portcullis-sessions: the Sentinels disagree on the master' "$GD/term")" "rc=11"
+t0="$(date +%s)"; guard "" "" >/dev/null
+expect_eq "sessions guard: the wait counts real seconds (GUARD_WAIT 3 → refused after 3-5 s, not 4 rounds of 2)" "$(( $(date +%s) - t0 >= 3 && $(date +%s) - t0 <= 6 ))" 1
+# sentinel-init (review M-b): two agreeing other Sentinels decide; a split
+# between them is a named error and the Valkey pods' own master decides;
+# exactly one answering with no Valkey reachable is followed; else sessions-0.
+SI="$WORK/sinit"; rm -rf "$SI"; mkdir -p "$SI/bin" "$SI/parts"; : > "$SI/parts/sentinel.conf"; : > "$SI/parts/sentinel-monitor.conf"
+cat > "$SI/bin/valkey-cli" <<'SISTUB'
+#!/bin/sh
+h="$*"; h="${h#*-h }"; h="${h%% *}"
+case "$*" in
+  *"sentinel get-master-addr-by-name"*) f="$SI_DIR/s-${h%%.*}"; [ -s "$f" ] || exit 0; cat "$f"; echo; echo 6379 ;;
+  *"info replication"*) f="$SI_DIR/v-${h%%.*}"; [ -s "$f" ] || exit 1; cat "$f" ;;
+esac
+SISTUB
+chmod +x "$SI/bin/valkey-cli"
+sinit() { # sinit <sentinel-1 answer> <sentinel-2 answer> <sessions-0 INFO> <sessions-1 INFO>
+  rm -f "$SI"/s-* "$SI"/v-* "$SI/out" "$SI/term"
+  printf '%s' "$1" > "$SI/s-sessions-sentinel-1"; printf '%s' "$2" > "$SI/s-sessions-sentinel-2"; printf '%s' "$3" > "$SI/v-sessions-0"; printf '%s' "$4" > "$SI/v-sessions-1"
+  ( export PATH="$SI/bin:$PATH" SI_DIR="$SI" POD_NAMESPACE=portcullis POD_NAME=sessions-sentinel-0 SENTINEL_INIT_PARTS="$SI/parts" SENTINEL_INIT_OUT="$SI/out" SENTINEL_INIT_TERMLOG="$SI/term"
+    sh "$HERE/../charts/portcullis/files/sessions-ha/sentinel-init.sh" ) >/dev/null 2>&1
+  sed -n 's/^sentinel monitor portcullis-sessions \([^ .]*\).* 6379 2$/\1/p' "$SI/out"
+}
+MASTERINFO="$(printf 'role:master\r\nconnected_slaves:1\r\n')"
+expect_eq "sentinel-init: both other Sentinels agree → their master" "$(sinit "$P1" "$P1" "$MASTERINFO" "")" sessions-1
+expect_eq "sentinel-init: the other two disagree → a named error, and the Valkey pods' own master decides" "$(sinit "$P0" "$P1" "" "$MASTERINFO"):$(grep -c '^portcullis-sessions: the other two Sentinels disagree' "$SI/term")" "sessions-1:1"
+expect_eq "sentinel-init: exactly one other Sentinel answers and no Valkey pod can be asked → follow it (never split from the one that's up)" "$(sinit "" "$P1" "" "")" sessions-1
+expect_eq "sentinel-init: nobody answers → sessions-0 (a first start)" "$(sinit "" "" "" "")" sessions-0
 expect_eq "sessions guard: the password never on valkey-cli's argv (VALKEYCLI_AUTH only)" "$(grep -c -- ' -a \| --pass ' "$GD/calls" || true)" 0
 # Restart only a running store, only when its config changed, before compose up.
 : > "$STUB_DIR/sess-calls"; rm -f "$STUB_DIR/sess-running"
@@ -4531,34 +4561,59 @@ t0="$(date +%s)"; OUT="$(kt "_kube_bounded 1 sh -c 'sleep 30; echo late' | cat; 
 expect_eq "_kube_bounded: a hung command (and its child holding the pipe) is cut at the bound" "$(printf '%s\n' "$OUT" | head -n1):$(( $(date +%s) - t0 < 10 ))" "after:1"
 t0="$(date +%s)"; OUT="$(kt "_kube_bounded 20 echo quick | cat")"
 expect_eq "_kube_bounded: a quick command returns at once (the watchdog holds no pipe)" "$(printf '%s\n' "$OUT" | head -n1):$(( $(date +%s) - t0 < 10 ))" "quick:1"
-# Fewer voters (HA off, review M3): the dropped voters leave raft first,
-# highest first, through vault-0; the kept set checked; any failure refuses.
+# Fewer voters (HA off, review M3, re-review I-a / M-a): through vault-0;
+# the unhealthy dropped peers first, a quorum after every step (else refused
+# before any removal, naming the down voter); the record before the first
+# removal, finished (wiped + deleted) after the chart; HA on refused while
+# it is there.
 VSH="$WORK/vshrink"; rm -rf "$VSH"; mkdir -p "$VSH"
-vshrink() { # vshrink <live replicas> <extra code>
-  rm -f "$VSH"/*; printf 'vault-0\nvault-1\nvault-2\n' > "$VSH/peers"
-  kt "export VAULT_TOKEN=s.shrink-tok KUBE_VAULT_REMOVE_WAIT=0
-    kube_ctl() { case \"\$*\" in *'get statefulset vault -o jsonpath={.spec.replicas}') echo $1 ;; *) return 1 ;; esac; }
+vshrink() { # vshrink <live replicas> <healthy map json> <extra code> [want: HA on = 3]
+  rm -f "$VSH"/calls "$VSH"/peers "$VSH"/state "$VSH"/k "$VSH"/*.fail; printf 'vault-0\nvault-1\nvault-2\n' > "$VSH/peers"
+  printf '%s' "${2:-{\"vault-0\":true,\"vault-1\":true,\"vault-2\":true\}}" | jq -c '{data: {servers: (to_entries | map({key, value: {healthy: .value}}) | from_entries)}}' > "$VSH/state"
+  kt "export VAULT_TOKEN=s.shrink-tok KUBE_VAULT_REMOVE_WAIT=0 ${4:+PORTCULLIS_HA=on}
+    kube_ctl() { echo \"\$*\" >> '$VSH/k'; case \"\$*\" in
+      *'get statefulset vault -o jsonpath={.spec.replicas}') echo $1 ;;
+      *'get configmap portcullis-vault-shrink -o json') [ -e '$VSH/rec' ] && jq -n --rawfile d '$VSH/rec' '{data: {dropped: \$d}}' || { echo 'Error from server (NotFound)'; return 1; } ;;
+      *'create configmap portcullis-vault-shrink --from-literal=dropped='*) a=\"\$*\"; a=\"\${a#*dropped=}\"; printf '%s' \"\${a%% --dry-run*}\" > '$VSH/rec'; echo '{}' ;;
+      *'apply -f -') cat >/dev/null ;;
+      *'delete configmap portcullis-vault-shrink'*) rm -f '$VSH/rec' ;;
+      *) return 1 ;; esac; }
     vexec() { echo \"\$* @\${_K_VAULT_POD:-}\" >> '$VSH/calls'; case \"\$1 \$2 \$3\" in
       'operator raft list-peers') [ ! -e '$VSH/list.fail' ] || return 1; jq -Rn '{data: {config: {servers: [inputs | {node_id: .}]}}}' < '$VSH/peers' ;;
+      'read -format=json sys/storage/raft/autopilot/state') cat '$VSH/state' ;;
       'operator raft remove-peer') [ ! -e '$VSH/remove.fail' ] || return 1; grep -vx \"\$4\" '$VSH/peers' > '$VSH/p.tmp'; mv '$VSH/p.tmp' '$VSH/peers' ;;
     esac; }
-    ${2:-}
+    ${3:-}
     kube_vault_shrink_prepare; echo \"shrink=\$_KUBE_VAULT_SHRINK\""
 }
-OUT="$(vshrink 3)"
-expect_eq "vault voters 3 → 1 (HA off): vault-2 then vault-1 removed from raft through vault-0, the peers then exactly vault-0" \
-  "$(printf '%s\n' "$OUT" | grep '^shrink='):$(grep -o 'remove-peer vault-[0-9] @vault-0' "$VSH/calls" | paste -sd, -):$(paste -sd, "$VSH/peers")" "shrink= vault-2 vault-1:remove-peer vault-2 @vault-0,remove-peer vault-1 @vault-0:vault-0"
-OUT="$(vshrink 1)"
-expect_eq "vault voters unchanged → no raft call" "$(printf '%s\n' "$OUT" | tail -n1):$(test -e "$VSH/calls" && echo calls || echo none)" "rc=0:none"
-OUT="$(vshrink 3 "touch '$VSH/list.fail'")"
+removals() { grep -o 'remove-peer vault-[0-9] @vault-0' "$VSH/calls" 2>/dev/null | sed 's/remove-peer //; s/ @vault-0//' | paste -sd, -; }
+rm -f "$VSH/rec"; OUT="$(vshrink 3)"
+expect_eq "vault voters 3 → 1 (HA off), all healthy: vault-2 then vault-1 removed through vault-0, the peers then exactly vault-0, the record written first" \
+  "$(printf '%s\n' "$OUT" | grep '^shrink='):$(removals):$(paste -sd, "$VSH/peers"):$(cat "$VSH/rec")" "shrink= vault-2 vault-1:vault-2,vault-1:vault-0:vault-2 vault-1"
+rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":true,"vault-1":false,"vault-2":true}')"
+expect_eq "vault voters 3 → 1 with vault-1 down (re-review I-a): the unhealthy vault-1 removed first, so {vault-0, vault-2} keeps its quorum" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(removals)" "rc=0:vault-1,vault-2"
+rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":false,"vault-1":true,"vault-2":true}')"
+case "$OUT" in *"would leave no quorum after removing vault-2 (down: vault-0)"*"rc=1") t_pass "vault voters 3 → 1 with the kept vault-0 down → refused before any removal, naming vault-0" ;; *) t_fail "shrink kept down: $OUT" ;; esac
+expect_eq "... and nothing removed, nothing recorded" "$(removals):$(test -e "$VSH/rec" && echo rec || echo none)" ":none"
+rm -f "$VSH/rec"; OUT="$(vshrink 1)"
+expect_eq "vault voters unchanged, no record → no raft call" "$(printf '%s\n' "$OUT" | tail -n1):$(test -e "$VSH/calls" && echo calls || echo none)" "rc=0:none"
+printf 'vault-2 vault-1' > "$VSH/rec"; OUT="$(vshrink 1)"
+expect_eq "vault HA off interrupted after the chart (record left, voters already 1) → the next up owes the wipe (re-review M-a)" "$(printf '%s\n' "$OUT" | grep '^shrink=')" "shrink= vault-2 vault-1"
+printf 'vault-2 vault-1' > "$VSH/rec"; OUT="$(vshrink 1 "" "" ha)"
+case "$OUT" in *"Vault's HA off isn't finished: the volumes of vault-2 vault-1 are still to be wiped"*"rc=1") t_pass "vault HA on while an HA off still owes its wipe → refused" ;; *) t_fail "shrink HA on with record: $OUT" ;; esac
+rm -f "$VSH/rec"; OUT="$(vshrink 3 "" "touch '$VSH/list.fail'")"
 case "$OUT" in *"can't read Vault's raft peers: refusing"*"rc=1") t_pass "vault voters 3 → 1, the peers unreadable → refused, nothing deployed" ;; *) t_fail "shrink list fail: $OUT" ;; esac
-OUT="$(vshrink 3 "touch '$VSH/remove.fail'")"
-case "$OUT" in *"could not remove Vault's raft peer vault-2: refusing"*"rc=1") t_pass "vault voters 3 → 1, a removal fails → refused" ;; *) t_fail "shrink remove fail: $OUT" ;; esac
-OUT="$(vshrink 3 "printf 'vault-0\nvault-1\nstranger\n' > '$VSH/peers'")"
+rm -f "$VSH/rec"; OUT="$(vshrink 3 "" "touch '$VSH/remove.fail'")"
+case "$OUT" in *"could not remove Vault's raft peer vault-2: refusing"*"rc=1") t_pass "vault voters 3 → 1, a removal fails → refused, the record kept for the next up" ;; *) t_fail "shrink remove fail: $OUT" ;; esac
+rm -f "$VSH/rec"; OUT="$(vshrink 3 "" "printf 'vault-0\nvault-1\nstranger\n' > '$VSH/peers'")"
 case "$OUT" in *"a peer stranger that isn't a voter of this chart"*"rc=1") t_pass "vault voters: a raft peer the chart doesn't know → refused, never removed blindly" ;; *) t_fail "shrink stranger: $OUT" ;; esac
-OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-2 vault-1'; kube_ctl() { echo \"\$*\" >> '$VSH/k'; }; _kube_helper_pod() { echo \"helper-\$1\"; }; _kube_helper_done() { echo \"done \$1\" >> '$VSH/k'; }; kube_vault_shrink_finish")"
-expect_eq "vault voters lowered: each removed voter's PVC emptied after its pod is gone" \
-  "$(grep -cE 'wait --for=delete pod/vault-[12]' "$VSH/k"):$(grep -cE 'exec helper-data-vault-[12] -- find /vol' "$VSH/k")" "2:2"
+rm -f "$VSH/k"; printf 'x' > "$VSH/rec"
+OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-2 vault-1'; kube_ctl() { echo \"\$*\" >> '$VSH/k'; case \"\$*\" in *' get pod vault-'*) return 1 ;; *' get pvc data-vault-'*) echo pvc ;; esac; }; _kube_helper_pod() { echo \"helper-\$1\"; }; _kube_helper_done() { echo \"done \$1\" >> '$VSH/k'; }; kube_vault_shrink_finish")"
+expect_eq "vault voters lowered: each removed voter's PVC emptied once its pod is gone, then the record deleted" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -cE 'wait --for=delete pod/vault-[12]' "$VSH/k"):$(grep -cE 'exec helper-data-vault-[12] -- find /vol' "$VSH/k"):$(grep -c 'delete configmap portcullis-vault-shrink' "$VSH/k")" "rc=0:2:2:1"
+OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-1'; kube_ctl() { case \"\$*\" in *' get pod vault-1 '*) echo pod/vault-1 ;; esac; }; kube_vault_shrink_finish")"
+case "$OUT" in *"the dropped voter vault-1 still runs"*"rc=1") t_pass "vault voters lowered, a dropped voter still running → its volume isn't touched, the record kept" ;; *) t_fail "shrink finish running: $OUT" ;; esac
 # The join listener's TLS (review M1): a private CA here, one server
 # certificate for every voter's name, the CA key never synced.
 JT="$WORK/jtls"; rm -rf "$JT"; mkdir -p "$JT/secrets"
@@ -4571,23 +4626,25 @@ kt "PORTCULLIS_ROOT='$JT'; kube_vault_join_tls_prepare" >/dev/null
 expect_eq "vault join TLS: kept on the next run (not reissued)" "$(cat "$JD"/*.crt | openssl dgst -sha256 -r)" "$SUM"
 expect_eq "vault join TLS: the CA key and the names file are never synced; the certificate and its key are" \
   "$(kt "_kube_sync_skip vault-join-tls/ca.key && echo skip; _kube_sync_skip vault-join-tls/sans && echo skip; _kube_sync_skip vault-join-tls/tls.key || echo sync" | grep -c -E '^(skip|sync)$')" 3
-# Cluster DNS in HA (controller ruling 3): k3s's CoreDNS one per non-small
-# node at main (at least 2, required there, one per node), ours on the small
-# nodes (a DaemonSet k3s never re-applies), PreferSameNode, a PDB.
+# Cluster DNS in HA (controller ruling 3, fix round 2): k3s's CoreDNS one
+# per non-small node at main (never more: N-1), ours on the small nodes
+# from kube/ha/coredns/small.yaml, PreferSameNode, a PDB; reverted with HA off.
 CD="$WORK/coredns"; rm -rf "$CD"; mkdir -p "$CD"
 cdns() { rm -f "$CD/k" "$CD/apply"; kt "kube_ctl() { echo \"\$*\" >> '$CD/k'; case \"\$*\" in *'get nodes -l portcullis.io/site=main,portcullis.io/class!=small -o json') printf '{\"items\":[%s]}' '$1' ;; *'get deployment coredns -o name') echo deployment.apps/coredns ;; *' patch '*) [ -z '${2:-}' ] || return 1 ;; esac; }; _ha_apply() { cat > '$CD/apply'; }; ha_coredns"; }
 OUT="$(cdns '{},{},{}')"
 P="$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //')"
-expect_eq "HA CoreDNS: 3 non-small nodes at main → k3s's 3 replicas, required at main, one per node; PreferSameNode" \
-  "$(printf '%s\n' "$OUT" | tail -n1):$(printf '%s' "$P" | jq -c '[.spec.replicas, .spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values, .spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey, (.spec.template.spec | has("tolerations"))]'):$(grep -c 'patch service kube-dns --type=merge -p {"spec": {"trafficDistribution": "PreferSameNode"}}' "$CD/k")" \
-  'rc=0:[3,["main"],"kubernetes.io/hostname",false]:1'
-expect_eq "HA CoreDNS: our DaemonSet on the small nodes at main (the small taint tolerated, the pinned image, k3s's ConfigMap read-only, k8s-app=kube-dns) and a PDB minAvailable 1" \
-  "$(jq -c '[.items[0].kind, .items[0].spec.template.spec.nodeSelector["portcullis.io/class"], (.items[0].spec.template.spec.tolerations | map(.key) | index("portcullis.io/small") != null), (.items[0].spec.template.spec.containers[0].image | test("@sha256:[0-9a-f]{64}$")), .items[0].spec.template.metadata.labels["k8s-app"], .items[0].spec.template.spec.volumes[0].configMap.name, .items[1].kind, .items[1].spec.minAvailable]' "$CD/apply")" \
-  '["DaemonSet","small",true,true,"kube-dns","coredns","PodDisruptionBudget",1]'
+expect_eq "HA CoreDNS: 3 non-small nodes at main → k3s's 3 replicas, required at main, one per node; PreferSameNode; our file applied" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(printf '%s' "$P" | jq -c '[.spec.replicas, .spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values, .spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey, (.spec.template.spec | has("tolerations"))]'):$(grep -c 'patch service kube-dns --type=merge -p {"spec": {"trafficDistribution": "PreferSameNode"}}' "$CD/k"):$(cmp -s "$CD/apply" "$HERE/../kube/ha/coredns/small.yaml" && echo file)" \
+  'rc=0:[3,["main"],"kubernetes.io/hostname",false]:1:file'
 OUT="$(cdns '{}')"
-expect_eq "HA CoreDNS: one non-small node at main → still 2 replicas" "$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //' | jq -c .spec.replicas)" 2
+expect_eq "HA CoreDNS: one non-small node at main → 1 replica (never one left Pending by the anti-affinity, re-review N-1)" "$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //' | jq -c .spec.replicas)" 1
 OUT="$(cdns '{},{}' fail)"
 case "$OUT" in *"could not spread CoreDNS"*"rc=1") t_pass "HA CoreDNS: a refused patch → refused (nothing deployed)" ;; *) t_fail "coredns patch fail: $OUT" ;; esac
+OUT="$(kt "kube_ctl() { echo \"\$*\" >> '$CD/r'; case \"\$*\" in *'get service kube-dns -o jsonpath={.spec.trafficDistribution}') echo PreferSameNode ;; *'get daemonset portcullis-dns-small -o name') echo daemonset.apps/portcullis-dns-small ;; esac; }; ha_coredns_revert")"
+expect_eq "HA off reverts the CoreDNS layout: k3s's 1 replica without affinity, no PreferSameNode, our DaemonSet and PDB gone (re-review N-3)" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'patch deployment coredns --type=merge -p {"spec": {"replicas": 1, "template": {"spec": {"affinity": null}}}}' "$CD/r"):$(grep -c '"trafficDistribution": null' "$CD/r"):$(grep -c 'delete daemonset portcullis-dns-small' "$CD/r"):$(grep -c 'delete poddisruptionbudget coredns' "$CD/r")" "rc=0:1:1:1:1"
+rm -f "$CD/r"; OUT="$(kt "kube_ctl() { echo \"\$*\" >> '$CD/r'; }; ha_coredns_revert")"
+expect_eq "HA off on a cluster that never had the layout → CoreDNS untouched" "$(grep -c 'patch\|delete' "$CD/r")" 0
 OUT="$(kt "kube_ctl() { return 1; }; kube_vault_pod")"
 expect_eq "kube_vault_pod: no leader (not initialised, or none answers) → vault-0" "$(printf '%s\n' "$OUT" | head -n1)" "vault-0"
 
@@ -5592,6 +5649,12 @@ expect_eq "kube_crashing_json: the crash-looping Hub and an app restarted 2 min 
   "$(cj | head -n1 | jq -c '[.[] | [.namespace, .deployment, .reason]]')" \
   '[["portcullis","hub","CrashLoopBackOff"],["portcullis-apps","echo-k--web","restarted"]]'
 expect_eq "kube_crashing_json: an unreadable pod list → null (status counts it a problem)" "$(cj 'return 1' | head -n1)" "null"
+printf '%s' '{"items":[{"metadata":{"name":"sessions-1","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
+  "status":{"initContainerStatuses":[{"restartCount":3,"lastState":{"terminated":{"message":"portcullis-sessions: the Sentinels disagree on the master (x): refusing to start\n"}},"state":{"waiting":{"reason":"PodInitializing"}}}],
+            "containerStatuses":[{"restartCount":0,"state":{"waiting":{"reason":"PodInitializing"}}}]}}]}' > "$WORK/crash-sess.json"
+expect_eq "kube_crashing_json: a StatefulSet's pod with the session store's named error → that error is the reason (review M-b)" \
+  "$(cj "cat '$WORK/crash-sess.json'" | head -n1 | jq -c '[.[] | select(.namespace == "portcullis") | [.deployment, .reason]]')" \
+  '[["sessions","portcullis-sessions: the Sentinels disagree on the master (x): refusing to start"]]'
 # status --json runtime
 OUT="$(kt 'kube_status_json v1.37.2+k3s1')"
 expect_eq "status --json runtime.name = kubernetes, runtime.context set, version, the § 6 rows as checks" \

@@ -1393,23 +1393,47 @@ kube_vault_join_tls_prepare() {
   chmod 600 "$d"/*
 }
 
-# ── fewer Vault voters (HA off; plan Task 25, review M3) ──
+# ── fewer Vault voters (HA off; plan Task 25, review M3, fix round 2) ──
 
 # kube_vault_shrink_prepare — before the chart lowers StatefulSet vault's
 # replicas (HA off: 3 → 1), the voters it drops leave raft first: `vault
-# operator raft remove-peer` for every configured peer outside vault-0 …
-# vault-<want−1>, highest first (a removed leader steps down), then the
-# peers must be exactly those kept. Without it vault-0 keeps a 3-voter
-# configuration and no quorum: Vault stays down. Anything unreadable or a
-# failed removal refuses the change (nothing deployed). _KUBE_VAULT_SHRINK
-# = the dropped pods, for kube_vault_shrink_finish.
+# operator raft remove-peer` through vault-0 (the voter that stays). The
+# order keeps a quorum after every step (re-review I-a: hashicorp/raft
+# v1.7.3 applies a configuration on append and commits it on a majority of
+# the new one, so removing a healthy peer while another is down leaves a
+# configuration nobody can commit): the unhealthy ones first (autopilot,
+# sys/storage/raft/autopilot/state), then the healthy, highest first; the
+# whole plan is checked before any removal, and a step that would leave
+# fewer healthy voters than a quorum refuses, naming the down voter(s).
+# Then the peers must read back exactly the kept set. Resumable (re-review
+# M-a): ConfigMap portcullis-vault-shrink records the dropped voters before
+# the first removal; kube_vault_shrink_finish wipes their volumes after the
+# chart and deletes it, so an interrupted run (before or after helm) is
+# finished by the next `up` with HA off, and HA on refuses while the record
+# is there. Anything unreadable or a failed removal refuses (nothing
+# deployed). _KUBE_VAULT_SHRINK = the dropped pods, for the finish.
 _KUBE_VAULT_SHRINK=""
+KUBE_VAULT_SHRINK_CM="portcullis-vault-shrink"
+_kube_vault_shrink_record() {
+  local out
+  if out="$(kube_ctl -n "$(kube_ns)" get configmap "$KUBE_VAULT_SHRINK_CM" -o json 2>&1)"; then
+    printf '%s' "$out" | jq -r '.data.dropped // empty'
+  else
+    case "$out" in *NotFound*|*"not found"*) return 0 ;; esac
+    return 1
+  fi
+}
 kube_vault_shrink_prepare() {
-  local cur want peers id keep i
+  local cur want peers state id keep i rec plan cfg step ok down n need
   _KUBE_VAULT_SHRINK=""
   cur="$(kube_ctl -n "$(kube_ns)" get statefulset vault -o jsonpath='{.spec.replicas}' 2>/dev/null)" || cur=""
   [[ "$cur" =~ ^[0-9]+$ ]] || return 0        # no Vault yet (a first install)
   want="$(_rtk_replicas vault)"
+  rec="$(_kube_vault_shrink_record)" || fail "can't read ConfigMap $KUBE_VAULT_SHRINK_CM (an unfinished HA off of Vault?): refusing (nothing deployed)"
+  if [ -n "$rec" ]; then
+    [ "$want" -le "$cur" ] || fail "Vault's HA off isn't finished: the volumes of $rec are still to be wiped. Run ./portcullis up with HA off first, then turn HA on (nothing deployed)"
+    _KUBE_VAULT_SHRINK=" $rec"
+  fi
   [ "$cur" -gt "$want" ] || return 0
   vault_admin_env >/dev/null 2>&1 || fail "lowering Vault's voters ($cur → $want) needs its root token (secrets/vault-init.json): refusing (nothing deployed)"
   # Through vault-0, the voter that stays (a standby forwards to the
@@ -1417,12 +1441,37 @@ kube_vault_shrink_prepare() {
   _K_VAULT_POD=vault-0
   peers="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '.data.config.servers[].node_id' 2>/dev/null)" \
     && [ -n "$peers" ] || fail "can't read Vault's raft peers: refusing to lower its voters $cur → $want (nothing deployed)"
+  state="$(vexec read -format=json sys/storage/raft/autopilot/state 2>/dev/null)" \
+    && printf '%s' "$state" | jq -e '.data.servers | type == "object"' >/dev/null 2>&1 \
+    || fail "can't read Vault's autopilot state (which voters are healthy): refusing to lower its voters $cur → $want (nothing deployed)"
   keep=""; for ((i = 0; i < want; i++)); do keep="$keep vault-$i"; done
-  for id in $(printf '%s\n' "$peers" | sort -r); do
-    case " $keep " in *" $id "*) continue ;; esac
+  for id in $peers; do
     [[ "$id" =~ ^vault-[0-9]+$ ]] || fail "Vault's raft has a peer $id that isn't a voter of this chart: refusing to lower its voters (nothing deployed)"
+  done
+  # The plan: dropped peers, unhealthy first, then healthy; highest first.
+  plan="$(printf '%s\n' $peers | P="$keep" S="$state" jq -Rr --slurp '
+      (env.S | fromjson | .data.servers) as $st | (env.P | split(" ") | map(select(. != ""))) as $keep
+      | split("\n") | map(select(. != "" and (. as $p | $keep | index($p) | not)))
+      | sort_by([($st[.].healthy // false), (ltrimstr("vault-") | tonumber | -.)]) | .[]')"
+  # Every step keeps a quorum of healthy voters, checked before any removal.
+  cfg="$peers"
+  for step in $plan; do
+    cfg="$(printf '%s\n' $cfg | grep -vx "$step")"
+    n="$(printf '%s\n' $cfg | grep -c .)"; need=$(( n / 2 + 1 ))
+    ok="$(printf '%s\n' $cfg | S="$state" jq -Rr --slurp '(env.S | fromjson | .data.servers) as $st | split("\n") | map(select(. != "" and ($st[.].healthy // false))) | length')"
+    if [ "$ok" -lt "$need" ]; then
+      down="$(printf '%s\n' $cfg | S="$state" jq -Rr --slurp '(env.S | fromjson | .data.servers) as $st | split("\n") | map(select(. != "" and (($st[.].healthy // false) | not))) | join(" ")')"
+      fail "lowering Vault's voters $cur → $want would leave no quorum after removing $step (down: ${down:-?}): bring ${down:-the down voter} back first; nothing removed, nothing deployed"
+    fi
+  done
+  # The record first: an interruption anywhere after this still owes the wipe.
+  rec=""; for ((i = cur - 1; i >= want; i--)); do rec="$rec vault-$i"; done
+  kube_ctl -n "$(kube_ns)" create configmap "$KUBE_VAULT_SHRINK_CM" --from-literal=dropped="${rec# }" --dry-run=client -o json \
+    | jq '.metadata.labels = {"app.kubernetes.io/managed-by": "portcullis"}' | kube_ctl apply -f - >/dev/null \
+    || fail "could not record the voters being dropped (ConfigMap $KUBE_VAULT_SHRINK_CM): nothing removed, nothing deployed"
+  for id in $plan; do
     info "Vault: removing raft peer $id (voters $cur → $want)..."
-    vexec operator raft remove-peer "$id" >/dev/null 2>&1 || fail "could not remove Vault's raft peer $id: refusing to lower its voters (nothing deployed)"
+    vexec operator raft remove-peer "$id" >/dev/null 2>&1 || fail "could not remove Vault's raft peer $id: refusing to lower its voters (nothing deployed; run ./portcullis up again to resume)"
   done
   # A removed leader steps down: the kept voters elect again before the
   # configuration reads back (found live: ~10 s). ≤ KUBE_VAULT_REMOVE_WAIT.
@@ -1435,86 +1484,81 @@ kube_vault_shrink_prepare() {
       || fail "Vault's raft peers are '$peers' after the removals, not '$want_set': refusing to lower its voters (nothing deployed)"
     sleep 2; waited=$((waited + 2))
   done
-  # Every dropped voter's PVC is emptied after (also when an earlier,
-  # interrupted run already removed its peer).
-  for ((i = cur - 1; i >= want; i--)); do _KUBE_VAULT_SHRINK="$_KUBE_VAULT_SHRINK vault-$i"; done
+  _KUBE_VAULT_SHRINK="$rec"
 }
 
 # kube_vault_shrink_finish — after the chart dropped them: each removed
-# voter's PVC emptied (its raft data names a cluster it left; a later HA
-# on starts it fresh, and it joins by retry_join).
+# voter's PVC emptied once its pod is gone (its raft data names a cluster
+# it left; a later HA on starts it fresh, and it joins by retry_join), then
+# the record deleted.
 kube_vault_shrink_finish() {
   local id pod
+  [ -n "${_KUBE_VAULT_SHRINK// /}" ] || return 0
   for id in $_KUBE_VAULT_SHRINK; do
     kube_ctl -n "$(kube_ns)" wait --for=delete "pod/$id" --timeout=180s >/dev/null 2>&1 || true
-    pod="$(_kube_helper_pod "data-$id" "100:1000" rw "$PORTCULLIS_HELPER_IMAGE")" || fail "could not empty data-$id (the removed voter's raft data)"
+    kube_ctl -n "$(kube_ns)" get pod "$id" -o name >/dev/null 2>&1 && fail "the dropped voter $id still runs: its volume isn't wiped (run ./portcullis up again)"
+    kube_ctl -n "$(kube_ns)" get pvc "data-$id" -o name >/dev/null 2>&1 || continue
+    pod="$(_kube_helper_pod "data-$id" "100:1000" rw "$PORTCULLIS_HELPER_IMAGE")" || fail "could not empty data-$id (the removed voter's raft data; run ./portcullis up again)"
     kube_ctl -n "$(kube_ns)" exec "$pod" -- find /vol -mindepth 1 -maxdepth 1 -exec rm -rf {} + || { _kube_helper_done "$pod"; fail "could not empty data-$id"; }
     _kube_helper_done "$pod"
   done
+  kube_ctl -n "$(kube_ns)" delete configmap "$KUBE_VAULT_SHRINK_CM" --ignore-not-found >/dev/null || fail "could not delete ConfigMap $KUBE_VAULT_SHRINK_CM (the wipe is done)"
   _KUBE_VAULT_SHRINK=""
 }
 
-# ── cluster DNS in HA (plan Task 25, controller ruling 3) ──
+# ── cluster DNS in HA (plan Task 25, controller ruling 3; fix round 2) ──
 
 # ha_coredns — k3s's packaged CoreDNS is one replica: losing its node
 # stopped all cluster DNS (~6 min measured), and with a replica on a lost
 # node half the lookups still went there until its endpoint left, holding
 # Valkey's Sentinels in TILT (~100 s instead of ~9 s). In HA, one CoreDNS
 # on every node at the primary site, and each pod asks its own node's:
-#   - k3s's Deployment coredns: one replica per non-small node at main (at
-#     least 2), required at main, one per node (required hostname
-#     anti-affinity: k3s's own spread is judged only at scheduling, a
-#     rollout left two on one node);
-#   - our DaemonSet portcullis-dns-small (kube-system): the same CoreDNS
-#     (k3s v1.37.2+k3s1's image, pinned by digest; its ConfigMap coredns,
-#     read-only) on each small node at main, tolerating the small taint —
-#     the small node runs a Sentinel and a Vault voter;
+#   - k3s's Deployment coredns: one replica per non-small node at main
+#     (never more than those nodes: a required hostname anti-affinity, so
+#     a replica that can't be placed would stay Pending — re-review N-1),
+#     required at main, one per node (k3s's own spread is judged only at
+#     scheduling: a rollout left two on one node);
+#   - kube/ha/coredns/small.yaml: our restricted DaemonSet of the same
+#     CoreDNS on each small node at main, and the PDB coredns (both sets);
 #   - Service kube-dns: trafficDistribution PreferSameNode (a lost node
-#     answers no other node's pods; cluster-wide only when a node's own is
-#     down); both sets carry k8s-app=kube-dns, so it selects them all;
-#   - PodDisruptionBudget coredns (ours): minAvailable 1.
+#     answers no other node's pods; kube-proxy falls back cluster-wide only
+#     when a node's own endpoint is not ready — a hung but ready one fails
+#     that node's lookups until its readiness probe trips, ~6 s).
 # What survives k3s (its pinned source): pkg/deploy/controller.go forces a
 # re-apply of manifests/coredns.yaml at every k3s start (listFiles(force),
 # :98-101, :164-167) through wrangler's three-way apply, which keeps the
 # fields its manifest doesn't set (replicas, affinity, the Service's
-# trafficDistribution) but replaces those it does (the tolerations list:
-# found live, a small toleration on k3s's Deployment was gone after a
-# k3s restart) — hence our own DaemonSet for the small nodes, which k3s
-# never touches. Re-applied by every `up`.
-HA_COREDNS_IMAGE="docker.io/rancher/mirrored-coredns-coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286"
+# trafficDistribution) but replaces those it does (the tolerations list) —
+# hence our own DaemonSet for the small nodes. Re-applied by every `up`;
+# ha_coredns_revert undoes it all with HA off (re-review N-3).
+KUBE_COREDNS_FILE="kube/ha/coredns/small.yaml"
 ha_coredns() {
   local n patch
   n="$(kube_ctl get nodes -l "portcullis.io/site=$KUBE_PRIMARY_SITE,portcullis.io/class!=small" -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null)" || n=""
   [[ "$n" =~ ^[0-9]+$ ]] || fail "can't count the nodes at $KUBE_PRIMARY_SITE for CoreDNS (nothing deployed)"
-  [ "$n" -ge 2 ] || n=2
+  [ "$n" -ge 1 ] || n=1
   kube_ctl -n kube-system get deployment coredns -o name >/dev/null 2>&1 || fail "no Deployment kube-system/coredns (k3s's packaged CoreDNS): HA needs it (nothing deployed)"
   patch="$(N="$n" SITE="$KUBE_PRIMARY_SITE" jq -cn '{spec: {replicas: (env.N | tonumber), template: {spec: {
       affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions: [{key: "portcullis.io/site", operator: "In", values: [env.SITE]}]}]}},
         podAntiAffinity: {requiredDuringSchedulingIgnoredDuringExecution: [{topologyKey: "kubernetes.io/hostname", labelSelector: {matchLabels: {"k8s-app": "kube-dns"}}}]}}}}}}')"
   kube_ctl -n kube-system patch deployment coredns --type=merge -p "$patch" >/dev/null || fail "could not spread CoreDNS over $KUBE_PRIMARY_SITE (nothing deployed)"
-  IMG="$HA_COREDNS_IMAGE" SITE="$KUBE_PRIMARY_SITE" jq -n '
-    def meta($n): {name: $n, namespace: "kube-system", labels: {"app.kubernetes.io/managed-by": "portcullis"}};
-    {apiVersion: "v1", kind: "List", items: [
-      {apiVersion: "apps/v1", kind: "DaemonSet", metadata: meta("portcullis-dns-small"),
-       spec: {selector: {matchLabels: {"portcullis.io/component": "dns-small"}},
-         updateStrategy: {type: "RollingUpdate", rollingUpdate: {maxUnavailable: 1}},
-         template: {metadata: {labels: {"portcullis.io/component": "dns-small", "k8s-app": "kube-dns"}},
-           spec: {priorityClassName: "system-cluster-critical", serviceAccountName: "coredns", dnsPolicy: "Default",
-             nodeSelector: {"kubernetes.io/os": "linux", "portcullis.io/site": env.SITE, "portcullis.io/class": "small"},
-             tolerations: [{key: "portcullis.io/small", operator: "Exists", effect: "NoSchedule"}, {key: "CriticalAddonsOnly", operator: "Exists"}],
-             containers: [{name: "coredns", image: env.IMG, imagePullPolicy: "IfNotPresent", args: ["-conf", "/etc/coredns/Corefile"],
-               ports: [{containerPort: 53, name: "dns", protocol: "UDP"}, {containerPort: 53, name: "dns-tcp", protocol: "TCP"}, {containerPort: 9153, name: "metrics", protocol: "TCP"}],
-               resources: {limits: {memory: "170Mi"}, requests: {cpu: "100m", memory: "70Mi"}},
-               securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {add: ["NET_BIND_SERVICE"], drop: ["ALL"]}},
-               livenessProbe: {httpGet: {path: "/health", port: 8080}, initialDelaySeconds: 60, periodSeconds: 10, timeoutSeconds: 1, failureThreshold: 3},
-               readinessProbe: {httpGet: {path: "/ready", port: 8181}, periodSeconds: 2, timeoutSeconds: 1, failureThreshold: 3},
-               volumeMounts: [{name: "config-volume", mountPath: "/etc/coredns", readOnly: true}, {name: "custom-config-volume", mountPath: "/etc/coredns/custom", readOnly: true}]}],
-             volumes: [{name: "config-volume", configMap: {name: "coredns", items: [{key: "Corefile", path: "Corefile"}, {key: "NodeHosts", path: "NodeHosts"}]}},
-                       {name: "custom-config-volume", configMap: {name: "coredns-custom", optional: true}}]}}}},
-      {apiVersion: "policy/v1", kind: "PodDisruptionBudget", metadata: meta("coredns"),
-       spec: {minAvailable: 1, selector: {matchLabels: {"k8s-app": "kube-dns"}}}}]}' | _ha_apply \
-    || fail "could not apply CoreDNS on the small nodes / its PodDisruptionBudget (nothing deployed)"
+  _ha_apply < "$PORTCULLIS_HOME/$KUBE_COREDNS_FILE" || fail "could not apply CoreDNS on the small nodes / its PodDisruptionBudget ($KUBE_COREDNS_FILE; nothing deployed)"
   kube_ctl -n kube-system patch service kube-dns --type=merge -p '{"spec": {"trafficDistribution": "PreferSameNode"}}' >/dev/null \
     || fail "could not set kube-dns's trafficDistribution PreferSameNode (nothing deployed)"
   _kube_applied_set ha.coredns "$n"
+}
+
+# ha_coredns_revert — HA off: k3s's CoreDNS as k3s ships it (one replica,
+# no affinity), no PreferSameNode, our DaemonSet and PDB gone. Only when
+# the HA layout is there (our DaemonSet, or the Service's setting).
+ha_coredns_revert() {
+  local td
+  td="$(kube_ctl -n kube-system get service kube-dns -o jsonpath='{.spec.trafficDistribution}' 2>/dev/null)" || td=""
+  [ "$(kube_ctl -n kube-system get daemonset portcullis-dns-small -o name 2>/dev/null)" = daemonset.apps/portcullis-dns-small ] || [ "$td" = PreferSameNode ] || return 0
+  info "HA off: CoreDNS back to k3s's layout..."
+  kube_ctl -n kube-system patch deployment coredns --type=merge -p '{"spec": {"replicas": 1, "template": {"spec": {"affinity": null}}}}' >/dev/null \
+    && kube_ctl -n kube-system patch service kube-dns --type=merge -p '{"spec": {"trafficDistribution": null}}' >/dev/null \
+    && kube_ctl -n kube-system delete daemonset portcullis-dns-small --ignore-not-found >/dev/null \
+    && kube_ctl -n kube-system delete poddisruptionbudget coredns --ignore-not-found >/dev/null \
+    || fail "could not put CoreDNS back to k3s's layout (HA off)"
 }

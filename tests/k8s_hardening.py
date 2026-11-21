@@ -143,6 +143,61 @@ FRONTDOOR_RULES = [
 ]
 
 
+def coredns_small_problems(docs):
+    """kube/ha/coredns/small.yaml (plan Task 25 fix round 2, re-review M-c):
+    our CoreDNS DaemonSet on the small nodes is restricted — non-root,
+    RuntimeDefault, drop ALL with nothing added (:53 by the safe sysctl
+    net.ipv4.ip_unprivileged_port_start), no escalation, read-only root,
+    no host namespace / hostPath / privileged, only ConfigMap volumes —, on
+    k3s's CoreDNS image by digest, on the small nodes at main only, and the
+    PDB minAvailable 1 over both CoreDNS sets."""
+    out = []
+    ds = [d for d in docs if d.get("kind") == "DaemonSet"]
+    pdb = [d for d in docs if d.get("kind") == "PodDisruptionBudget"]
+    if len(ds) != 1 or len(pdb) != 1 or len(docs) != 2:
+        return ["coredns small: exactly one DaemonSet and one PodDisruptionBudget"]
+    sp = ds[0]["spec"]["template"]["spec"]
+    psc = sp.get("securityContext", {})
+    if psc.get("runAsNonRoot") is not True or not psc.get("runAsUser") or (psc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
+        out.append("coredns small: pod runAsNonRoot, a non-zero runAsUser and RuntimeDefault seccomp")
+    if psc.get("sysctls", []) != [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "53"}]:
+        out.append("coredns small: sysctls only net.ipv4.ip_unprivileged_port_start=53")
+    if any(sp.get(k) for k in ("hostNetwork", "hostPID", "hostIPC")) or sp.get("initContainers") or len(sp.get("containers", [])) != 1:
+        out.append("coredns small: no host namespace, one container, no init container")
+    if any(set(v) - {"name", "configMap"} for v in sp.get("volumes", [])):
+        out.append("coredns small: ConfigMap volumes only")
+    c = sp["containers"][0]
+    sc = c.get("securityContext", {})
+    caps = sc.get("capabilities", {})
+    if sc.get("allowPrivilegeEscalation") is not False or sc.get("readOnlyRootFilesystem") is not True or sc.get("privileged") \
+            or caps.get("drop") != ["ALL"] or caps.get("add") or (sc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
+        out.append("coredns small: container no escalation, read-only root, drop ALL with nothing added, RuntimeDefault")
+    if not re.fullmatch(r"docker\.io/rancher/mirrored-coredns-coredns:[0-9.]+@sha256:[0-9a-f]{64}", c.get("image", "")):
+        out.append(f"coredns small: image {c.get('image')} (k3s's CoreDNS, by digest)")
+    if sp.get("nodeSelector", {}).get("portcullis.io/class") != "small" or sp.get("nodeSelector", {}).get("portcullis.io/site") != "main" \
+            or sp.get("serviceAccountName") != "coredns":
+        out.append("coredns small: the small nodes at main, k3s's ServiceAccount coredns")
+    if ds[0]["spec"]["template"]["metadata"]["labels"].get("k8s-app") != "kube-dns" or pdb[0]["spec"] != {"minAvailable": 1, "selector": {"matchLabels": {"k8s-app": "kube-dns"}}}:
+        out.append("coredns small: labelled k8s-app=kube-dns; the PDB minAvailable 1 on k8s-app=kube-dns")
+    return out
+
+
+def check_coredns_small():
+    docs = [d for d in yaml.safe_load_all((K.ROOT / "kube" / "ha" / "coredns" / "small.yaml").read_text()) if d]
+    for p in coredns_small_problems(docs):
+        F.add(p)
+    ds = lambda d: next(x for x in d if x["kind"] == "DaemonSet")["spec"]["template"]["spec"]
+    for mutate in (lambda d: ds(d)["containers"][0]["securityContext"]["capabilities"].__setitem__("add", ["NET_ADMIN"]),
+                   lambda d: ds(d)["securityContext"].pop("runAsNonRoot"),
+                   lambda d: ds(d).__setitem__("hostNetwork", True),
+                   lambda d: ds(d)["containers"][0].__setitem__("image", "docker.io/rancher/mirrored-coredns-coredns:1.14.7"),
+                   lambda d: ds(d)["volumes"].append({"name": "h", "hostPath": {"path": "/"}})):
+        bad = copy.deepcopy(docs)
+        mutate(bad)
+        if not coredns_small_problems(bad):
+            F.add("coredns_small_problems misses a mutated DaemonSet (mutation test)")
+
+
 def check_frontdoor():
     """HA only (contract §20.8): the front door's pod has the baseline, its
     Role is exactly its Lease and frontdoor-status (get / update, by name),
@@ -744,6 +799,7 @@ def main():
     check_edge(docs)
     check_edge(K.render(yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())))
     check_frontdoor()
+    check_coredns_small()
     check_hub_core()
     check_nodeadm()
     check_log_ports()

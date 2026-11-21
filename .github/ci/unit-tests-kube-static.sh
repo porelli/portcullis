@@ -146,7 +146,7 @@ done
 # The CLI-applied manifests (probe, storage, admission; not the template of
 # the params' keys).
 KUBE_FILES=()
-while IFS= read -r f; do KUBE_FILES+=("$f"); done < <(ls kube/priorityclasses.yaml kube/probe/*.yaml kube/storage/*.yaml kube/ha/cnpg/rbac.yaml; find kube/admission -name '*.yaml' ! -name '*.tmpl.yaml' | sort)
+while IFS= read -r f; do KUBE_FILES+=("$f"); done < <(ls kube/priorityclasses.yaml kube/probe/*.yaml kube/storage/*.yaml kube/ha/cnpg/rbac.yaml kube/ha/coredns/small.yaml; find kube/admission -name '*.yaml' ! -name '*.tmpl.yaml' | sort)
 "$KUBECONFORM" -strict -summary -kubernetes-version "$K8S_VERSION" \
   -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$K8S_SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json" \
   "${KUBE_FILES[@]}"

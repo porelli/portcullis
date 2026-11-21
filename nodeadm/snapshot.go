@@ -148,6 +148,11 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 			continue
 		}
 		snap.Pods = append(snap.Pods, snapPod(p, mins))
+		if p.Namespace == s.cfg.CoreNS {
+			if msg := sessionsError(p); msg != "" {
+				snap.Errors = append(snap.Errors, fmt.Sprintf("pod %s: %s", p.Name, msg))
+			}
+		}
 		switch {
 		case p.Namespace == s.cfg.CoreNS && strings.HasPrefix(p.Name, sentinelSet+"-"):
 			snap.Quorum.Sentinel.Voters++
@@ -385,4 +390,26 @@ func (s *Server) volumes(ctx context.Context) []Volume {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// sessionsError is the session store's named error on one of its pods (plan
+// Task 25 review M-b): the termination message its init guard or a
+// Sentinel's start writes, prefixed "portcullis-sessions:" (the Sentinels
+// disagree on the master, none answers, the master fallback), for the HA
+// page; "" when none.
+func sessionsError(p *corev1.Pod) string {
+	const prefix = "portcullis-sessions: "
+	all := append(append([]corev1.ContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...)
+	for _, cs := range all {
+		for _, t := range []*corev1.ContainerStateTerminated{cs.State.Terminated, cs.LastTerminationState.Terminated} {
+			if t != nil && strings.HasPrefix(t.Message, prefix) {
+				m := strings.TrimSpace(strings.TrimPrefix(t.Message, prefix))
+				if len(m) > 400 {
+					m = m[:400]
+				}
+				return "the session store: " + m
+			}
+		}
+	}
+	return ""
 }

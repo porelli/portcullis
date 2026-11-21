@@ -782,18 +782,19 @@ kube_crashing_json() {
       && printf '%s' "$pods" | jq -e '.items | type == "array"' >/dev/null 2>&1 || { echo null; return 0; }
     all="$(NS="$ns" NOW="$now" jq -c --argjson acc "$all" '
       $acc + [.items[] | select(.metadata.deletionTimestamp == null)
-        | (.metadata.ownerReferences // [] | map(select(.kind == "ReplicaSet")) | .[0].name) as $rs
-        | select($rs != null)
+        | (.metadata.ownerReferences // [] | map(select(.kind == "ReplicaSet" or .kind == "StatefulSet")) | .[0]) as $own
+        | select($own != null)
         | (.metadata.labels["pod-template-hash"] // "") as $h
-        | ($rs | if $h != "" and endswith("-" + $h) then .[0:(length - ($h | length) - 1)] else . end) as $dep
+        | ($own.name | if $own.kind == "ReplicaSet" and $h != "" and endswith("-" + $h) then .[0:(length - ($h | length) - 1)] else . end) as $dep
         | .metadata.name as $pod
         | [(.status.initContainerStatuses // [])[], (.status.containerStatuses // [])[]] as $cs
         | ([$cs[] | .state.waiting.reason // empty | select(. == "CrashLoopBackOff" or . == "Error" or . == "ImagePullBackOff" or . == "ErrImagePull")] | first) as $wait
         | ([$cs[] | select((.restartCount // 0) > 0 and .ready != true)
              | .lastState.terminated.finishedAt // empty | (try fromdateiso8601 catch 0)
              | select(. > ((env.NOW | tonumber) - 600))] | length > 0) as $recent
-        | select($wait != null or $recent)
-        | {namespace: env.NS, deployment: $dep, pod: $pod, reason: ($wait // "restarted"),
+        | ([$cs[] | .state.terminated.message, .lastState.terminated.message | strings | select(startswith("portcullis-sessions:")) | rtrimstr("\n")] | first) as $named
+        | select($wait != null or $recent or $named != null)
+        | {namespace: env.NS, deployment: $dep, pod: $pod, reason: ($named // $wait // "restarted"),
            restarts: ([$cs[] | .restartCount // 0] | add // 0)}]' <<< "$pods" 2>/dev/null)" || { echo null; return 0; }
   done
   printf '%s\n' "$all" | jq -c 'unique_by([.namespace, .deployment])'
@@ -1259,7 +1260,7 @@ kube_cluster_setup() {
   # Postgres' operator (plan Task 23, D8: every install), before the chart
   # sends its Cluster to the operator's webhook.
   ha_install_cnpg
-  ! kube_ha_on || ha_coredns  # cluster DNS on every node at main (ha.sh)
+  if kube_ha_on; then ha_coredns; else ha_coredns_revert; fi  # cluster DNS (ha.sh)
 
   info "Cluster setup: Traefik CRDs ($(basename "$crds" .yaml))..."
   _kube_apply_files "$crds" || fail "could not apply the Traefik CRDs"
