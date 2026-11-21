@@ -4476,7 +4476,7 @@ chmod +x "$VS/bin/curl"
 cat > "$VS/pf.sh" <<'VPF'
 case "$*" in
   "port-forward --address 127.0.0.1 pod/vault-"[0-9]" :8200")
-    t="${*#*pod/vault-}"; echo "pod/vault-${t%% *}" >> "$VS_DIR/fwd"; echo "Forwarding from 127.0.0.1:701${t%% *} -> 8200"; exec sleep 47 ;;
+    a="$*"; t="${a#*pod/vault-}"; echo "pod/vault-${t%% *}" >> "$VS_DIR/fwd"; echo "Forwarding from 127.0.0.1:701${t%% *} -> 8200"; exec sleep 47 ;;
 esac
 VPF
 vsnap() { # vsnap <vault-0's status json> <vault-1's> <vault-2's> [extra code]
@@ -4508,9 +4508,10 @@ printf 'keep' > "$VS/planted-target"
 for pfx in "${TMPDIR:-/tmp}/.portcullis-fwd-" "$VS/.portcullis-fwd-"; do
   ln -sf "$VS/planted-target" "${pfx}1-7011"; printf '7011' > "${pfx}$$-$VICTIM"
 done
+sleep 1; touch "$VS/planted-at"
 OUT="$(TMPDIR="$VS" vsnap "$S" "$L" "$S")"
 expect_eq "backup: a planted forward record / symlink neither kills its process nor gets written; no record made" \
-  "$(printf '%s' "$OUT" | tail -n1):$(kill -0 "$VICTIM" 2>/dev/null && echo alive):$(cat "$VS/planted-target"):$(find "$VS" -maxdepth 1 -name '.portcullis-fwd-*' -newer "$VS/planted-target" | wc -l | tr -d ' ')" "rc=0:alive:keep:0"
+  "$(printf '%s' "$OUT" | tail -n1):$(kill -0 "$VICTIM" 2>/dev/null && echo alive):$(cat "$VS/planted-target"):$(find "$VS" -maxdepth 1 -name '.portcullis-fwd-*' -newer "$VS/planted-at" | wc -l | tr -d ' ')" "rc=0:alive:keep:0"
 kill "$VICTIM" 2>/dev/null; rm -f "${TMPDIR:-/tmp}"/.portcullis-fwd-1-7011 "${TMPDIR:-/tmp}/.portcullis-fwd-$$-$VICTIM" "$VS"/.portcullis-fwd-*
 expect_eq "backup: the snapshot's port-forwards end with it (no stub kubectl left running)" "$(pgrep -fx 'sleep 47' | grep -c . || true)" 0
 OUT="$(kt "kube_ctl() { case \"\$*\" in *' exec vault-1 '*) echo '{\"ha_enabled\":true,\"is_self\":true}' ;; *' get statefulset vault '*) echo 3 ;; *) return 1 ;; esac; }; kube_vault_pod_set; kube_ctl() { return 1; }; kube_vault_pod; echo \"cached=\$_K_VAULT_POD\"")"
