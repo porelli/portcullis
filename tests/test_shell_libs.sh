@@ -4486,7 +4486,7 @@ vsnap() { # vsnap <vault-0's status json> <vault-1's> <vault-2's> [extra code]
   kt "export VS_DIR='$VS' VS_SNAP='$WORK/good.snap' PATH='$VS/bin':\$PATH VAULT_TOKEN=s.vsnap-token-1234 KUBE_VAULT_SNAPSHOT_TRIES=2 KUBE_VAULT_SNAPSHOT_WAIT=0
     kube_vault_voters() { printf 'vault-0\nvault-1\nvault-2\n'; }
     export STUB_KUBE_SCRIPT='$VS/pf.sh'
-    kube_ctl() { case \"\$*\" in *' exec vault-'[0-9]' -c vault -- vault status -format=json') p=\"\${*#* exec }\"; cat \"$VS/st-\${p%% *}\" ;; *) return 1 ;; esac; }
+    kube_ctl() { case \"\$*\" in *' exec vault-'[0-9]' -c vault -- vault status -format=json') a=\"\$*\"; p=\"\${a#* exec }\"; cat \"$VS/st-\${p%% *}\" ;; *) return 1 ;; esac; }
     ${4:-}
     _backup_vault_snapshot '$VS/out.snap'"
 }
