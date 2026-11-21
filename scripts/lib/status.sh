@@ -242,7 +242,13 @@ status_run() {
   clock="$(status_clock_synced)"
 
   # ── lldap / traefik ──
-  lldap="$(jq -n --arg h "$(rt_health lldap)" '{health: $h}')"
+  # LLDAP's key seed (users.sh): the host file and what the running
+  # container has; any problem is a problem (fail closed).
+  local seed_problems
+  seed_problems="$( { lldap_key_seed_problem; lldap_key_seed_runtime_problems; } | sed '/^$/d')"
+  [ -z "$seed_problems" ] || problems=1
+  lldap="$(jq -n --arg h "$(rt_health lldap)" --arg sp "$seed_problems" \
+    '{health: $h, key_seed: {ok: ($sp == ""), problems: [$sp | split("\n")[] | select(. != "")]}}')"
   traefik="$(rt_health traefik)"
   case "$traefik" in healthy|running) ;; *) problems=1 ;; esac
   # A non-core container answering to a core service name on portcullis-proxy
@@ -407,6 +413,11 @@ status_run() {
   printf '\n%sLLDAP / Traefik%s\n' "$C_CYAN" "$C_NC"
   out="$(printf '%s' "$lldap" | jq -r .health)"
   [ "$out" = healthy ] && _st_line ok "lldap healthy" || _st_line fail "lldap $out"
+  if [ -z "$seed_problems" ]; then
+    _st_line ok "lldap key seed: this install's own (secrets/lldap/key-seed)"
+  else
+    while IFS= read -r out; do _st_line fail "lldap key seed: $out"; done <<< "$seed_problems"
+  fi
   case "$traefik" in healthy|running) _st_line ok "traefik $traefik" ;; *) _st_line fail "traefik $traefik" ;; esac
   domains_status_lines
   local shadow cns cdep creason crest

@@ -61,8 +61,8 @@ docker run --rm --network none -v portcullis_hub_data:/data -v "$RUNNER_TEMP/tem
   cp -r /tpl/stalwart /src/mail-fake /data/repos/portcullis/ &&
   printf "sources:\n  - name: portcullis\n    url: \"\"\n    path: /data/repos/portcullis\n" > /data/state.yaml &&
   chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
 docker compose up -d postgres lldap
-./portcullis vault init
 ./portcullis pki setup --with-server-cert
 ./portcullis config apply --bundle-only
 printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
