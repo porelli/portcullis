@@ -56,43 +56,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -100,7 +100,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -242,43 +242,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -286,7 +286,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "docker.io/library/alpine:3.24.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -428,43 +428,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -472,7 +472,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -530,43 +530,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -574,7 +574,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -708,43 +708,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -752,7 +752,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -814,43 +814,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -858,7 +858,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -990,43 +990,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -1034,7 +1034,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -1176,43 +1176,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -1220,7 +1220,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -1362,43 +1362,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -1406,7 +1406,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -1549,43 +1549,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -1593,7 +1593,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -1736,43 +1736,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -1780,7 +1780,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -1922,43 +1922,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -1966,7 +1966,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -2114,43 +2114,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -2158,7 +2158,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -2300,43 +2300,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -2344,7 +2344,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -2491,43 +2491,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -2535,7 +2535,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -2681,43 +2681,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -2725,7 +2725,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -2867,43 +2867,43 @@
        },
        {
         "name": "WATCHDOG_PATH",
-        "value": "v"
+        "value": "/dev/watchdog"
        },
        {
         "name": "PEER_API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "API_CHECK_INTERVAL",
-        "value": "v"
+        "value": "10000000000"
        },
        {
         "name": "PEER_UPDATE_INTERVAL",
-        "value": "v"
+        "value": "30000000000"
        },
        {
         "name": "API_SERVER_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_DIAL_TIMEOUT",
-        "value": "v"
+        "value": "5000000000"
        },
        {
         "name": "PEER_REQUEST_TIMEOUT",
-        "value": "v"
+        "value": "7000000000"
        },
        {
         "name": "MAX_API_ERROR_THRESHOLD",
-        "value": "v"
+        "value": "2"
        },
        {
         "name": "IS_SOFTWARE_REBOOT_ENABLED",
-        "value": "v"
+        "value": "true"
        },
        {
         "name": "END_POINT_HEALTH_CHECK_URL",
-        "value": "v"
+        "value": ""
        },
        {
         "name": "HOST_PORT",
@@ -2911,7 +2911,7 @@
        },
        {
         "name": "MIN_PEERS_FOR_REMEDIATION",
-        "value": "v"
+        "value": "1"
        }
       ],
       "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -2989,6 +2989,2291 @@
         {
          "serviceAccountToken": {
           "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: a postStart hook",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-a-poststart-hook",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/bash",
+          "-c",
+          "id"
+         ]
+        }
+       }
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: an exec liveness probe",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-an-exec-liveness-probe",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "livenessProbe": {
+       "exec": {
+        "command": [
+         "/bin/bash",
+         "-c",
+         "id"
+        ]
+       }
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: an exec readiness probe",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-an-exec-readiness-probe",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "exec": {
+        "command": [
+         "/bin/bash",
+         "-c",
+         "id"
+        ]
+       }
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: envFrom",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-envfrom",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "envFrom": [
+       {
+        "configMapRef": {
+         "name": "x"
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: a workingDir",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-a-workingdir",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ],
+      "workingDir": "/tmp"
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: stdin",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-stdin",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "stdin": true,
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: tty",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-tty",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "tty": true,
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: an extra env (LD_PRELOAD)",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-an-extra-env-ld-preload",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       },
+       {
+        "name": "LD_PRELOAD",
+        "value": "/dev/shm/x.so"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: another watchdog path",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-another-watchdog-path",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/null"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: an env from a Secret",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-an-env-from-a-secret",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "valueFrom": {
+         "secretKeyRef": {
+          "key": "y",
+          "name": "x"
+         }
+        }
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: the node name from another field",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-the-node-name-from-another-field",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.name"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "agent: a projected Secret source",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-agent-a-projected-secret-source",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "remediation.medik8s.io/exclude-from-remediation",
+           "operator": "NotIn",
+           "values": [
+            "true"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--is-manager=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "WATCHDOG_PATH",
+        "value": "/dev/watchdog"
+       },
+       {
+        "name": "PEER_API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "API_CHECK_INTERVAL",
+        "value": "10000000000"
+       },
+       {
+        "name": "PEER_UPDATE_INTERVAL",
+        "value": "30000000000"
+       },
+       {
+        "name": "API_SERVER_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_DIAL_TIMEOUT",
+        "value": "5000000000"
+       },
+       {
+        "name": "PEER_REQUEST_TIMEOUT",
+        "value": "7000000000"
+       },
+       {
+        "name": "MAX_API_ERROR_THRESHOLD",
+        "value": "2"
+       },
+       {
+        "name": "IS_SOFTWARE_REBOOT_ENABLED",
+        "value": "true"
+       },
+       {
+        "name": "END_POINT_HEALTH_CHECK_URL",
+        "value": ""
+       },
+       {
+        "name": "HOST_PORT",
+        "value": "30001"
+       },
+       {
+        "name": "MIN_PEERS_FOR_REMEDIATION",
+        "value": "1"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "imagePullPolicy": "IfNotPresent",
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 30001,
+        "hostPort": 30001,
+        "name": "self-n-r-port",
+        "protocol": "TCP"
+       }
+      ],
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "60Mi"
+       }
+      },
+      "securityContext": {
+       "privileged": true
+      },
+      "terminationMessagePath": "/dev/termination-log",
+      "terminationMessagePolicy": "File",
+      "volumeMounts": [
+       {
+        "mountPath": "/dev",
+        "name": "devices"
+       }
+      ]
+     }
+    ],
+    "dnsPolicy": "ClusterFirst",
+    "hostPID": true,
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Always",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+     "runAsUser": 0
+    },
+    "serviceAccountName": "self-node-remediation-agent",
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+     {
+      "effect": "NoSchedule",
+      "key": "remediation.medik8s.io/self-node-remediation",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/master",
+      "operator": "Exists"
+     },
+     {
+      "effect": "NoSchedule",
+      "key": "node-role.kubernetes.io/control-plane",
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/dev",
+       "type": "Directory"
+      },
+      "name": "devices"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        },
+        {
+         "secret": {
+          "name": "x"
          }
         }
        ]
@@ -7416,6 +9701,2948 @@
   "policy": "portcullis-fencing-pods"
  },
  {
+  "allowed": false,
+  "name": "manager: another postStart hook",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-another-poststart-hook",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/sh",
+          "-c",
+          "id"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: another preStop hook",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-another-prestop-hook",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "/bin/sh",
+          "-c",
+          "id"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: an exec liveness probe",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-an-exec-liveness-probe",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "exec": {
+        "command": [
+         "/bin/sh",
+         "-c",
+         "id"
+        ]
+       }
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: an exec startup probe",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-an-exec-startup-probe",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "exec": {
+        "command": [
+         "/bin/sh",
+         "-c",
+         "id"
+        ]
+       }
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: envFrom",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-envfrom",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "envFrom": [
+       {
+        "configMapRef": {
+         "name": "x"
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: a workingDir",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-a-workingdir",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ],
+      "workingDir": "/tmp"
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: tty",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-tty",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "tty": true,
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: an extra env",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-an-extra-env",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       },
+       {
+        "name": "LD_PRELOAD",
+        "value": "/tmp/x.so"
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: another agent image in env",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-another-agent-image-in-env",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "docker.io/library/alpine:3.24.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: pod seccomp Unconfined",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-pod-seccomp-unconfined",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "Unconfined"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: container seccomp Unconfined",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-container-seccomp-unconfined",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true,
+       "seccompProfile": {
+        "type": "Unconfined"
+       }
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: container AppArmor Unconfined",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-container-apparmor-unconfined",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "appArmorProfile": {
+        "type": "Unconfined"
+       },
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: a projected Secret source",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-a-projected-secret-source",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        },
+        {
+         "secret": {
+          "name": "x"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
   "allowed": true,
   "name": "probe: the CLI's shape",
   "pod": {
@@ -9838,6 +15065,1261 @@
         "containerPort": 80
        }
       ],
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: a postStart hook",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-a-poststart-hook",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "sh",
+          "-c",
+          "id"
+         ]
+        }
+       }
+      },
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: an exec liveness probe",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-an-exec-liveness-probe",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "livenessProbe": {
+       "exec": {
+        "command": [
+         "sh",
+         "-c",
+         "id"
+        ]
+       }
+      },
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: envFrom",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-envfrom",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "envFrom": [
+       {
+        "configMapRef": {
+         "name": "x"
+        }
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: CHECKS from a field",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-checks-from-a-field",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.name"
+         }
+        }
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: a workingDir",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-a-workingdir",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ],
+      "workingDir": "/host"
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: stdin",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-stdin",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "stdin": true,
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: tty",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-tty",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "tty": true,
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: container seccomp Unconfined",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-container-seccomp-unconfined",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true,
+       "seccompProfile": {
+        "type": "Unconfined"
+       }
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: container AppArmor Unconfined",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-container-apparmor-unconfined",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "appArmorProfile": {
+        "type": "Unconfined"
+       },
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "name": "probe: pod AppArmor Unconfined",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-pod-apparmor-unconfined",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
+      "resources": {
+       "limits": {
+        "memory": "32Mi"
+       },
+       "requests": {
+        "memory": "32Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/host",
+        "name": "host",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "enableServiceLinks": false,
+    "hostPID": true,
+    "nodeName": "node-x",
+    "priorityClassName": "portcullis-core",
+    "restartPolicy": "Never",
+    "securityContext": {
+     "appArmorProfile": {
+      "type": "Unconfined"
+     },
+     "runAsGroup": 65534,
+     "runAsNonRoot": true,
+     "runAsUser": 65534,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "terminationGracePeriodSeconds": 1,
+    "tolerations": [
+     {
+      "operator": "Exists"
+     }
+    ],
+    "volumes": [
+     {
+      "hostPath": {
+       "path": "/",
+       "type": "Directory"
+      },
+      "name": "host"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "ephemeral": true,
+  "ephemeralContainers": [
+   {
+    "command": [
+     "sh"
+    ],
+    "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+    "name": "debug"
+   }
+  ],
+  "name": "portcullis-fencing-pods: an ephemeral container added",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-eph",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-bkkm275dff"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "ephemeral": true,
+  "ephemeralContainers": [
+   {
+    "command": [
+     "sh"
+    ],
+    "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+    "name": "debug"
+   }
+  ],
+  "name": "portcullis-ha-probe-pods: an ephemeral container added",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "labels": {
+     "portcullis.io/component": "ha-check"
+    },
+    "name": "v-probe-eph",
+    "namespace": "portcullis-ha-probe"
+   },
+   "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+     {
+      "command": [
+       "sh",
+       "-c",
+       "\nhas() { for f in \"$@\"; do [ -e \"/host$f\" ] && return 0; done; return 1; }\nrunning() { for c in /proc/[0-9]*/comm; do [ \"$(cat \"$c\" 2>/dev/null)\" = \"$1\" ] && return 0; done; return 1; }\nfor c in $CHECKS; do case \"$c\" in\n  iscsid) if ! has /usr/sbin/iscsiadm /sbin/iscsiadm; then echo \"iscsid fail open-iscsi is not installed (apt install open-iscsi): Longhorn needs it\"\n    elif ! running iscsid; then echo \"iscsid fail open-iscsi is installed but iscsid is not running (systemctl enable --now iscsid)\"; else echo \"iscsid ok\"; fi ;;\n  iscsi_tcp) if [ -d /host/sys/module/iscsi_tcp ]; then echo \"iscsi_tcp ok\"; else echo \"iscsi_tcp fail the iscsi_tcp module is not loaded (modprobe iscsi_tcp, and list it in /etc/modules-load.d/)\"; fi ;;\n  nfs_common) if has /usr/sbin/mount.nfs /sbin/mount.nfs; then echo \"nfs_common ok\"; else echo \"nfs_common fail nfs-common is not installed (apt install nfs-common)\"; fi ;;\n  multipath_blacklist)\n    if ! has /usr/sbin/multipathd /sbin/multipathd && ! running multipathd; then echo \"multipath_blacklist ok\"\n    elif cat /host/etc/multipath.conf /host/etc/multipath/conf.d/*.conf 2>/dev/null | sed \"s/#.*//\" | awk '\n        /^[[:space:]]*blacklist[[:space:]]*\\{/ { b = 1; next } b && /\\}/ { b = 0 } b { gsub(/[[:space:]]+/, \" \"); sub(/^ /, \"\"); sub(/ $/, \"\"); if ($0 == \"devnode \\\"^sd[a-z0-9]+\\\"\") f = 1 } END { exit !f }'; then echo \"multipath_blacklist ok\"\n    else echo \"multipath_blacklist fail multipathd has no blacklist for Longhorn devices: add blacklist { devnode \\\"^sd[a-z0-9]+\\\" } to /etc/multipath.conf and restart multipathd\"; fi ;;\n  longhorn_path) p=/host/var/lib/longhorn; while [ ! -e \"$p\" ] && [ \"$p\" != /host ]; do p=\"${p%/*}\"; [ -n \"$p\" ] || p=/host; done\n    t=\"$(stat -f -c %T \"$p\" 2>/dev/null)\"\n    case \"$t\" in \"\") echo \"longhorn_path fail the file system of /var/lib/longhorn is unknown\" ;;\n      zfs) echo \"longhorn_path fail /var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk\" ;; *) echo \"longhorn_path ok\" ;; esac ;;\n  watchdog) if [ -c /host/dev/watchdog ]; then echo \"watchdog ok\"; else echo \"watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)\"; fi ;;\nesac; done"
+      ],
+      "env": [
+       {
+        "name": "CHECKS",
+        "value": "iscsid watchdog"
+       }
+      ],
+      "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "name": "check",
       "resources": {
        "limits": {
         "memory": "32Mi"

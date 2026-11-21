@@ -19,9 +19,11 @@ on:
 
 permissions: {}
 
+# Never cancelled on main: a cancel between the push and `cosign sign`
+# would leave an unsigned digest under edge / main-<sha7>.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:
@@ -33,7 +35,7 @@ jobs:
       id-token: write   # keyless cosign signing (GitHub OIDC)
     env:
       # The repository (not a pinned ref: this job builds it).
-      ADAPTER_REPO: ghcr.io/${{ github.repository_owner }}/portcullis-snr
+      SNR_REPO: ghcr.io/${{ github.repository_owner }}/portcullis-snr
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,7 +78,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.ADAPTER_REPO }}
+          images: ${{ env.SNR_REPO }}
           flavor: |
             latest=false
           tags: |
@@ -103,11 +105,11 @@ jobs:
       - name: Sign image (keyless)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${ADAPTER_REPO}@${DIGEST}"
+        run: cosign sign --yes "${SNR_REPO}@${DIGEST}"
 
       - name: Digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           TAG: ${{ steps.tag.outputs.tag }}
           FIXED: ${{ steps.tag.outputs.fixed }}
-        run: echo "pushed ${ADAPTER_REPO}:${TAG}${FIXED:+ and :${FIXED}}@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+        run: echo "pushed ${SNR_REPO}:${TAG}${FIXED:+ and :${FIXED}}@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"

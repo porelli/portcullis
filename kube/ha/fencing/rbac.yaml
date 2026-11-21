@@ -12,9 +12,10 @@
 #   - SNR's agents (the DaemonSet on every node) have their OWN
 #     ServiceAccount (agent-daemonset.yaml.tmpl): Nodes read and updated —
 #     by the admission policy portcullis-node-labels only its own Node's
-#     annotations —, pods and SelfNodeRemediations read, and one Secret,
-#     the peers' certificate, by name (get / list / watch with the patched
-#     cache's metadata.name field selector);
+#     annotations —, SelfNodeRemediations read; in portcullis-fencing only
+#     its peers' pods and one Secret, the peers' certificate, by name (get /
+#     list / watch with the patched cache's metadata.name field selector;
+#     fix round 2, review M5: the patch scopes the agent's pod cache too);
 #   - no Node Healthcheck (nodeadm creates the SelfNodeRemediations: its
 #     Role in the chart, templates/nodeadm.yaml);
 #   - pods in portcullis-fencing: only these shapes (admission.yaml).
@@ -114,11 +115,8 @@ metadata:
   name: portcullis-snr-agent
   labels: {app.kubernetes.io/managed-by: portcullis}
 rules:
-  # No Secret right here (security ruling): the peers' certificate is the
-  # Role below, by name.
-  - apiGroups: [""]
-    resources: [namespaces, pods]
-    verbs: [get, list, watch]
+  # No Secret or pod right here: the peers' certificate and the peer pods
+  # are the Role below (our SNR caches both in portcullis-fencing only).
   # Its own Node's annotations only (portcullis-node-labels judges it).
   - apiGroups: [""]
     resources: [nodes]
@@ -159,6 +157,10 @@ rules:
   - apiGroups: [""]
     resources: [secrets]
     resourceNames: [self-node-remediation-certificates]
+    verbs: [get, list, watch]
+  # Its peers: the agent pods (internal/peers lists them by label).
+  - apiGroups: [""]
+    resources: [pods]
     verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

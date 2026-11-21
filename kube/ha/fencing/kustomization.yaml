@@ -41,4 +41,10 @@ patches:
       apiVersion: rbac.authorization.k8s.io/v1
       kind: ClusterRoleBinding
       metadata: {name: self-node-remediation-controller-manager}
+  # NHC's aggregation target (no NHC: nodeadm creates the remediations).
+  - patch: |-
+      $patch: delete
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata: {name: self-node-remediation-ext-remediation}
   - path: managers.yaml

@@ -6386,6 +6386,7 @@ h24() {
     _ha_wait() { echo \"WAIT \$2\" >> '$WORK/h24-calls'; }
     _ha_crds_established() { :; }; _ha_fencing_cert() { echo CERT >> '$WORK/h24-calls'; }
     _ha_probe_setup() { echo PROBESETUP >> '$WORK/h24-calls'; }
+    _ha_policy_in_force() { echo \"INFORCE \$2\" >> '$WORK/h24-calls'; }
     ha_fencing_ready() { echo READY-CHECK >> '$WORK/h24-calls'; }
     _kube_apply_files() { echo \"FILES \$*\" >> '$WORK/h24-calls'; }
     $1" 2>&1
@@ -6442,9 +6443,9 @@ expect_eq "ha_install_fencing: every node checked (the small one and the edge on
 OUT="$(h24 "HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/portcullis-snr@sha256:1111111111111111111111111111111111111111111111111111111111111111; ha_install_fencing")"
 expect_eq "ha_install_fencing: namespace → policies → watchdogs → certificate → render → managers → config.yaml → agents → ha_fencing_ready" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;CERT;RENDER fencing;K apply;WAIT SNR's manager;FILES config.yaml;WAIT SNR's agents (DaemonSet self-node-remediation-ds);READY-CHECK;"
+  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;CERT;K apply;INFORCE portcullis-fencing-pods;RENDER fencing;K apply;WAIT SNR's manager;FILES config.yaml;WAIT SNR's agents (DaemonSet self-node-remediation-ds);READY-CHECK;"
 expect_eq "ha_install_fencing: portcullis-fencing's policies: deny, DNS, API, SNR's peers on 30001 only between agents" \
-  "$(jq -c '[.items[] | .metadata.name] + [.items[] | select(.metadata.name == "snr-peers") | .spec.ingress[0].ports[0].port]' < <(head -c "$(wc -c < "$WORK/h24-applied")" "$WORK/h24-applied" | jq -s '.[0]'))" \
+  "$(jq -c '[.items[] | .metadata.name] + [.items[] | select(.metadata.name == "snr-peers") | .spec.ingress[0].ports[0].port]' < <(jq -cn 'first(inputs)' "$WORK/h24-applied" 2>/dev/null))" \
   '["default-deny","kube-dns","kube-api","snr-peers",30001]'
 OUT="$(h24 ha_install_snapshotter)"
 expect_eq "ha_install_snapshotter: its own kube-system policy first (only its pods), the CRDs, then the controller" \
@@ -6459,7 +6460,7 @@ expect_eq "ha_install_certmanager: cert-manager (restricted) → deny + its webh
 # and the exact script) and the policy itself.
 rm -f "$WORK/ps-calls" "$WORK/ps-in"
 OUT="$(kt "PORTCULLIS_HOME='$H24'; mkdir -p '$H24/kube/ha/probe'; cp '$HERE/../kube/ha/probe/admission.yaml' '$H24/kube/ha/probe/'
-  kube_namespace_apply() { echo \"NS \$*\" >> '$WORK/ps-calls'; }
+  kube_namespace_apply() { echo \"NS \$*\" >> '$WORK/ps-calls'; }; _ha_policy_in_force() { :; }
   kube_ctl() { echo \"K \$*\" >> '$WORK/ps-calls'; case \"\$*\" in *'create configmap'*) all=\"\$*\"; d=\"\${all##*--from-file=}\"; d=\"\${d%% *}\"; jq -n --rawfile i \"\$d/image\" --rawfile s \"\$d/script\" '{data: {image: \$i, script: \$s}}' ;; *'-f -'*) cat >> '$WORK/ps-in' ;; esac; }
   _ha_probe_setup; jq -sj '.[1].data.script' '$WORK/ps-in' | cmp -s - <(printf '%s' \"\$HA_PROBE_SH\") && echo SCRIPT-SAME")"
 expect_eq "_ha_probe_setup: portcullis-ha-probe (PSA haprobe) → its default-deny → the params (helper image, the exact probe script) → the probe policy" \
@@ -6468,14 +6469,24 @@ expect_eq "_ha_probe_setup: portcullis-ha-probe (PSA haprobe) → its default-de
 expect_eq "_ha_probe_setup: the namespace's only policy is default-deny; the params hold the helper image and HA_PROBE_SH exactly" \
   "$(jq -sc '[.[0].items[].metadata.name]' "$WORK/ps-in"):$(jq -sr '.[1].data.image' "$WORK/ps-in"):$(printf '%s\n' "$OUT" | grep -c '^SCRIPT-SAME$')" \
   '["default-deny"]:docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a:1'
+# Review M1: a policy is in force once a pod no shape admits is refused BY
+# it (server dry-run); never refused → not in force (fail).
+rm -f "$WORK/pif"
+OUT="$(kt "sleep() { :; }; kube_ctl() { cat >/dev/null; echo . >> '$WORK/pif'; [ \$(wc -l < '$WORK/pif') -ge 3 ] && echo \"denied: ValidatingAdmissionPolicy 'portcullis-fencing-pods' with binding x denied\" >&2; return 1; }; _ha_policy_in_force portcullis-fencing portcullis-fencing-pods && echo IN-FORCE; kube_ctl() { cat >/dev/null; return 0; }; _ha_policy_in_force portcullis-fencing portcullis-fencing-pods || echo NOT-IN-FORCE")"
+expect_eq "_ha_policy_in_force: refused by the policy (after two misses) → in force; admitted every time → not in force" \
+  "$(printf '%s\n' "$OUT" | grep -c '^IN-FORCE$\|^NOT-IN-FORCE$')" 2
 # ha_fencing_ready (the jq over SNR's agents → per node ready), fail closed.
 FR_CFG='{"spec":{"watchdogFilePath":"/dev/watchdog","safeTimeToAssumeNodeRebootedSeconds":150}}'
 fr() { kt "_ha_deploy_ready() { [ -z \"\${STUB_MGR_DOWN:-}\" ]; }; kube_ctl() { case \"\$*\" in *'get nodes'*) printf '%s' '{\"items\":[{\"metadata\":{\"name\":\"m1\"}},{\"metadata\":{\"name\":\"m2\"}}]}' ;;
     *'get pods'*) [ -n '$1' ] || return 1; printf '%s' '$1' ;; *selfnoderemediationconfigs*) printf '%s' '$2' ;; esac; }; ha_fencing_ready"; }
-AGENT='{"metadata":{"name":"self-node-remediation-ds-%s","ownerReferences":[{"kind":"DaemonSet","name":"self-node-remediation-ds"}]},"spec":{"nodeName":"%s"},"status":{"conditions":[{"type":"Ready","status":"%s"}]}}'
-A1="$(printf "$AGENT" a m1 True)" A2="$(printf "$AGENT" b m2 True)" A2N="$(printf "$AGENT" b m2 False)"
+SNRIMG="ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+AGENT='{"metadata":{"name":"self-node-remediation-ds-%s","ownerReferences":[{"kind":"DaemonSet","name":"self-node-remediation-ds"}]},"spec":{"nodeName":"%s","containers":[{"image":"%s"}]},"status":{"conditions":[{"type":"Ready","status":"%s"}]}}'
+A1="$(printf "$AGENT" a m1 "$SNRIMG" True)" A2="$(printf "$AGENT" b m2 "$SNRIMG" True)" A2N="$(printf "$AGENT" b m2 "$SNRIMG" False)"
+A2OLD="$(printf "$AGENT" b m2 "quay.io/medik8s/self-node-remediation-operator:v0.13.0@sha256:9ad002dca9ea183c72e350f72e47aff7020397fd476b4a3ac4ebc3627412a5b0" True)"
 expect_eq "ha_fencing_ready: every node's agent Ready and our configuration → each node ready, exit 0" \
   "$(fr "{\"items\":[$A1,$A2]}" "$FR_CFG" | tr '\t\n' ' ;')" "m1 ready;m2 ready;rc=0;"
+expect_eq "ha_fencing_ready: m2's agent of another (old) image → m2 not ready (review nit 7)" \
+  "$(fr "{\"items\":[$A1,$A2OLD]}" "$FR_CFG" | tr '\t\n' ' ;')" "m1 ready;m2 not ready (no Ready SNR agent);rc=1;"
 expect_eq "ha_fencing_ready: m2's agent not Ready → m2 not ready, exit 1 (Task 31 stops: no stateful failover)" \
   "$(fr "{\"items\":[$A1,$A2N]}" "$FR_CFG" | tr '\t\n' ' ;')" "m1 ready;m2 not ready (no Ready SNR agent);rc=1;"
 expect_eq "ha_fencing_ready: another safe time / watchdog (not ours) → no node ready" \

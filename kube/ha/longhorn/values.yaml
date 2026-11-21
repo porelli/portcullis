@@ -57,6 +57,10 @@ defaultSettings:
   replicaSoftAntiAffinity: false
   # Fencing decides (SNR's out-of-service taint), never Longhorn.
   nodeDownPodDeletionPolicy: do-nothing
+  # Longhorn never deletes a workload pod (review M9): no app-namespace
+  # write; a pod whose volume detached unexpectedly is restarted by its
+  # kubelet / controller, not by Longhorn.
+  autoDeletePodWhenVolumeDetachedUnexpectedly: false
   # Longhorn's system-managed pods (instance managers, engine images, CSI)
   # on the primary site only: storage and every replicated-volume pod are
   # there (portcullis.sitePin); a small node's NoSchedule taint keeps them

@@ -24,6 +24,9 @@ want no "$A" list secrets -A
 want no "$A" get secrets -n portcullis
 want no "$A" get secrets/fencing-webhook-cert -n portcullis-fencing
 want yes "$A" get secrets/self-node-remediation-certificates -n portcullis-fencing
+want no "$A" list pods -A
+want no "$A" get pods -n portcullis
+want yes "$A" list pods -n portcullis-fencing
 want no "$A" create nodes
 want no "$A" delete nodes
 want no "$A" patch nodes
@@ -45,9 +48,12 @@ want no "$L" get secrets -n portcullis
 want no "$L" list secrets -A
 want no "$L" create clusterroles
 want no "$L" patch nodes
+want no "$L" delete pods -n portcullis
+want no "$L" delete pods -n portcullis-apps
 want no "$L" create validatingwebhookconfigurations
 want no "$L" create mutatingwebhookconfigurations
 C=cert-manager:cert-manager
 want no "$C" get secrets -n portcullis
+want no "$C" list secrets -A
 want yes "$C" create secrets -n cnpg-system
 exit "$fail"

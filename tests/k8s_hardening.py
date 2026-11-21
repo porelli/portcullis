@@ -1335,14 +1335,15 @@ def snr_agent_problems(fe):
     out = []
     for _, r in rules_of(fe, "ClusterRole", {"portcullis-snr-agent"}):
         res, verbs = set(r["resources"]), set(r["verbs"])
-        if "secrets" in res or "*" in res or ("nodes" in res and verbs - {"get", "list", "watch", "update"}) \
+        if "secrets" in res or "*" in res or res & {"pods", "namespaces"} or ("nodes" in res and verbs - {"get", "list", "watch", "update"}) \
                 or res & {"daemonsets", "volumeattachments", "pods/exec"} or "*" in verbs:
             out.append(f"fencing: the agent's ClusterRole rule {r} (no Secret at all, its Node's annotations, nothing else written)")
     agent_role = [r for _, r in rules_of(fe, "Role", {"portcullis-snr-agent"})]
     # get / list / watch by name: the patched cache lists with the
     # metadata.name field selector (RBAC checks resourceNames then).
-    if agent_role != [{"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["self-node-remediation-certificates"], "verbs": ["get", "list", "watch"]}]:
-        out.append(f"fencing: the agent's Role {agent_role} (only its peers' certificate Secret, by name)")
+    if agent_role != [{"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["self-node-remediation-certificates"], "verbs": ["get", "list", "watch"]},
+                      {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch"]}]:
+        out.append(f"fencing: the agent's Role {agent_role} (only its peers' certificate Secret by name, and its peers' pods)")
     return out
 
 
@@ -1391,6 +1392,8 @@ def check_ha_infra():
                    and (set(r["verbs"]) <= set(u["verbs"]) or "*" in u["verbs"]) for u in up):
             F.add(f"longhorn: portcullis-longhorn's rule {r} isn't within the chart's longhorn-role")
     for _, r in rules_of(lh, "ClusterRole", {"portcullis-longhorn"}):
+        if "" in r["apiGroups"] and "pods" in r["resources"] and set(r["verbs"]) - {"get", "list", "watch"}:
+            F.add(f"longhorn: {r} (pods deleted only in longhorn-system, review M9)")
         if any(x.endswith("webhookconfigurations") for x in r["resources"]) and set(r["verbs"]) & {"create", "*", "update"}:
             F.add(f"longhorn: {r} (no webhook-configuration create: the CLI makes Longhorn's two, fix round 1)")
     crd_names = sorted(d["metadata"]["name"] for d in lh if d.get("kind") == "CustomResourceDefinition")
@@ -1399,6 +1402,7 @@ def check_ha_infra():
         F.add(f"longhorn: CRD writes must be update on its own {len(crd_names)} by name only")
     settings = yaml.safe_load(next(d for d in lh if d.get("kind") == "ConfigMap" and d["metadata"]["name"] == "longhorn-default-setting")["data"]["default-setting.yaml"])
     want = {"create-default-disk-labeled-nodes": True, "node-down-pod-deletion-policy": "do-nothing", "replica-soft-anti-affinity": False,
+            "auto-delete-pod-when-volume-detached-unexpectedly": False,
             "system-managed-components-node-selector": "portcullis.io/site:main", "priority-class": "portcullis-core", "upgrade-checker": False,
             "allow-collecting-longhorn-usage-metrics": False, "default-data-locality": "best-effort"}
     for k, v in want.items():
@@ -1530,7 +1534,7 @@ def check_ha_infra():
         vecs = json.loads((K.ROOT / "tests" / "ha_admission_vectors.json").read_text())
         for pol in ("portcullis-fencing-pods", "portcullis-ha-probe-pods"):
             vs = [v for v in vecs if v["policy"] == pol]
-            if sum(v["allowed"] for v in vs) < 1 or sum(not v["allowed"] for v in vs) < 14:
+            if sum(v["allowed"] for v in vs) < 1 or sum(not v["allowed"] for v in vs) < 20 or not any(v.get("ephemeral") for v in vs):
                 F.add(f"ha_admission_vectors: {pol} needs its admitted base(s) and the refused variants")
     probe_pol = [d for d in yaml.safe_load_all((K.ROOT / "kube/ha/probe/admission.yaml").read_text()) if d]
     pb = next((d for d in probe_pol if d["kind"] == "ValidatingAdmissionPolicyBinding"), None)

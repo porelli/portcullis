@@ -5,7 +5,9 @@
 # host probes' namespace with portcullis-ha-probe-pods and its params
 # (ha.sh _ha_probe_setup), then server-dry-runs every vector of
 # tests/ha_admission_vectors.json: an allowed one must be admitted, a
-# refused one refused BY ITS POLICY (the message names it). Run by
+# refused one refused BY ITS POLICY (the message names it); an
+# "ephemeral" vector adds an ephemeral container to its (admitted, real)
+# pod through pods/ephemeralcontainers. Run by
 # e2e-ha-vm (Task 33) after the HA installs; locally against k3d / k3s.
 # With HUB_DEV=1 + PORTCULLIS_DEV_SNR_IMAGE the vectors' SNR image is that
 # one (as ha_render's).
@@ -30,7 +32,17 @@ fail=0 n=0
 while IFS= read -r v; do
   n=$((n + 1))
   name="$(jq -r .name <<<"$v")" allowed="$(jq -r .allowed <<<"$v")" policy="$(jq -r .policy <<<"$v")"
-  out="$(jq -c .pod <<<"$v" | sed "s|$pinned|$img|g" | kubectl --context "$ctx" create --dry-run=server -f - 2>&1)" && got=true || got=false
+  if [ "$(jq -r '.ephemeral // false' <<<"$v")" = true ]; then
+    # pods/ephemeralcontainers: an admitted pod made for real, then the
+    # subresource update (server dry-run), then the pod removed.
+    ns="$(jq -r .pod.metadata.namespace <<<"$v")" pn="$(jq -r .pod.metadata.name <<<"$v")"
+    jq -c .pod <<<"$v" | sed "s|$pinned|$img|g" | kubectl --context "$ctx" create -f - >/dev/null
+    out="$(kubectl --context "$ctx" -n "$ns" get pod "$pn" -o json | jq --argjson e "$(jq -c .ephemeralContainers <<<"$v")" '.spec.ephemeralContainers = $e' \
+      | kubectl --context "$ctx" replace --subresource=ephemeralcontainers --dry-run=server -f - 2>&1)" && got=true || got=false
+    kubectl --context "$ctx" -n "$ns" delete pod "$pn" --wait=false >/dev/null 2>&1 || true
+  else
+    out="$(jq -c .pod <<<"$v" | sed "s|$pinned|$img|g" | kubectl --context "$ctx" create --dry-run=server -f - 2>&1)" && got=true || got=false
+  fi
   if [ "$allowed" = true ] && [ "$got" = true ]; then echo "ok   - $name: admitted"
   elif [ "$allowed" = false ] && [ "$got" = false ] && grep -q "$policy" <<<"$out"; then echo "ok   - $name: refused by $policy"
   else echo "FAIL - $name: allowed=$allowed got=$got: $(head -c 300 <<<"$out")"; fail=1; fi

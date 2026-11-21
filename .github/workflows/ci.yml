@@ -539,6 +539,12 @@ jobs:
           test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
           CGO_ENABLED=0 go build -o /dev/null .
           CGO_ENABLED=1 go test -race ./...
+      # Our SNR (kube/ha/fencing/snr-patch, plan Task 24): the patch applies
+      # to the pinned tag, vets, SNR's certificates tests, arm64
+      # cross-compile, the image builds (no push: snr.yml pushes on main).
+      - name: Our SNR build (no push)
+        timeout-minutes: 20
+        run: bash .github/ci/unit-tests-snr.sh
       - name: mailctl unit tests (config, the Hub API guard, the JMAP envelope, the schema snapshot, spam rules; contract §19)
         working-directory: mailctl
         run: |

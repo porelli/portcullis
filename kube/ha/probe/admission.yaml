@@ -4,13 +4,16 @@
 # namespace portcullis-ha-probe — PSA privileged (hostPID, a hostPath), no
 # Role or workload of anyone in it — and this policy admits there exactly
 # that pod and nothing else, whoever creates it:
-#   one container, no init / ephemeral ones; the image and the exact
+#   one container, no init / ephemeral ones (pods/ephemeralcontainers is
+#   matched and refused), no lifecycle hook / probe / envFrom / workingDir /
+#   stdin / tty / volumeDevices; the image and the exact
 #   `sh -c <script>` from the params ConfigMap ha-probe-params (written by
 #   the CLI only: nobody else has a right in this namespace; missing =
 #   deny); env exactly CHECKS = check ids; the default ServiceAccount with
 #   no token; pod runAsNonRoot, runAsUser / runAsGroup 65534, RuntimeDefault;
 #   the container drop ALL with no add, no escalation, read-only root,
-#   nothing in its securityContext that runs as root; hostPID (to see
+#   nothing in its securityContext that runs as root, seccomp / AppArmor
+#   RuntimeDefault or unset (never Unconfined) at pod and container level; hostPID (to see
 #   iscsid), no hostIPC / hostNetwork / port; volumes exactly the host's /
 #   (Directory), mounted read-only at /host.
 # tests/ha_admission_vectors.json holds each refused variant.
@@ -29,8 +32,10 @@ spec:
       - apiGroups: [""]
         apiVersions: [v1]
         operations: [CREATE, UPDATE]
-        resources: [pods]
+        resources: [pods, pods/ephemeralcontainers]
   variables:
+    - name: sub
+      expression: "has(request.subResource) ? request.subResource : ''"
     - name: c
       expression: "object.spec.containers[0]"
     - name: shape
@@ -39,8 +44,11 @@ spec:
         && variables.c.image == string(params.data.image)
         && variables.c.command == ['sh', '-c', string(params.data.script)] && !has(variables.c.args)
         && has(variables.c.env) && size(variables.c.env) == 1 && variables.c.env[0].name == 'CHECKS'
-        && has(variables.c.env[0].value) && variables.c.env[0].value.matches('^[a-z_ ]{1,200}$') && !has(variables.c.envFrom)
-        && !has(variables.c.ports)
+        && has(variables.c.env[0].value) && variables.c.env[0].value.matches('^[a-z_ ]{1,200}$') && !has(variables.c.env[0].valueFrom)
+        && !has(variables.c.envFrom) && !has(variables.c.ports) && !has(variables.c.workingDir) && !has(variables.c.volumeDevices)
+        && !has(variables.c.lifecycle) && !has(variables.c.livenessProbe) && !has(variables.c.readinessProbe) && !has(variables.c.startupProbe)
+        && !(has(variables.c.stdin) && variables.c.stdin) && !(has(variables.c.stdinOnce) && variables.c.stdinOnce)
+        && !(has(variables.c.tty) && variables.c.tty)
     - name: identity
       expression: >-
         (!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == 'default')
@@ -52,6 +60,7 @@ spec:
         && has(object.spec.securityContext.runAsGroup) && object.spec.securityContext.runAsGroup == 65534
         && (!has(object.spec.securityContext.supplementalGroups) || size(object.spec.securityContext.supplementalGroups) == 0)
         && has(object.spec.securityContext.seccompProfile) && object.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
+        && (!has(object.spec.securityContext.appArmorProfile) || object.spec.securityContext.appArmorProfile.type == 'RuntimeDefault')
     - name: containerSecurity
       expression: >-
         has(variables.c.securityContext)
@@ -64,6 +73,8 @@ spec:
         && (!has(variables.c.securityContext.runAsGroup) || variables.c.securityContext.runAsGroup == 65534)
         && (!has(variables.c.securityContext.runAsNonRoot) || variables.c.securityContext.runAsNonRoot)
         && !has(variables.c.securityContext.procMount) && !has(variables.c.securityContext.seLinuxOptions)
+        && (!has(variables.c.securityContext.seccompProfile) || variables.c.securityContext.seccompProfile.type == 'RuntimeDefault')
+        && (!has(variables.c.securityContext.appArmorProfile) || variables.c.securityContext.appArmorProfile.type == 'RuntimeDefault')
     - name: host
       expression: >-
         has(object.spec.hostPID) && object.spec.hostPID
@@ -75,6 +86,8 @@ spec:
         && has(variables.c.volumeMounts[0].readOnly) && variables.c.volumeMounts[0].readOnly
         && !has(variables.c.volumeMounts[0].subPath) && !has(variables.c.volumeMounts[0].subPathExpr)
   validations:
+    - expression: "variables.sub != 'ephemeralcontainers'"
+      message: "no ephemeral container in portcullis-ha-probe"
     - expression: "variables.shape && variables.identity && variables.podSecurity && variables.containerSecurity && variables.host"
       message: "only the CLI's host probe, in its exact shape, runs in portcullis-ha-probe"
 ---

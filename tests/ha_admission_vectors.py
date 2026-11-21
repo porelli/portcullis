@@ -44,10 +44,39 @@ def manager_base():
     return pod(spec, "portcullis-fencing", "v-manager")
 
 
+# SNR v0.13.0's SelfNodeRemediationConfig defaults (its CRD), under
+# kube/ha/fencing/config.yaml's values: what SNR's manager renders into the
+# agent template (durations as nanoseconds, internal/controller
+# selfnoderemediationconfig_controller.go).
+SNR_DEFAULTS = {"watchdogFilePath": "/dev/watchdog", "peerApiServerTimeout": "5s", "apiCheckInterval": "15s", "peerUpdateInterval": "15m",
+                "apiServerTimeout": "5s", "peerDialTimeout": "5s", "peerRequestTimeout": "7s", "maxApiErrorThreshold": 3,
+                "isSoftwareRebootEnabled": True, "endpointHealthCheckUrl": "", "hostPort": 30001, "minPeersForRemediation": 1}
+
+
+def ns(d):
+    m = re.fullmatch(r"(\d+)(s|m)", d)
+    return str(int(m.group(1)) * (60 if m.group(2) == "m" else 1) * 10**9)
+
+
+def agent_values():
+    cfg = next(d for d in yaml.safe_load_all((ROOT / "kube/ha/fencing/config.yaml").read_text()) if d)["spec"]
+    v = dict(SNR_DEFAULTS) | {k: cfg[k] for k in SNR_DEFAULTS if k in cfg}
+    return {"WatchdogPath": v["watchdogFilePath"], "PeerApiServerTimeout": ns(v["peerApiServerTimeout"]),
+            "ApiCheckInterval": ns(v["apiCheckInterval"]), "PeerUpdateInterval": ns(v["peerUpdateInterval"]),
+            "ApiServerTimeout": ns(v["apiServerTimeout"]), "PeerDialTimeout": ns(v["peerDialTimeout"]),
+            "PeerRequestTimeout": ns(v["peerRequestTimeout"]), "MaxApiErrorThreshold": str(v["maxApiErrorThreshold"]),
+            "IsSoftwareRebootEnabled": '"' + str(v["isSoftwareRebootEnabled"]).lower() + '"',
+            "EndpointHealthCheckUrl": v["endpointHealthCheckUrl"] or '""', "HostPort": str(v["hostPort"]),
+            "MinPeersForRemediation": str(v["minPeersForRemediation"])}
+
+
 def agent_base(image):
     t = (ROOT / "kube/ha/fencing/agent-daemonset.yaml.tmpl").read_text()
-    t = t.replace("{{.Image}}", image).replace("{{.Namespace}}", "portcullis-fencing").replace("{{.HostPort}}", "30001")
-    t = re.sub(r"\{\{\.[A-Za-z]+\}\}", "v", t)
+    t = t.replace("{{.Image}}", image).replace("{{.Namespace}}", "portcullis-fencing")
+    for k, val in agent_values().items():
+        t = t.replace("{{." + k + "}}", val)
+    if "{{" in t:
+        sys.exit("agent-daemonset.yaml.tmpl has a placeholder agent_values() doesn't know")
     ds = yaml.safe_load(t)
     spec = copy.deepcopy(ds["spec"]["template"]["spec"])
     spec["volumes"].append({"name": "kube-api-access", "projected": {"sources": [{"serviceAccountToken": {"path": "token"}}]}})
@@ -122,6 +151,18 @@ def vectors():
         ("agent: another hostPort", lambda s: c0(s)["ports"].append({"containerPort": 22, "hostPort": 22})),
         ("agent: another ServiceAccount", lambda s: s.__setitem__("serviceAccountName", "self-node-remediation-controller-manager")),
         ("agent: an SELinux override", lambda s: csc(s).__setitem__("seLinuxOptions", {"type": "spc_t"})),
+        ("agent: a postStart hook", lambda s: c0(s).__setitem__("lifecycle", {"postStart": {"exec": {"command": ["/bin/bash", "-c", "id"]}}})),
+        ("agent: an exec liveness probe", lambda s: c0(s).__setitem__("livenessProbe", {"exec": {"command": ["/bin/bash", "-c", "id"]}})),
+        ("agent: an exec readiness probe", lambda s: c0(s).__setitem__("readinessProbe", {"exec": {"command": ["/bin/bash", "-c", "id"]}})),
+        ("agent: envFrom", lambda s: c0(s).__setitem__("envFrom", [{"configMapRef": {"name": "x"}}])),
+        ("agent: a workingDir", lambda s: c0(s).__setitem__("workingDir", "/tmp")),
+        ("agent: stdin", lambda s: c0(s).__setitem__("stdin", True)),
+        ("agent: tty", lambda s: c0(s).__setitem__("tty", True)),
+        ("agent: an extra env (LD_PRELOAD)", lambda s: c0(s)["env"].append({"name": "LD_PRELOAD", "value": "/dev/shm/x.so"})),
+        ("agent: another watchdog path", lambda s: next(e for e in c0(s)["env"] if e["name"] == "WATCHDOG_PATH").__setitem__("value", "/dev/null")),
+        ("agent: an env from a Secret", lambda s: c0(s)["env"][2].__setitem__("valueFrom", {"secretKeyRef": {"name": "x", "key": "y"}}) or c0(s)["env"][2].pop("value")),
+        ("agent: the node name from another field", lambda s: c0(s)["env"][0]["valueFrom"]["fieldRef"].__setitem__("fieldPath", "metadata.name")),
+        ("agent: a projected Secret source", lambda s: s["volumes"][-1]["projected"]["sources"].append({"secret": {"name": "x"}})),
     ]:
         add(F, agent, name, fn)
     add(F, mgr, "manager: the CSV's shape", allowed=True)
@@ -144,6 +185,19 @@ def vectors():
         ("manager: a second container", extra_container),
         ("manager: an init container", init_container),
         ("manager: another image", lambda s: c0(s).__setitem__("image", "docker.io/library/alpine:3.24.3@sha256:" + "a" * 64)),
+        ("manager: another postStart hook", lambda s: c0(s)["lifecycle"]["postStart"]["exec"].__setitem__("command", ["/bin/sh", "-c", "id"])),
+        ("manager: another preStop hook", lambda s: c0(s)["lifecycle"]["preStop"]["exec"].__setitem__("command", ["/bin/sh", "-c", "id"])),
+        ("manager: an exec liveness probe", lambda s: c0(s).__setitem__("livenessProbe", {"exec": {"command": ["/bin/sh", "-c", "id"]}})),
+        ("manager: an exec startup probe", lambda s: c0(s).__setitem__("startupProbe", {"exec": {"command": ["/bin/sh", "-c", "id"]}})),
+        ("manager: envFrom", lambda s: c0(s).__setitem__("envFrom", [{"configMapRef": {"name": "x"}}])),
+        ("manager: a workingDir", lambda s: c0(s).__setitem__("workingDir", "/tmp")),
+        ("manager: tty", lambda s: c0(s).__setitem__("tty", True)),
+        ("manager: an extra env", lambda s: c0(s)["env"].append({"name": "LD_PRELOAD", "value": "/tmp/x.so"})),
+        ("manager: another agent image in env", lambda s: next(e for e in c0(s)["env"] if e["name"] == "SELF_NODE_REMEDIATION_IMAGE").__setitem__("value", "docker.io/library/alpine:3.24.3@sha256:" + "a" * 64)),
+        ("manager: pod seccomp Unconfined", lambda s: s["securityContext"].__setitem__("seccompProfile", {"type": "Unconfined"})),
+        ("manager: container seccomp Unconfined", lambda s: csc(s).__setitem__("seccompProfile", {"type": "Unconfined"})),
+        ("manager: container AppArmor Unconfined", lambda s: csc(s).__setitem__("appArmorProfile", {"type": "Unconfined"})),
+        ("manager: a projected Secret source", lambda s: s["volumes"][-1]["projected"]["sources"].append({"secret": {"name": "x"}})),
     ]:
         add(F, mgr, name, fn)
     add(P, probe, "probe: the CLI's shape", allowed=True)
@@ -174,8 +228,26 @@ def vectors():
         ("probe: another ServiceAccount", lambda s: s.__setitem__("serviceAccountName", "vector-sa")),
         ("probe: another image", lambda s: c0(s).__setitem__("image", "docker.io/library/busybox:1@sha256:" + "b" * 64)),
         ("probe: a port", lambda s: c0(s).__setitem__("ports", [{"containerPort": 80}])),
+        ("probe: a postStart hook", lambda s: c0(s).__setitem__("lifecycle", {"postStart": {"exec": {"command": ["sh", "-c", "id"]}}})),
+        ("probe: an exec liveness probe", lambda s: c0(s).__setitem__("livenessProbe", {"exec": {"command": ["sh", "-c", "id"]}})),
+        ("probe: envFrom", lambda s: c0(s).__setitem__("envFrom", [{"configMapRef": {"name": "x"}}])),
+        ("probe: CHECKS from a field", lambda s: c0(s)["env"][0].pop("value") and c0(s)["env"][0].__setitem__("valueFrom", {"fieldRef": {"fieldPath": "metadata.name"}})),
+        ("probe: a workingDir", lambda s: c0(s).__setitem__("workingDir", "/host")),
+        ("probe: stdin", lambda s: c0(s).__setitem__("stdin", True)),
+        ("probe: tty", lambda s: c0(s).__setitem__("tty", True)),
+        ("probe: container seccomp Unconfined", lambda s: csc(s).__setitem__("seccompProfile", {"type": "Unconfined"})),
+        ("probe: container AppArmor Unconfined", lambda s: csc(s).__setitem__("appArmorProfile", {"type": "Unconfined"})),
+        ("probe: pod AppArmor Unconfined", lambda s: s["securityContext"].__setitem__("appArmorProfile", {"type": "Unconfined"})),
     ]:
         add(P, probe, name, fn)
+    # pods/ephemeralcontainers (review I2): an ephemeral container added to
+    # an admitted pod (e2e: the pod created, then the subresource dry-run).
+    for pol, base in ((F, mgr), (P, probe)):
+        e = copy.deepcopy(base)
+        e["metadata"]["name"] = base["metadata"]["name"] + "-eph"
+        out.append({"policy": pol, "name": f"{pol}: an ephemeral container added", "allowed": False, "ephemeral": True, "pod": e,
+                    "ephemeralContainers": [{"name": "debug", "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+                                             "command": ["sh"]}]})
     return out
 
 

@@ -698,6 +698,21 @@ _ha_probe_setup() {
     rm -rf "$t"; fail "could not apply the host probes' admission policy ($KUBE_HA_PROBE_POLICY; nothing installed)"
   fi
   rm -rf "$t"
+  _ha_policy_in_force "$KUBE_HA_PROBE_NS" portcullis-ha-probe-pods || fail "the host probes' admission policy isn't in force (nothing installed)"
+}
+
+# _ha_policy_in_force <namespace> <policy> — a pod no shape admits is
+# refused there BY that policy (server dry-run, ≤ 30 s): the policy and its
+# binding are in force before anything runs (review M1).
+_ha_policy_in_force() {
+  local i out
+  for ((i = 0; i < 15; i++)); do
+    out="$(NS="$1" IMG="$PORTCULLIS_HELPER_IMAGE" jq -n '{apiVersion: "v1", kind: "Pod", metadata: {name: "portcullis-policy-check", namespace: env.NS},
+        spec: {priorityClassName: "portcullis-core", containers: [{name: "x", image: env.IMG, command: ["true"]}]}}' | kube_ctl create --dry-run=server -f - 2>&1)" || true
+    case "$out" in *"$2"*) return 0 ;; esac
+    sleep 2
+  done
+  return 1
 }
 
 # _ha_probe_pod_json <name> <namespace> <node> <checks> — one host probe
@@ -729,8 +744,8 @@ _ha_node_probes() {
     _ha_probe_pod_json "$name" "$ns" "$n" "$checks" > "$tmpd/$name.json"
     # A policy binding just applied may take a moment to see its params:
     # retried, then a refusal is a failed check (fail closed).
-    for ((j = 0; j < 10; j++)); do kube_ctl create -f "$tmpd/$name.json" >/dev/null 2>&1 && break; sleep 2; done
-    [ "$j" -lt 10 ] || { echo "$n probe fail the check pod was refused"; names="${names% *}"; }
+    for ((j = 0; j < 10; j++)); do kube_ctl create -f "$tmpd/$name.json" >/dev/null 2> "$tmpd/err" && break; sleep 2; done
+    [ "$j" -lt 10 ] || { echo "$n probe fail the check pod was refused: $(tr '\n' ' ' < "$tmpd/err" | cut -c1-300)"; names="${names% *}"; }
   done
   for k in $names; do
     name="${k%%=*}" n="${k#*=}" phase=""
@@ -965,8 +980,13 @@ ha_install_fencing() {
   done
   [ "${t:-}" != refused ] || fail "fencing needs a watchdog on every node: without it a node is never declared dead, so nothing stateful fails over (nothing installed)"
   _ha_fencing_cert
-  info "HA: Self Node Remediation v0.13.0 + Portcullis' patch (portcullis-fencing)..."
+  # The pod policy first, in force before anything runs there (review M1):
+  # the same image swap as ha_render's.
   t="$(mktemp)"
+  { local pol; pol="$(cat "$PORTCULLIS_HOME/$HA_DIR/fencing/admission.yaml")"; printf '%s\n' "${pol//"$HA_SNR_IMAGE"/"$img"}"; } > "$t"
+  _ha_apply < "$t" || { rm -f "$t"; fail "could not apply the fencing pod policy (nothing installed)"; }
+  _ha_policy_in_force "$KUBE_FENCING_NS" portcullis-fencing-pods || { rm -f "$t"; fail "the fencing pod policy isn't in force (nothing installed)"; }
+  info "HA: Self Node Remediation v0.13.0 + Portcullis' patch (portcullis-fencing)..."
   ha_render fencing > "$t" || { rm -f "$t"; fail "could not render fencing (kubectl kustomize)"; }
   _ha_apply < "$t" || { rm -f "$t"; fail "could not apply fencing (see above)"; }
   _ha_crds_established "$t" || { rm -f "$t"; fail "the fencing CRDs aren't established"; }
@@ -989,8 +1009,9 @@ _ha_snr_ds_current() {
 # ha_fencing_ready — per node "<node> ready|not ready (<why>)" and exit 0
 # only when every node is ready: the SNR configuration is ours (the
 # watchdog, the 150 s safe time), SNR's manager is available, and the
-# node runs a Ready, current agent
-# of the DaemonSet self-node-remediation-ds (nodeadm's snapshot counts the
+# node runs a Ready, current agent of the DaemonSet self-node-remediation-ds
+# in our SNR image (review nit 7: an old image's agent isn't ready;
+# nodeadm's snapshot counts the
 # same pod for the Hub's ha_fencing_unavailable). Anything unreadable is
 # not ready (fail closed: no stateful failover).
 ha_fencing_ready() {
@@ -1002,12 +1023,13 @@ ha_fencing_ready() {
   # The manager too: without it no out-of-service taint.
   mgr=ok
   _ha_deploy_ready "$KUBE_FENCING_NS" self-node-remediation-controller-manager || mgr=down
-  M="$mgr" jq -rn --argjson n "$nodes" --argjson p "$pods" --argjson c "$cfg" '
+  M="$mgr" IMG="$(ha_snr_image)" jq -rn --argjson n "$nodes" --argjson p "$pods" --argjson c "$cfg" '
     ($c.spec // {}) as $s
     | (if $s.watchdogFilePath != "/dev/watchdog" or $s.safeTimeToAssumeNodeRebootedSeconds != 150 then "SNR configuration missing or not ours"
        elif env.M != "ok" then "SNR'"'"'s manager isn'"'"'t available" else "" end) as $bad
     | [$p.items[]? | select(.metadata.deletionTimestamp == null and (.metadata.name | startswith("self-node-remediation-ds-"))
         and any(.metadata.ownerReferences[]?; .kind == "DaemonSet" and .name == "self-node-remediation-ds")
+        and ([.spec.containers[].image] == [env.IMG])
         and any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .spec.nodeName] as $ok
     | [$n.items[] | .metadata.name as $m
         | if $bad != "" then "\($m)\tnot ready (\($bad))"

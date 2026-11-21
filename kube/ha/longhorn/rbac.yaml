@@ -13,9 +13,13 @@
 #   - its two webhook configurations get / patch / delete by name (the CLI
 #     makes them first, ha.sh _ha_longhorn_webhooks: no create right; list
 #     can't be named);
-# Residual: pods delete in any namespace
-# (it deletes a workload pod whose volume detached unexpectedly), PV / PVC /
-# VolumeAttachment / StorageClass writes (its CSI role).
+#   - pods read cluster-wide, deleted only in longhorn-system (the chart's
+#     Role): its node-down policy is do-nothing and
+#     autoDeletePodWhenVolumeDetachedUnexpectedly is off (values.yaml), the
+#     only two paths that delete a workload pod (controller/
+#     kubernetes_pod_controller.go) — review M9.
+# Residual: PV / PVC / VolumeAttachment / StorageClass writes (its CSI
+# role).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -31,7 +35,7 @@ rules:
     verbs: [update]
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list, watch, delete]
+    verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [events]
     verbs: [get, list, watch, create, update, patch]
