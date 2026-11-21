@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests snr-build build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail e2e-servers e2e-servers-podman"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests snr-build domains-tests nodeadm-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail e2e-servers e2e-servers-podman"
         type: string
         default: all
       # `-f scenarios="4 members_only_list"`: only those scenarios of the e2e
@@ -490,26 +490,6 @@ jobs:
             go test -count=1 -v -run 'TestLiveSSHVault' . 2>&1 | tee "$RUNNER_TEMP/ssh-live.log"
           test "${PIPESTATUS[0]}" = 0
           grep -q -- '--- PASS: TestLiveSSHVault' "$RUNNER_TEMP/ssh-live.log" || { echo "::error::TestLiveSSHVault didn't run"; exit 1; }
-      - name: domains unit tests (in-process Pebble, fake libdns provider + DNS server)
-        working-directory: domains
-        run: |
-          go mod verify
-          go vet ./...
-          go vet -tags testprovider ./...
-          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
-          # The production build (no tags) never links the fake provider.
-          if go list -deps . | grep -q 'internal/fakedns'; then echo "FAIL: production build links internal/fakedns"; exit 1; fi
-          CGO_ENABLED=1 go test -race ./...
-      - name: nodeadm unit tests (the HA API vectors; contract §20.2)
-        working-directory: nodeadm
-        run: |
-          go mod verify
-          go vet ./...
-          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
-          # The Hub's byte copies (joincode / site roles) are compared by
-          # unit-tests-kube-static.sh; this module's own vectors are authored here.
-          test -s testdata/nodeadm_api_vectors.json && test -s testdata/joincode_v2_vectors.json && test -s testdata/site_roles_vectors.json
-          CGO_ENABLED=1 go test -race ./...
       - name: mcp-gate unit tests (config, token checks, resource metadata; contract §15)
         working-directory: mcp-gate
         run: |
@@ -633,6 +613,60 @@ jobs:
             ~/go/pkg/mod
             ~/.cache/go-build
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
+
+  # The domains service's Go tests (~5 min). Their own job (Task 25 review I2): unit-tests had under a
+  # minute of headroom to its 20 minutes.
+  domains-tests:
+    needs: jobs-input
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',domains-tests,') || contains(format(' ,{0}, ', inputs.jobs), ',domains-tests ') || contains(format(' ,{0}, ', inputs.jobs), ' domains-tests,') || contains(format(' ,{0}, ', inputs.jobs), ' domains-tests ')
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # No cache: nothing is restored or saved (never from the builder).
+          cache: false
+      - name: domains unit tests (in-process Pebble, fake libdns provider + DNS server)
+        working-directory: domains
+        run: |
+          go mod verify
+          go vet ./...
+          go vet -tags testprovider ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          # The production build (no tags) never links the fake provider.
+          if go list -deps . | grep -q 'internal/fakedns'; then echo "FAIL: production build links internal/fakedns"; exit 1; fi
+          CGO_ENABLED=1 go test -race ./...
+
+  # nodeadm's Go tests (~3 min). Their own job (Task 25 review I2): unit-tests had under a
+  # minute of headroom to its 20 minutes.
+  nodeadm-tests:
+    needs: jobs-input
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',nodeadm-tests,') || contains(format(' ,{0}, ', inputs.jobs), ',nodeadm-tests ') || contains(format(' ,{0}, ', inputs.jobs), ' nodeadm-tests,') || contains(format(' ,{0}, ', inputs.jobs), ' nodeadm-tests ')
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # No cache: nothing is restored or saved (never from the builder).
+          cache: false
+      - name: nodeadm unit tests (the HA API vectors; contract §20.2)
+        working-directory: nodeadm
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          # The Hub's byte copies (joincode / site roles) are compared by
+          # unit-tests-kube-static.sh; this module's own vectors are authored here.
+          test -s testdata/nodeadm_api_vectors.json && test -s testdata/joincode_v2_vectors.json && test -s testdata/site_roles_vectors.json
+          CGO_ENABLED=1 go test -race ./...
 
   # Our SNR (kube/ha/fencing/snr-patch, plan Task 24): the patch applies to
   # the pinned tag, vets, SNR's certificates tests, arm64 cross-compile, the
