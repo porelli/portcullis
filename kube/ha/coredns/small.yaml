@@ -7,10 +7,11 @@
 # holds its shape:
 #   - k3s's image (rancher/mirrored-coredns-coredns:1.14.7), pinned by its
 #     index digest; its user 65532 (the image's nonroot);
-#   - restricted: runAsNonRoot, RuntimeDefault seccomp, drop ALL, no added
-#     capability, no escalation, read-only root — :53 is bound without
-#     NET_BIND_SERVICE through the namespaced safe sysctl
-#     net.ipv4.ip_unprivileged_port_start=53;
+#   - restricted: runAsNonRoot, RuntimeDefault seccomp, no escalation,
+#     read-only root, drop ALL plus NET_BIND_SERVICE only — it binds :53,
+#     and the image's /coredns carries the file capability
+#     cap_net_bind_service (found live: without it in the bounding set the
+#     exec itself fails, "operation not permitted");
 #   - k3s's ServiceAccount coredns (system:coredns: read-only endpoints /
 #     services / pods / namespaces / endpointslices) with its token — the
 #     kubernetes plugin needs it; k3s's ConfigMaps coredns (Corefile,
@@ -46,8 +47,6 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         seccompProfile: {type: RuntimeDefault}
-        sysctls:
-          - {name: net.ipv4.ip_unprivileged_port_start, value: "53"}
       containers:
         - name: coredns
           image: docker.io/rancher/mirrored-coredns-coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286
@@ -65,7 +64,7 @@ spec:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
             seccompProfile: {type: RuntimeDefault}
-            capabilities: {drop: ["ALL"]}
+            capabilities: {drop: ["ALL"], add: ["NET_BIND_SERVICE"]}
           livenessProbe:
             httpGet: {path: /health, port: 8080}
             initialDelaySeconds: 60

@@ -146,8 +146,8 @@ FRONTDOOR_RULES = [
 def coredns_small_problems(docs):
     """kube/ha/coredns/small.yaml (plan Task 25 fix round 2, re-review M-c):
     our CoreDNS DaemonSet on the small nodes is restricted — non-root,
-    RuntimeDefault, drop ALL with nothing added (:53 by the safe sysctl
-    net.ipv4.ip_unprivileged_port_start), no escalation, read-only root,
+    RuntimeDefault, drop ALL plus NET_BIND_SERVICE alone (it binds :53),
+    no escalation, read-only root,
     no host namespace / hostPath / privileged, only ConfigMap volumes —, on
     k3s's CoreDNS image by digest, on the small nodes at main only, and the
     PDB minAvailable 1 over both CoreDNS sets."""
@@ -160,8 +160,8 @@ def coredns_small_problems(docs):
     psc = sp.get("securityContext", {})
     if psc.get("runAsNonRoot") is not True or not psc.get("runAsUser") or (psc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
         out.append("coredns small: pod runAsNonRoot, a non-zero runAsUser and RuntimeDefault seccomp")
-    if psc.get("sysctls", []) != [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "53"}]:
-        out.append("coredns small: sysctls only net.ipv4.ip_unprivileged_port_start=53")
+    if psc.get("sysctls"):
+        out.append("coredns small: no sysctls")
     if any(sp.get(k) for k in ("hostNetwork", "hostPID", "hostIPC")) or sp.get("initContainers") or len(sp.get("containers", [])) != 1:
         out.append("coredns small: no host namespace, one container, no init container")
     if any(set(v) - {"name", "configMap"} for v in sp.get("volumes", [])):
@@ -170,8 +170,8 @@ def coredns_small_problems(docs):
     sc = c.get("securityContext", {})
     caps = sc.get("capabilities", {})
     if sc.get("allowPrivilegeEscalation") is not False or sc.get("readOnlyRootFilesystem") is not True or sc.get("privileged") \
-            or caps.get("drop") != ["ALL"] or caps.get("add") or (sc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
-        out.append("coredns small: container no escalation, read-only root, drop ALL with nothing added, RuntimeDefault")
+            or caps.get("drop") != ["ALL"] or caps.get("add") != ["NET_BIND_SERVICE"] or (sc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
+        out.append("coredns small: container no escalation, read-only root, drop ALL plus NET_BIND_SERVICE alone, RuntimeDefault")
     if not re.fullmatch(r"docker\.io/rancher/mirrored-coredns-coredns:[0-9.]+@sha256:[0-9a-f]{64}", c.get("image", "")):
         out.append(f"coredns small: image {c.get('image')} (k3s's CoreDNS, by digest)")
     if sp.get("nodeSelector", {}).get("portcullis.io/class") != "small" or sp.get("nodeSelector", {}).get("portcullis.io/site") != "main" \
@@ -187,7 +187,7 @@ def check_coredns_small():
     for p in coredns_small_problems(docs):
         F.add(p)
     ds = lambda d: next(x for x in d if x["kind"] == "DaemonSet")["spec"]["template"]["spec"]
-    for mutate in (lambda d: ds(d)["containers"][0]["securityContext"]["capabilities"].__setitem__("add", ["NET_ADMIN"]),
+    for mutate in (lambda d: ds(d)["containers"][0]["securityContext"]["capabilities"].__setitem__("add", ["NET_BIND_SERVICE", "NET_ADMIN"]),
                    lambda d: ds(d)["securityContext"].pop("runAsNonRoot"),
                    lambda d: ds(d).__setitem__("hostNetwork", True),
                    lambda d: ds(d)["containers"][0].__setitem__("image", "docker.io/rancher/mirrored-coredns-coredns:1.14.7"),
