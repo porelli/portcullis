@@ -35,3 +35,20 @@ func TestViewerSecretLeaks(t *testing.T) {
 		}
 	}
 }
+
+// N3: without @type, a property masked in one variant and plain in
+// another is plain (fail closed). Built from a two-variant schema, since
+// the one such field in the snapshot (DnsServer token) is denied.
+func TestViewerSecretLeaksVariantFallback(t *testing.T) {
+	ty, err := ParseTypes([]byte(`{"schemas":{"x:Domain":{"type":"multiple","variants":[{"name":"A","schemaName":"a"},{"name":"B","schemaName":"b"}]}},
+"fields":{"a":{"properties":{"token":{"type":{"type":"string","format":"secret"}}}},"b":{"properties":{"token":{"type":{"type":"string"}}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ViewerSecretLeaks(ty, "Domain", map[string]any{"token": "s3cret-sentinel"}, "s3cret-sentinel"); len(got) != 1 {
+		t.Errorf("no @type: %v, want the plain variant's leak", got)
+	}
+	if got := ViewerSecretLeaks(ty, "Domain", map[string]any{"@type": "A", "token": "s3cret-sentinel"}, "s3cret-sentinel"); len(got) != 0 {
+		t.Errorf("@type A (masked): %v", got)
+	}
+}

@@ -21,9 +21,17 @@ type fakeStalwart struct {
 	mu      sync.Mutex
 	objs    map[string]map[string]map[string]any // object → id → fields
 	next    int
-	calls   []string // "x:Obj/set create" etc.
+	calls   []string    // "x:Obj/set create" etc.
+	writes  []fakeWrite // every create and update body, in order (N4)
 	refuse  map[string]string
 	keyNext int
+}
+
+// fakeWrite is one create or update the job sent: the object (without
+// x:) and the fields or patch as sent.
+type fakeWrite struct {
+	obj    string
+	fields map[string]any
 }
 
 func newFake() *fakeStalwart {
@@ -110,6 +118,7 @@ func (f *fakeStalwart) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			created := map[string]any{}
 			notCreated := map[string]any{}
 			for cid, o := range create {
+				f.writes = append(f.writes, fakeWrite{obj, o})
 				if why := f.refuse[obj]; why != "" {
 					notCreated[cid] = map[string]any{"type": "forbidden", "description": why}
 					continue
@@ -128,6 +137,7 @@ func (f *fakeStalwart) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.calls = append(f.calls, method+" update")
 			updated := map[string]any{}
 			for id, p := range update {
+				f.writes = append(f.writes, fakeWrite{obj, p})
 				if f.objs[store] == nil {
 					f.objs[store] = map[string]map[string]any{}
 				}
@@ -777,6 +787,21 @@ func TestViewerPasswordNeverReachesViewer(t *testing.T) {
 		}
 		if !seen {
 			t.Fatal("a password was never stored: the check proves nothing")
+		}
+		// Every write too, not only what was stored at the end (N4): a
+		// transient write to a readable plain field, later overwritten,
+		// would reach the viewer meanwhile.
+		sent := false
+		for _, w := range f.writes {
+			if b, _ := json.Marshal(w.fields); strings.Contains(string(b), sec) {
+				sent = true
+			}
+			if l := stalwart.ViewerSecretLeaks(ty, w.obj, w.fields, sec); len(l) > 0 {
+				t.Errorf("a write sends a password to a viewer-readable field: %v", l)
+			}
+		}
+		if !sent {
+			t.Fatal("a password was never written: the write check proves nothing")
 		}
 	}
 }

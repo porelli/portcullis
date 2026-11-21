@@ -85,13 +85,22 @@ func (t *Types) schemasFor(on string, v map[string]any) []string {
 }
 
 // field is property p's type in any of schemas (ok false: unknown).
+// Without a known variant it fails closed (N3): a property plain in any
+// candidate variant is plain.
 func (t *Types) field(schemas []string, p string) (FieldType, bool) {
+	var first FieldType
+	found := false
 	for _, s := range schemas {
 		if f, ok := t.Fields[s].Properties[p]; ok {
-			return f.Type, true
+			if !f.Type.masked() {
+				return f.Type, true
+			}
+			if !found {
+				first, found = f.Type, true
+			}
 		}
 	}
-	return FieldType{}, false
+	return first, found
 }
 
 // ViewerSecretLeaks is the data-flow check of a secret value (security
