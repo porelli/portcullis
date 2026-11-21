@@ -314,6 +314,10 @@ func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 		for _, id := range gone {
 			if r := st.Nodes[id]; r != nil && r.Removed && st.Ops[id] == nil {
 				delete(st.Nodes, id)
+				// Its back-off and maintenance mark go with it (review
+				// round 4 nit 1: a node re-enrolled under the name starts clean).
+				delete(st.Remediations, id)
+				delete(st.Maintenance, id)
 			}
 		}
 		return nil
@@ -323,6 +327,8 @@ func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 	}
 	for _, id := range gone {
 		delete(st.Nodes, id)
+		delete(st.Remediations, id)
+		delete(st.Maintenance, id)
 		s.log.Info("removed node left the admission params: dropped", "node", id)
 	}
 }

@@ -45,10 +45,22 @@ const (
 	remediationStuck = 2*150*time.Second + 2*time.Minute
 	// clockSkew: a back-off record further in the future than this is
 	// ignored (never a hold forever).
-	clockSkew    = time.Minute
+	clockSkew = time.Minute
+	// fenceTime: T_fence, SNR's safeTimeToAssumeNodeRebootedSeconds
+	// (kube/ha/fencing/config.yaml): a remediation counts as "fenced, kept"
+	// only this long after its creation (server-set) AND with the
+	// out-of-service taint on its node — never on Succeeded alone, which is
+	// status (review round 4 I1).
+	fenceTime    = 150 * time.Second
 	snrManagedBy = "portcullis-nodeadm"
-	// labelExclude: SNR's own opt-out label (its agent DaemonSet honours it).
+	// labelExclude: SNR's own opt-out label (its manager skips a node
+	// carrying it; an admin's, set through nodeadm).
 	labelExclude = "remediation.medik8s.io/exclude-from-remediation"
+	// taintOutOfService: the taint SNR's manager puts once the node is
+	// assumed rebooted (the OutOfServiceTaint strategy).
+	taintOutOfService = "node.kubernetes.io/out-of-service"
+	// phaseFencingStarted: SNR's first phase (an unset phase is it too).
+	phaseFencingStarted = "Fencing-Started"
 )
 
 // remediationNode is one node as the guard sees it.
@@ -65,8 +77,14 @@ type remediationNode struct {
 	// Excluded: in planned maintenance — cordoned through nodeadm (its
 	// mark AND spec.unschedulable), SNR's exclude-from-remediation label
 	// (an admin's: portcullis-node-labels refuses it from node identities
-	// and the fencing ServiceAccounts), or nodeadm removing it (review M4).
+	// and the fencing ServiceAccounts), or nodeadm removing it (review M4):
+	// never remediated anew. Only ExcludeLabel releases a running one.
 	Excluded bool
+	// ExcludeLabel: SNR's exclude-from-remediation label alone — the one
+	// exclusion SNR itself honours (review round 4 M1).
+	ExcludeLabel bool
+	// OutOfService: node.kubernetes.io/out-of-service is on the node.
+	OutOfService bool
 	// LastRemediated: its last remediation's start from nodeadm's own
 	// state (zero = never).
 	LastRemediated time.Time
@@ -76,7 +94,8 @@ type remediationNode struct {
 type remediationCR struct {
 	Name      string
 	Created   time.Time
-	Succeeded bool // condition Succeeded True
+	Succeeded bool   // condition Succeeded True (status: a hint, never proof)
+	Phase     string // status.phase ("" = not started)
 }
 
 // remediationPlan is one round's decision.
@@ -94,9 +113,11 @@ type remediationPlan struct {
 //   - a node Ready again whose remediation Succeeded (or is
 //     remediationStale old Ready) → its CR is removed (SNR then lifts its
 //     taints); a node gone → its CR removed after remediationStale;
-//   - a Succeeded remediation of a node still down is KEPT (removing it
-//     would lift the out-of-service taint) but no longer counts as in
-//     progress (review I3: a node fenced for good never blocks the next);
+//   - a fenced remediation of a node still down — Succeeded AND the
+//     out-of-service taint on the node AND fenceTime since its creation —
+//     is KEPT (removing it would lift the taint) but no longer counts as
+//     in progress (review I3: a node fenced for good never blocks the
+//     next; round 4 I1: status alone never proves the fencing);
 //   - no new remediation while one is in progress (not yet Succeeded);
 //   - no new remediation while more than half of the primary site's nodes
 //     are unhealthy (a partition's minority, or a site-wide outage, never
@@ -109,9 +130,11 @@ type remediationPlan struct {
 //   - never a node in planned maintenance (Excluded), nor one remediated
 //     less than remediationBackoff ago (flapping; a record in the future
 //     beyond clockSkew is ignored);
-//   - a remediation not Succeeded remediationStuck after it started, or
-//     whose node got excluded, no longer counts as in progress (Stuck:
-//     kept, reported);
+//   - a remediation not fenced remediationStuck after it started, or whose
+//     node got SNR's exclude label before fencing began (phase unset or
+//     Fencing-Started: SNR skips it), no longer counts as in progress
+//     (Stuck: kept, reported); maintenance, an op in flight or a removal
+//     keep the hold until that bound (round 4 M1: SNR doesn't skip those);
 //   - otherwise the first node by name NotReady longer than remediateAfter.
 func planRemediation(nodes []remediationNode, crs []remediationCR, primary string, now time.Time) remediationPlan {
 	var p remediationPlan
@@ -130,12 +153,12 @@ func planRemediation(nodes []remediationNode, crs []remediationCR, primary strin
 		case !known && now.Sub(c.Created) >= remediationStale:
 			// The node is gone (removed): its remediation with it.
 			p.Delete = append(p.Delete, c.Name)
-		case c.Succeeded:
+		case c.Succeeded && known && n.OutOfService && now.Sub(c.Created) >= fenceTime:
 			// Fenced and still down: kept, not in progress.
-		case known && n.Excluded:
-			p.Stuck = append(p.Stuck, c.Name+": excluded from remediation while it ran (SNR skips it)")
+		case known && n.ExcludeLabel && (c.Phase == "" || c.Phase == phaseFencingStarted):
+			p.Stuck = append(p.Stuck, c.Name+": labelled exclude-from-remediation before its fencing began (SNR skips it)")
 		case now.Sub(c.Created) >= remediationStuck:
-			p.Stuck = append(p.Stuck, c.Name+": not Succeeded "+remediationStuck.String()+" after it started")
+			p.Stuck = append(p.Stuck, c.Name+": not fenced "+remediationStuck.String()+" after it started")
 		default:
 			inProgress = append(inProgress, c.Name)
 		}
@@ -216,8 +239,14 @@ func (s *Server) remediationInputs(ctx context.Context) ([]remediationNode, []re
 	for _, c := range cl {
 		rn := remediationNode{Name: c.Name, Site: c.Site, Class: c.Class, Ready: c.Ready, Replicated: replicated[c.Name]}
 		rec := st.Nodes[c.Name]
-		rn.Excluded = (c.Node.Spec.Unschedulable && st.Maintenance[c.Name]) || c.Node.Labels[labelExclude] == "true" ||
+		rn.ExcludeLabel = c.Node.Labels[labelExclude] == "true"
+		rn.Excluded = (c.Node.Spec.Unschedulable && st.Maintenance[c.Name]) || rn.ExcludeLabel ||
 			st.Ops[c.Name] != nil || (rec != nil && rec.Removed)
+		for _, t := range c.Node.Spec.Taints {
+			if t.Key == taintOutOfService {
+				rn.OutOfService = true
+			}
+		}
 		rn.LastRemediated = st.Remediations[c.Name]
 		for _, cond := range c.Node.Status.Conditions {
 			if cond.Type == corev1.NodeReady {
@@ -236,6 +265,7 @@ func (s *Server) remediationInputs(ctx context.Context) ([]remediationNode, []re
 	var crs []remediationCR
 	for _, o := range l.Items {
 		c := remediationCR{Name: o.GetName(), Created: o.GetCreationTimestamp().Time}
+		c.Phase, _, _ = unstructured.NestedString(o.Object, "status", "phase")
 		conds, _, _ := unstructured.NestedSlice(o.Object, "status", "conditions")
 		for _, x := range conds {
 			m, _ := x.(map[string]any)

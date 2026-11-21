@@ -24,6 +24,11 @@ func rn(name, site, class string, ready bool, agoS int, replicated bool) remedia
 
 func with(n remediationNode, f func(*remediationNode)) remediationNode { f(&n); return n }
 
+// oos: the out-of-service taint on the node; exl: SNR's exclude label
+// (also maintenance, as remediationInputs sets it).
+func oos(n remediationNode) remediationNode { n.OutOfService = true; return n }
+func exl(n remediationNode) remediationNode { n.ExcludeLabel, n.Excluded = true, true; return n }
+
 func TestPlanRemediationGuard(t *testing.T) {
 	main3 := func(n2 remediationNode) []remediationNode {
 		return []remediationNode{rn("m1", "main", "cloud", true, 3600, true), n2, rn("m3", "main", "cloud", true, 3600, false)}
@@ -44,9 +49,19 @@ func TestPlanRemediationGuard(t *testing.T) {
 		{"in progress and another due: held", []remediationNode{rn("m1", "main", "cloud", false, 300, true), rn("m2", "main", "home", true, 3600, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", false, 300, true), rn("m5", "main", "cloud", true, 3600, true)},
 			[]remediationCR{{Name: "m1", Created: ago(1)}}, remediationPlan{Hold: "a remediation is in progress (m1)"}},
 		// Review I3: fenced for good, then a second node dies → remediated.
-		{"fenced and still down (Succeeded), then a second node dies → the second remediated, the first kept",
-			[]remediationNode{rn("m1", "main", "cloud", false, 1800, true), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+		{"fenced and still down (Succeeded + out-of-service + T_fence), then a second node dies → the second remediated, the first kept",
+			[]remediationNode{oos(rn("m1", "main", "cloud", false, 1800, true)), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
 			[]remediationCR{{Name: "m1", Created: ago(29), Succeeded: true}}, remediationPlan{Create: "m2"}},
+		// Round 4 I1: Succeeded is status — never proof of a fencing alone.
+		{"Succeeded but no out-of-service taint (a forged status): still in progress, the next held",
+			[]remediationNode{rn("m1", "main", "cloud", false, 600, true), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+			[]remediationCR{{Name: "m1", Created: ago(1), Succeeded: true}}, remediationPlan{Hold: "a remediation is in progress (m1)"}},
+		{"Succeeded with the taint but younger than T_fence: still in progress",
+			[]remediationNode{oos(rn("m1", "main", "cloud", false, 600, true)), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+			[]remediationCR{{Name: "m1", Created: remNow.Add(-100 * time.Second), Succeeded: true}}, remediationPlan{Hold: "a remediation is in progress (m1)"}},
+		{"Succeeded, the taint, T_fence passed (151 s): fenced, the next remediated",
+			[]remediationNode{oos(rn("m1", "main", "cloud", false, 600, true)), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+			[]remediationCR{{Name: "m1", Created: remNow.Add(-151 * time.Second), Succeeded: true}}, remediationPlan{Create: "m2"}},
 		// Review I3 + M2: an edge site's WAN drops — never fenced, main still remediated.
 		{"edge WAN down: the edge node never remediated, and a main node dying meanwhile is",
 			[]remediationNode{rn("e1", "edge", "cloud", false, 600, true), rn("m1", "main", "cloud", false, 60, true), rn("m2", "main", "home", true, 3600, true), rn("m3", "main", "cloud", true, 3600, true)},
@@ -67,12 +82,19 @@ func TestPlanRemediationGuard(t *testing.T) {
 			remediationPlan{Hold: "nothing to remediate: m2: remediated less than 20m0s ago (back-off)"}},
 		{"flapping: down again 25 min after → remediated", main3(with(rn("m2", "main", "home", false, 60, true), func(n *remediationNode) { n.LastRemediated = ago(25) })), nil, remediationPlan{Create: "m2"}},
 		// Round 3 I1d: a remediation can't stall all fencing.
-		{"excluded while its remediation ran (SNR skips it, never Succeeded): stuck, the next node remediated",
+		{"SNR's exclude label before fencing began (SNR skips it): stuck, the next node remediated",
+			[]remediationNode{exl(rn("m1", "main", "cloud", false, 600, true)), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+			[]remediationCR{{Name: "m1", Created: ago(2), Phase: "Fencing-Started"}}, remediationPlan{Create: "m2", Stuck: []string{"m1: labelled exclude-from-remediation before its fencing began (SNR skips it)"}}},
+		{"SNR's exclude label after the pre-reboot phase (its agent still resets): the hold kept",
+			[]remediationNode{exl(rn("m1", "main", "cloud", false, 600, true)), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+			[]remediationCR{{Name: "m1", Created: ago(2), Phase: "Pre-Reboot-Completed"}}, remediationPlan{Hold: "a remediation is in progress (m1)"}},
+		// Round 4 M1: maintenance, an op in flight or a removal keep the hold until the bound.
+		{"an op in flight (or maintenance) on a node with a young remediation: the hold kept",
 			[]remediationNode{with(rn("m1", "main", "cloud", false, 600, true), func(n *remediationNode) { n.Excluded = true }), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
-			[]remediationCR{{Name: "m1", Created: ago(2)}}, remediationPlan{Create: "m2", Stuck: []string{"m1: excluded from remediation while it ran (SNR skips it)"}}},
-		{"not Succeeded 7 min after it started: stuck, the next node remediated",
+			[]remediationCR{{Name: "m1", Created: ago(2)}}, remediationPlan{Hold: "a remediation is in progress (m1)"}},
+		{"not fenced 7 min after it started: stuck, the next node remediated",
 			[]remediationNode{rn("m1", "main", "cloud", false, 900, true), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
-			[]remediationCR{{Name: "m1", Created: ago(8)}}, remediationPlan{Create: "m2", Stuck: []string{"m1: not Succeeded 7m0s after it started"}}},
+			[]remediationCR{{Name: "m1", Created: ago(8)}}, remediationPlan{Create: "m2", Stuck: []string{"m1: not fenced 7m0s after it started"}}},
 		{"6 min, not Succeeded: still in progress", main3(rn("m2", "main", "home", false, 400, true)), []remediationCR{{Name: "m2", Created: ago(6)}}, remediationPlan{}},
 		{"a back-off record in the future (beyond the skew) is ignored: remediated", main3(with(rn("m2", "main", "home", false, 60, true), func(n *remediationNode) { n.LastRemediated = remNow.Add(48 * time.Hour) })), nil, remediationPlan{Create: "m2"}},
 		{"a back-off record 30 s ahead (clock skew) still holds", main3(with(rn("m2", "main", "home", false, 60, true), func(n *remediationNode) { n.LastRemediated = remNow.Add(30 * time.Second) })), nil,
@@ -210,5 +232,52 @@ func TestRemediateMaintenanceMark(t *testing.T) {
 	h.s.remediate(ctx)
 	if l, _ := d.Resource(gvrSNR).Namespace("portcullis-fencing").List(ctx, metav1.ListOptions{}); len(l.Items) != 1 {
 		t.Fatal("a node cordoned by someone else (no nodeadm mark) wasn't remediated")
+	}
+}
+
+// TestRemediationInputsFenceFacts (round 4 I1, M1): the round reads the
+// out-of-service taint from the Node, SNR's exclude label on its own, and
+// the CR's phase.
+func TestRemediationInputsFenceFacts(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	n2, _ := h.kube.CoreV1().Nodes().Get(ctx, "n2", metav1.GetOptions{})
+	n2.Spec.Taints = append(n2.Spec.Taints, corev1.Taint{Key: taintOutOfService, Value: "nodeshutdown", Effect: corev1.TaintEffectNoExecute})
+	n2.Labels[labelExclude] = "true"
+	h.kube.CoreV1().Nodes().Update(ctx, n2, metav1.UpdateOptions{})
+	cr := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "self-node-remediation.medik8s.io/v1alpha1", "kind": "SelfNodeRemediation",
+		"metadata": map[string]any{"name": "n2", "namespace": "portcullis-fencing"}, "status": map[string]any{"phase": "Pre-Reboot-Completed"}}}
+	h.s.dyn = dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvrSNR: "SelfNodeRemediationList", gvrLonghornVolume: "VolumeList"}, cr)
+	nodes, crs, err := h.s.remediationInputs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got remediationNode
+	for _, n := range nodes {
+		if n.Name == "n2" {
+			got = n
+		}
+	}
+	if !got.OutOfService || !got.ExcludeLabel || !got.Excluded || len(crs) != 1 || crs[0].Phase != "Pre-Reboot-Completed" {
+		t.Fatalf("inputs: %+v %+v", got, crs)
+	}
+}
+
+// TestDropRemovedPrunesRemediationState (round 4 nit 1): a removed node's
+// back-off record and maintenance mark leave with its record.
+func TestDropRemovedPrunesRemediationState(t *testing.T) {
+	h := newHarness(t)
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["n9"] = &nodeRecord{Role: "agent", Removed: true, MeshIP: "10.215.0.99"}
+		st.Remediations["n9"] = vecNow
+		st.Maintenance["n9"] = true
+		st.Remediations["n2"] = vecNow
+	})
+	h.admit(t, "10.215.0.1") // the active generation no longer holds n9's address
+	h.s.dropRemoved(context.Background(), h.state(t))
+	st := h.state(t)
+	if st.Nodes["n9"] != nil || !st.Remediations["n9"].IsZero() || st.Maintenance["n9"] || st.Remediations["n2"].IsZero() {
+		t.Fatalf("after the drop: node %v, remediations %v, maintenance %v", st.Nodes["n9"], st.Remediations, st.Maintenance)
 	}
 }

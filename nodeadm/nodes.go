@@ -266,21 +266,34 @@ func (s *Server) handleCordon(on bool) func(http.ResponseWriter, *http.Request) 
 		if _, err := s.getNode(r.Context(), id); err != nil {
 			return err
 		}
+		// The maintenance mark (remediate.go): only a cordon made here
+		// keeps the node out of fencing — spec.unschedulable alone could be
+		// anyone's. Cordon: the mark first (round 4 nit 2: a failed state
+		// write never leaves a cordon unmarked; a mark without the cordon
+		// excludes nothing — both are needed). Uncordon: the cordon lifted
+		// first, then the mark.
+		mark := func() error {
+			return s.mutate(r.Context(), func(st *nodeadmState) error {
+				if on {
+					st.Maintenance[id] = true
+				} else {
+					delete(st.Maintenance, id)
+				}
+				return nil
+			})
+		}
+		if on {
+			if err := mark(); err != nil {
+				return err
+			}
+		}
 		if err := s.patchNode(r.Context(), id, map[string]any{"spec": map[string]any{"unschedulable": on}}); err != nil {
 			return err
 		}
-		// The maintenance mark (remediate.go): only a cordon made here
-		// keeps the node out of fencing — spec.unschedulable alone could be
-		// anyone's.
-		if err := s.mutate(r.Context(), func(st *nodeadmState) error {
-			if on {
-				st.Maintenance[id] = true
-			} else {
-				delete(st.Maintenance, id)
+		if !on {
+			if err := mark(); err != nil {
+				return err
 			}
-			return nil
-		}); err != nil {
-			return err
 		}
 		s.log.Info("node cordon", "node", id, "unschedulable", on)
 		w.WriteHeader(http.StatusNoContent)
@@ -371,11 +384,12 @@ func isDaemonSetPod(p *corev1.Pod) bool {
 // pods through the eviction API; a PDB that keeps refusing a pod for
 // Timing.PDBRefusal is replica_minimum; at most Timing.DrainMax overall.
 func (s *Server) drain(ctx context.Context, id string) error {
-	if err := s.patchNode(ctx, id, map[string]any{"spec": map[string]any{"unschedulable": true}}); err != nil {
+	// Planned maintenance (remediate.go): a drained node isn't fenced. The
+	// mark first, then the cordon (round 4 nit 2).
+	if err := s.mutate(ctx, func(st *nodeadmState) error { st.Maintenance[id] = true; return nil }); err != nil {
 		return err
 	}
-	// Planned maintenance (remediate.go): a drained node isn't fenced.
-	if err := s.mutate(ctx, func(st *nodeadmState) error { st.Maintenance[id] = true; return nil }); err != nil {
+	if err := s.patchNode(ctx, id, map[string]any{"spec": map[string]any{"unschedulable": true}}); err != nil {
 		return err
 	}
 	start := time.Now()
