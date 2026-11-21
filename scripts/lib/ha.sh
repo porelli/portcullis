@@ -1466,8 +1466,9 @@ kube_vault_shrink_prepare() {
   done
   # The record first: an interruption anywhere after this still owes the wipe.
   rec=""; for ((i = cur - 1; i >= want; i--)); do rec="$rec vault-$i"; done
-  kube_ctl -n "$(kube_ns)" create configmap "$KUBE_VAULT_SHRINK_CM" --from-literal=dropped="${rec# }" --dry-run=client -o json \
-    | jq '.metadata.labels = {"app.kubernetes.io/managed-by": "portcullis"}' | kube_ctl apply -f - >/dev/null \
+  N="$KUBE_VAULT_SHRINK_CM" NS="$(kube_ns)" D="${rec# }" jq -n '{apiVersion: "v1", kind: "ConfigMap",
+      metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}}, data: {dropped: env.D}}' \
+    | kube_ctl apply -f - >/dev/null \
     || fail "could not record the voters being dropped (ConfigMap $KUBE_VAULT_SHRINK_CM): nothing removed, nothing deployed"
   for id in $plan; do
     info "Vault: removing raft peer $id (voters $cur → $want)..."

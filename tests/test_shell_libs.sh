@@ -4574,8 +4574,7 @@ vshrink() { # vshrink <live replicas> <healthy map json> <extra code> [want: HA 
     kube_ctl() { echo \"\$*\" >> '$VSH/k'; case \"\$*\" in
       *'get statefulset vault -o jsonpath={.spec.replicas}') echo $1 ;;
       *'get configmap portcullis-vault-shrink -o json') [ -e '$VSH/rec' ] && jq -n --rawfile d '$VSH/rec' '{data: {dropped: \$d}}' || { echo 'Error from server (NotFound)'; return 1; } ;;
-      *'create configmap portcullis-vault-shrink --from-literal=dropped='*) a=\"\$*\"; a=\"\${a#*dropped=}\"; printf '%s' \"\${a%% --dry-run*}\" > '$VSH/rec'; echo '{}' ;;
-      *'apply -f -') cat >/dev/null ;;
+      *'apply -f -') jq -j 'select(.kind == \"ConfigMap\" and .metadata.name == \"portcullis-vault-shrink\" and .metadata.namespace == \"portcullis\") | .data.dropped' > '$VSH/rec.new'; [ -s '$VSH/rec.new' ] && mv '$VSH/rec.new' '$VSH/rec' || rm -f '$VSH/rec.new' ;;
       *'delete configmap portcullis-vault-shrink'*) rm -f '$VSH/rec' ;;
       *) return 1 ;; esac; }
     vexec() { echo \"\$* @\${_K_VAULT_POD:-}\" >> '$VSH/calls'; case \"\$1 \$2 \$3\" in
