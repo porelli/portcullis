@@ -1,11 +1,11 @@
-# The two managers: our PriorityClass (ruling I5); pinned to the primary
+# SNR's manager: our PriorityClass (ruling I5); pinned to the primary
 # site's non-small nodes (their cluster-wide rights never on an edge or
 # small node); the agent image by digest (SNR copies
 # SELF_NODE_REMEDIATION_IMAGE into its DaemonSet) and SNR's agent template
 # from the ConfigMap snr-install (the agents' own ServiceAccount), and the
 # throwaway webhook serving certificate ha_install_fencing makes (Secret
-# fencing-webhook-cert; no webhook configuration is registered, the servers
-# only have to start).
+# fencing-webhook-cert; no webhook configuration is registered, the server
+# only has to start).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,7 +26,7 @@ spec:
         - name: manager
           env:
             - name: SELF_NODE_REMEDIATION_IMAGE
-              value: quay.io/medik8s/self-node-remediation-operator:v0.13.0@sha256:9ad002dca9ea183c72e350f72e47aff7020397fd476b4a3ac4ebc3627412a5b0
+              value: ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000
           volumeMounts:
             - name: webhook-cert
               mountPath: /apiserver.local.config/certificates
@@ -43,31 +43,3 @@ spec:
         - name: install
           configMap:
             name: snr-install
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: node-healthcheck-controller-manager
-  namespace: portcullis-fencing
-spec:
-  template:
-    spec:
-      priorityClassName: portcullis-core
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - {key: portcullis.io/site, operator: In, values: [main]}
-                  - {key: portcullis.io/class, operator: NotIn, values: [small]}
-      containers:
-        - name: manager
-          volumeMounts:
-            - name: webhook-cert
-              mountPath: /apiserver.local.config/certificates
-              readOnly: true
-      volumes:
-        - name: webhook-cert
-          secret:
-            secretName: fencing-webhook-cert
-            items: [{key: tls.crt, path: apiserver.crt}, {key: tls.key, path: apiserver.key}]

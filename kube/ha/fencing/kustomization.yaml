@@ -1,16 +1,23 @@
-# Fencing (plan Task 24, spike S3): medik8s Self Node Remediation v0.13.0
-# and Node Healthcheck v0.12.0 without OLM, in portcullis-fencing (PSA
-# privileged: SNR's agent DaemonSet opens /dev/watchdog). The upstream
+# Fencing (plan Task 24, spike S3; fix round 1, user ruling "Patch SNR,
+# drop NHC"): medik8s Self Node Remediation v0.13.0 without OLM, in
+# portcullis-fencing (PSA privileged: SNR's agent DaemonSet opens
+# /dev/watchdog), running OUR image ghcr.io/porelli/portcullis-snr (the
+# pinned tag + snr-patch/: its Secret cache holds only its peers'
+# certificate; .github/workflows/snr.yml). No Node Healthcheck: nodeadm
+# creates the SelfNodeRemediations (nodeadm/remediate.go). The upstream
 # manifests are kube/ha/fencing/from-bundle.py's conversion of the pinned
-# bundles (upstream/*.tar.gz, sha256 in scripts/lib/ha.sh); this overlay
-# only pins, narrows and names our class. Rendered by `kubectl kustomize`
-# (ha_install_fencing), never edited by hand after rendering.
+# bundle (upstream/*.tar.gz, sha256 in scripts/lib/ha.sh); this overlay
+# only pins, narrows, names our class and adds the pod admission policy.
+# Rendered by `kubectl kustomize` (ha_render fencing), never edited by hand
+# after rendering. The image's digest is a PLACEHOLDER (all zeros) until
+# snr.yml's first main build: ha_install_fencing refuses it outside
+# HUB_DEV=1 + PORTCULLIS_DEV_SNR_IMAGE (development / e2e only).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - upstream/snr-v0.13.0.yaml
-  - upstream/nhc-v0.12.0.yaml
   - rbac.yaml
+  - admission.yaml
 # SNR's agent template with its own ServiceAccount (agent-daemonset.yaml.tmpl).
 configMapGenerator:
   - name: snr-install
@@ -19,13 +26,11 @@ configMapGenerator:
       - self-node-remediation-deamonset.yaml=agent-daemonset.yaml.tmpl
 images:
   - name: quay.io/medik8s/self-node-remediation-operator
-    newTag: v0.13.0
-    digest: sha256:9ad002dca9ea183c72e350f72e47aff7020397fd476b4a3ac4ebc3627412a5b0
-  - name: quay.io/medik8s/node-healthcheck-operator
-    newTag: v0.12.0
-    digest: sha256:5b048ad5d2b8578d2120989a5a822a041d65c985f9ac88d50b000427b32b5391
+    newName: ghcr.io/porelli/portcullis-snr
+    newTag: edge
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 patches:
-  # The CSVs' cluster-wide rules are replaced by rbac.yaml's narrowed ones.
+  # The CSV's cluster-wide rules are replaced by rbac.yaml's narrowed ones.
   - patch: |-
       $patch: delete
       apiVersion: rbac.authorization.k8s.io/v1
@@ -36,14 +41,4 @@ patches:
       apiVersion: rbac.authorization.k8s.io/v1
       kind: ClusterRoleBinding
       metadata: {name: self-node-remediation-controller-manager}
-  - patch: |-
-      $patch: delete
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRole
-      metadata: {name: node-healthcheck-controller-manager}
-  - patch: |-
-      $patch: delete
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRoleBinding
-      metadata: {name: node-healthcheck-controller-manager}
   - path: managers.yaml

@@ -1,0 +1,87 @@
+# portcullis-fencing-pods (plan Task 24 fix round 1, security review; like
+# portcullis-ingress-pods): portcullis-fencing is PSA privileged (SNR's
+# agent opens /dev/watchdog and resets the node), so this policy admits
+# there only three pod shapes, whoever creates them:
+#   - SNR's agent (the DaemonSet SNR's manager renders from our template):
+#     ServiceAccount self-node-remediation-agent, our SNR image by digest
+#     in its one container, hostPath /dev only (the watchdog), no
+#     hostNetwork;
+#   - SNR's manager: ServiceAccount self-node-remediation-controller-manager,
+#     our image, non-root, not privileged, no hostPath / hostPID /
+#     hostNetwork;
+#   - the CLI's watchdog probe (ha_install_fencing): the helper image, the
+#     host's / read-only as nobody, no token, not privileged.
+# So a manager or anything writing a DaemonSet here can't run another
+# image or mount more of the host. Static (no params): ha_render fencing
+# applies it with the namespace; a dev / e2e SNR image (HUB_DEV=1 +
+# PORTCULLIS_DEV_SNR_IMAGE) replaces the image literal the same way it
+# replaces the Deployment's.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-fencing-pods
+  labels: {app.kubernetes.io/managed-by: portcullis}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  variables:
+    - name: snrImage
+      expression: "'ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000'"
+    - name: helperImage
+      expression: "'docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a'"
+    - name: containers
+      expression: >-
+        object.spec.containers
+        + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+        + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+    - name: sa
+      expression: "has(object.spec.serviceAccountName) ? object.spec.serviceAccountName : 'default'"
+    - name: hostPaths
+      expression: "has(object.spec.volumes) ? object.spec.volumes.filter(v, has(v.hostPath)).map(v, v.hostPath.path) : []"
+    - name: privileged
+      expression: >-
+        variables.containers.exists(c, has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged)
+    - name: hostNet
+      expression: "has(object.spec.hostNetwork) && object.spec.hostNetwork"
+    - name: hostPID
+      expression: "has(object.spec.hostPID) && object.spec.hostPID"
+    - name: agent
+      expression: >-
+        variables.sa == 'self-node-remediation-agent'
+        && size(variables.containers) == 1 && variables.containers.all(c, c.image == variables.snrImage)
+        && variables.hostPaths == ['/dev'] && !variables.hostNet
+    - name: manager
+      expression: >-
+        variables.sa == 'self-node-remediation-controller-manager'
+        && variables.containers.all(c, c.image == variables.snrImage)
+        && size(variables.hostPaths) == 0 && !variables.privileged && !variables.hostNet && !variables.hostPID
+        && has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot
+    - name: probe
+      expression: >-
+        variables.sa == 'default'
+        && size(variables.containers) == 1 && variables.containers.all(c, c.image == variables.helperImage
+             && has(c.volumeMounts) && c.volumeMounts.all(m, has(m.readOnly) && m.readOnly))
+        && variables.hostPaths == ['/'] && !variables.privileged && !variables.hostNet
+        && has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken
+        && has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser) && object.spec.securityContext.runAsUser == 65534
+  validations:
+    - expression: "variables.agent || variables.manager || variables.probe"
+      message: "only SNR's agent and manager pods (and the CLI's watchdog probe) run in portcullis-fencing"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-fencing-guard-pods
+  labels: {app.kubernetes.io/managed-by: portcullis}
+spec:
+  policyName: portcullis-fencing-pods
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-fencing

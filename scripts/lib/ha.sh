@@ -486,8 +486,13 @@ _backup_verify_dir_kube() {
 KUBE_LONGHORN_NS="longhorn-system"
 KUBE_FENCING_NS="portcullis-fencing"
 KUBE_CERTMANAGER_NS="cert-manager"
-# NHC's remediation Leases (the medik8s lease manager's fixed namespace).
-KUBE_FENCING_LEASES_NS="medik8s-leases"
+# Our SNR image (kube/ha/fencing/snr-patch, .github/workflows/snr.yml; fix
+# round 1): kube/ha/fencing pins this ref. Its digest is a placeholder
+# until snr.yml's first main build: ha_install_fencing refuses it but for
+# development / e2e, where HUB_DEV=1 lets PORTCULLIS_DEV_SNR_IMAGE (a
+# name@sha256 ref) replace it.
+HA_SNR_IMAGE="ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+HA_SNR_PLACEHOLDER="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 HA_DIR="kube/ha"
 KUBE_REPLICATED_SC="kube/storage/storageclass-replicated.yaml"
 
@@ -502,9 +507,7 @@ _ha_pins() {
       snapshotter/upstream/rbac-snapshot-controller.yaml 99c4ac480b6c9563be0d85599e29cc7b68b25a82d250b0e789726727551e8d38
       snapshotter/upstream/setup-snapshot-controller.yaml 54b9342a7433c377b83a671babf416660078a716ec2e63f658a77aa629de5581" ;;
     fencing) echo "fencing/upstream/snr-v0.13.0-bundle.tar.gz c7d58af594390e5a544a4f0d51579e55462669bd8d5dfe37822dc833efd300c2
-      fencing/upstream/nhc-v0.12.0-bundle.tar.gz b12c9eb3bcc22136b8527974700f72260c2f19b141122ea6fe2dfa170f495597
       fencing/upstream/snr-v0.13.0.yaml fc1076bb255eb59aa10a30386c0caf1a17b2f09922e50b3172344a13cac4f7ee
-      fencing/upstream/nhc-v0.12.0.yaml 11e9f93ba86105dc03a597fd55910d085bddc84d5514d782e95fad6c08b80514
       fencing/upstream/self-node-remediation-deamonset.yaml.tmpl a82494959ab0cd212c466d67064df7cb23da1c3381da0974256ab26e106778c4" ;;
     certmanager) echo "cert-manager/upstream/cert-manager-v1.21.3.yaml c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74" ;;
     *) return 1 ;;
@@ -529,6 +532,19 @@ ha_pins_ok() {
   _K_ERR=""
 }
 
+# ha_snr_image — the SNR image ha_render fencing uses: HA_SNR_IMAGE, or
+# with HUB_DEV=1 a PORTCULLIS_DEV_SNR_IMAGE name@sha256 ref (development /
+# e2e: the image built from kube/ha/fencing/snr-patch before it is
+# published).
+ha_snr_image() {
+  if [ -n "${PORTCULLIS_DEV_SNR_IMAGE:-}" ]; then
+    [ "${HUB_DEV:-}" = 1 ] || { echo "PORTCULLIS_DEV_SNR_IMAGE is for development only (HUB_DEV=1)" >&2; return 1; }
+    [[ "$PORTCULLIS_DEV_SNR_IMAGE" =~ ^[a-z0-9.:/_-]+@sha256:[0-9a-f]{64}$ ]] || { echo "PORTCULLIS_DEV_SNR_IMAGE must be name@sha256:<64 hex>" >&2; return 1; }
+    printf '%s\n' "$PORTCULLIS_DEV_SNR_IMAGE"; return 0
+  fi
+  printf '%s\n' "$HA_SNR_IMAGE"
+}
+
 # ha_render <component> [<API server sources> <iSCSI initiator sources>] —
 # the component's manifests as `kubectl apply` gets them (YAML on stdout):
 # kubectl kustomize of kube/ha/<c>/ (snapshotter: the controller only, its
@@ -540,7 +556,14 @@ ha_pins_ok() {
 ha_render() {
   local c="$1" d="$PORTCULLIS_HOME/$HA_DIR" t rc=0
   case "$c" in
-    snapshotter|fencing|certmanager) kubectl kustomize "$d/$(_ha_dir "$c")" ;;
+    snapshotter|certmanager) kubectl kustomize "$d/$(_ha_dir "$c")" ;;
+    fencing)
+      # The pinned SNR image, or the development one (a literal swap of the
+      # one pinned ref: its Deployment, its agents' image, the pod policy).
+      local img out
+      img="$(ha_snr_image)" || return 1
+      out="$(kubectl kustomize "$d/fencing")" || return 1
+      printf '%s\n' "${out//"$HA_SNR_IMAGE"/"$img"}" ;;
     longhorn)
       [ -n "${2:-}" ] && [ -n "${3:-}" ] || { echo "ha_render longhorn: the webhook's and the iSCSI initiators' sources are required" >&2; return 1; }
       t="$(mktemp -d)"
@@ -787,6 +810,7 @@ $(_ha_node_probes "$KUBE_LONGHORN_NS" "longhorn_path" $storage)"
 $n probe fail no answer from the node's check"
   done
   _ha_checks_refuse "Longhorn needs these on every node it runs on: fix them and run it again" "$lines"
+  _ha_longhorn_webhooks || fail "could not make Longhorn's webhook configurations (nothing installed)"
   info "HA: Longhorn v1.13.0 (longhorn-system)..."
   t="$(mktemp)"
   ha_render longhorn "$api" "$init" > "$t" || { rm -f "$t"; fail "could not render Longhorn (helm template + kubectl kustomize)"; }
@@ -796,6 +820,30 @@ $n probe fail no answer from the node's check"
   _ha_wait 600 "Longhorn's CSI driver" _ha_longhorn_csi_ready
   _kube_apply_files "$PORTCULLIS_HOME/$KUBE_REPLICATED_SC" || fail "could not apply the StorageClass portcullis-core-replicated"
   _kube_applied_set ha.longhorn "$(_kube_sha "$PORTCULLIS_HOME/$HA_DIR/longhorn"/*.yaml "$PORTCULLIS_HOME/$HA_DIR/longhorn/upstream"/* "$PORTCULLIS_HOME/$KUBE_REPLICATED_SC")"
+}
+
+# _ha_longhorn_webhooks — Longhorn's two webhook configurations made by the
+# CLI before Longhorn runs (fix round 1, security review: Longhorn's
+# identity may not create webhook configurations — a create can't be
+# limited by name, and an admission policy can't judge them, R-ADM). Empty
+# (no webhook: nothing is judged until Longhorn fills them in), carrying
+# the labels and annotations of wrangler's apply that Longhorn uses
+# (webhook/server/server.go: owner = the Secret longhorn-webhook-ca, set
+# id empty; the hash is wrangler's objectSetHash), so its apply finds and
+# patches them by name instead of creating. Kept as they are when present.
+_ha_longhorn_webhooks() {
+  local h k name
+  h="$(printf '%s' "/v1, Kind=Secretlonghorn-webhook-ca$KUBE_LONGHORN_NS" | { sha1sum 2>/dev/null || shasum -a 1; } | awk '{print $1}')"
+  for k in ValidatingWebhookConfiguration:longhorn-webhook-validator MutatingWebhookConfiguration:longhorn-webhook-mutator; do
+    name="${k#*:}"
+    kube_ctl get "${k%%:*}" "$name" -o name >/dev/null 2>&1 && continue
+    K="${k%%:*}" N="$name" H="$h" NS="$KUBE_LONGHORN_NS" jq -n '
+      {apiVersion: "admissionregistration.k8s.io/v1", kind: env.K,
+       metadata: {name: env.N, labels: {"objectset.rio.cattle.io/hash": env.H, "app.kubernetes.io/managed-by": "portcullis"},
+         annotations: {"objectset.rio.cattle.io/id": "", "objectset.rio.cattle.io/owner-gvk": "/v1, Kind=Secret",
+           "objectset.rio.cattle.io/owner-name": "longhorn-webhook-ca", "objectset.rio.cattle.io/owner-namespace": env.NS}},
+       webhooks: []}' | kube_ctl create -f - >/dev/null || return 1
+  done
 }
 
 # _ha_longhorn_csi_ready — the driver deployer's CSI: the CSIDriver, the
@@ -850,21 +898,18 @@ _ha_fencing_cert() {
   rm -rf "$t"
 }
 
-# BLOCKED (plan Task 24 report): with the security ruling's rights SNR
-# v0.13.0's agents can't start peer health (their Secret cache lists every
-# namespace) and NHC v0.12.0 can't start (it re-applies its aggregated
-# ClusterRole, which needs escalate): ha_fencing_ready then answers not
-# ready (fail closed) until a ruling on a patched build or another
-# remediator.
-# ha_install_fencing — SNR v0.13.0 + NHC v0.12.0 in portcullis-fencing
-# (spike S3, OLM-free) with config.yaml (watchdog /dev/watchdog, safe time
-# 150 s, OutOfServiceTaint, every node). Refused (nothing installed) while
+# ha_install_fencing — our SNR (v0.13.0 + snr-patch) in portcullis-fencing
+# (spike S3, OLM-free; fix round 1: no NHC, nodeadm creates the
+# remediations) with config.yaml (watchdog /dev/watchdog, safe time 150 s)
+# and the pod policy portcullis-fencing-pods. Refused (nothing installed) while
 # any node has no watchdog: a node that can't be fenced is never declared
 # dead, and no stateful failover would be safe there. Ends with
 # ha_fencing_ready (every node's agent ready, or it fails).
 ha_install_fencing() {
-  local nodes all lines n t
+  local nodes all lines n t img
   ha_pins_ok fencing || fail "the fencing pins don't hold: $_K_ERR (nothing installed)"
+  img="$(ha_snr_image)" || fail "the SNR image: see above (nothing installed)"
+  case "$img" in *"@$HA_SNR_PLACEHOLDER") fail "the SNR image ($HA_SNR_IMAGE) isn't published yet (a placeholder digest until .github/workflows/snr.yml's first main build): nothing installed" ;; esac
   nodes="$(_ha_nodes_json)" || exit 1
   all="$(printf '%s' "$nodes" | jq -r '.items[].metadata.name')"
   [ -n "$all" ] || fail "the cluster has no node (nothing installed)"
@@ -878,15 +923,14 @@ ha_install_fencing() {
     t=refused
   done
   [ "${t:-}" != refused ] || fail "fencing needs a watchdog on every node: without it a node is never declared dead, so nothing stateful fails over (nothing installed)"
-  _ha_namespace leases "$KUBE_FENCING_LEASES_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
   _ha_fencing_cert
-  info "HA: Self Node Remediation v0.13.0 + Node Healthcheck v0.12.0 (portcullis-fencing)..."
+  info "HA: Self Node Remediation v0.13.0 + Portcullis' patch (portcullis-fencing)..."
   t="$(mktemp)"
   ha_render fencing > "$t" || { rm -f "$t"; fail "could not render fencing (kubectl kustomize)"; }
   _ha_apply < "$t" || { rm -f "$t"; fail "could not apply fencing (see above)"; }
   _ha_crds_established "$t" || { rm -f "$t"; fail "the fencing CRDs aren't established"; }
   rm -f "$t"
-  _ha_wait 300 "the fencing managers" _ha_deploy_ready "$KUBE_FENCING_NS" self-node-remediation-controller-manager node-healthcheck-controller-manager
+  _ha_wait 300 "SNR's manager" _ha_deploy_ready "$KUBE_FENCING_NS" self-node-remediation-controller-manager
   _kube_apply_files "$PORTCULLIS_HOME/$HA_DIR/fencing/config.yaml" || fail "could not apply the fencing configuration (kube/ha/fencing/config.yaml)"
   _ha_wait 300 "SNR's agents (DaemonSet self-node-remediation-ds)" _ha_snr_ds_current
   ha_fencing_ready >/dev/null || { ha_fencing_ready >&2 || true; fail "fencing isn't ready on every node (above): no stateful failover until it is"; }
@@ -903,7 +947,7 @@ _ha_snr_ds_current() {
 
 # ha_fencing_ready — per node "<node> ready|not ready (<why>)" and exit 0
 # only when every node is ready: the SNR configuration is ours (the
-# watchdog, the 150 s safe time), both managers are available, and the
+# watchdog, the 150 s safe time), SNR's manager is available, and the
 # node runs a Ready, current agent
 # of the DaemonSet self-node-remediation-ds (nodeadm's snapshot counts the
 # same pod for the Hub's ha_fencing_unavailable). Anything unreadable is
@@ -914,14 +958,13 @@ ha_fencing_ready() {
   pods="$(kube_ctl -n "$KUBE_FENCING_NS" get pods -l app.kubernetes.io/name=self-node-remediation,app.kubernetes.io/component=agent -o json 2>/dev/null)" \
     || { warn "can't read SNR's agents: fencing unconfirmed"; return 1; }
   cfg="$(kube_ctl -n "$KUBE_FENCING_NS" get selfnoderemediationconfigs.self-node-remediation.medik8s.io self-node-remediation-config -o json 2>/dev/null || echo '{}')"
-  # The managers too: without NHC nothing is remediated, without SNR's
-  # manager no out-of-service taint.
+  # The manager too: without it no out-of-service taint.
   mgr=ok
-  _ha_deploy_ready "$KUBE_FENCING_NS" self-node-remediation-controller-manager node-healthcheck-controller-manager || mgr=down
+  _ha_deploy_ready "$KUBE_FENCING_NS" self-node-remediation-controller-manager || mgr=down
   M="$mgr" jq -rn --argjson n "$nodes" --argjson p "$pods" --argjson c "$cfg" '
     ($c.spec // {}) as $s
     | (if $s.watchdogFilePath != "/dev/watchdog" or $s.safeTimeToAssumeNodeRebootedSeconds != 150 then "SNR configuration missing or not ours"
-       elif env.M != "ok" then "the SNR / NHC managers aren'"'"'t available" else "" end) as $bad
+       elif env.M != "ok" then "SNR'"'"'s manager isn'"'"'t available" else "" end) as $bad
     | [$p.items[]? | select(.metadata.deletionTimestamp == null and (.metadata.name | startswith("self-node-remediation-ds-"))
         and any(.metadata.ownerReferences[]?; .kind == "DaemonSet" and .name == "self-node-remediation-ds")
         and any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .spec.nodeName] as $ok

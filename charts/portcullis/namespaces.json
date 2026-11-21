@@ -1,5 +1,5 @@
 {
-  "_comment": "Pod Security Admission levels of the six namespaces: [enforce, warn, audit]. The one source: ./portcullis (kube_cluster_setup, status) applies and checks them, templates/namespaces.yaml renders them for kubeconform. apps and storage enforce privileged (root one-shots / the storage helpers' hostPath; their admission policies pin what runs there), warn / audit baseline; ingress (NEW, HA) enforces privileged (Traefik's hostPort 80/443; portcullis-ingress-pods admits only its DaemonSet's pod shape), warn / audit baseline; nodeadm (NEW, HA) is restricted (it holds no etcd key and mounts nothing of the host); cnpg (cnpg-system: the CloudNativePG operator and the Cluster portcullis-pg, plan Task 23) is restricted. longhorn (longhorn-system, HA only, Task 24) and fencing (portcullis-fencing: SNR + NHC) enforce privileged (Longhorn's instance managers and CSI, SNR's watchdog agent), warn privileged (their every apply would warn), audit baseline; certmanager (cert-manager, HA only: the barman-cloud plugin's certificates) and leases (medik8s-leases: NHC's per-node remediation Leases, no pod) are restricted.",
+  "_comment": "Pod Security Admission levels of the six namespaces: [enforce, warn, audit]. The one source: ./portcullis (kube_cluster_setup, status) applies and checks them, templates/namespaces.yaml renders them for kubeconform. apps and storage enforce privileged (root one-shots / the storage helpers' hostPath; their admission policies pin what runs there), warn / audit baseline; ingress (NEW, HA) enforces privileged (Traefik's hostPort 80/443; portcullis-ingress-pods admits only its DaemonSet's pod shape), warn / audit baseline; nodeadm (NEW, HA) is restricted (it holds no etcd key and mounts nothing of the host); cnpg (cnpg-system: the CloudNativePG operator and the Cluster portcullis-pg, plan Task 23) is restricted. longhorn (longhorn-system, HA only, Task 24) and fencing (portcullis-fencing: SNR + NHC) enforce privileged (Longhorn's instance managers and CSI, SNR's watchdog agent), warn privileged (their every apply would warn), audit baseline; certmanager (cert-manager, HA only: the barman-cloud plugin's certificates) is restricted.",
   "core": ["restricted", "restricted", "restricted"],
   "apps": ["privileged", "baseline", "baseline"],
   "storage": ["privileged", "baseline", "baseline"],
@@ -9,6 +9,5 @@
   "cnpg": ["restricted", "restricted", "restricted"],
   "longhorn": ["privileged", "privileged", "baseline"],
   "fencing": ["privileged", "privileged", "baseline"],
-  "certmanager": ["restricted", "restricted", "restricted"],
-  "leases": ["restricted", "restricted", "restricted"]
+  "certmanager": ["restricted", "restricted", "restricted"]
 }

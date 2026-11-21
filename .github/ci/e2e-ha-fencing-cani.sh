@@ -3,10 +3,13 @@
 # live (plan Task 24 security ruling; e2e-ha-vm, Task 33, runs it after
 # ha_install_fencing): SNR's agent (every node) reads no Secret but its
 # peers' certificate by name and writes no Node but through
-# portcullis-node-labels; SNR's manager writes no Secret outside
-# portcullis-fencing; NHC creates no ClusterRole; Longhorn reads no Secret
-# outside longhorn-system; cert-manager none outside cnpg-system /
-# cert-manager. `kubectl auth can-i --as` (impersonation: no token).
+# portcullis-node-labels; SNR's manager lists no Secret anywhere (fix
+# round 1: our patched SNR caches its certificate by name) and writes none
+# outside portcullis-fencing; nodeadm creates SelfNodeRemediations only in
+# portcullis-fencing; no Node Healthcheck identity exists; Longhorn reads no
+# Secret outside longhorn-system and creates no webhook configuration;
+# cert-manager none outside cnpg-system / cert-manager. `kubectl auth can-i
+# --as` (impersonation: no token).
 set -euo pipefail
 ctx="${1:?usage: e2e-ha-fencing-cani.sh <kube context>}"
 fail=0
@@ -25,18 +28,25 @@ want no "$A" create nodes
 want no "$A" delete nodes
 want no "$A" patch nodes
 M=portcullis-fencing:self-node-remediation-controller-manager
+want no "$M" list secrets -A
+want no "$M" get secrets -n portcullis
+want no "$M" get secrets/fencing-webhook-cert -n portcullis-fencing
+want yes "$M" get secrets/self-node-remediation-certificates -n portcullis-fencing
 want no "$M" create secrets -n portcullis
+want no "$M" patch daemonsets/other -n portcullis-fencing
+want yes "$M" patch daemonsets/self-node-remediation-ds -n portcullis-fencing
 want no "$M" delete nodes
 want no "$M" delete pods -n portcullis
-N=portcullis-fencing:node-healthcheck-controller-manager
-want no "$N" create clusterroles
-want no "$N" create namespaces
-want no "$N" get secrets -n portcullis
+D=portcullis-nodeadm:nodeadm
+want yes "$D" create selfnoderemediations.self-node-remediation.medik8s.io -n portcullis-fencing
+want no "$D" create selfnoderemediations.self-node-remediation.medik8s.io -n portcullis
 L=longhorn-system:longhorn-service-account
 want no "$L" get secrets -n portcullis
 want no "$L" list secrets -A
 want no "$L" create clusterroles
 want no "$L" patch nodes
+want no "$L" create validatingwebhookconfigurations
+want no "$L" create mutatingwebhookconfigurations
 C=cert-manager:cert-manager
 want no "$C" get secrets -n portcullis
 want yes "$C" create secrets -n cnpg-system

@@ -6401,9 +6401,21 @@ case "$OUT" in *"node m1: /var/lib/longhorn is on a ZFS dataset"*"rc=1") t_pass 
 OUT="$(h24 ha_install_longhorn)"
 expect_eq "ha_install_longhorn: namespace (PSA longhorn) → deny policies → node checks → render (API + initiator sources) → apply → waits → StorageClass" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBE longhorn-system;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;"
+  "rc=0:NS;K apply;PROBE longhorn-system;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;"
 expect_eq "ha_install_longhorn: the namespace is longhorn-system with namespaces.json's longhorn levels; applied.json records ha.longhorn" \
   "$(grep '^NS' "$WORK/h24-calls"):$(jq -r 'has("ha.longhorn")' "$WORK/h24root/secrets/kube/applied.json")" "NS longhorn-system privileged:true"
+# Fix round 1: Longhorn's webhook configurations are the CLI's (no create
+# right for Longhorn), empty, with wrangler's objectset labels so its apply
+# patches them; present ones are left alone.
+LHW="$(printf '%s' "/v1, Kind=Secretlonghorn-webhook-calonghorn-system" | { sha1sum 2>/dev/null || shasum -a 1; } | awk '{print $1}')"
+OUT="$(kt "kube_ctl() { case \"\$*\" in get*) return 1 ;; *'create -f -'*) cat >> '$WORK/lhw.json' ;; esac; }; rm -f '$WORK/lhw.json'; _ha_longhorn_webhooks")"
+expect_eq "_ha_longhorn_webhooks: the validator and the mutator made empty, labelled with wrangler's hash (owner = longhorn-webhook-ca)" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(jq -sc '[.[] | [.kind, .metadata.name, .metadata.labels["objectset.rio.cattle.io/hash"] == "'"$LHW"'", .metadata.annotations["objectset.rio.cattle.io/owner-name"], (.webhooks | length)]]' "$WORK/lhw.json")" \
+  'rc=0:[["ValidatingWebhookConfiguration","longhorn-webhook-validator",true,"longhorn-webhook-ca",0],["MutatingWebhookConfiguration","longhorn-webhook-mutator",true,"longhorn-webhook-ca",0]]'
+OUT="$(kt "kube_ctl() { case \"\$*\" in *'create'*) echo CREATED ;; esac; }; _ha_longhorn_webhooks")"
+expect_eq "_ha_longhorn_webhooks: present ones are kept (no create)" "$(printf '%s\n' "$OUT" | grep -c CREATED || true)" 0
+expect_eq "Longhorn's ClusterRole: no create on webhook configurations (the CLI makes them)" \
+  "$(awk '/webhookconfigurations/ { w = 1; next } w && /verbs:/ { print; w = 0 }' "$HERE/../kube/ha/longhorn/rbac.yaml" | grep -c create || true)" 0
 printf 'x' >> "$H24/kube/ha/longhorn/upstream/longhorn-1.13.0.tgz"
 OUT="$(h24 ha_install_longhorn)"
 case "$OUT" in *"the Longhorn pins don't hold: kube/ha/longhorn/upstream/longhorn-1.13.0.tgz has sha256"*"not the pinned e57f010d"*"rc=1") t_pass "ha_install_longhorn: a chart that isn't the pinned release asset → refused" ;; *) t_fail "longhorn pin: $OUT" ;; esac
@@ -6413,15 +6425,22 @@ printf '%s' '{"items":[{"metadata":{"name":"m3","labels":{"portcullis.io/site":"
 OUT="$(h24 ha_install_longhorn)"
 case "$OUT" in *"no storage node at main"*"(nothing installed)"*"rc=1") t_pass "ha_install_longhorn: no storage node → refused" ;; *) t_fail "longhorn no storage: $OUT" ;; esac
 printf '%s' "$H24_NODES" > "$WORK/h24-nodes.json"
-OUT="$(STUB_PROBE_FAIL='e1 watchdog:no watchdog device (/dev/watchdog; modprobe softdog provides it)' h24 ha_install_fencing)"
+OUT="$(h24 ha_install_fencing)"
+case "$OUT" in *"the SNR image (ghcr.io/porelli/portcullis-snr:edge@sha256:0000"*"isn't published yet"*"nothing installed"*"rc=1")
+  t_pass "ha_install_fencing: the placeholder SNR digest (before snr.yml's first main build) → refused" ;; *) t_fail "fencing placeholder: $OUT" ;; esac
+expect_eq "ha_install_fencing: the placeholder refused before any cluster call" "$(cat "$WORK/h24-calls" 2>/dev/null | wc -l | tr -d ' ')" 0
+OUT="$(kt "PORTCULLIS_HOME='$H24'; PORTCULLIS_DEV_SNR_IMAGE=localhost/x@sha256:'"$(printf '1%.0s' $(seq 64))"'; ha_snr_image; HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/x:tag ha_snr_image; HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/x@sha256:'"$(printf '1%.0s' $(seq 64))"' ha_snr_image" 2>&1)"
+expect_eq "ha_snr_image: a dev SNR image only with HUB_DEV=1, and only name@sha256" \
+  "$(printf '%s\n' "$OUT" | grep -c 'is for development only (HUB_DEV=1)\|must be name@sha256'):$(printf '%s\n' "$OUT" | grep -c '^localhost/x@sha256:1')" "2:1"
+OUT="$(STUB_PROBE_FAIL='e1 watchdog:no watchdog device (/dev/watchdog; modprobe softdog provides it)' h24 "HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/portcullis-snr@sha256:1111111111111111111111111111111111111111111111111111111111111111; ha_install_fencing")"
 case "$OUT" in *"node e1 has no watchdog: fencing can't be confirmed (no watchdog device"*"fencing needs a watchdog on every node"*"(nothing installed)"*"rc=1")
   t_pass "ha_install_fencing: refuses a node without /dev/watchdog: 'node <n> has no watchdog: fencing can't be confirmed'" ;; *) t_fail "fencing no watchdog: $OUT" ;; esac
 expect_eq "ha_install_fencing: every node checked (the small one and the edge one too); refused → no certificate, render or config" \
   "$(grep '^PROBE' "$WORK/h24-calls"):$(grep -c 'CERT\|RENDER\|FILES' "$WORK/h24-calls" || true)" "PROBE portcullis-fencing watchdog m1 m2 m3 e1:0"
-OUT="$(h24 ha_install_fencing)"
+OUT="$(h24 "HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/portcullis-snr@sha256:1111111111111111111111111111111111111111111111111111111111111111; ha_install_fencing")"
 expect_eq "ha_install_fencing: namespace → policies → watchdogs → certificate → render → managers → config.yaml → agents → ha_fencing_ready" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBE portcullis-fencing;NS;K apply;CERT;RENDER fencing;K apply;WAIT the fencing managers;FILES config.yaml;WAIT SNR's agents (DaemonSet self-node-remediation-ds);READY-CHECK;"
+  "rc=0:NS;K apply;PROBE portcullis-fencing;CERT;RENDER fencing;K apply;WAIT SNR's manager;FILES config.yaml;WAIT SNR's agents (DaemonSet self-node-remediation-ds);READY-CHECK;"
 expect_eq "ha_install_fencing: portcullis-fencing's policies: deny, DNS, API, SNR's peers on 30001 only between agents" \
   "$(jq -c '[.items[] | .metadata.name] + [.items[] | select(.metadata.name == "snr-peers") | .spec.ingress[0].ports[0].port]' < <(head -c "$(wc -c < "$WORK/h24-applied")" "$WORK/h24-applied" | jq -s '.[0]'))" \
   '["default-deny","kube-dns","kube-api","snr-peers",30001]'
@@ -6445,8 +6464,8 @@ expect_eq "ha_fencing_ready: m2's agent not Ready → m2 not ready, exit 1 (Task
   "$(fr "{\"items\":[$A1,$A2N]}" "$FR_CFG" | tr '\t\n' ' ;')" "m1 ready;m2 not ready (no Ready SNR agent);rc=1;"
 expect_eq "ha_fencing_ready: another safe time / watchdog (not ours) → no node ready" \
   "$(fr "{\"items\":[$A1,$A2]}" '{"spec":{"watchdogFilePath":"/dev/watchdog","safeTimeToAssumeNodeRebootedSeconds":90}}' | grep -c 'not ready (SNR configuration missing or not ours)'):$(fr "{\"items\":[$A1,$A2]}" '{"spec":{}}' | tail -n1)" "2:rc=1"
-expect_eq "ha_fencing_ready: a manager (SNR or NHC) not available → no node ready (nothing remediates)" \
-  "$(STUB_MGR_DOWN=1 fr "{\"items\":[$A1,$A2]}" "$FR_CFG" | grep -c "not ready (the SNR / NHC managers aren't available)")" 2
+expect_eq "ha_fencing_ready: SNR's manager not available → no node ready (no out-of-service taint)" \
+  "$(STUB_MGR_DOWN=1 fr "{\"items\":[$A1,$A2]}" "$FR_CFG" | grep -c "not ready (SNR's manager isn't available)")" 2
 OUT="$(fr "" "$FR_CFG")"
 case "$OUT" in *"can't read SNR's agents: fencing unconfirmed"*"rc=1") t_pass "ha_fencing_ready: the agents unreadable → fencing unconfirmed, exit 1" ;; *) t_fail "fencing unreadable: $OUT" ;; esac
 # Fail closed (Global Constraints [24]): no volume leaves an unfenced node by timeout.
@@ -6456,8 +6475,8 @@ expect_eq "fencing unconfirmed → no stateful failover: every server's kube-con
 LHV="$HERE/../kube/ha/longhorn/values.yaml"
 expect_eq "longhorn settings: node-down-pod-deletion-policy do-nothing, no soft anti-affinity, disks only on labelled nodes, system pods at main" \
   "$(grep -cE '^  (nodeDownPodDeletionPolicy: do-nothing|replicaSoftAntiAffinity: false|createDefaultDiskLabeledNodes: true|systemManagedComponentsNodeSelector: "portcullis.io/site:main"|upgradeChecker: false)$' "$LHV")" 5
-expect_eq "fencing config: watchdog /dev/watchdog, safe time 150 (S3), OutOfServiceTaint, small nodes tolerated, NHC on every node" \
-  "$(grep -cE '^  (watchdogFilePath: /dev/watchdog|safeTimeToAssumeNodeRebootedSeconds: 150|maxApiErrorThreshold: 2)$|^      remediationStrategy: OutOfServiceTaint$|key: portcullis.io/small, operator: Exists|^  minHealthy: 51%$' "$HERE/../kube/ha/fencing/config.yaml")" 6
+expect_eq "fencing config: watchdog /dev/watchdog, safe time 150 (S3), small nodes tolerated; no NHC (nodeadm remediates)" \
+  "$(grep -cE '^  (watchdogFilePath: /dev/watchdog|safeTimeToAssumeNodeRebootedSeconds: 150|maxApiErrorThreshold: 2)$|key: portcullis.io/small, operator: Exists' "$HERE/../kube/ha/fencing/config.yaml"):$(grep -c 'NodeHealthCheck\|node-healthcheck' "$HERE/../kube/ha/fencing/config.yaml" "$HERE/../kube/ha/fencing/kustomization.yaml" "$HERE/../kube/ha/fencing/rbac.yaml" "$HERE/../scripts/lib/ha.sh" | awk -F: '{s += $2} END {print s}')" "4:0"
 # ha manifests: every image pinned by digest (lint_images over kube/ha;
 # a broken digest in a values file and a kustomization fails it).
 LT="$WORK/lint-ha"; rm -rf "$LT"; mkdir -p "$LT"
@@ -6465,7 +6484,7 @@ LT="$WORK/lint-ha"; rm -rf "$LT"; mkdir -p "$LT"
     -o -name Dockerfile -o -name portcullis \) -print | tar -cf - -T - ) | tar -xf - -C "$LT"
 expect_eq "ha manifests: every image pinned by digest (tests/lint_images.sh)" "$(bash "$LT/tests/lint_images.sh" >/dev/null 2>&1; echo $?)" 0
 sed -i.bak 's/v2.18.0@sha256:[0-9a-f]*"/v2.18.0"/' "$LT/kube/ha/longhorn/values.yaml"
-awk '!/digest: sha256:9ad002/' "$LT/kube/ha/fencing/kustomization.yaml" > "$LT/k.t" && mv "$LT/k.t" "$LT/kube/ha/fencing/kustomization.yaml"
+awk '!/^    digest: sha256:0000/' "$LT/kube/ha/fencing/kustomization.yaml" > "$LT/k.t" && mv "$LT/k.t" "$LT/kube/ha/fencing/kustomization.yaml"
 OUT="$(bash "$LT/tests/lint_images.sh" 2>&1)"
 expect_eq "ha manifests: a values tag without a digest and a kustomization image without one → lint fails naming both" \
   "$(printf '%s\n' "$OUT" | grep -c 'values.yaml:.*v2.18.0 (not <tag>@sha256)\|fencing/kustomization.yaml: image quay.io/medik8s/self-node-remediation-operator without a sha256 digest')" 2

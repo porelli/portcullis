@@ -774,7 +774,7 @@ PSA_WANT = {"core": ["restricted"] * 3, "apps": ["privileged", "baseline", "base
             # (iSCSI, the watchdog; warn privileged: every apply would warn),
             # cert-manager restricted.
             "longhorn": ["privileged", "privileged", "baseline"], "fencing": ["privileged", "privileged", "baseline"],
-            "certmanager": ["restricted"] * 3, "leases": ["restricted"] * 3}
+            "certmanager": ["restricted"] * 3}
 
 
 NODEADM_NS = "portcullis-nodeadm"
@@ -795,6 +795,8 @@ NODEADM_CORE_RULES = [
 ]
 NODEADM_KUBE_SYSTEM_RULES = [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "delete"]}]
 NODEADM_LONGHORN_RULES = [{"apiGroups": ["longhorn.io"], "resources": ["nodes"], "verbs": ["get", "patch"]}]
+# Fix round 1 (Task 24): nodeadm creates / removes SNR's remediation requests.
+NODEADM_FENCING_RULES = [{"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["create", "delete"]}]
 ADMISSION_RESOURCES = {"validatingadmissionpolicies", "validatingadmissionpolicybindings", "mutatingwebhookconfigurations",
                        "validatingwebhookconfigurations", "mutatingadmissionpolicies", "mutatingadmissionpolicybindings"}
 
@@ -860,6 +862,7 @@ def check_nodeadm():
         want = {(K.NS, "portcullis-nodeadm"): NODEADM_CORE_RULES, ("kube-system", "portcullis-nodeadm"): NODEADM_KUBE_SYSTEM_RULES}
         if ha:
             want[("longhorn-system", "portcullis-nodeadm")] = NODEADM_LONGHORN_RULES
+            want[("portcullis-fencing", "portcullis-nodeadm")] = NODEADM_FENCING_RULES
         if roles != want:
             F.add(f"nodeadm's Roles {roles} != {want}")
         for d in K.by_kind(docs, "ClusterRole") + K.by_kind(docs, "Role"):
@@ -1334,8 +1337,10 @@ def snr_agent_problems(fe):
                 or res & {"daemonsets", "volumeattachments", "pods/exec"} or "*" in verbs:
             out.append(f"fencing: the agent's ClusterRole rule {r} (no Secret at all, its Node's annotations, nothing else written)")
     agent_role = [r for _, r in rules_of(fe, "Role", {"portcullis-snr-agent"})]
-    if agent_role != [{"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["self-node-remediation-certificates"], "verbs": ["get"]}]:
-        out.append(f"fencing: the agent's Role {agent_role} (only get on its peers' certificate Secret by name)")
+    # get / list / watch by name: the patched cache lists with the
+    # metadata.name field selector (RBAC checks resourceNames then).
+    if agent_role != [{"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["self-node-remediation-certificates"], "verbs": ["get", "list", "watch"]}]:
+        out.append(f"fencing: the agent's Role {agent_role} (only its peers' certificate Secret, by name)")
     return out
 
 
@@ -1348,8 +1353,8 @@ def check_ha_infra():
     import hashlib
     ha_sh = (K.ROOT / "scripts" / "lib" / "ha.sh").read_text()
     pins = re.findall(r"([a-z-]+/upstream/[A-Za-z0-9._-]+) ([0-9a-f]{64})", ha_sh)
-    if len(pins) != 10:
-        F.add(f"ha.sh _ha_pins: {len(pins)} pins (want the 10 upstream files)")
+    if len(pins) != 8:
+        F.add(f"ha.sh _ha_pins: {len(pins)} pins (want the 8 upstream files)")
     for f, want in pins:
         got = hashlib.sha256((K.ROOT / "kube" / "ha" / f).read_bytes()).hexdigest()
         if got != want:
@@ -1383,6 +1388,9 @@ def check_ha_infra():
         if not any(set(r["apiGroups"]) <= set(u["apiGroups"]) and set(r["resources"]) <= set(u["resources"])
                    and (set(r["verbs"]) <= set(u["verbs"]) or "*" in u["verbs"]) for u in up):
             F.add(f"longhorn: portcullis-longhorn's rule {r} isn't within the chart's longhorn-role")
+    for _, r in rules_of(lh, "ClusterRole", {"portcullis-longhorn"}):
+        if any(x.endswith("webhookconfigurations") for x in r["resources"]) and set(r["verbs"]) & {"create", "*", "update"}:
+            F.add(f"longhorn: {r} (no webhook-configuration create: the CLI makes Longhorn's two, fix round 1)")
     crd_names = sorted(d["metadata"]["name"] for d in lh if d.get("kind") == "CustomResourceDefinition")
     crd_w = [r for _, r in rules_of(lh, "ClusterRole", {"portcullis-longhorn"}) if "customresourcedefinitions" in r["resources"] and set(r["verbs"]) - {"get", "list", "watch"}]
     if len(crd_w) != 1 or sorted(crd_w[0].get("resourceNames", [])) != crd_names or crd_w[0]["verbs"] != ["update"]:
@@ -1413,22 +1421,55 @@ def check_ha_infra():
     # Fencing: the conversion reproduces, the CSVs' wide roles replaced by
     # narrower ones (subsets), Secrets read only (SNR's cluster-wide cache).
     fdir = K.ROOT / "kube/ha/fencing"
-    for b, out in (("snr-v0.13.0-bundle.tar.gz", "snr-v0.13.0.yaml"), ("nhc-v0.12.0-bundle.tar.gz", "nhc-v0.12.0.yaml")):
+    for b, out in (("snr-v0.13.0-bundle.tar.gz", "snr-v0.13.0.yaml"),):
         got = subprocess.run([sys.executable, str(fdir / "from-bundle.py"), str(fdir / "upstream" / b), K_FENCING_NS], check=True, capture_output=True, text=True).stdout
         if got != (fdir / "upstream" / out).read_text():
             F.add(f"kube/ha/fencing/upstream/{out} isn't from-bundle.py's conversion of {b}")
     fe = renders["fencing"]
     for p in wide_rule_problems("fencing", fe, K_FENCING_NS, allow_secret_read=True):
         F.add(p)
-    csv = [d for f in ("snr-v0.13.0.yaml", "nhc-v0.12.0.yaml") for d in yaml.safe_load_all((fdir / "upstream" / f).read_text()) if d]
-    for mine, theirs in (("portcullis-snr", "self-node-remediation-controller-manager"), ("portcullis-nhc", "node-healthcheck-controller-manager")):
+    csv = [d for d in yaml.safe_load_all((fdir / "upstream" / "snr-v0.13.0.yaml").read_text()) if d]
+    for mine, theirs in (("portcullis-snr", "self-node-remediation-controller-manager"),):
         up = [r for _, r in rules_of(csv, "ClusterRole", {theirs})]
         for _, r in rules_of(fe, "ClusterRole", {mine}):
             if not any(set(r["apiGroups"]) <= set(u["apiGroups"]) and set(r["resources"]) <= set(u["resources"])
                        and (set(r["verbs"]) <= set(u["verbs"]) or "*" in u["verbs"]) for u in up):
                 F.add(f"fencing: {mine}'s rule {r} isn't within the CSV's {theirs}")
-    if {d["metadata"]["name"] for d in fe if d.get("kind") == "ClusterRole"} & {"self-node-remediation-controller-manager", "node-healthcheck-controller-manager"}:
-        F.add("fencing: a CSV's wide ClusterRole is still rendered")
+    if {d["metadata"]["name"] for d in fe if d.get("kind") == "ClusterRole"} & {"self-node-remediation-controller-manager"}:
+        F.add("fencing: the CSV's wide ClusterRole is still rendered")
+    # Fix round 1: no Node Healthcheck at all; no Secret in any fencing
+    # ClusterRole (our SNR caches one Secret by name in its namespace); the
+    # manager's DaemonSet writes by name; our image, the same ref in the
+    # Deployment, its agents' env and the pod policy, = ha.sh HA_SNR_IMAGE.
+    if any("node-healthcheck" in d["metadata"].get("name", "") or d.get("kind") == "NodeHealthCheck"
+           or "remediation.medik8s.io" == d.get("spec", {}).get("group") for d in fe):
+        F.add("fencing: a Node Healthcheck object is still rendered (nodeadm replaces it)")
+    for role, r in rules_of(fe, "ClusterRole"):
+        if "secrets" in r.get("resources", []) or "*" in r.get("resources", []):
+            F.add(f"fencing: ClusterRole {role} has a Secret rule {r} (none cluster-wide, fix round 1)")
+    for role, r in rules_of(fe, "Role"):
+        if r.get("resources") == ["secrets"] and set(r["verbs"]) - {"create"} and r.get("resourceNames") != ["self-node-remediation-certificates"]:
+            F.add(f"fencing: Role {role}'s Secret rule {r} (only the peers' certificate by name; create can't be named)")
+        if "daemonsets" in r.get("resources", []) and set(r["verbs"]) - {"create"} and r.get("resourceNames") != ["self-node-remediation-ds"]:
+            F.add(f"fencing: Role {role}'s DaemonSet rule {r} (writes by name)")
+    snr_img = re.search(r'^HA_SNR_IMAGE="([^"]+)"$', ha_sh, re.M)
+    snr_img = snr_img.group(1) if snr_img else None
+    for d in fe:
+        if d.get("kind") == "Deployment":
+            c = pod_spec_of(d)["containers"][0]
+            env = {e["name"]: e.get("value") for e in c.get("env", [])}
+            if c["image"] != snr_img or env.get("SELF_NODE_REMEDIATION_IMAGE") != snr_img:
+                F.add(f"fencing: SNR's manager runs {c['image']} / its agents {env.get('SELF_NODE_REMEDIATION_IMAGE')} (want {snr_img}, ha.sh HA_SNR_IMAGE)")
+    pols = [d for d in fe if d.get("kind") == "ValidatingAdmissionPolicy"]
+    binds = [d for d in fe if d.get("kind") == "ValidatingAdmissionPolicyBinding"]
+    if len(pols) != 1 or pols[0]["metadata"]["name"] != "portcullis-fencing-pods" or f"'{snr_img}'" not in json.dumps(pols[0]) \
+            or len(binds) != 1 or binds[0]["spec"]["policyName"] != "portcullis-fencing-pods" or binds[0]["spec"]["validationActions"] != ["Deny"] \
+            or binds[0]["spec"]["matchResources"]["namespaceSelector"]["matchLabels"] != {"kubernetes.io/metadata.name": K_FENCING_NS}:
+        F.add("fencing: the pod policy portcullis-fencing-pods (our SNR image, Deny, bound to portcullis-fencing) is missing or off")
+    snr_src = (fdir / "snr-patch" / "Dockerfile").read_text()
+    psha = hashlib.sha256((fdir / "snr-patch" / "0001-secret-cache-own-namespace.patch").read_bytes()).hexdigest()
+    if snr_src.count(f"ARG PATCH_SHA256={psha}") != 2 or "ARG SNR_COMMIT=79fb792830c6db78b0dab45c45f5b79591118c76" not in snr_src:
+        F.add("snr-patch/Dockerfile: the patch's sha256 / the upstream commit aren't the pinned ones")
     if any(d.get("kind") in ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration") for d in fe):
         F.add("fencing: a webhook configuration (none is registered)")
     # Security ruling: SNR's agents (every node) have their own
@@ -1476,10 +1517,8 @@ def check_ha_infra():
     if (snrc.get("watchdogFilePath"), snrc.get("safeTimeToAssumeNodeRebootedSeconds")) != ("/dev/watchdog", 150) \
             or not any(t.get("key") == "portcullis.io/small" for t in snrc.get("customDsTolerations", [])):
         F.add(f"fencing config: {snrc} (watchdog /dev/watchdog, safe time 150, small tolerated: S3)")
-    tpl = next(d for d in cfg if d["kind"] == "SelfNodeRemediationTemplate")
-    nhc = next(d for d in cfg if d["kind"] == "NodeHealthCheck")
-    if tpl["spec"]["template"]["spec"].get("remediationStrategy") != "OutOfServiceTaint" or nhc["spec"]["remediationTemplate"]["name"] != tpl["metadata"]["name"]:
-        F.add("fencing: NHC must remediate with SNR's OutOfServiceTaint template")
+    if [d["kind"] for d in cfg] != ["SelfNodeRemediationConfig"]:
+        F.add(f"fencing config.yaml: {[d['kind'] for d in cfg]} (only the SelfNodeRemediationConfig: nodeadm creates the remediations)")
     # cert-manager: only cnpg-system and its own namespace; no ACME.
     cm = renders["certmanager"]
     for p in wide_rule_problems("certmanager", cm, K_CERTMANAGER_NS):

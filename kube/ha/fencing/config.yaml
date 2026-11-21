@@ -2,16 +2,15 @@
 # ha_install_fencing once the managers run:
 #   - SelfNodeRemediationConfig (the one SNR accepts, its fixed name):
 #     the watchdog /dev/watchdog; API check 10 s, timeout 5 s, 2 errors
-#     (SNR's minimum safe time 90 s); the safe time 150 s = 90 + 60 s for
+#     (SNR's minimum safe time 90 s), the peers re-read every 30 s; the safe time 150 s = 90 + 60 s for
 #     the upstream bug that drops the watchdog term (T_fence = 150 s); the
 #     agent on small nodes too (portcullis.io/small) and on a node nodeadm
 #     hasn't labelled yet;
-#   - the remediation template: OutOfServiceTaint (SNR itself puts
-#     node.kubernetes.io/out-of-service once the node is assumed rebooted;
-#     nothing else ever force-deletes);
-#   - the NodeHealthCheck: every node, Ready False / Unknown for 30 s,
-#     at least 51 % healthy (a partition's minority never remediates the
-#     majority).
+#   - no remediation template and no Node Healthcheck (fix round 1):
+#     nodeadm creates each SelfNodeRemediation itself, strategy
+#     OutOfServiceTaint (SNR puts node.kubernetes.io/out-of-service once
+#     the node is assumed rebooted; nothing else ever force-deletes), with
+#     its storm guard (nodeadm/remediate.go).
 apiVersion: self-node-remediation.medik8s.io/v1alpha1
 kind: SelfNodeRemediationConfig
 metadata:
@@ -23,37 +22,12 @@ spec:
   apiCheckInterval: 10s
   apiServerTimeout: 5s
   maxApiErrorThreshold: 2
+  # The peers' addresses refreshed every 30 s (SNR's default 15 min): after
+  # a DaemonSet rollout an agent asked stale pod IPs, every peer refused, and
+  # a healthy node reset itself during another node's loss (live, fix round
+  # 1). Peers vouch for a node whose own API checks fail.
+  peerUpdateInterval: 30s
   isSoftwareRebootEnabled: true
   customDsTolerations:
     - {key: portcullis.io/small, operator: Exists, effect: NoSchedule}
     - {key: nodeadm.portcullis/unlabelled, operator: Exists, effect: NoSchedule}
----
-apiVersion: self-node-remediation.medik8s.io/v1alpha1
-kind: SelfNodeRemediationTemplate
-metadata:
-  name: portcullis-out-of-service
-  namespace: portcullis-fencing
-  annotations:
-    remediation.medik8s.io/multiple-templates-support: "true"
-spec:
-  template:
-    spec:
-      remediationStrategy: OutOfServiceTaint
----
-apiVersion: remediation.medik8s.io/v1alpha1
-kind: NodeHealthCheck
-metadata:
-  name: portcullis-nodes
-spec:
-  selector:
-    matchExpressions:
-      - {key: kubernetes.io/os, operator: In, values: [linux]}
-  minHealthy: 51%
-  unhealthyConditions:
-    - {type: Ready, status: "False", duration: 30s}
-    - {type: Ready, status: Unknown, duration: 30s}
-  remediationTemplate:
-    apiVersion: self-node-remediation.medik8s.io/v1alpha1
-    kind: SelfNodeRemediationTemplate
-    name: portcullis-out-of-service
-    namespace: portcullis-fencing

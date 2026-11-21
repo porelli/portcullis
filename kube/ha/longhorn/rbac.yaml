@@ -10,9 +10,10 @@
 #   - Nodes: read only (it never writes a Node);
 #   - no ClusterRole / ClusterRoleBinding right (only its system restore
 #     makes them: unused);
-#   - its two webhook configurations (wrangler's apply lists and creates:
-#     list / create can't be named) get / patch / delete by name.
-# Residual: create on webhook configurations, pods delete in any namespace
+#   - its two webhook configurations get / patch / delete by name (the CLI
+#     makes them first, ha.sh _ha_longhorn_webhooks: no create right; list
+#     can't be named);
+# Residual: pods delete in any namespace
 # (it deletes a workload pod whose volume detached unexpectedly), PV / PVC /
 # VolumeAttachment / StorageClass writes (its CSI role).
 apiVersion: rbac.authorization.k8s.io/v1
@@ -78,7 +79,7 @@ rules:
     verbs: [list, watch]
   - apiGroups: [admissionregistration.k8s.io]
     resources: [mutatingwebhookconfigurations, validatingwebhookconfigurations]
-    verbs: [list, create]
+    verbs: [list]
   - apiGroups: [admissionregistration.k8s.io]
     resources: [mutatingwebhookconfigurations, validatingwebhookconfigurations]
     resourceNames: [longhorn-webhook-mutator, longhorn-webhook-validator]
