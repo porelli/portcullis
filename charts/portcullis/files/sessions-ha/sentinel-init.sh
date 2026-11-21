@@ -3,8 +3,8 @@
 # emptyDir: Sentinel rewrites its own config) from the CLI's parts
 # (secrets-sessions-ha: sentinel.conf — ACL users, the peers' user — and
 # sentinel-monitor.conf — auth and timings, after the monitor line) with
-# this pod's announced name and the master to monitor: the one another
-# Sentinel names; else the Valkey pod that is a master with replicas (or a
+# this pod's announced name and the master to monitor: the one both other
+# Sentinels name; else the Valkey pod that is a master with replicas (or a
 # master at all); else sessions-0 (a first start). Only the two Valkey pods'
 # names are ever monitored. Passwords only in the Secret's files and
 # VALKEYCLI_AUTH, never argv.
@@ -15,12 +15,16 @@ SVC="sessions-pods.$NS.svc.cluster.local"
 me="$ME.sessions-sentinel.$NS.svc.cluster.local"
 cli() { valkey-cli --no-auth-warning -t 2 --user sessions-admin "$@"; }
 ours() { case "$1" in "sessions-0.$SVC" | "sessions-1.$SVC") return 0 ;; esac; return 1; }
-m=""
+# The master both other Sentinels name (two agreeing answers, review M2:
+# one stale Sentinel alone never decides).
+m="" seen=""
 for i in 0 1 2; do
   s="sessions-sentinel-$i.sessions-sentinel.$NS.svc.cluster.local"
   [ "$s" != "$me" ] || continue
   a="$(cli -h "$s" -p 26379 sentinel get-master-addr-by-name "$MASTER_NAME" 2>/dev/null | head -n1)"
-  if ours "$a"; then m="$a"; break; fi
+  ours "$a" || continue
+  if [ "$a" = "$seen" ]; then m="$a"; break; fi
+  seen="$a"
 done
 if [ -z "$m" ]; then
   cand=""

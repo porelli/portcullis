@@ -28,10 +28,16 @@ log() { echo "sessions-guard: $*" >&2; }
 # ours <host> — one of the two Valkey pods' names (a Sentinel's answer is
 # never trusted beyond that).
 ours() { case "$1" in "sessions-0.$SVC" | "sessions-1.$SVC") return 0 ;; esac; return 1; }
+# ask_master — the master at least two Sentinels name (quorum 2: a
+# restarted or partitioned Sentinel alone never steers this pod); exit 1
+# without two agreeing answers.
 ask_master() {
+  a=""
   for s in $sentinels; do
-    m="$(cli -h "$s" -p 26379 sentinel get-master-addr-by-name "$MASTER_NAME" 2>/dev/null | head -n1)"
-    if ours "$m"; then printf '%s\n' "$m"; return 0; fi
+    x="$(cli -h "$s" -p 26379 sentinel get-master-addr-by-name "$MASTER_NAME" 2>/dev/null | head -n1)"
+    ours "$x" || continue
+    case " $a " in *" $x "*) printf '%s\n' "$x"; return 0 ;; esac
+    a="$a $x"
   done
   return 1
 }
@@ -61,10 +67,18 @@ if [ "$m" = "$me" ]; then
   fi
   if [ "$peer" = replica ]; then
     log "the Sentinels still name this pod the master and a replica is healthy: failing over first"
-    for s in $sentinels; do cli -h "$s" -p 26379 sentinel failover "$MASTER_NAME" >/dev/null 2>&1 && break; done
-    i=0
-    while m="$(ask_master)" && [ "$m" = "$me" ]; do
+    for s in $sentinels; do [ "$(cli -h "$s" -p 26379 sentinel failover "$MASTER_NAME" 2>/dev/null)" = OK ] && break; done
+    # Until two Sentinels name another master. No answer is no reason to
+    # start (review I1: a failed query used to end the wait with this pod
+    # starting as the master): only the explicit timeout below does that.
+    i=0 last=""
+    while :; do
+      if n="$(ask_master)"; then last="$n"; [ "$n" = "$me" ] || { m="$n"; break; }; else last=""; fi
       i=$((i + 2))
+      if [ "$i" -ge "$WAIT" ] && [ -z "$last" ]; then
+        log "no two Sentinels answer after the failover: refusing to start (never a master on silence)"
+        exit 1
+      fi
       if [ "$i" -ge "$WAIT" ]; then
         # The Sentinels refuse a replica whose link was down longer than 10
         # × down-after (valkey src/sentinel.c sentinelSelectReplica: found

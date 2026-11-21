@@ -1671,7 +1671,12 @@ cat > "$GD/bin/valkey-cli" <<'GSTUB'
 # Sentinel answers from $GD_DIR: master (its name, or empty), replicas, after-failover.
 echo "$*" >> "$GD_DIR/calls"
 case "$*" in
-  *"sentinel get-master-addr-by-name portcullis-sessions") [ -s "$GD_DIR/master" ] || exit 0; if [ -e "$GD_DIR/failed-over" ]; then cat "$GD_DIR/after"; else cat "$GD_DIR/master"; echo; fi; echo 6379 ;;
+  *"sentinel get-master-addr-by-name portcullis-sessions")
+    # Per Sentinel (master-<n>: that one's own answer, "-" = silent), else the common one.
+    h="$*"; h="${h#*-h sessions-sentinel-}"; f="$GD_DIR/master-${h%%.*}"
+    [ -e "$f" ] || f="$GD_DIR/master"
+    [ -s "$f" ] && [ "$(cat "$f")" != - ] || exit 0
+    if [ -e "$GD_DIR/failed-over" ]; then [ -e "$GD_DIR/silent-after" ] && exit 0; cat "$GD_DIR/after"; else cat "$f"; echo; fi; echo 6379 ;;
   *"-p 6379 info replication") [ -s "$GD_DIR/peer" ] || exit 1; cat "$GD_DIR/peer" ;;
   *"sentinel failover portcullis-sessions") [ -e "$GD_DIR/no-failover" ] || touch "$GD_DIR/failed-over"; echo OK ;;
 esac
@@ -1699,6 +1704,12 @@ expect_eq "sessions guard: no Sentinel answers → refused (exit 1: never a seco
   "$(guard "" "")$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
 expect_eq "sessions guard: a Sentinel naming a host that isn't one of the two Valkey pods is ignored (refused)" \
   "$(guard "evil.example.org" "")" "rc=1"
+expect_eq "sessions guard: every Sentinel silent after the FAILOVER → refused (exit 1), never a master config (review I1)" \
+  "$(touch "$GD/silent-after"; guard "$P1" "$REP0" "$P0"; rm -f "$GD/silent-after")$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
+expect_eq "sessions guard: one Sentinel alone names another master (the others silent) → no two agreeing answers, refused (review M2)" \
+  "$(printf '%s' - > "$GD/master-1"; printf '%s' - > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
+expect_eq "sessions guard: two of three Sentinels agree (the third names this pod) → the two decide: a replica of their master" \
+  "$(printf '%s' "$P1" > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(grep -c "^replicaof $P0 6379$" "$GD/conf")" "rc=01"
 expect_eq "sessions guard: the password never on valkey-cli's argv (VALKEYCLI_AUTH only)" "$(grep -c -- ' -a \| --pass ' "$GD/calls" || true)" 0
 # Restart only a running store, only when its config changed, before compose up.
 : > "$STUB_DIR/sess-calls"; rm -f "$STUB_DIR/sess-running"

@@ -71,7 +71,7 @@ spec:
   "initContainers" (list $guard)
   "probes" (dict
     "readinessProbe" (dict "exec" (dict "command" (list "sh" "/scripts/ready.sh")) "periodSeconds" 2 "timeoutSeconds" 3 "failureThreshold" 2)
-    "livenessProbe" (dict "exec" (dict "command" (list "sh" "-c" "valkey-cli -h 127.0.0.1 ping 2>&1 | grep -q NOAUTH")) "periodSeconds" 5 "timeoutSeconds" 3 "failureThreshold" 20))
+    "livenessProbe" (dict "exec" (dict "command" (list "sh" "-c" "env -u VALKEYCLI_AUTH valkey-cli --no-auth-warning -h 127.0.0.1 ping 2>&1 | grep -q NOAUTH")) "periodSeconds" 5 "timeoutSeconds" 3 "failureThreshold" 20))
   "mounts" (list
     (dict "name" "data" "mountPath" "/data")
     $confMnt
