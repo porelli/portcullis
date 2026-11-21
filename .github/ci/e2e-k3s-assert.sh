@@ -68,20 +68,25 @@ sudo ip addr del 198.51.100.9/24 dev ext-host
 pass "status warns (--node-external-ip) when the public IP is local but not published"
 
 # ── trust: kcinternal strips client certificates; websecure strips spoofed headers ──
-probe_pod "$NS" e2e-hubside '{"portcullis.io/component": "hub-probe"}'
-# A pod labelled like an internal client (hub) for kcinternal: the
+# Two pods, each labelled once at creation and never relabelled: k3s's
+# policy controller (kube-router) applies a label change on its next full
+# sync, so a pod relabelled away from hub keeps hub's access for that long
+# (seen in CI under pod churn: the dial right after the relabel connected).
+# e2e-kcclient is labelled like an internal client (hub) for kcinternal: the
 # certificate header never reaches Keycloak (no X.509 login: the realm's
 # certificate flow sees no cert and the request is an ordinary one).
-# Its network label too: egress from the core namespace is default-deny,
-# the Hub reaches Traefik through net-portcullis-egress.
-K -n "$NS" label pod e2e-hubside portcullis.io/component=hub portcullis.io/net-portcullis=true --overwrite >/dev/null
+# Both carry the network label: egress from the core namespace is
+# default-deny, the Hub reaches Traefik through net-portcullis-egress.
+# e2e-hubside (hub-probe) is no internal client, ever.
+probe_pod "$NS" e2e-kcclient '{"portcullis.io/component": "hub", "portcullis.io/net-portcullis": "true"}'
+probe_pod "$NS" e2e-hubside '{"portcullis.io/component": "hub-probe", "portcullis.io/net-portcullis": "true"}'
 KI="$(svc_ip keycloak-internal)"
-out="$(K -n "$NS" exec e2e-hubside -- wget -q -O - --header 'X-Forwarded-Tls-Client-Cert: MIIBfake' --header 'X-Forwarded-For: 203.0.113.66' \
+out="$(K -n "$NS" exec e2e-kcclient -- wget -q -O - --header 'X-Forwarded-Tls-Client-Cert: MIIBfake' --header 'X-Forwarded-For: 203.0.113.66' \
   "http://$KI:8081/realms/portcullis/.well-known/openid-configuration" 2>&1 || true)"
 printf '%s' "$out" | jq -e '.issuer | endswith("/realms/portcullis")' >/dev/null || fail "kcinternal didn't serve Keycloak's discovery: $(printf '%s' "$out" | head -c 300)"
 K -n "$NS" logs deploy/traefik -c traefik --since=1m | grep -c 'MIIBfake' | grep -qx 0 || true
 pass "kcinternal (keycloak-internal:8081) reaches Keycloak for an internal client"
-K -n "$NS" label pod e2e-hubside portcullis.io/component=hub-probe --overwrite >/dev/null
+K -n "$NS" delete pod e2e-kcclient --grace-period=1 --wait=true --timeout=60s >/dev/null  # before pod_ip hub picks it
 if dial "$NS" e2e-hubside "$KI" 8081; then fail "a pod that isn't one of the five internal clients reaches kcinternal"; fi
 if dial "$NS" e2e-hubside "$(pod_ip keycloak)" 8080; then fail "a pod other than Traefik reaches Keycloak :8080"; fi
 pass "kcinternal admits only the internal clients; Keycloak :8080 only Traefik"
