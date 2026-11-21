@@ -68,7 +68,7 @@ pf_svc() { # pf_svc <svc> <port> — a port-forward to a core Service (dies with
 
 lldap_gql() { # lldap_gql <base> <query> — LLDAP's GraphQL as admin (the token never printed)
   local tok
-  tok="$(lldap_token "$1")" || return 1; echo "::add-mask::$tok"
+  tok="$(lldap_token "$1")" || return 1; echo "::add-mask::$tok" >&2
   jq -n --arg q "$2" '{query: $q}' | curl -sf "$1/api/graphql" -H @<(printf 'Authorization: Bearer %s\n' "$tok") -H 'Content-Type: application/json' -d @-
 }
 
@@ -84,7 +84,7 @@ kc_signin() { # kc_signin — Keycloak's admin signs in (password grant on maste
   port="$(pf_svc keycloak 8080)"
   out="$(mktemp)"
   for _ in $(seq 1 60); do
-    code="$(PW="$pw" jq -rn '"grant_type=password&client_id=admin-cli&username=admin&password=" + (env.PW | @uri)' \
+    code="$(PW="$pw" jq -jn '"grant_type=password&client_id=admin-cli&username=admin&password=" + (env.PW | @uri)' \
       | curl -s -o "$out" -w '%{http_code}' --max-time 10 "http://127.0.0.1:$port/realms/master/protocol/openid-connect/token" \
           -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- || true)"
     [ "$code" = 200 ] && jq -e '.access_token | length > 0' "$out" >/dev/null 2>&1 && { rm -f "$out"; return 0; }

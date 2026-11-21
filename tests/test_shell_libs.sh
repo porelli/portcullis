@@ -6233,6 +6233,8 @@ expect_eq "kube_pg_sync_secrets: no password on argv (kubectl / helm argv record
   "$(cat "$KS/kubectl-calls" "$KS/helm-calls" 2>/dev/null | grep -cE 'LLPG-SECRET-888|PG-SECRET-777' || true)" 0
 expect_eq "kube_pg_sync_secrets: LLDAP's URL is the rw Service's, its password in the Secret (base64), never in a log" \
   "$(grep -c "$(printf 'postgres://lldap:LLPG-SECRET-888@portcullis-pg-rw.cnpg-system.svc.cluster.local:5432/lldap' | base64 | tr -d '\n')" "$KS/kubectl-stdin"):$(printf '%s\n' "$OUT" | grep -c 'LLPG-SECRET-888' || true)" "1:0"
+expect_eq "kube_pg_sync_secrets: the roles' Secrets carry cnpg.io/reload (the operator re-applies a changed password only then)" \
+  "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object" and .metadata.namespace? == "portcullis" and (.metadata.name | startswith("portcullis-pg-"))) | .metadata.labels["cnpg.io/reload"]' 2>/dev/null | sort | uniq -c | tr -s ' ')" "$(printf ' 2 "true"\n 1 null')"
 OUT="$(kt "$K15_ENV; kube_images_ready() { echo NO-IMAGES; }; kube_ctl() { echo \"KCTL \$*\"; }; kube_lldap_server_key; echo done")"
 expect_eq "kube_lldap_server_key: a present key is kept (no pod)" "$(printf '%s\n' "$OUT" | grep -c 'KCTL\|NO-IMAGES' || true):$(cat "$K15/secrets/lldap-key/server_key")" "0:LLDAP-SERVER-KEY"
 expect_eq "kube_lldap_server_key: the key read with exec cat into a 0600 file, never a pod's logs" \
@@ -6240,12 +6242,13 @@ expect_eq "kube_lldap_server_key: the key read with exec cat into a 0600 file, n
 PGX="$WORK/pgx"; rm -rf "$PGX"; mkdir -p "$PGX/b1" "$PGX/b2"
 printf 'PGDMPkc' > "$PGX/b1/postgres.dump"; printf 'PGDMPll' > "$PGX/b1/lldap.dump"
 printf 'PGDMPkc' > "$PGX/b2/postgres.dump"; printf 'tar' > "$PGX/b2/lldap_data.tar.gz"
-pgx() { kt "_kube_pg_wait() { :; }; _kube_pg_exec() { echo \"PG \$*\" >> '$PGX/calls'; case \"\$1\" in pg_restore) cat > '$PGX/in-'\"\$2\" ;; esac; }; kube_ctl() { echo \"KCTL \$*\" >> '$PGX/calls'; }; _kube_restore_pg '$1'" 2>&1; }
+pgx() { kt "_kube_pg_wait() { :; }; _kube_pg_roles_wait() { echo \"PG roles-wait \$1\" >> '$PGX/calls'; }; _kube_pg_exec() { echo \"PG \$*\" >> '$PGX/calls'; case \"\$1\" in pg_restore) cat > '$PGX/in-'\"\$2\" ;; esac; }; kube_ctl() { echo \"KCTL \$*\" >> '$PGX/calls'; }; _kube_restore_pg '$1'" 2>&1; }
 rm -f "$PGX/calls"; OUT="$(pgx "$PGX/b1")"
 expect_eq "_kube_restore_pg (test_restore_into_cnpg): keycloak and lldap emptied, then pg_restore'd as their own roles in one transaction; LLDAP's schema Jobs removed" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c '^PG dropdb --if-exists --force keycloak$\|^PG createdb -O keycloak keycloak$\|^PG pg_restore -d keycloak --no-owner --no-privileges --role=keycloak --exit-on-error --single-transaction$\|^PG dropdb --if-exists --force lldap$\|^PG pg_restore -d lldap --no-owner --no-privileges --role=lldap --exit-on-error --single-transaction$' "$PGX/calls"):$(cat "$PGX/in--d" 2>/dev/null | head -c 7):$(grep -c 'KCTL -n portcullis delete job -l portcullis.io/component=lldap-schema' "$PGX/calls")" "rc=0:5:PGDMPll:1"
 rm -f "$PGX/calls"; OUT="$(pgx "$PGX/b2")"
 case "$OUT" in *"This backup's LLDAP is SQLite (lldap_data.tar.gz, made on Docker / Podman): it isn't converted into Postgres on Kubernetes yet, so LLDAP starts empty."*"rc=0") t_pass "_kube_restore_pg: a Docker backup → Keycloak restored, LLDAP's database emptied with a warning (the conversion is Task 26)" ;; *) t_fail "restore pg docker backup: $OUT" ;; esac
+expect_eq "_kube_restore_pg: waits for the operator to apply the restored roles' passwords (300 s)" "$(grep -c '^PG roles-wait 300$' "$PGX/calls")" 1
 expect_eq "_kube_restore_pg: a Docker backup's lldap volume never restored into Postgres here" "$(grep -c 'pg_restore -d lldap' "$PGX/calls" || true)" 0
 OUT="$(kt "_kube_pg_exec() { echo 3; }; _kube_pg_lldap_count; _kube_pg_exec() { echo 'ERROR: relation \"users\" does not exist'; return 1; }; _kube_pg_lldap_count")"
 expect_eq "the restore's LLDAP guard on Kubernetes counts LLDAP's users in Postgres; no schema → missing" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "3 missing "

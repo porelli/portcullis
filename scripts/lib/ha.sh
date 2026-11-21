@@ -144,8 +144,12 @@ kube_pg_sync_secrets() {
    printf 'lldap' > "$st/ll/username"; printf '%s' "$LLDAP_PG_PASSWORD" > "$st/ll/password"
    printf 'postgres://lldap:%s@%s:5432/lldap' "$LLDAP_PG_PASSWORD" "$KUBE_PG_RW_HOST" > "$st/url/LLDAP_DATABASE_URL"
    printf '%s' "$LLDAP_PG_PASSWORD" > "$st/url/PGPASSWORD")
-  if ! { kube_ctl create secret generic portcullis-pg-keycloak -n "$KUBE_CNPG_NS" --type=kubernetes.io/basic-auth --from-file="$st/kc" --dry-run=client -o json > "$f" && _kube_put "$f"; } \
-     || ! { kube_ctl create secret generic portcullis-pg-lldap -n "$KUBE_CNPG_NS" --type=kubernetes.io/basic-auth --from-file="$st/ll" --dry-run=client -o json > "$f" && _kube_put "$f"; } \
+  # cnpg.io/reload: the operator re-applies a role's password when its
+  # Secret changes only with this label (a restored .env's passwords).
+  if ! { kube_ctl create secret generic portcullis-pg-keycloak -n "$KUBE_CNPG_NS" --type=kubernetes.io/basic-auth --from-file="$st/kc" --dry-run=client -o json \
+           | jq '.metadata.labels["cnpg.io/reload"] = "true"' > "$f" && _kube_put "$f"; } \
+     || ! { kube_ctl create secret generic portcullis-pg-lldap -n "$KUBE_CNPG_NS" --type=kubernetes.io/basic-auth --from-file="$st/ll" --dry-run=client -o json \
+           | jq '.metadata.labels["cnpg.io/reload"] = "true"' > "$f" && _kube_put "$f"; } \
      || ! { kube_ctl create secret generic portcullis-pg-lldap -n "$(kube_ns)" --from-file="$st/url" --dry-run=client -o json > "$f" && _kube_put "$f"; }; then
     rm -rf "$st"; fail "could not sync the Postgres roles' Secrets"
   fi
@@ -245,6 +249,24 @@ _kube_restore_pg() {
   fi
   kube_ctl -n "$(kube_ns)" delete job -l portcullis.io/component=lldap-schema --ignore-not-found >/dev/null \
     || fail "could not remove LLDAP's schema Jobs"
+  # The backup's role passwords (kube_pg_sync_secrets ran before) in effect
+  # before Keycloak and LLDAP start on them.
+  _kube_pg_roles_wait 300 || fail "the CNPG operator didn't apply the restored roles' passwords within 300 s"
+}
+
+# _kube_pg_roles_wait <seconds> — the operator has applied both roles'
+# passwords from their Secrets as they are now (managedRolesStatus'
+# passwordStatus names each Secret's resourceVersion).
+_kube_pg_roles_wait() {
+  local i want got
+  for ((i = 0; i < "$1"; i += 3)); do
+    want="$(kube_ctl -n "$KUBE_CNPG_NS" get secret portcullis-pg-keycloak portcullis-pg-lldap -o json 2>/dev/null | jq -c '[.items[].metadata.resourceVersion]' 2>/dev/null || true)"
+    got="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null \
+      | jq -c '[.status.managedRolesStatus.passwordStatus.keycloak.resourceVersion, .status.managedRolesStatus.passwordStatus.lldap.resourceVersion]' 2>/dev/null || true)"
+    [ -n "$want" ] && [ "$want" = "$got" ] && return 0
+    sleep 3
+  done
+  return 1
 }
 
 # _kube_pg_lldap_count — LLDAP's users besides admin / portcullis-hub in the
