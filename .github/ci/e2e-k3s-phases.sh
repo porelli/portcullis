@@ -337,10 +337,10 @@ restore)
   K -n portcullis wait --for=condition=Ready "pod/$pod" --timeout=180s >/dev/null
   [ "$(K -n portcullis exec "$pod" -- cat /b/rt-inst/20261121T000000Z.tar)" = rt-instance-backup ] && K -n portcullis exec "$pod" -- sh -c '[ ! -e /s/backups/rt-inst ]' \
     || fail "the Docker backup's instance backup isn't on hub-backups (or is still in hub-state)"
-  # Review NN4: the move keeps the PVC root's mode (its portcullis.io/mode).
-  m="$(K -n portcullis get pvc hub-backups -o jsonpath='{.metadata.labels.portcullis\.io/mode}')"
+  # Review NN4: the move keeps the PVC root's mode (its portcullis.io/mode annotation).
+  m="$(K -n portcullis get pvc hub-backups -o jsonpath='{.metadata.annotations.portcullis\.io/mode}')"
   [ -n "$m" ] && [ "$(K -n portcullis exec "$pod" -- stat -c %a /b)" = "${m#0}" ] \
-    || fail "hub-backups' root mode $(K -n portcullis exec "$pod" -- stat -c %a /b) isn't its label's ${m:-none} after the move"
+    || fail "hub-backups' root mode $(K -n portcullis exec "$pod" -- stat -c %a /b) isn't its annotation's ${m:-none} after the move"
   K -n portcullis delete pod "$pod" --wait=false >/dev/null
   echo "PASS: test_lldap_convert_keeps_uuids: the Docker backup's LLDAP converted into CNPG (uuids, password hashes and memberships equal the source, rt-alice and rt-bob bind with their passwords, Keycloak links rt-alice by the same entryUUID); host keys kept, status clean, the CA chain the Docker phase's, Keycloak signs in"
   ;;
