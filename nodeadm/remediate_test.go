@@ -423,6 +423,41 @@ func TestCordonRollsTheMarkBack(t *testing.T) {
 	}
 }
 
+// TestCordonRollbackOnlyItsOwnMark (round 5, the security review of the
+// rollback): a failed cordon never drops a mark that was already there,
+// and a patch that landed but answered an error keeps the mark.
+func TestCordonRollbackOnlyItsOwnMark(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.putState(t, func(st *nodeadmState) { st.Maintenance["n1"] = true })
+	h.kube.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("refused")
+	})
+	if w := h.internal(clientHub, "POST", "/v1/nodes/n1/cordon", map[string]any{}); w.Code < 400 {
+		t.Fatalf("the failed cordon answered %d", w.Code)
+	}
+	if !h.state(t).Maintenance["n1"] {
+		t.Fatal("a pre-existing mark was dropped by a failed cordon")
+	}
+	// The patch lands, then the answer is an error (a timeout after the write).
+	h.kube.ReactionChain = h.kube.ReactionChain[1:]
+	h.kube.PrependReactor("patch", "nodes", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		n, _ := h.kube.Tracker().Get(schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, "", a.(k8stesting.PatchAction).GetName())
+		node := n.(*corev1.Node).DeepCopy()
+		node.Spec.Unschedulable = true
+		if err := h.kube.Tracker().Update(schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, node, ""); err != nil {
+			t.Fatal(err)
+		}
+		return true, nil, fmt.Errorf("the request timed out")
+	})
+	if w := h.internal(clientHub, "POST", "/v1/nodes/n2/cordon", map[string]any{}); w.Code < 400 {
+		t.Fatalf("the errored cordon answered %d", w.Code)
+	}
+	if n, _ := h.kube.CoreV1().Nodes().Get(ctx, "n2", metav1.GetOptions{}); !n.Spec.Unschedulable || !h.state(t).Maintenance["n2"] {
+		t.Fatalf("a cordon that landed lost its mark: unschedulable %v, marks %v", n.Spec.Unschedulable, h.state(t).Maintenance)
+	}
+}
+
 // TestManagerRuleJudgesEveryNodeSpecField (round 5 nit 2): the manager's
 // rule in portcullis-node-labels compares every v1 NodeSpec field of the
 // vendored k8s.io/api but taints (judged by the taint allowlist), so a new

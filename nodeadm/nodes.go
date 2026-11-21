@@ -263,38 +263,23 @@ func (s *Server) handleCordon(on bool) func(http.ResponseWriter, *http.Request) 
 		if err := emptyBody(r); err != nil {
 			return err
 		}
-		if _, err := s.getNode(r.Context(), id); err != nil {
+		n, err := s.getNode(r.Context(), id)
+		if err != nil {
 			return err
 		}
 		// The maintenance mark (remediate.go): only a cordon made here
 		// keeps the node out of fencing — spec.unschedulable alone could be
-		// anyone's. Cordon: the mark first (round 4 nit 2: a failed state
-		// write never leaves a cordon unmarked; a mark without the cordon
-		// excludes nothing — both are needed). Uncordon: the cordon lifted
+		// anyone's. Cordon: markAndCordon. Uncordon: the cordon lifted
 		// first, then the mark.
-		mark := func() error {
-			return s.mutate(r.Context(), func(st *nodeadmState) error {
-				if on {
-					st.Maintenance[id] = true
-				} else {
-					delete(st.Maintenance, id)
-				}
-				return nil
-			})
-		}
 		if on {
-			if err := mark(); err != nil {
+			if err := s.markAndCordon(r.Context(), id, n); err != nil {
 				return err
 			}
-		}
-		if err := s.patchNode(r.Context(), id, map[string]any{"spec": map[string]any{"unschedulable": on}}); err != nil {
-			if on {
-				s.unmark(r.Context(), id) // round 5 nit 3: no mark left on an uncordoned node
+		} else {
+			if err := s.patchNode(r.Context(), id, map[string]any{"spec": map[string]any{"unschedulable": false}}); err != nil {
+				return err
 			}
-			return err
-		}
-		if !on {
-			if err := mark(); err != nil {
+			if err := s.mutate(r.Context(), func(st *nodeadmState) error { delete(st.Maintenance, id); return nil }); err != nil {
 				return err
 			}
 		}
@@ -304,13 +289,34 @@ func (s *Server) handleCordon(on bool) func(http.ResponseWriter, *http.Request) 
 	}
 }
 
-// unmark rolls the maintenance mark back after a cordon that failed
-// (review round 5 nit 3); a failure is logged (the mark alone excludes
-// nothing: remediate.go needs it AND spec.unschedulable).
-func (s *Server) unmark(ctx context.Context, id string) {
+// markAndCordon: the maintenance mark first, then the cordon (round 4
+// nit 2: a failed state write never leaves a cordon unmarked; a mark
+// without the cordon excludes nothing — remediate.go needs both). A failed
+// cordon rolls back only a mark THIS call added (round 5 nit 3, and the
+// security review of it): never when the mark or the cordon (n, read
+// before) was already there, and never when the Node reads back cordoned
+// or can't be read (the patch may have landed: keeping the mark is the
+// side that never makes a node in maintenance fenceable).
+func (s *Server) markAndCordon(ctx context.Context, id string, n *corev1.Node) error {
+	was := false
+	if err := s.mutate(ctx, func(st *nodeadmState) error {
+		was = st.Maintenance[id]
+		st.Maintenance[id] = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	perr := s.patchNode(ctx, id, map[string]any{"spec": map[string]any{"unschedulable": true}})
+	if perr == nil || was || n.Spec.Unschedulable {
+		return perr
+	}
+	if cur, err := s.getNode(ctx, id); err != nil || cur.Spec.Unschedulable {
+		return perr
+	}
 	if err := s.mutate(ctx, func(st *nodeadmState) error { delete(st.Maintenance, id); return nil }); err != nil {
 		s.log.Warn("couldn't roll back a maintenance mark after a failed cordon", "node", id, "err", redact(err.Error()))
 	}
+	return perr
 }
 
 // POST /v1/nodes/{id}/drain
@@ -396,13 +402,12 @@ func isDaemonSetPod(p *corev1.Pod) bool {
 // pods through the eviction API; a PDB that keeps refusing a pod for
 // Timing.PDBRefusal is replica_minimum; at most Timing.DrainMax overall.
 func (s *Server) drain(ctx context.Context, id string) error {
-	// Planned maintenance (remediate.go): a drained node isn't fenced. The
-	// mark first, then the cordon (round 4 nit 2).
-	if err := s.mutate(ctx, func(st *nodeadmState) error { st.Maintenance[id] = true; return nil }); err != nil {
+	// Planned maintenance (remediate.go): a drained node isn't fenced.
+	n, err := s.getNode(ctx, id)
+	if err != nil {
 		return err
 	}
-	if err := s.patchNode(ctx, id, map[string]any{"spec": map[string]any{"unschedulable": true}}); err != nil {
-		s.unmark(ctx, id)
+	if err := s.markAndCordon(ctx, id, n); err != nil {
 		return err
 	}
 	start := time.Now()
