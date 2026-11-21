@@ -1,21 +1,26 @@
-# portcullis-fencing-pods (plan Task 24 fix round 1, security review; like
+# portcullis-fencing-pods (plan Task 24 fix round 1, security reviews; like
 # portcullis-ingress-pods): portcullis-fencing is PSA privileged (SNR's
 # agent opens /dev/watchdog and resets the node), so this policy admits
-# there only three pod shapes, whoever creates them:
-#   - SNR's agent (the DaemonSet SNR's manager renders from our template):
-#     ServiceAccount self-node-remediation-agent, our SNR image by digest
-#     in its one container, hostPath /dev only (the watchdog), no
-#     hostNetwork;
+# there exactly two pod shapes, whoever creates them (no CLI exemption; the
+# CLI's host probes run in their own namespace, kube/ha/probe):
+#   - SNR's agent (the DaemonSet SNR's manager renders from our
+#     agent-daemonset.yaml.tmpl): ServiceAccount self-node-remediation-agent,
+#     one container of our SNR image running exactly /manager
+#     --is-manager=false, privileged as the template says and nothing else
+#     in its securityContext, hostPID (the template's), no hostIPC /
+#     hostNetwork, volumes only hostPath /dev and the projected token, the
+#     one hostPort 30001 (peer health);
 #   - SNR's manager: ServiceAccount self-node-remediation-controller-manager,
-#     our image, non-root, not privileged, no hostPath / hostPID /
-#     hostNetwork;
-#   - the CLI's watchdog probe (ha_install_fencing): the helper image, the
-#     host's / read-only as nobody, no token, not privileged.
-# So a manager or anything writing a DaemonSet here can't run another
-# image or mount more of the host. Static (no params): ha_render fencing
-# applies it with the namespace; a dev / e2e SNR image (HUB_DEV=1 +
+#     one container of our image running exactly the CSV's /manager args,
+#     non-root (pod runAsNonRoot, no container-level root), drop ALL with no
+#     added capability, no escalation, read-only root, no hostPath / hostPID
+#     / hostIPC / hostNetwork / hostPort, volumes only Secret, ConfigMap and
+#     the projected token.
+# No init or ephemeral containers in either. Static (no params): ha_render
+# fencing applies it with the namespace; a dev / e2e SNR image (HUB_DEV=1 +
 # PORTCULLIS_DEV_SNR_IMAGE) replaces the image literal the same way it
-# replaces the Deployment's.
+# replaces the Deployment's. tests/ha_admission_vectors.json holds each
+# refused variant (.github/ci/e2e-ha-admission.sh tries them).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -32,46 +37,60 @@ spec:
   variables:
     - name: snrImage
       expression: "'ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000'"
-    - name: helperImage
-      expression: "'docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a'"
-    - name: containers
-      expression: >-
-        object.spec.containers
-        + (has(object.spec.initContainers) ? object.spec.initContainers : [])
-        + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
     - name: sa
       expression: "has(object.spec.serviceAccountName) ? object.spec.serviceAccountName : 'default'"
-    - name: hostPaths
-      expression: "has(object.spec.volumes) ? object.spec.volumes.filter(v, has(v.hostPath)).map(v, v.hostPath.path) : []"
-    - name: privileged
+    - name: one
       expression: >-
-        variables.containers.exists(c, has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged)
-    - name: hostNet
-      expression: "has(object.spec.hostNetwork) && object.spec.hostNetwork"
+        size(object.spec.containers) == 1 && !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers)
+        && object.spec.containers[0].image == variables.snrImage
+    - name: c
+      expression: "object.spec.containers[0]"
+    - name: hasCsc
+      expression: "has(object.spec.containers[0].securityContext)"
+    - name: hostNS
+      expression: >-
+        (has(object.spec.hostNetwork) && object.spec.hostNetwork) || (has(object.spec.hostIPC) && object.spec.hostIPC)
     - name: hostPID
       expression: "has(object.spec.hostPID) && object.spec.hostPID"
+    - name: vols
+      expression: "has(object.spec.volumes) ? object.spec.volumes : []"
+    - name: hostPorts
+      expression: >-
+        has(object.spec.containers[0].ports) ? object.spec.containers[0].ports.filter(p, has(p.hostPort) && p.hostPort != 0).map(p, p.hostPort) : []
+    # The container may not lower its pod's non-root setting or run as root.
+    - name: noRootOverride
+      expression: >-
+        !variables.hasCsc || ((!has(variables.c.securityContext.runAsUser) || variables.c.securityContext.runAsUser != 0)
+          && (!has(variables.c.securityContext.runAsNonRoot) || variables.c.securityContext.runAsNonRoot))
     - name: agent
       expression: >-
-        variables.sa == 'self-node-remediation-agent'
-        && size(variables.containers) == 1 && variables.containers.all(c, c.image == variables.snrImage)
-        && variables.hostPaths == ['/dev'] && !variables.hostNet
+        variables.sa == 'self-node-remediation-agent' && variables.one
+        && variables.c.command == ['/manager'] && has(variables.c.args) && variables.c.args == ['--is-manager=false']
+        && variables.hasCsc && has(variables.c.securityContext.privileged) && variables.c.securityContext.privileged
+        && !has(variables.c.securityContext.capabilities) && !has(variables.c.securityContext.procMount)
+        && !has(variables.c.securityContext.seLinuxOptions) && !has(variables.c.securityContext.windowsOptions)
+        && variables.hostPID && !variables.hostNS
+        && variables.vols.all(v, (has(v.hostPath) && v.hostPath.path == '/dev') || has(v.projected))
+        && size(variables.vols.filter(v, has(v.hostPath))) == 1
+        && variables.hostPorts == [30001]
     - name: manager
       expression: >-
-        variables.sa == 'self-node-remediation-controller-manager'
-        && variables.containers.all(c, c.image == variables.snrImage)
-        && size(variables.hostPaths) == 0 && !variables.privileged && !variables.hostNet && !variables.hostPID
+        variables.sa == 'self-node-remediation-controller-manager' && variables.one
+        && variables.c.command == ['/manager'] && has(variables.c.args)
+        && variables.c.args == ['--health-probe-bind-address=:8081', '--metrics-bind-address=:8443', '--leader-elect', '--is-manager', '--enable-http2=false']
         && has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot
-    - name: probe
-      expression: >-
-        variables.sa == 'default'
-        && size(variables.containers) == 1 && variables.containers.all(c, c.image == variables.helperImage
-             && has(c.volumeMounts) && c.volumeMounts.all(m, has(m.readOnly) && m.readOnly))
-        && variables.hostPaths == ['/'] && !variables.privileged && !variables.hostNet
-        && has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken
-        && has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser) && object.spec.securityContext.runAsUser == 65534
+        && (!has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser != 0)
+        && variables.noRootOverride
+        && variables.hasCsc && (!has(variables.c.securityContext.privileged) || !variables.c.securityContext.privileged)
+        && has(variables.c.securityContext.allowPrivilegeEscalation) && !variables.c.securityContext.allowPrivilegeEscalation
+        && has(variables.c.securityContext.readOnlyRootFilesystem) && variables.c.securityContext.readOnlyRootFilesystem
+        && has(variables.c.securityContext.capabilities) && has(variables.c.securityContext.capabilities.drop)
+        && variables.c.securityContext.capabilities.drop == ['ALL'] && !has(variables.c.securityContext.capabilities.add)
+        && !variables.hostPID && !variables.hostNS && size(variables.hostPorts) == 0
+        && variables.vols.all(v, has(v.secret) || has(v.configMap) || has(v.projected))
   validations:
-    - expression: "variables.agent || variables.manager || variables.probe"
-      message: "only SNR's agent and manager pods (and the CLI's watchdog probe) run in portcullis-fencing"
+    - expression: "variables.agent || variables.manager"
+      message: "only SNR's agent and manager pods, in their exact shapes, run in portcullis-fencing"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

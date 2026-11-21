@@ -486,6 +486,10 @@ _backup_verify_dir_kube() {
 KUBE_LONGHORN_NS="longhorn-system"
 KUBE_FENCING_NS="portcullis-fencing"
 KUBE_CERTMANAGER_NS="cert-manager"
+# The CLI's host probes (fix round 1, security review): their own namespace,
+# no Role or workload of anyone there, pinned by portcullis-ha-probe-pods.
+KUBE_HA_PROBE_NS="portcullis-ha-probe"
+KUBE_HA_PROBE_POLICY="kube/ha/probe/admission.yaml"
 # Our SNR image (kube/ha/fencing/snr-patch, .github/workflows/snr.yml; fix
 # round 1): kube/ha/fencing pins this ref. Its digest is a placeholder
 # until snr.yml's first main build: ha_install_fencing refuses it but for
@@ -649,8 +653,9 @@ _ha_namespace() {
 }
 
 # The host probe (one pod per node, nodeName: a small node's taint doesn't
-# keep it off; hostPID and the host's root read-only, as nobody, in a PSA
-# privileged namespace with no network): one line per check, "<id> ok|fail
+# keep it off; hostPID and the host's root read-only, as nobody, in its own
+# PSA privileged namespace portcullis-ha-probe with no network, pinned by
+# portcullis-ha-probe-pods): one line per check, "<id> ok|fail
 # <detail>", the nodeagent's checks' texts (Hub internal/nodeagent/host).
 # shellcheck disable=SC2016  # the probe's own shell
 HA_PROBE_SH='
@@ -673,15 +678,33 @@ for c in $CHECKS; do case "$c" in
   watchdog) if [ -c /host/dev/watchdog ]; then echo "watchdog ok"; else echo "watchdog fail no watchdog device (/dev/watchdog; modprobe softdog provides it)"; fi ;;
 esac; done'
 
-# _ha_node_probes <namespace> <checks (words)> <node>… — runs the probe on
-# each node (in parallel) and prints "<node> <id> ok|fail <detail>" lines;
-# a probe that doesn't complete is "<node> probe fail <why>" (fail closed).
-_ha_node_probes() {
-  local ns="$1" checks="$2" n i=0 name names="" j phase k
-  shift 2
-  for n in "$@"; do
-    i=$((i + 1)); name="ha-check-$i-$(openssl rand -hex 3)"; names="$names $name=$n"
-    N="$name" NS="$ns" NODE="$n" IMG="$PORTCULLIS_HELPER_IMAGE" C="$checks" S="$HA_PROBE_SH" jq -n '
+# _ha_probe_setup — the probes' namespace (PSA from namespaces.json
+# haprobe), its default-deny (the probe needs no network), the params of
+# portcullis-ha-probe-pods (the helper image and the exact script, from
+# files: kubectl --from-file) and that policy with its binding. Applied
+# before every probe run (idempotent).
+_ha_probe_setup() {
+  local psa t
+  psa="$(kube_psa haprobe)" || exit 1
+  # shellcheck disable=SC2086  # three single-word levels
+  kube_namespace_apply "$KUBE_HA_PROBE_NS" $psa || fail "could not create the namespace $KUBE_HA_PROBE_NS (nothing installed)"
+  ha_ns_policies "$KUBE_HA_PROBE_NS" "" | jq '.items |= map(select(.metadata.name == "default-deny"))' | _ha_apply \
+    || fail "could not apply $KUBE_HA_PROBE_NS's default-deny (nothing installed)"
+  t="$(mktemp -d)"
+  printf '%s' "$PORTCULLIS_HELPER_IMAGE" > "$t/image"
+  printf '%s' "$HA_PROBE_SH" > "$t/script"
+  if ! kube_ctl -n "$KUBE_HA_PROBE_NS" create configmap ha-probe-params --from-file="$t" --dry-run=client -o json | _ha_apply \
+     || ! _kube_apply_files "$PORTCULLIS_HOME/$KUBE_HA_PROBE_POLICY"; then
+    rm -rf "$t"; fail "could not apply the host probes' admission policy ($KUBE_HA_PROBE_POLICY; nothing installed)"
+  fi
+  rm -rf "$t"
+}
+
+# _ha_probe_pod_json <name> <namespace> <node> <checks> — one host probe
+# pod (the shape portcullis-ha-probe-pods admits; the admission vectors'
+# base, tests/ha_admission_vectors.py).
+_ha_probe_pod_json() {
+  N="$1" NS="$2" NODE="$3" IMG="$PORTCULLIS_HELPER_IMAGE" C="$4" S="$HA_PROBE_SH" jq -n '
       {apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "ha-check"}},
        spec: {nodeName: env.NODE, restartPolicy: "Never", hostPID: true, priorityClassName: "portcullis-core",
          automountServiceAccountToken: false, enableServiceLinks: false, terminationGracePeriodSeconds: 1,
@@ -691,8 +714,23 @@ _ha_node_probes() {
          containers: [{name: "check", image: env.IMG, command: ["sh", "-c", env.S], env: [{name: "CHECKS", value: env.C}],
            volumeMounts: [{name: "host", mountPath: "/host", readOnly: true}],
            resources: {limits: {memory: "32Mi"}, requests: {memory: "32Mi"}},
-           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}' \
-      | kube_ctl create -f - >/dev/null 2>&1 || { echo "$n probe fail the check pod was refused"; names="${names% *}"; }
+           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}'
+}
+
+# _ha_node_probes <namespace> <checks (words)> <node>… — runs the probe on
+# each node (in parallel) and prints "<node> <id> ok|fail <detail>" lines;
+# a probe that doesn't complete is "<node> probe fail <why>" (fail closed).
+_ha_node_probes() {
+  local ns="$1" checks="$2" n i=0 name names="" j phase k tmpd
+  shift 2
+  tmpd="$(mktemp -d)"
+  for n in "$@"; do
+    i=$((i + 1)); name="ha-check-$i-$(openssl rand -hex 3)"; names="$names $name=$n"
+    _ha_probe_pod_json "$name" "$ns" "$n" "$checks" > "$tmpd/$name.json"
+    # A policy binding just applied may take a moment to see its params:
+    # retried, then a refusal is a failed check (fail closed).
+    for ((j = 0; j < 10; j++)); do kube_ctl create -f "$tmpd/$name.json" >/dev/null 2>&1 && break; sleep 2; done
+    [ "$j" -lt 10 ] || { echo "$n probe fail the check pod was refused"; names="${names% *}"; }
   done
   for k in $names; do
     name="${k%%=*}" n="${k#*=}" phase=""
@@ -708,6 +746,7 @@ _ha_node_probes() {
     fi
     kube_ctl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
   done
+  rm -rf "$tmpd"
 }
 
 # _ha_checks_refuse <what> <probe lines> — every failing check as
@@ -800,11 +839,12 @@ ha_install_longhorn() {
   init="$(kube_node_host_sources)" || fail "can't read the nodes' addresses: Longhorn's iSCSI targets would be open to every pod (nothing installed)"
   _ha_namespace longhorn "$KUBE_LONGHORN_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
   info "HA: checking the nodes Longhorn runs on ($(printf '%s' "$lh" | tr '\n' ' ' | sed 's/ $//'))..."
+  _ha_probe_setup
   # shellcheck disable=SC2086  # node names
-  lines="$(_ha_node_probes "$KUBE_LONGHORN_NS" "iscsid iscsi_tcp nfs_common multipath_blacklist" $lh)"
+  lines="$(_ha_node_probes "$KUBE_HA_PROBE_NS" "iscsid iscsi_tcp nfs_common multipath_blacklist" $lh)"
   # shellcheck disable=SC2086
   lines="$lines
-$(_ha_node_probes "$KUBE_LONGHORN_NS" "longhorn_path" $storage)"
+$(_ha_node_probes "$KUBE_HA_PROBE_NS" "longhorn_path" $storage)"
   for n in $lh; do
     printf '%s\n' "$lines" | awk -v n="$n" '$1 == n && $2 == "iscsid" { f = 1 } END { exit !f }' || lines="$lines
 $n probe fail no answer from the node's check"
@@ -915,8 +955,9 @@ ha_install_fencing() {
   [ -n "$all" ] || fail "the cluster has no node (nothing installed)"
   _ha_namespace fencing "$KUBE_FENCING_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
   info "HA: checking every node's watchdog..."
+  _ha_probe_setup
   # shellcheck disable=SC2086  # node names
-  lines="$(_ha_node_probes "$KUBE_FENCING_NS" watchdog $all)"
+  lines="$(_ha_node_probes "$KUBE_HA_PROBE_NS" watchdog $all)"
   for n in $all; do
     printf '%s\n' "$lines" | awk -v n="$n" '$1 == n && $2 == "watchdog" && $3 == "ok" { f = 1 } END { exit !f }' && continue
     warn "node $n has no watchdog: fencing can't be confirmed$(printf '%s\n' "$lines" | awk -v n="$n" '$1 == n && $3 == "fail" { $1 = $2 = $3 = ""; sub(/^ +/, ""); print " (" $0 ")"; exit }')"

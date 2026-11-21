@@ -774,7 +774,9 @@ PSA_WANT = {"core": ["restricted"] * 3, "apps": ["privileged", "baseline", "base
             # (iSCSI, the watchdog; warn privileged: every apply would warn),
             # cert-manager restricted.
             "longhorn": ["privileged", "privileged", "baseline"], "fencing": ["privileged", "privileged", "baseline"],
-            "certmanager": ["restricted"] * 3}
+            "certmanager": ["restricted"] * 3,
+            # The CLI's host probes (fix round 1): hostPID + the host's /.
+            "haprobe": ["privileged", "privileged", "baseline"]}
 
 
 NODEADM_NS = "portcullis-nodeadm"
@@ -1519,6 +1521,24 @@ def check_ha_infra():
         F.add(f"fencing config: {snrc} (watchdog /dev/watchdog, safe time 150, small tolerated: S3)")
     if [d["kind"] for d in cfg] != ["SelfNodeRemediationConfig"]:
         F.add(f"fencing config.yaml: {[d['kind'] for d in cfg]} (only the SelfNodeRemediationConfig: nodeadm creates the remediations)")
+    # The pod policies' admission vectors (fix round 1, security review):
+    # current with the real shapes (e2e-ha-admission.sh runs them live).
+    r = subprocess.run([sys.executable, str(K.ROOT / "tests" / "ha_admission_vectors.py"), "--check"], capture_output=True, text=True)
+    if r.returncode != 0:
+        F.add(f"tests/ha_admission_vectors.json: {(r.stderr or r.stdout).strip()}")
+    else:
+        vecs = json.loads((K.ROOT / "tests" / "ha_admission_vectors.json").read_text())
+        for pol in ("portcullis-fencing-pods", "portcullis-ha-probe-pods"):
+            vs = [v for v in vecs if v["policy"] == pol]
+            if sum(v["allowed"] for v in vs) < 1 or sum(not v["allowed"] for v in vs) < 14:
+                F.add(f"ha_admission_vectors: {pol} needs its admitted base(s) and the refused variants")
+    probe_pol = [d for d in yaml.safe_load_all((K.ROOT / "kube/ha/probe/admission.yaml").read_text()) if d]
+    pb = next((d for d in probe_pol if d["kind"] == "ValidatingAdmissionPolicyBinding"), None)
+    if not pb or pb["spec"]["paramRef"] != {"name": "ha-probe-params", "namespace": "portcullis-ha-probe", "parameterNotFoundAction": "Deny"} \
+            or pb["spec"]["matchResources"]["namespaceSelector"]["matchLabels"] != {"kubernetes.io/metadata.name": "portcullis-ha-probe"}:
+        F.add("probe: portcullis-ha-probe-guard-pods must bind portcullis-ha-probe with its params, missing = deny")
+    if "_ha_node_probes \"$KUBE_HA_PROBE_NS\"" not in ha_sh or ha_sh.count("_ha_probe_setup\n") < 2:
+        F.add("ha.sh: the host probes must run in portcullis-ha-probe after _ha_probe_setup")
     # cert-manager: only cnpg-system and its own namespace; no ACME.
     cm = renders["certmanager"]
     for p in wide_rule_problems("certmanager", cm, K_CERTMANAGER_NS):

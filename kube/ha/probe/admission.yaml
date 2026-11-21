@@ -1,0 +1,96 @@
+# portcullis-ha-probe-pods (plan Task 24 fix round 1, security review): the
+# CLI's host probes (ha.sh _ha_node_probes: iSCSI / nfs / multipath / ZFS /
+# watchdog, one pod per node, the host's / read-only) run in their own
+# namespace portcullis-ha-probe — PSA privileged (hostPID, a hostPath), no
+# Role or workload of anyone in it — and this policy admits there exactly
+# that pod and nothing else, whoever creates it:
+#   one container, no init / ephemeral ones; the image and the exact
+#   `sh -c <script>` from the params ConfigMap ha-probe-params (written by
+#   the CLI only: nobody else has a right in this namespace; missing =
+#   deny); env exactly CHECKS = check ids; the default ServiceAccount with
+#   no token; pod runAsNonRoot, runAsUser / runAsGroup 65534, RuntimeDefault;
+#   the container drop ALL with no add, no escalation, read-only root,
+#   nothing in its securityContext that runs as root; hostPID (to see
+#   iscsid), no hostIPC / hostNetwork / port; volumes exactly the host's /
+#   (Directory), mounted read-only at /host.
+# tests/ha_admission_vectors.json holds each refused variant.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-ha-probe-pods
+  labels: {app.kubernetes.io/managed-by: portcullis}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  variables:
+    - name: c
+      expression: "object.spec.containers[0]"
+    - name: shape
+      expression: >-
+        size(object.spec.containers) == 1 && !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers)
+        && variables.c.image == string(params.data.image)
+        && variables.c.command == ['sh', '-c', string(params.data.script)] && !has(variables.c.args)
+        && has(variables.c.env) && size(variables.c.env) == 1 && variables.c.env[0].name == 'CHECKS'
+        && has(variables.c.env[0].value) && variables.c.env[0].value.matches('^[a-z_ ]{1,200}$') && !has(variables.c.envFrom)
+        && !has(variables.c.ports)
+    - name: identity
+      expression: >-
+        (!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == 'default')
+        && has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken
+    - name: podSecurity
+      expression: >-
+        has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot
+        && has(object.spec.securityContext.runAsUser) && object.spec.securityContext.runAsUser == 65534
+        && has(object.spec.securityContext.runAsGroup) && object.spec.securityContext.runAsGroup == 65534
+        && (!has(object.spec.securityContext.supplementalGroups) || size(object.spec.securityContext.supplementalGroups) == 0)
+        && has(object.spec.securityContext.seccompProfile) && object.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
+    - name: containerSecurity
+      expression: >-
+        has(variables.c.securityContext)
+        && has(variables.c.securityContext.allowPrivilegeEscalation) && !variables.c.securityContext.allowPrivilegeEscalation
+        && has(variables.c.securityContext.readOnlyRootFilesystem) && variables.c.securityContext.readOnlyRootFilesystem
+        && has(variables.c.securityContext.capabilities) && has(variables.c.securityContext.capabilities.drop)
+        && variables.c.securityContext.capabilities.drop == ['ALL'] && !has(variables.c.securityContext.capabilities.add)
+        && (!has(variables.c.securityContext.privileged) || !variables.c.securityContext.privileged)
+        && (!has(variables.c.securityContext.runAsUser) || variables.c.securityContext.runAsUser == 65534)
+        && (!has(variables.c.securityContext.runAsGroup) || variables.c.securityContext.runAsGroup == 65534)
+        && (!has(variables.c.securityContext.runAsNonRoot) || variables.c.securityContext.runAsNonRoot)
+        && !has(variables.c.securityContext.procMount) && !has(variables.c.securityContext.seLinuxOptions)
+    - name: host
+      expression: >-
+        has(object.spec.hostPID) && object.spec.hostPID
+        && !(has(object.spec.hostIPC) && object.spec.hostIPC) && !(has(object.spec.hostNetwork) && object.spec.hostNetwork)
+        && has(object.spec.volumes) && size(object.spec.volumes) == 1
+        && has(object.spec.volumes[0].hostPath) && object.spec.volumes[0].hostPath.path == '/'
+        && has(variables.c.volumeMounts) && size(variables.c.volumeMounts) == 1
+        && variables.c.volumeMounts[0].name == object.spec.volumes[0].name && variables.c.volumeMounts[0].mountPath == '/host'
+        && has(variables.c.volumeMounts[0].readOnly) && variables.c.volumeMounts[0].readOnly
+        && !has(variables.c.volumeMounts[0].subPath) && !has(variables.c.volumeMounts[0].subPathExpr)
+  validations:
+    - expression: "variables.shape && variables.identity && variables.podSecurity && variables.containerSecurity && variables.host"
+      message: "only the CLI's host probe, in its exact shape, runs in portcullis-ha-probe"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-ha-probe-guard-pods
+  labels: {app.kubernetes.io/managed-by: portcullis}
+spec:
+  policyName: portcullis-ha-probe-pods
+  validationActions: [Deny]
+  paramRef:
+    name: ha-probe-params
+    namespace: portcullis-ha-probe
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-ha-probe

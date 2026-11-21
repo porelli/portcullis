@@ -6385,6 +6385,7 @@ h24() {
     ha_render() { echo \"RENDER \$*\" >> '$WORK/h24-calls'; echo '{}'; }
     _ha_wait() { echo \"WAIT \$2\" >> '$WORK/h24-calls'; }
     _ha_crds_established() { :; }; _ha_fencing_cert() { echo CERT >> '$WORK/h24-calls'; }
+    _ha_probe_setup() { echo PROBESETUP >> '$WORK/h24-calls'; }
     ha_fencing_ready() { echo READY-CHECK >> '$WORK/h24-calls'; }
     _kube_apply_files() { echo \"FILES \$*\" >> '$WORK/h24-calls'; }
     $1" 2>&1
@@ -6395,13 +6396,13 @@ case "$OUT" in *"node m2: open-iscsi is not installed"*"Longhorn needs these on 
 expect_eq "ha_install_longhorn: a failed check → nothing rendered or applied but the namespace's own deny policies" \
   "$(grep -c 'RENDER\|FILES' "$WORK/h24-calls" || true):$(jq -r '.items[].metadata.name' "$WORK/h24-applied" | tr '\n' ' ')" "0:default-deny kube-dns kube-api longhorn-internal "
 expect_eq "ha_install_longhorn: checks the main site's non-small nodes (not the small m3, not edge's e1); the ZFS check on the storage nodes" \
-  "$(grep '^PROBE' "$WORK/h24-calls" | tr '\n' ';')" "PROBE longhorn-system iscsid iscsi_tcp nfs_common multipath_blacklist m1 m2;PROBE longhorn-system longhorn_path m1 m2;"
+  "$(grep '^PROBE ' "$WORK/h24-calls" | tr '\n' ';')" "PROBE portcullis-ha-probe iscsid iscsi_tcp nfs_common multipath_blacklist m1 m2;PROBE portcullis-ha-probe longhorn_path m1 m2;"
 OUT="$(STUB_PROBE_FAIL='m1 longhorn_path:/var/lib/longhorn is on a ZFS dataset: use a zvol or a separate disk' h24 ha_install_longhorn)"
 case "$OUT" in *"node m1: /var/lib/longhorn is on a ZFS dataset"*"rc=1") t_pass "ha_install_longhorn: a ZFS dataset under /var/lib/longhorn → refused (spike S2)" ;; *) t_fail "longhorn zfs: $OUT" ;; esac
 OUT="$(h24 ha_install_longhorn)"
 expect_eq "ha_install_longhorn: namespace (PSA longhorn) → deny policies → node checks → render (API + initiator sources) → apply → waits → StorageClass" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBE longhorn-system;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;"
+  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;"
 expect_eq "ha_install_longhorn: the namespace is longhorn-system with namespaces.json's longhorn levels; applied.json records ha.longhorn" \
   "$(grep '^NS' "$WORK/h24-calls"):$(jq -r 'has("ha.longhorn")' "$WORK/h24root/secrets/kube/applied.json")" "NS longhorn-system privileged:true"
 # Fix round 1: Longhorn's webhook configurations are the CLI's (no create
@@ -6429,18 +6430,19 @@ OUT="$(h24 ha_install_fencing)"
 case "$OUT" in *"the SNR image (ghcr.io/porelli/portcullis-snr:edge@sha256:0000"*"isn't published yet"*"nothing installed"*"rc=1")
   t_pass "ha_install_fencing: the placeholder SNR digest (before snr.yml's first main build) → refused" ;; *) t_fail "fencing placeholder: $OUT" ;; esac
 expect_eq "ha_install_fencing: the placeholder refused before any cluster call" "$(cat "$WORK/h24-calls" 2>/dev/null | wc -l | tr -d ' ')" 0
-OUT="$(kt "PORTCULLIS_HOME='$H24'; PORTCULLIS_DEV_SNR_IMAGE=localhost/x@sha256:'"$(printf '1%.0s' $(seq 64))"'; ha_snr_image; HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/x:tag ha_snr_image; HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/x@sha256:'"$(printf '1%.0s' $(seq 64))"' ha_snr_image" 2>&1)"
+ONES="1111111111111111111111111111111111111111111111111111111111111111"
+OUT="$(kt "PORTCULLIS_HOME='$H24'; PORTCULLIS_DEV_SNR_IMAGE=localhost/x@sha256:$ONES; ha_snr_image; HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/x:tag ha_snr_image; HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/x@sha256:$ONES ha_snr_image" 2>&1)"
 expect_eq "ha_snr_image: a dev SNR image only with HUB_DEV=1, and only name@sha256" \
   "$(printf '%s\n' "$OUT" | grep -c 'is for development only (HUB_DEV=1)\|must be name@sha256'):$(printf '%s\n' "$OUT" | grep -c '^localhost/x@sha256:1')" "2:1"
 OUT="$(STUB_PROBE_FAIL='e1 watchdog:no watchdog device (/dev/watchdog; modprobe softdog provides it)' h24 "HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/portcullis-snr@sha256:1111111111111111111111111111111111111111111111111111111111111111; ha_install_fencing")"
 case "$OUT" in *"node e1 has no watchdog: fencing can't be confirmed (no watchdog device"*"fencing needs a watchdog on every node"*"(nothing installed)"*"rc=1")
   t_pass "ha_install_fencing: refuses a node without /dev/watchdog: 'node <n> has no watchdog: fencing can't be confirmed'" ;; *) t_fail "fencing no watchdog: $OUT" ;; esac
 expect_eq "ha_install_fencing: every node checked (the small one and the edge one too); refused → no certificate, render or config" \
-  "$(grep '^PROBE' "$WORK/h24-calls"):$(grep -c 'CERT\|RENDER\|FILES' "$WORK/h24-calls" || true)" "PROBE portcullis-fencing watchdog m1 m2 m3 e1:0"
+  "$(grep '^PROBE ' "$WORK/h24-calls"):$(grep -c 'CERT\|RENDER\|FILES' "$WORK/h24-calls" || true)" "PROBE portcullis-ha-probe watchdog m1 m2 m3 e1:0"
 OUT="$(h24 "HUB_DEV=1 PORTCULLIS_DEV_SNR_IMAGE=localhost/portcullis-snr@sha256:1111111111111111111111111111111111111111111111111111111111111111; ha_install_fencing")"
 expect_eq "ha_install_fencing: namespace → policies → watchdogs → certificate → render → managers → config.yaml → agents → ha_fencing_ready" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBE portcullis-fencing;CERT;RENDER fencing;K apply;WAIT SNR's manager;FILES config.yaml;WAIT SNR's agents (DaemonSet self-node-remediation-ds);READY-CHECK;"
+  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;CERT;RENDER fencing;K apply;WAIT SNR's manager;FILES config.yaml;WAIT SNR's agents (DaemonSet self-node-remediation-ds);READY-CHECK;"
 expect_eq "ha_install_fencing: portcullis-fencing's policies: deny, DNS, API, SNR's peers on 30001 only between agents" \
   "$(jq -c '[.items[] | .metadata.name] + [.items[] | select(.metadata.name == "snr-peers") | .spec.ingress[0].ports[0].port]' < <(head -c "$(wc -c < "$WORK/h24-applied")" "$WORK/h24-applied" | jq -s '.[0]'))" \
   '["default-deny","kube-dns","kube-api","snr-peers",30001]'
@@ -6452,6 +6454,20 @@ OUT="$(h24 ha_install_certmanager)"
 expect_eq "ha_install_certmanager: cert-manager (restricted) → deny + its webhook :10250 from the API server only → render" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(grep '^NS' "$WORK/h24-calls"):$(jq -sc '.[0].items[] | select(.metadata.name == "webhook") | [[.spec.ingress[0].from[].ipBlock.cidr], .spec.ingress[0].ports[0].port]' "$WORK/h24-applied")" \
   'rc=0:NS cert-manager restricted:[["10.1.0.4/32","10.42.0.0/32","10.42.0.1/32"],10250]'
+# Fix round 1 (security review): the host probes run in their own
+# namespace, after its default-deny, the policy's params (the helper image
+# and the exact script) and the policy itself.
+rm -f "$WORK/ps-calls" "$WORK/ps-in"
+OUT="$(kt "PORTCULLIS_HOME='$H24'; mkdir -p '$H24/kube/ha/probe'; cp '$HERE/../kube/ha/probe/admission.yaml' '$H24/kube/ha/probe/'
+  kube_namespace_apply() { echo \"NS \$*\" >> '$WORK/ps-calls'; }
+  kube_ctl() { echo \"K \$*\" >> '$WORK/ps-calls'; case \"\$*\" in *'create configmap'*) all=\"\$*\"; d=\"\${all##*--from-file=}\"; d=\"\${d%% *}\"; jq -n --rawfile i \"\$d/image\" --rawfile s \"\$d/script\" '{data: {image: \$i, script: \$s}}' ;; *'-f -'*) cat >> '$WORK/ps-in' ;; esac; }
+  _ha_probe_setup; jq -sj '.[1].data.script' '$WORK/ps-in' | cmp -s - <(printf '%s' \"\$HA_PROBE_SH\") && echo SCRIPT-SAME")"
+expect_eq "_ha_probe_setup: portcullis-ha-probe (PSA haprobe) → its default-deny → the params (helper image, the exact probe script) → the probe policy" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*(create configmap ha-probe-params).*/\1 \2/; s/^K .*apply.*-f -$/K apply/; s/^K .*apply.*admission.yaml$/K policy/' "$WORK/ps-calls" | tr '\n' ';')" \
+  "rc=0:NS portcullis-ha-probe privileged privileged baseline;K apply;K create configmap ha-probe-params;K apply;K policy;"
+expect_eq "_ha_probe_setup: the namespace's only policy is default-deny; the params hold the helper image and HA_PROBE_SH exactly" \
+  "$(jq -sc '[.[0].items[].metadata.name]' "$WORK/ps-in"):$(jq -sr '.[1].data.image' "$WORK/ps-in"):$(printf '%s\n' "$OUT" | grep -c '^SCRIPT-SAME$')" \
+  '["default-deny"]:docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a:1'
 # ha_fencing_ready (the jq over SNR's agents → per node ready), fail closed.
 FR_CFG='{"spec":{"watchdogFilePath":"/dev/watchdog","safeTimeToAssumeNodeRebootedSeconds":150}}'
 fr() { kt "_ha_deploy_ready() { [ -z \"\${STUB_MGR_DOWN:-}\" ]; }; kube_ctl() { case \"\$*\" in *'get nodes'*) printf '%s' '{\"items\":[{\"metadata\":{\"name\":\"m1\"}},{\"metadata\":{\"name\":\"m2\"}}]}' ;;
