@@ -313,16 +313,16 @@ def main() -> int:
         check("long_backup: an admin's > 60 s backup through Traefik (202, polled) completes; a concurrent one is 409", long_backup_through_traefik)
 
         def domains_dns_panel():
-            # Settings → Domains: the enrolled domain's DNS panel (contract
-            # §12.3): its CAA rows are ok and the CA would issue.
+            # Settings → Network → Domains: the enrolled domain's DNS panel
+            # (contract §12.3): its CAA rows are ok and the CA would issue.
             # A full load of the Hub page (a goto that only changes the hash
             # is a same-document navigation with no response), then the
-            # Settings tab.
+            # Settings → Network section by its route (#settings/network;
+            # the Settings tab alone opens the section shown last).
             assert goto_ok(page, HUB + "/"), "admin cannot open the Hub"
-            # (showTab: the tab's own handler; a click can wait on the
-            # list's periodic re-render.)
-            page.wait_for_function("typeof showTab === 'function'", timeout=TIMEOUT_MS)
-            page.evaluate("() => showTab('settings')")
+            page.wait_for_function("typeof PortcullisSettingsNav === 'object' && typeof showTab === 'function'", timeout=TIMEOUT_MS)
+            page.evaluate("() => { location.hash = '#settings/network'; }")
+            page.locator('#settings-network:not([hidden])').wait_for(timeout=TIMEOUT_MS)
             btn = page.locator(f'[data-domain-dns="{EXTRA}"]')
             btn.wait_for(timeout=TIMEOUT_MS)
             btn.click()
