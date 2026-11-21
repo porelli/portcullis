@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# CI unit-tests, "Our SNR build" (plan Task 24 fix round 2, review M7): the
+# CI job snr-build, "Our SNR build" (plan Task 24 fix round 2, review M7;
+# its own job since Task 25: it pushed unit-tests past 20 minutes): the
 # patch in kube/ha/fencing/snr-patch applies to the pinned tag, the patched
 # code vets, SNR's own certificates tests pass (envtest), the binary
 # cross-compiles for arm64 (no emulation), and the image builds (amd64, no

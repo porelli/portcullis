@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail e2e-servers e2e-servers-podman"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests snr-build build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail e2e-servers e2e-servers-podman"
         type: string
         default: all
       # `-f scenarios="4 members_only_list"`: only those scenarios of the e2e
@@ -539,14 +539,6 @@ jobs:
           test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
           CGO_ENABLED=0 go build -o /dev/null .
           CGO_ENABLED=1 go test -race ./...
-      # Our SNR (kube/ha/fencing/snr-patch, plan Task 24): the patch applies
-      # to the pinned tag, vets, SNR's certificates tests, arm64
-      # cross-compile, the image builds (no push: snr.yml pushes on main).
-      - name: Our SNR build (no push)
-        timeout-minutes: 20
-        env:
-          SNR_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: bash .github/ci/unit-tests-snr.sh
       - name: mailctl unit tests (config, the Hub API guard, the JMAP envelope, the schema snapshot, spam rules; contract §19)
         working-directory: mailctl
         run: |
@@ -641,6 +633,32 @@ jobs:
             ~/go/pkg/mod
             ~/.cache/go-build
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
+
+  # Our SNR (kube/ha/fencing/snr-patch, plan Task 24): the patch applies to
+  # the pinned tag, vets, SNR's certificates tests, arm64 cross-compile, the
+  # image builds (no push: snr.yml pushes on main). Its own job (Task 25):
+  # the arm64 cross-build pushed unit-tests past its 20 minutes. Skipped
+  # inside the script unless snr-patch/ or the script changed (the patch's
+  # sha256 is checked either way).
+  snr-build:
+    needs: jobs-input
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',snr-build,') || contains(format(' ,{0}, ', inputs.jobs), ',snr-build ') || contains(format(' ,{0}, ', inputs.jobs), ' snr-build,') || contains(format(' ,{0}, ', inputs.jobs), ' snr-build ')
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # No cache: nothing is restored or saved (never from the builder).
+          cache: false
+      - name: Our SNR build (no push)
+        timeout-minutes: 25
+        env:
+          SNR_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash .github/ci/unit-tests-snr.sh
 
   build-and-test:
     needs: jobs-input

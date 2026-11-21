@@ -47,6 +47,8 @@ want no "$M" delete pods -n portcullis
 want no "$M" create selfnoderemediations.self-node-remediation.medik8s.io -A
 want no "$M" create selfnoderemediations.self-node-remediation.medik8s.io -n portcullis-fencing
 want no "$M" delete selfnoderemediations.self-node-remediation.medik8s.io -n portcullis-fencing
+want no "$M" patch selfnoderemediations.self-node-remediation.medik8s.io -n portcullis-fencing
+want yes "$M" update selfnoderemediations.self-node-remediation.medik8s.io -n portcullis-fencing
 want yes "$M" update selfnoderemediations.self-node-remediation.medik8s.io/status -n portcullis-fencing
 D=portcullis-nodeadm:nodeadm
 want yes "$D" create selfnoderemediations.self-node-remediation.medik8s.io -n portcullis-fencing

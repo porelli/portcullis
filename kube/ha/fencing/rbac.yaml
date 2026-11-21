@@ -46,13 +46,16 @@ rules:
   # template/creator.go). The SelfNodeRemediations themselves: never created
   # or deleted by v0.13.0 (only Update for its finalizer and the status;
   # review round 5 M1) — nodeadm alone creates and deletes them, in
-  # portcullis-fencing only.
+  # portcullis-fencing only. No patch either: v0.13.0's only writes on the
+  # object are Update (addFinalizer / removeFinalizer,
+  # selfnoderemediation_controller.go:633, :655); its status writes go
+  # through the status subresource below.
   - apiGroups: [self-node-remediation.medik8s.io]
     resources: [selfnoderemediationconfigs, selfnoderemediationtemplates]
     verbs: [create, delete, get, list, patch, update, watch]
   - apiGroups: [self-node-remediation.medik8s.io]
     resources: [selfnoderemediations]
-    verbs: [get, list, patch, update, watch]
+    verbs: [get, list, update, watch]
   - apiGroups: [self-node-remediation.medik8s.io]
     resources: [selfnoderemediationconfigs/finalizers, selfnoderemediations/finalizers, selfnoderemediationtemplates/finalizers]
     verbs: [update]

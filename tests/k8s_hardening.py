@@ -1448,20 +1448,39 @@ def check_ha_infra():
             if not any(set(r["apiGroups"]) <= set(u["apiGroups"]) and set(r["resources"]) <= set(u["resources"])
                        and (set(r["verbs"]) <= set(u["verbs"]) or "*" in u["verbs"]) for u in up):
                 F.add(f"fencing: {mine}'s rule {r} isn't within the CSV's {theirs}")
-    # Review round 5 M1: only nodeadm creates or deletes SelfNodeRemediations.
-    def snr_manager_cr_writes(docs):
-        return [r for _, r in rules_of(docs, "ClusterRole", {"portcullis-snr"})
+    # Review round 5 M1: only nodeadm creates or deletes SelfNodeRemediations
+    # (its Role in the chart, not in this render). Task 24 re-review 4 nit 2:
+    # every rendered fencing ClusterRole / Role is judged, not only the
+    # manager's.
+    def snr_cr_writes(docs):
+        return [(kind, name, r) for kind in ("ClusterRole", "Role") for name, r in rules_of(docs, kind)
                 if set(r.get("apiGroups", [])) & {"self-node-remediation.medik8s.io", "*"}
                 and set(r["resources"]) & {"selfnoderemediations", "*"} and set(r["verbs"]) & {"create", "delete", "deletecollection", "*"}]
-    for r in snr_manager_cr_writes(fe):
-        F.add(f"fencing: SNR's manager may create / delete SelfNodeRemediations: {r} (nodeadm alone does)")
-    mut_fe = copy.deepcopy(fe)
-    next(d for d in mut_fe if d.get("kind") == "ClusterRole" and d["metadata"]["name"] == "portcullis-snr")["rules"].append(
-        {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["create"]})
-    if not snr_manager_cr_writes(mut_fe):
-        F.add("snr_manager_cr_writes misses a create rule on portcullis-snr (mutation test)")
-    if {d["metadata"]["name"] for d in fe if d.get("kind") == "ClusterRole"} & {"self-node-remediation-controller-manager"}:
-        F.add("fencing: the CSV's wide ClusterRole is still rendered")
+    for kind, name, r in snr_cr_writes(fe):
+        F.add(f"fencing: {kind} {name} may create / delete SelfNodeRemediations: {r} (nodeadm alone does)")
+    for kind, name, extra in (("ClusterRole", "portcullis-snr", {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["create"]}),
+                              ("ClusterRole", "portcullis-snr-agent", {"apiGroups": ["*"], "resources": ["selfnoderemediations"], "verbs": ["delete"]}),
+                              ("Role", "portcullis-snr-agent", {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["*"], "verbs": ["deletecollection"]})):
+        mut_fe = copy.deepcopy(fe)
+        next(d for d in mut_fe if d.get("kind") == kind and d["metadata"]["name"] == name)["rules"].append(extra)
+        if not snr_cr_writes(mut_fe):
+            F.add(f"snr_cr_writes misses {extra} on {kind} {name} (mutation test)")
+    # Nit 1: the manager's verbs on the object are v0.13.0's exactly
+    # (Update for its finalizer; status through the subresource).
+    mgr_snr = [set(r["verbs"]) for _, r in rules_of(fe, "ClusterRole", {"portcullis-snr"}) if r["resources"] == ["selfnoderemediations"]]
+    if mgr_snr != [{"get", "list", "update", "watch"}]:
+        F.add(f"fencing: portcullis-snr's SelfNodeRemediation verbs {mgr_snr} (want get, list, update, watch: v0.13.0 only Updates its finalizer)")
+    # The CSV's wide role and its aggregated ext-remediation role (create /
+    # delete on SNR CRs, aggregated to NHC) stay deleted (kustomization.yaml).
+    # (The CSV's namespaced Role of the manager stays: its leader Lease etc.)
+    gone = {"ClusterRole": {"self-node-remediation-controller-manager", "self-node-remediation-ext-remediation"},
+            "Role": {"self-node-remediation-ext-remediation"}}
+    for kind in ("ClusterRole", "Role", "ClusterRoleBinding", "RoleBinding"):
+        for d in fe:
+            names = gone["Role" if kind in ("Role", "RoleBinding") else "ClusterRole"]
+            if d.get("kind") == kind and (d["metadata"]["name"] in names
+                                          or (kind.endswith("Binding") and d["roleRef"]["name"] in gone[d["roleRef"]["kind"]])):
+                F.add(f"fencing: the CSV's {kind} {d['metadata']['name']} is still rendered")
     # Fix round 1: no Node Healthcheck at all; no Secret in any fencing
     # ClusterRole (our SNR caches one Secret by name in its namespace); the
     # manager's DaemonSet writes by name; our image, the same ref in the
