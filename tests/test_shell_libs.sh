@@ -5652,6 +5652,14 @@ expect_eq "kube_crashing_json: an unreadable pod list → null (status counts it
 printf '%s' '{"items":[{"metadata":{"name":"sessions-1","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
   "status":{"initContainerStatuses":[{"restartCount":3,"lastState":{"terminated":{"message":"portcullis-sessions: the Sentinels disagree on the master (x): refusing to start\n"}},"state":{"waiting":{"reason":"PodInitializing"}}}],
             "containerStatuses":[{"restartCount":0,"state":{"waiting":{"reason":"PodInitializing"}}}]}}]}' > "$WORK/crash-sess.json"
+printf '%s' '{"items":[{"metadata":{"name":"echo-k--web-0","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
+  "status":{"containerStatuses":[{"restartCount":1,"ready":false,"lastState":{"terminated":{"message":"portcullis-sessions: spoofed by an app","finishedAt":"'"$REC"'"}},"state":{"running":{}}}]}}]}' > "$WORK/crash-spoof.json"
+expect_eq "kube_crashing_json: an apps-namespace pod writing the session store's prefix → its message is never the reason (security review)" \
+  "$(kt "kube_ctl() { case \"\$*\" in *'-n portcullis get pods -o json'*) echo '{\"items\":[]}' ;; *'-n portcullis-apps get pods -o json'*) cat '$WORK/crash-spoof.json' ;; esac; }; kube_crashing_json" | head -n1 | jq -c '[.[] | .reason]')" '["restarted"]'
+printf '%s' '{"items":[{"metadata":{"name":"sessions-1","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
+  "status":{"initContainerStatuses":[{"restartCount":2,"lastState":{"terminated":{"message":"portcullis-sessions: line one\u001b[31m\nline two '"$(printf 'x%.0s' $(seq 1 300))"'"}},"state":{"waiting":{"reason":"PodInitializing"}}}]}}]}' > "$WORK/crash-long.json"
+expect_eq "kube_crashing_json: the named error stripped of control characters and capped at 200 characters" \
+  "$(cj "cat '$WORK/crash-long.json'" | head -n1 | jq -r '.[] | select(.namespace == "portcullis") | .reason' | awk '{ print length($0) ":" (index($0, "\033") == 0) }')" "200:1"
 expect_eq "kube_crashing_json: a StatefulSet's pod with the session store's named error → that error is the reason (review M-b)" \
   "$(cj "cat '$WORK/crash-sess.json'" | head -n1 | jq -c '[.[] | select(.namespace == "portcullis") | [.deployment, .reason]]')" \
   '[["sessions","portcullis-sessions: the Sentinels disagree on the master (x): refusing to start"]]'

@@ -780,7 +780,7 @@ kube_crashing_json() {
   for ns in "$(kube_ns)" "$(kube_apps_ns)"; do
     pods="$(kube_ctl -n "$ns" get pods -o json 2>/dev/null)" \
       && printf '%s' "$pods" | jq -e '.items | type == "array"' >/dev/null 2>&1 || { echo null; return 0; }
-    all="$(NS="$ns" NOW="$now" jq -c --argjson acc "$all" '
+    all="$(NS="$ns" CORE="$(kube_ns)" NOW="$now" jq -c --argjson acc "$all" '
       $acc + [.items[] | select(.metadata.deletionTimestamp == null)
         | (.metadata.ownerReferences // [] | map(select(.kind == "ReplicaSet" or .kind == "StatefulSet")) | .[0]) as $own
         | select($own != null)
@@ -792,7 +792,9 @@ kube_crashing_json() {
         | ([$cs[] | select((.restartCount // 0) > 0 and .ready != true)
              | .lastState.terminated.finishedAt // empty | (try fromdateiso8601 catch 0)
              | select(. > ((env.NOW | tonumber) - 600))] | length > 0) as $recent
-        | ([$cs[] | .state.terminated.message, .lastState.terminated.message | strings | select(startswith("portcullis-sessions:")) | rtrimstr("\n")] | first) as $named
+        | (if env.NS == env.CORE and $own.kind == "StatefulSet" and ($own.name == "sessions" or $own.name == "sessions-sentinel")
+           then [$cs[] | .state.terminated.message, .lastState.terminated.message | strings | select(startswith("portcullis-sessions:"))
+                 | gsub("[\u0000-\u001f\u007f]"; " ") | rtrimstr(" ") | .[0:200]] | first else null end) as $named
         | select($wait != null or $recent or $named != null)
         | {namespace: env.NS, deployment: $dep, pod: $pod, reason: ($named // $wait // "restarted"),
            restarts: ([$cs[] | .restartCount // 0] | add // 0)}]' <<< "$pods" 2>/dev/null)" || { echo null; return 0; }

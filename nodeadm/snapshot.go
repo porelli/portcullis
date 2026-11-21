@@ -148,7 +148,7 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 			continue
 		}
 		snap.Pods = append(snap.Pods, snapPod(p, mins))
-		if p.Namespace == s.cfg.CoreNS {
+		if p.Namespace == s.cfg.CoreNS && (ownedBy(p, "StatefulSet", "sessions") || ownedBy(p, "StatefulSet", sentinelSet)) {
 			if msg := sessionsError(p); msg != "" {
 				snap.Errors = append(snap.Errors, fmt.Sprintf("pod %s: %s", p.Name, msg))
 			}
@@ -403,9 +403,14 @@ func sessionsError(p *corev1.Pod) string {
 	for _, cs := range all {
 		for _, t := range []*corev1.ContainerStateTerminated{cs.State.Terminated, cs.LastTerminationState.Terminated} {
 			if t != nil && strings.HasPrefix(t.Message, prefix) {
-				m := strings.TrimSpace(strings.TrimPrefix(t.Message, prefix))
-				if len(m) > 400 {
-					m = m[:400]
+				m := strings.Map(func(r rune) rune {
+					if r < 0x20 || r == 0x7f {
+						return ' '
+					}
+					return r
+				}, strings.TrimSpace(strings.TrimPrefix(t.Message, prefix)))
+				if len(m) > 200 {
+					m = m[:200]
 				}
 				return "the session store: " + m
 			}

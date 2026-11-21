@@ -1061,13 +1061,17 @@ func TestSessionsNamedErrorInSnapshot(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	for _, p := range []*corev1.Pod{
-		{ObjectMeta: metav1.ObjectMeta{Name: "sessions-1", Namespace: coreNS}, Spec: corev1.PodSpec{NodeName: "n1"},
+		{ObjectMeta: metav1.ObjectMeta{Name: "sessions-1", Namespace: coreNS, OwnerReferences: []metav1.OwnerReference{{Kind: "StatefulSet", Name: "sessions"}}}, Spec: corev1.PodSpec{NodeName: "n1"},
 			Status: corev1.PodStatus{Phase: corev1.PodPending, InitContainerStatuses: []corev1.ContainerStatus{{Name: "guard",
 				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1,
 					Message: "portcullis-sessions: the Sentinels disagree on the master (x): refusing to start\n"}}}}}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: coreNS}, Spec: corev1.PodSpec{NodeName: "n1"},
 			Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "x",
 				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: "something else"}}}}}},
+		// Not the session store's: the prefix alone is never trusted (security review).
+		{ObjectMeta: metav1.ObjectMeta{Name: "spoof", Namespace: coreNS}, Spec: corev1.PodSpec{NodeName: "n1"},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "x",
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: "portcullis-sessions: spoofed"}}}}}},
 	} {
 		if _, err := h.kube.CoreV1().Pods(coreNS).Create(ctx, p, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
@@ -1076,7 +1080,7 @@ func TestSessionsNamedErrorInSnapshot(t *testing.T) {
 	snap, _ := h.s.snapshot(ctx)
 	var got []string
 	for _, e := range snap.Errors {
-		if strings.Contains(e, "session store") || strings.Contains(e, "something else") {
+		if strings.Contains(e, "session store") || strings.Contains(e, "something else") || strings.Contains(e, "spoofed") {
 			got = append(got, e)
 		}
 	}
