@@ -628,9 +628,14 @@ expect_eq "worker leave (agent unreachable): every listed app down, then the age
 
 # Ruling P30: --privileged only in the CI's docker:dind worker (and the
 # local runner containers, e2e-k3s-local, run-job and the builder's runner-loop), each on its line marked
-# "# reviewed exception"; never privileged: true in a compose file.
+# "# reviewed exception"; never privileged: true in a compose file. HA
+# (plan Task 24): SNR's agent template (its privileged line marked
+# reviewed exception; portcullis-fencing-pods admits only that pod) and its
+# vendored, sha256-pinned upstream copy (unedited) are the two others.
 expect_eq "--privileged only in .github/ci/e2e-servers-worker.sh (and the local runner containers), next to # reviewed exception; no privileged: true anywhere" \
-  "$(git -C "$ROOT_DIR_SOCK" grep -n -e '--privileged' -e 'privileged: *true' -- . ':!tests/test_cli.sh' ':!*.md' | grep -vE '^\.github/ci/(e2e-servers-worker|e2e-k3s-local|local/run-job|local/runner/runner-loop)\.sh:[0-9]+:.*--privileged.*# reviewed exception$' || true)" ""
+  "$(git -C "$ROOT_DIR_SOCK" grep -n -e '--privileged' -e 'privileged: *true' -- . ':!tests/test_cli.sh' ':!*.md' | grep -vE '^\.github/ci/(e2e-servers-worker|e2e-k3s-local|local/run-job|local/runner/runner-loop)\.sh:[0-9]+:.*--privileged.*# reviewed exception$' \
+     | grep -vE '^kube/ha/fencing/agent-daemonset\.yaml\.tmpl:[0-9]+: +privileged: true  # reviewed exception: SNR resets the node; portcullis-fencing-pods pins this pod$' \
+     | grep -vE '^kube/ha/fencing/upstream/self-node-remediation-deamonset\.yaml\.tmpl:[0-9]+: +privileged: true$' || true)" ""
 expect_eq "the dind worker's privileged run is there (the exception the lint above allows)" \
   "$(grep -c -- '--privileged.*# reviewed exception$' "$ROOT_DIR_SOCK/.github/ci/e2e-servers-worker.sh")" 1
 expect_eq "worker join: an install under /root (the agent can't traverse it) → refused" \

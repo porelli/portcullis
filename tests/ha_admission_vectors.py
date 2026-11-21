@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """The HA pod admission vectors (plan Task 24 fix round 1, security
-review): portcullis-fencing-pods (kube/ha/fencing/admission.yaml) and
-portcullis-ha-probe-pods (kube/ha/probe/admission.yaml). The bases are the
+review): portcullis-fencing-pods (kube/ha/fencing/admission.yaml),
+portcullis-ha-probe-pods (kube/ha/probe/admission.yaml) and, from round 3,
+portcullis-node-labels' storm-guard rules (kube/admission/policies.yaml:
+node identities and SNR's manager on a Node). The pod bases are the
 real shapes — SNR's manager from ha_render fencing, its agent from
 kube/ha/fencing/agent-daemonset.yaml.tmpl, the host probe from ha.sh
 _ha_probe_pod_json — and every refused variant the reviews named is one
@@ -189,6 +191,13 @@ def vectors():
         ("manager: another preStop hook", lambda s: c0(s)["lifecycle"]["preStop"]["exec"].__setitem__("command", ["/bin/sh", "-c", "id"])),
         ("manager: an exec liveness probe", lambda s: c0(s).__setitem__("livenessProbe", {"exec": {"command": ["/bin/sh", "-c", "id"]}})),
         ("manager: an exec startup probe", lambda s: c0(s).__setitem__("startupProbe", {"exec": {"command": ["/bin/sh", "-c", "id"]}})),
+        # Round 3 M2: every httpGet probe exactly the CSV's.
+        ("manager: a liveness probe host", lambda s: c0(s)["livenessProbe"]["httpGet"].__setitem__("host", "169.254.169.254")),
+        ("manager: readiness probe httpHeaders", lambda s: c0(s)["readinessProbe"]["httpGet"].__setitem__("httpHeaders", [{"name": "Authorization", "value": "x"}])),
+        ("manager: another startup probe path", lambda s: c0(s)["startupProbe"]["httpGet"].__setitem__("path", "/metrics")),
+        ("manager: another liveness probe port", lambda s: c0(s)["livenessProbe"]["httpGet"].__setitem__("port", 8443)),
+        ("manager: readiness probe scheme HTTPS", lambda s: c0(s)["readinessProbe"]["httpGet"].__setitem__("scheme", "HTTPS")),
+        ("manager: a tcpSocket readiness probe", lambda s: c0(s).__setitem__("readinessProbe", {"tcpSocket": {"port": 8081}})),
         ("manager: envFrom", lambda s: c0(s).__setitem__("envFrom", [{"configMapRef": {"name": "x"}}])),
         ("manager: a workingDir", lambda s: c0(s).__setitem__("workingDir", "/tmp")),
         ("manager: tty", lambda s: c0(s).__setitem__("tty", True)),
@@ -248,6 +257,34 @@ def vectors():
         out.append({"policy": pol, "name": f"{pol}: an ephemeral container added", "allowed": False, "ephemeral": True, "pod": e,
                     "ephemeralContainers": [{"name": "debug", "image": "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
                                              "command": ["sh"]}]})
+    # portcullis-node-labels (round 3 I1): the storm guard's inputs. A
+    # "node" vector is a merge patch of the cluster's first Node (@NODE@)
+    # as a node identity or SNR's manager (impersonated, server dry-run);
+    # "taints_add" appends to the Node's live taints.
+    NL = "portcullis-node-labels"
+    node_id = {"user": "system:node:@NODE@", "groups": ["system:nodes", "system:authenticated"]}
+    manager_id = {"user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager",
+                  "groups": ["system:serviceaccounts", "system:serviceaccounts:portcullis-fencing", "system:authenticated"]}
+    exclude = {"metadata": {"labels": {"remediation.medik8s.io/exclude-from-remediation": "true"}}}
+    nodeadm_ann = {"metadata": {"annotations": {"nodeadm.portcullis/remediated-at": "2999-01-01T00:00:00Z"}}}
+    cordon = {"spec": {"unschedulable": True}}
+    harmless = {"metadata": {"annotations": {"example.org/vector": "1"}}}
+    remediation_taint = {"key": "medik8s.io/remediation", "value": "self-node-remediation", "effect": "NoExecute"}
+    for who, ident, cases in (
+        ("a node", node_id, [("labels itself excluded from remediation", exclude, False),
+                             ("adds a nodeadm.portcullis/ annotation", nodeadm_ann, False),
+                             ("cordons itself", cordon, False),
+                             ("adds a harmless annotation", harmless, True)]),
+        ("SNR's manager", manager_id, [("labels a node excluded from remediation", exclude, False),
+                                       ("adds a nodeadm.portcullis/ annotation", nodeadm_ann, False),
+                                       ("cordons a node", cordon, False),
+                                       ("adds a harmless annotation", harmless, False)])):
+        for what, patch, ok in cases:
+            out.append({"policy": NL, "name": f"{who} {what}", "allowed": ok, "node": True, "as": ident, "patch": patch})
+    out.append({"policy": NL, "name": "SNR's manager adds its remediation taint", "allowed": True, "node": True, "as": manager_id,
+                "taints_add": [remediation_taint]})
+    out.append({"policy": NL, "name": "SNR's manager adds the out-of-service taint", "allowed": True, "node": True, "as": manager_id,
+                "taints_add": [{"key": "node.kubernetes.io/out-of-service", "value": "nodeshutdown", "effect": "NoExecute"}]})
     return out
 
 

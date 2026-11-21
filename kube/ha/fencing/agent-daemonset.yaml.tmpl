@@ -1,7 +1,8 @@
 # SNR's agent DaemonSet template (Go text/template, rendered by the SNR
 # manager from /install): upstream/self-node-remediation-deamonset.yaml.tmpl
 # (install/ at the v0.13.0 tag, the file the image ships; sha256 pinned)
-# with three changes only (tests/k8s_hardening.py check_ha_infra): its own
+# with three changes only (tests/k8s_hardening.py check_ha_infra; the
+# privileged line's reviewed-exception comment aside): its own
 # ServiceAccount self-node-remediation-agent (never the manager's), our
 # PriorityClass (ruling I5) and IfNotPresent (the image is pinned by
 # digest). Mounted over the image's file by managers.yaml (ConfigMap
@@ -88,7 +89,7 @@ spec:
           - name: devices
             mountPath: /dev
         securityContext:
-          privileged: true
+          privileged: true  # reviewed exception: SNR resets the node; portcullis-fencing-pods pins this pod
         name: manager
         ports:
         - containerPort: {{.HostPort}}

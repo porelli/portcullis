@@ -21,7 +21,8 @@
 # workingDir / stdin / tty / volumeDevices, env names and values exactly the
 # rendered ones (the agent's from config.yaml + SNR's defaults), the agent
 # with no lifecycle hook or probe, the manager with exactly the CSV's hooks
-# (/bin/true, sleep 5) and httpGet probes only, RuntimeDefault seccomp for
+# (/bin/true, sleep 5) and exactly the CSV's httpGet probes (/healthz,
+# /readyz on 8081; no host, no headers, HTTP: round 3 M2), RuntimeDefault seccomp for
 # the manager, projected volumes only of the token / kube-root-ca.crt /
 # downwardAPI. Static (no params): ha_render
 # fencing applies it with the namespace; a dev / e2e SNR image (HUB_DEV=1 +
@@ -124,9 +125,15 @@ spec:
         && variables.c.lifecycle.postStart.exec.command == ['/bin/true'] && !has(variables.c.lifecycle.postStart.httpGet)
         && has(variables.c.lifecycle.preStop) && has(variables.c.lifecycle.preStop.exec)
         && variables.c.lifecycle.preStop.exec.command == ['sleep', '5'] && !has(variables.c.lifecycle.preStop.httpGet)
-        && (!has(variables.c.livenessProbe) || (has(variables.c.livenessProbe.httpGet) && !has(variables.c.livenessProbe.exec) && !has(variables.c.livenessProbe.tcpSocket) && !has(variables.c.livenessProbe.grpc)))
-        && (!has(variables.c.readinessProbe) || (has(variables.c.readinessProbe.httpGet) && !has(variables.c.readinessProbe.exec) && !has(variables.c.readinessProbe.tcpSocket) && !has(variables.c.readinessProbe.grpc)))
-        && (!has(variables.c.startupProbe) || (has(variables.c.startupProbe.httpGet) && !has(variables.c.startupProbe.exec) && !has(variables.c.startupProbe.tcpSocket) && !has(variables.c.startupProbe.grpc)))
+        && has(variables.c.livenessProbe) && has(variables.c.livenessProbe.httpGet) && !has(variables.c.livenessProbe.exec) && !has(variables.c.livenessProbe.tcpSocket) && !has(variables.c.livenessProbe.grpc)
+        && variables.c.livenessProbe.httpGet.path == '/healthz' && string(variables.c.livenessProbe.httpGet.port) == '8081' && !has(variables.c.livenessProbe.httpGet.host)
+        && !has(variables.c.livenessProbe.httpGet.httpHeaders) && (!has(variables.c.livenessProbe.httpGet.scheme) || variables.c.livenessProbe.httpGet.scheme == 'HTTP')
+        && has(variables.c.readinessProbe) && has(variables.c.readinessProbe.httpGet) && !has(variables.c.readinessProbe.exec) && !has(variables.c.readinessProbe.tcpSocket) && !has(variables.c.readinessProbe.grpc)
+        && variables.c.readinessProbe.httpGet.path == '/readyz' && string(variables.c.readinessProbe.httpGet.port) == '8081' && !has(variables.c.readinessProbe.httpGet.host)
+        && !has(variables.c.readinessProbe.httpGet.httpHeaders) && (!has(variables.c.readinessProbe.httpGet.scheme) || variables.c.readinessProbe.httpGet.scheme == 'HTTP')
+        && has(variables.c.startupProbe) && has(variables.c.startupProbe.httpGet) && !has(variables.c.startupProbe.exec) && !has(variables.c.startupProbe.tcpSocket) && !has(variables.c.startupProbe.grpc)
+        && variables.c.startupProbe.httpGet.path == '/healthz' && string(variables.c.startupProbe.httpGet.port) == '8081' && !has(variables.c.startupProbe.httpGet.host)
+        && !has(variables.c.startupProbe.httpGet.httpHeaders) && (!has(variables.c.startupProbe.httpGet.scheme) || variables.c.startupProbe.httpGet.scheme == 'HTTP')
     - name: manager
       expression: >-
         variables.sub == '' && variables.sa == 'self-node-remediation-controller-manager' && variables.one && variables.plain
@@ -151,6 +158,11 @@ spec:
         && !variables.hostPID && !variables.hostNS && size(variables.hostPorts) == 0
         && variables.vols.all(v, has(v.secret) || has(v.configMap) || has(v.projected))
   validations:
+    # The in-force check (round 3 nit): the CLI substitutes this file's own
+    # generation (_ha_policy_text) and probes with a pod annotated with it,
+    # so an older copy of this policy never passes for the one applied.
+    - expression: "!has(object.metadata.annotations) || !('portcullis.io/policy-check' in object.metadata.annotations) || object.metadata.annotations['portcullis.io/policy-check'] != '@POLICY_GENERATION@'"
+      message: "portcullis-fencing-pods generation @POLICY_GENERATION@ is in force"
     - expression: "variables.sub != 'ephemeralcontainers'"
       message: "no ephemeral container in portcullis-fencing"
     - expression: "variables.agent || variables.manager"

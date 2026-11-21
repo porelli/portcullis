@@ -1484,7 +1484,7 @@ def check_ha_infra():
     # never writes a Secret, never creates or deletes a Node; the managers
     # run only on the primary site's non-small nodes.
     up_t = (fdir / "upstream/self-node-remediation-deamonset.yaml.tmpl").read_text().splitlines()
-    my_t = [l for l in (fdir / "agent-daemonset.yaml.tmpl").read_text().splitlines() if not l.startswith("#")]
+    my_t = [re.sub(r"  # reviewed exception: .*$", "", l) for l in (fdir / "agent-daemonset.yaml.tmpl").read_text().splitlines() if not l.startswith("#")]
     diff = [(a, b) for a, b in zip(up_t, my_t) if a != b]
     if len(up_t) != len(my_t) or diff != [("      serviceAccountName: self-node-remediation-controller-manager", "      serviceAccountName: self-node-remediation-agent"),
                                           ("      priorityClassName: system-node-critical", "      priorityClassName: portcullis-core"),
@@ -1536,6 +1536,39 @@ def check_ha_infra():
             vs = [v for v in vecs if v["policy"] == pol]
             if sum(v["allowed"] for v in vs) < 1 or sum(not v["allowed"] for v in vs) < 20 or not any(v.get("ephemeral") for v in vs):
                 F.add(f"ha_admission_vectors: {pol} needs its admitted base(s) and the refused variants")
+        # Round 3 I1: the storm guard's admission vectors (node identities, SNR's manager).
+        nl = [v for v in vecs if v["policy"] == "portcullis-node-labels"]
+        if not any(v["allowed"] and v["as"]["user"].startswith("system:node:") for v in nl) \
+                or sum(not v["allowed"] for v in nl) < 7 or not any(v["allowed"] and v.get("taints_add") for v in nl):
+            F.add("ha_admission_vectors: portcullis-node-labels needs a node's and the manager's refused / admitted vectors")
+    # Round 3 I1: portcullis-node-labels guards the storm guard's inputs.
+    nlp = next((d for d in yaml.safe_load_all((K.ROOT / "kube/admission/policies.yaml").read_text())
+                if d and d.get("kind") == "ValidatingAdmissionPolicy" and d["metadata"]["name"] == "portcullis-node-labels"), None)
+    if not nlp:
+        F.add("policies.yaml: portcullis-node-labels missing")
+    else:
+        nv = {v["name"]: v["expression"] for v in nlp["spec"]["variables"]}
+        nexpr = "\n".join(v["expression"] for v in nlp["spec"]["validations"])
+        if "'remediation.medik8s.io/'" not in nv.get("placed", "") or "'nodeadm.portcullis/'" not in nv.get("annPrefixes", "") \
+                or "variables.newUnsched == variables.oldUnsched" not in nexpr \
+                or "self-node-remediation-controller-manager'" not in nexpr \
+                or "variables.newLabels == variables.oldLabels && variables.newAnn == variables.oldAnn" not in nexpr \
+                or "system:serviceaccount:portcullis-fencing:" not in nlp["spec"]["matchConditions"][0]["expression"]:
+            F.add("policies.yaml portcullis-node-labels: remediation.medik8s.io/ labels, nodeadm.portcullis/ annotations, cordons and the manager's taint-only rule")
+    # Round 3 M2 + nit: the manager's probes pinned exactly; each pod policy refuses its own generation first.
+    fa = (K.ROOT / "kube/ha/fencing/admission.yaml").read_text()
+    for probe, path in (("livenessProbe", "/healthz"), ("readinessProbe", "/readyz"), ("startupProbe", "/healthz")):
+        b = f"variables.c.{probe}"
+        for want in (f"{b}.httpGet.path == '{path}'", f"string({b}.httpGet.port) == '8081'", f"!has({b}.httpGet.host)",
+                     f"!has({b}.httpGet.httpHeaders)", f"(!has({b}.httpGet.scheme) || {b}.httpGet.scheme == 'HTTP')",
+                     f"!has({b}.exec)", f"!has({b}.tcpSocket)", f"!has({b}.grpc)"):
+            if want not in fa:
+                F.add(f"fencing admission.yaml: the manager's {probe} isn't pinned ({want})")
+    for f, pol in (("kube/ha/fencing/admission.yaml", "portcullis-fencing-pods"), ("kube/ha/probe/admission.yaml", "portcullis-ha-probe-pods")):
+        d = next(x for x in yaml.safe_load_all((K.ROOT / f).read_text()) if x and x["kind"] == "ValidatingAdmissionPolicy")
+        v0 = d["spec"]["validations"][0]
+        if "'@POLICY_GENERATION@'" not in v0["expression"] or v0.get("message") != f"{pol} generation @POLICY_GENERATION@ is in force":
+            F.add(f"{f}: the first validation must refuse the in-force check of its own generation")
     probe_pol = [d for d in yaml.safe_load_all((K.ROOT / "kube/ha/probe/admission.yaml").read_text()) if d]
     pb = next((d for d in probe_pol if d["kind"] == "ValidatingAdmissionPolicyBinding"), None)
     if not pb or pb["spec"]["paramRef"] != {"name": "ha-probe-params", "namespace": "portcullis-ha-probe", "parameterNotFoundAction": "Deny"} \

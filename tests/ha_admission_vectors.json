@@ -5487,7 +5487,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -5712,7 +5712,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -5937,7 +5937,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -6161,7 +6161,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -6388,7 +6388,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -6608,7 +6608,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -6832,7 +6832,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -7057,7 +7057,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -7281,7 +7281,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -7506,7 +7506,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -7731,7 +7731,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -7956,7 +7956,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -8180,7 +8180,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -8414,7 +8414,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -8640,7 +8640,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -8865,7 +8865,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -9159,7 +9159,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -9455,7 +9455,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -9679,7 +9679,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -9905,7 +9905,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -10130,7 +10130,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -10356,7 +10356,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -10581,7 +10581,1356 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: a liveness probe host",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-a-liveness-probe-host",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "host": "169.254.169.254",
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-fdb97mfc4g"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: readiness probe httpHeaders",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-readiness-probe-httpheaders",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "httpHeaders": [
+         {
+          "name": "Authorization",
+          "value": "x"
+         }
+        ],
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-fdb97mfc4g"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: another startup probe path",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-another-startup-probe-path",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/metrics",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-fdb97mfc4g"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: another liveness probe port",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-another-liveness-probe-port",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8443
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-fdb97mfc4g"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: readiness probe scheme HTTPS",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-readiness-probe-scheme-https",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/readyz",
+        "port": 8081,
+        "scheme": "HTTPS"
+       },
+       "initialDelaySeconds": 5,
+       "periodSeconds": 10
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-fdb97mfc4g"
+      },
+      "name": "install"
+     },
+     {
+      "name": "kube-api-access",
+      "projected": {
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "path": "token"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-fencing-pods"
+ },
+ {
+  "allowed": false,
+  "name": "manager: a tcpSocket readiness probe",
+  "pod": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "v-manager-a-tcpsocket-readiness-probe",
+    "namespace": "portcullis-fencing"
+   },
+   "spec": {
+    "affinity": {
+     "nodeAffinity": {
+      "requiredDuringSchedulingIgnoredDuringExecution": {
+       "nodeSelectorTerms": [
+        {
+         "matchExpressions": [
+          {
+           "key": "portcullis.io/site",
+           "operator": "In",
+           "values": [
+            "main"
+           ]
+          },
+          {
+           "key": "portcullis.io/class",
+           "operator": "NotIn",
+           "values": [
+            "small"
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    "containers": [
+     {
+      "args": [
+       "--health-probe-bind-address=:8081",
+       "--metrics-bind-address=:8443",
+       "--leader-elect",
+       "--is-manager",
+       "--enable-http2=false"
+      ],
+      "command": [
+       "/manager"
+      ],
+      "env": [
+       {
+        "name": "SELF_NODE_REMEDIATION_IMAGE",
+        "value": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+       },
+       {
+        "name": "MY_NODE_NAME",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "spec.nodeName"
+         }
+        }
+       },
+       {
+        "name": "DEPLOYMENT_NAMESPACE",
+        "valueFrom": {
+         "fieldRef": {
+          "fieldPath": "metadata.namespace"
+         }
+        }
+       }
+      ],
+      "image": "ghcr.io/porelli/portcullis-snr:edge@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "lifecycle": {
+       "postStart": {
+        "exec": {
+         "command": [
+          "/bin/true"
+         ]
+        }
+       },
+       "preStop": {
+        "exec": {
+         "command": [
+          "sleep",
+          "5"
+         ]
+        }
+       }
+      },
+      "livenessProbe": {
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 20
+      },
+      "name": "manager",
+      "ports": [
+       {
+        "containerPort": 9443,
+        "name": "webhook-server",
+        "protocol": "TCP"
+       },
+       {
+        "containerPort": 8443,
+        "name": "https",
+        "protocol": "TCP"
+       }
+      ],
+      "readinessProbe": {
+       "tcpSocket": {
+        "port": 8081
+       }
+      },
+      "resources": {
+       "requests": {
+        "cpu": "20m",
+        "memory": "110Mi"
+       }
+      },
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+       "failureThreshold": 12,
+       "httpGet": {
+        "path": "/healthz",
+        "port": 8081
+       },
+       "periodSeconds": 5
+      },
+      "terminationMessagePolicy": "FallbackToLogsOnError",
+      "volumeMounts": [
+       {
+        "mountPath": "/apiserver.local.config/certificates",
+        "name": "webhook-cert",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/install/self-node-remediation-deamonset.yaml",
+        "name": "install",
+        "readOnly": true,
+        "subPath": "self-node-remediation-deamonset.yaml"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "priorityClassName": "portcullis-core",
+    "securityContext": {
+     "runAsNonRoot": true,
+     "runAsUser": 65532,
+     "seccompProfile": {
+      "type": "RuntimeDefault"
+     }
+    },
+    "serviceAccountName": "self-node-remediation-controller-manager",
+    "terminationGracePeriodSeconds": 15,
+    "topologySpreadConstraints": [
+     {
+      "labelSelector": {
+       "matchLabels": {
+        "control-plane": "controller-manager",
+        "self-node-remediation-operator": ""
+       }
+      },
+      "maxSkew": 1,
+      "topologyKey": "kubernetes.io/hostname",
+      "whenUnsatisfiable": "DoNotSchedule"
+     }
+    ],
+    "volumes": [
+     {
+      "name": "webhook-cert",
+      "secret": {
+       "items": [
+        {
+         "key": "tls.crt",
+         "path": "apiserver.crt"
+        },
+        {
+         "key": "tls.key",
+         "path": "apiserver.key"
+        }
+       ],
+       "secretName": "fencing-webhook-cert"
+      }
+     },
+     {
+      "configMap": {
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -10812,7 +12161,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -11037,7 +12386,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -11262,7 +12611,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -11490,7 +12839,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -11714,7 +13063,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -11938,7 +13287,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -12165,7 +13514,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -12392,7 +13741,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -12616,7 +13965,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -16259,7 +17608,7 @@
      },
      {
       "configMap": {
-       "name": "snr-install-bkkm275dff"
+       "name": "snr-install-fdb97mfc4g"
       },
       "name": "install"
      },
@@ -16377,5 +17726,207 @@
    }
   },
   "policy": "portcullis-ha-probe-pods"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:@NODE@"
+  },
+  "name": "a node labels itself excluded from remediation",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "labels": {
+     "remediation.medik8s.io/exclude-from-remediation": "true"
+    }
+   }
+  },
+  "policy": "portcullis-node-labels"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:@NODE@"
+  },
+  "name": "a node adds a nodeadm.portcullis/ annotation",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "annotations": {
+     "nodeadm.portcullis/remediated-at": "2999-01-01T00:00:00Z"
+    }
+   }
+  },
+  "policy": "portcullis-node-labels"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:@NODE@"
+  },
+  "name": "a node cordons itself",
+  "node": true,
+  "patch": {
+   "spec": {
+    "unschedulable": true
+   }
+  },
+  "policy": "portcullis-node-labels"
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:@NODE@"
+  },
+  "name": "a node adds a harmless annotation",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "annotations": {
+     "example.org/vector": "1"
+    }
+   }
+  },
+  "policy": "portcullis-node-labels"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager labels a node excluded from remediation",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "labels": {
+     "remediation.medik8s.io/exclude-from-remediation": "true"
+    }
+   }
+  },
+  "policy": "portcullis-node-labels"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds a nodeadm.portcullis/ annotation",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "annotations": {
+     "nodeadm.portcullis/remediated-at": "2999-01-01T00:00:00Z"
+    }
+   }
+  },
+  "policy": "portcullis-node-labels"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager cordons a node",
+  "node": true,
+  "patch": {
+   "spec": {
+    "unschedulable": true
+   }
+  },
+  "policy": "portcullis-node-labels"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds a harmless annotation",
+  "node": true,
+  "patch": {
+   "metadata": {
+    "annotations": {
+     "example.org/vector": "1"
+    }
+   }
+  },
+  "policy": "portcullis-node-labels"
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds its remediation taint",
+  "node": true,
+  "policy": "portcullis-node-labels",
+  "taints_add": [
+   {
+    "effect": "NoExecute",
+    "key": "medik8s.io/remediation",
+    "value": "self-node-remediation"
+   }
+  ]
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis-fencing",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager"
+  },
+  "name": "SNR's manager adds the out-of-service taint",
+  "node": true,
+  "policy": "portcullis-node-labels",
+  "taints_add": [
+   {
+    "effect": "NoExecute",
+    "key": "node.kubernetes.io/out-of-service",
+    "value": "nodeshutdown"
+   }
+  ]
  }
 ]

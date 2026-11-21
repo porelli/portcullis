@@ -7,7 +7,9 @@
 # tests/ha_admission_vectors.json: an allowed one must be admitted, a
 # refused one refused BY ITS POLICY (the message names it); an
 # "ephemeral" vector adds an ephemeral container to its (admitted, real)
-# pod through pods/ephemeralcontainers. Run by
+# pod through pods/ephemeralcontainers; a "node" vector patches the first
+# Node as a node identity or SNR's manager under portcullis-node-labels
+# (round 3 I1: the storm guard's inputs). Run by
 # e2e-ha-vm (Task 33) after the HA installs; locally against k3d / k3s.
 # With HUB_DEV=1 + PORTCULLIS_DEV_SNR_IMAGE the vectors' SNR image is that
 # one (as ha_render's).
@@ -24,15 +26,35 @@ for ns in portcullis-fencing portcullis-ha-probe; do
   kubectl --context "$ctx" -n "$ns" create serviceaccount vector-sa --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
 done
 lib 'ha_render fencing' | python3 -c 'import sys, yaml, json
-print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in yaml.safe_load_all(sys.stdin) if d and (d["kind"].startswith("ValidatingAdmissionPolicy") or d["kind"] == "ServiceAccount")]}))' \
+keep = ("ServiceAccount", "ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding")
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in yaml.safe_load_all(sys.stdin) if d and (d["kind"].startswith("ValidatingAdmissionPolicy") or d["kind"] in keep)]}))' \
   | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
+# portcullis-node-labels (round 3 I1) with its binding and a params
+# ConfigMap of a test generation; SNR's RBAC above lets the manager patch.
+kubectl --context "$ctx" create namespace portcullis --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
+kubectl --context "$ctx" -n portcullis create configmap portcullis-admission-params --from-literal=generation=e2e0ha0000000000 --dry-run=client -o json \
+  | kubectl --context "$ctx" apply -f - >/dev/null
+python3 -c 'import sys, yaml, json
+docs = [d for f in sys.argv[1:] for d in yaml.safe_load_all(open(f)) if d]
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in docs if d["metadata"]["name"] in ("portcullis-node-labels", "portcullis-nodes-guard-labels")]}))' \
+  kube/admission/policies.yaml kube/admission/bindings.yaml \
+  | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
+node="$(kubectl --context "$ctx" get nodes -o jsonpath='{.items[0].metadata.name}')"
 pinned="$(lib 'printf %s "$HA_SNR_IMAGE"')" img="$(lib ha_snr_image)"
 sleep 3   # the bindings see their params
 fail=0 n=0
 while IFS= read -r v; do
   n=$((n + 1))
   name="$(jq -r .name <<<"$v")" allowed="$(jq -r .allowed <<<"$v")" policy="$(jq -r .policy <<<"$v")"
-  if [ "$(jq -r '.ephemeral // false' <<<"$v")" = true ]; then
+  if [ "$(jq -r '.node // false' <<<"$v")" = true ]; then
+    # A Node patch as a node identity / SNR's manager (impersonated).
+    as=(--as "$(jq -r .as.user <<<"$v" | sed "s|@NODE@|$node|")")
+    while IFS= read -r g; do as+=(--as-group "$g"); done < <(jq -r '.as.groups[]' <<<"$v")
+    if jq -e '.taints_add' <<<"$v" >/dev/null; then
+      p="$(kubectl --context "$ctx" get node "$node" -o json | jq -c --argjson a "$(jq -c .taints_add <<<"$v")" '{spec: {taints: ((.spec.taints // []) + $a)}}')"
+    else p="$(jq -c .patch <<<"$v")"; fi
+    out="$(kubectl --context "$ctx" "${as[@]}" patch node "$node" --type=merge -p "$p" --dry-run=server 2>&1)" && got=true || got=false
+  elif [ "$(jq -r '.ephemeral // false' <<<"$v")" = true ]; then
     # pods/ephemeralcontainers: an admitted pod made for real, then the
     # subresource update (server dry-run), then the pod removed.
     ns="$(jq -r .pod.metadata.namespace <<<"$v")" pn="$(jq -r .pod.metadata.name <<<"$v")"

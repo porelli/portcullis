@@ -557,6 +557,24 @@ ha_snr_image() {
 # with values.yaml and a generated sources file (the webhook's and the
 # iSCSI initiators' addresses, space-separated IPv4s: both required — the
 # chart's policies admit anyone without them). Local only (no cluster).
+# _ha_policy_gen <file> [<image>] — a pod policy file's generation: the
+# sha256 (16 hex) of its text after the SNR image swap, placeholder kept.
+# _ha_policy_text <file> [<image>] prints that text with @POLICY_GENERATION@
+# replaced: the policy then refuses exactly a pod annotated
+# portcullis.io/policy-check=<generation>, which _ha_policy_in_force sends
+# (round 3 nit: the policy in force is the one just applied).
+_ha_policy_gen() {
+  local t; t="$(cat "$1")" || return 1
+  [ -z "${2:-}" ] || t="${t//"$HA_SNR_IMAGE"/"$2"}"
+  printf '%s\n' "$t" | _kube_sha | cut -c1-16
+}
+_ha_policy_text() {
+  local t g; t="$(cat "$1")" || return 1
+  [ -z "${2:-}" ] || t="${t//"$HA_SNR_IMAGE"/"$2"}"
+  g="$(_ha_policy_gen "$1" "${2:-}")" || return 1
+  printf '%s\n' "${t//@POLICY_GENERATION@/"$g"}"
+}
+
 ha_render() {
   local c="$1" d="$PORTCULLIS_HOME/$HA_DIR" t rc=0
   case "$c" in
@@ -564,10 +582,12 @@ ha_render() {
     fencing)
       # The pinned SNR image, or the development one (a literal swap of the
       # one pinned ref: its Deployment, its agents' image, the pod policy).
-      local img out
+      local img out g
       img="$(ha_snr_image)" || return 1
+      g="$(_ha_policy_gen "$d/fencing/admission.yaml" "$img")" || return 1
       out="$(kubectl kustomize "$d/fencing")" || return 1
-      printf '%s\n' "${out//"$HA_SNR_IMAGE"/"$img"}" ;;
+      out="${out//"$HA_SNR_IMAGE"/"$img"}"
+      printf '%s\n' "${out//@POLICY_GENERATION@/"$g"}" ;;
     longhorn)
       [ -n "${2:-}" ] && [ -n "${3:-}" ] || { echo "ha_render longhorn: the webhook's and the iSCSI initiators' sources are required" >&2; return 1; }
       t="$(mktemp -d)"
@@ -694,22 +714,26 @@ _ha_probe_setup() {
   printf '%s' "$PORTCULLIS_HELPER_IMAGE" > "$t/image"
   printf '%s' "$HA_PROBE_SH" > "$t/script"
   if ! kube_ctl -n "$KUBE_HA_PROBE_NS" create configmap ha-probe-params --from-file="$t" --dry-run=client -o json | _ha_apply \
-     || ! _kube_apply_files "$PORTCULLIS_HOME/$KUBE_HA_PROBE_POLICY"; then
+     || ! _ha_policy_text "$PORTCULLIS_HOME/$KUBE_HA_PROBE_POLICY" > "$t/admission.yaml" || ! _kube_apply_files "$t/admission.yaml"; then
     rm -rf "$t"; fail "could not apply the host probes' admission policy ($KUBE_HA_PROBE_POLICY; nothing installed)"
   fi
   rm -rf "$t"
-  _ha_policy_in_force "$KUBE_HA_PROBE_NS" portcullis-ha-probe-pods || fail "the host probes' admission policy isn't in force (nothing installed)"
+  _ha_policy_in_force "$KUBE_HA_PROBE_NS" portcullis-ha-probe-pods "$(_ha_policy_gen "$PORTCULLIS_HOME/$KUBE_HA_PROBE_POLICY")" || fail "the host probes' admission policy isn't in force (nothing installed)"
 }
 
-# _ha_policy_in_force <namespace> <policy> — a pod no shape admits is
-# refused there BY that policy (server dry-run, ≤ 30 s): the policy and its
-# binding are in force before anything runs (review M1).
+# _ha_policy_in_force <namespace> <policy> <generation> — a pod annotated
+# portcullis.io/policy-check=<generation> is refused there BY that policy
+# with the generation's own message (server dry-run, ≤ 30 s): the policy
+# just applied and its binding are in force before anything runs (review
+# M1; round 3 nit: an older copy of the policy doesn't pass).
 _ha_policy_in_force() {
   local i out
+  [ -n "${3:-}" ] || return 1
   for ((i = 0; i < 15; i++)); do
-    out="$(NS="$1" IMG="$PORTCULLIS_HELPER_IMAGE" jq -n '{apiVersion: "v1", kind: "Pod", metadata: {name: "portcullis-policy-check", namespace: env.NS},
+    out="$(NS="$1" G="$3" IMG="$PORTCULLIS_HELPER_IMAGE" jq -n '{apiVersion: "v1", kind: "Pod",
+        metadata: {name: "portcullis-policy-check", namespace: env.NS, annotations: {"portcullis.io/policy-check": env.G}},
         spec: {priorityClassName: "portcullis-core", containers: [{name: "x", image: env.IMG, command: ["true"]}]}}' | kube_ctl create --dry-run=server -f - 2>&1)" || true
-    case "$out" in *"$2"*) return 0 ;; esac
+    case "$out" in *"$2 generation $3 is in force"*) return 0 ;; esac
     sleep 2
   done
   return 1
@@ -983,9 +1007,9 @@ ha_install_fencing() {
   # The pod policy first, in force before anything runs there (review M1):
   # the same image swap as ha_render's.
   t="$(mktemp)"
-  { local pol; pol="$(cat "$PORTCULLIS_HOME/$HA_DIR/fencing/admission.yaml")"; printf '%s\n' "${pol//"$HA_SNR_IMAGE"/"$img"}"; } > "$t"
+  _ha_policy_text "$PORTCULLIS_HOME/$HA_DIR/fencing/admission.yaml" "$img" > "$t" || { rm -f "$t"; fail "could not read the fencing pod policy (nothing installed)"; }
   _ha_apply < "$t" || { rm -f "$t"; fail "could not apply the fencing pod policy (nothing installed)"; }
-  _ha_policy_in_force "$KUBE_FENCING_NS" portcullis-fencing-pods || { rm -f "$t"; fail "the fencing pod policy isn't in force (nothing installed)"; }
+  _ha_policy_in_force "$KUBE_FENCING_NS" portcullis-fencing-pods "$(_ha_policy_gen "$PORTCULLIS_HOME/$HA_DIR/fencing/admission.yaml" "$img")" || { rm -f "$t"; fail "the fencing pod policy isn't in force (nothing installed)"; }
   info "HA: Self Node Remediation v0.13.0 + Portcullis' patch (portcullis-fencing)..."
   ha_render fencing > "$t" || { rm -f "$t"; fail "could not render fencing (kubectl kustomize)"; }
   _ha_apply < "$t" || { rm -f "$t"; fail "could not apply fencing (see above)"; }

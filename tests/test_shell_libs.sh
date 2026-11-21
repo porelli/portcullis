@@ -6405,7 +6405,7 @@ expect_eq "ha_install_longhorn: namespace (PSA longhorn) → deny policies → n
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
   "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;"
 expect_eq "ha_install_longhorn: the namespace is longhorn-system with namespaces.json's longhorn levels; applied.json records ha.longhorn" \
-  "$(grep '^NS' "$WORK/h24-calls"):$(jq -r 'has("ha.longhorn")' "$WORK/h24root/secrets/kube/applied.json")" "NS longhorn-system privileged:true"
+  "$(grep '^NS' "$WORK/h24-calls"):$(jq -r 'has("ha.longhorn")' "$WORK/h24root/secrets/kube/applied.json")" "NS longhorn-system $(jq -r '.longhorn[0]' "$HERE/../charts/portcullis/namespaces.json"):true"
 # Fix round 1: Longhorn's webhook configurations are the CLI's (no create
 # right for Longhorn), empty, with wrangler's objectset labels so its apply
 # patches them; present ones are left alone.
@@ -6458,23 +6458,28 @@ expect_eq "ha_install_certmanager: cert-manager (restricted) → deny + its webh
 # Fix round 1 (security review): the host probes run in their own
 # namespace, after its default-deny, the policy's params (the helper image
 # and the exact script) and the policy itself.
-rm -f "$WORK/ps-calls" "$WORK/ps-in"
+rm -f "$WORK/ps-calls" "$WORK/ps-in" "$WORK/ps-pol"
 OUT="$(kt "PORTCULLIS_HOME='$H24'; mkdir -p '$H24/kube/ha/probe'; cp '$HERE/../kube/ha/probe/admission.yaml' '$H24/kube/ha/probe/'
   kube_namespace_apply() { echo \"NS \$*\" >> '$WORK/ps-calls'; }; _ha_policy_in_force() { :; }
-  kube_ctl() { echo \"K \$*\" >> '$WORK/ps-calls'; case \"\$*\" in *'create configmap'*) all=\"\$*\"; d=\"\${all##*--from-file=}\"; d=\"\${d%% *}\"; jq -n --rawfile i \"\$d/image\" --rawfile s \"\$d/script\" '{data: {image: \$i, script: \$s}}' ;; *'-f -'*) cat >> '$WORK/ps-in' ;; esac; }
+  kube_ctl() { echo \"K \$*\" >> '$WORK/ps-calls'; case \"\$*\" in *'create configmap'*) all=\"\$*\"; d=\"\${all##*--from-file=}\"; d=\"\${d%% *}\"; jq -n --rawfile i \"\$d/image\" --rawfile s \"\$d/script\" '{data: {image: \$i, script: \$s}}' ;; *'-f -'*) cat >> '$WORK/ps-in' ;; *admission.yaml) cp \"\${@: -1}\" '$WORK/ps-pol' ;; esac; }
   _ha_probe_setup; jq -sj '.[1].data.script' '$WORK/ps-in' | cmp -s - <(printf '%s' \"\$HA_PROBE_SH\") && echo SCRIPT-SAME")"
 expect_eq "_ha_probe_setup: portcullis-ha-probe (PSA haprobe) → its default-deny → the params (helper image, the exact probe script) → the probe policy" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*(create configmap ha-probe-params).*/\1 \2/; s/^K .*apply.*-f -$/K apply/; s/^K .*apply.*admission.yaml$/K policy/' "$WORK/ps-calls" | tr '\n' ';')" \
   "rc=0:NS portcullis-ha-probe privileged privileged baseline;K apply;K create configmap ha-probe-params;K apply;K policy;"
+expect_eq "_ha_probe_setup: the policy applied carries its own generation (no placeholder left), the one _ha_policy_gen names" \
+  "$(grep -o 'portcullis-ha-probe-pods generation [0-9a-f]* is in force' "$WORK/ps-pol" | sort -u):$(grep -c '@POLICY_GENERATION@' "$WORK/ps-pol" || true)" \
+  "portcullis-ha-probe-pods generation $(kt "_ha_policy_gen '$HERE/../kube/ha/probe/admission.yaml'" | head -n1) is in force:0"
 expect_eq "_ha_probe_setup: the namespace's only policy is default-deny; the params hold the helper image and HA_PROBE_SH exactly" \
   "$(jq -sc '[.[0].items[].metadata.name]' "$WORK/ps-in"):$(jq -sr '.[1].data.image' "$WORK/ps-in"):$(printf '%s\n' "$OUT" | grep -c '^SCRIPT-SAME$')" \
   '["default-deny"]:docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a:1'
 # Review M1: a policy is in force once a pod no shape admits is refused BY
 # it (server dry-run); never refused → not in force (fail).
 rm -f "$WORK/pif"
-OUT="$(kt "sleep() { :; }; kube_ctl() { cat >/dev/null; echo . >> '$WORK/pif'; [ \$(wc -l < '$WORK/pif') -ge 3 ] && echo \"denied: ValidatingAdmissionPolicy 'portcullis-fencing-pods' with binding x denied\" >&2; return 1; }; _ha_policy_in_force portcullis-fencing portcullis-fencing-pods && echo IN-FORCE; kube_ctl() { cat >/dev/null; return 0; }; _ha_policy_in_force portcullis-fencing portcullis-fencing-pods || echo NOT-IN-FORCE")"
-expect_eq "_ha_policy_in_force: refused by the policy (after two misses) → in force; admitted every time → not in force" \
-  "$(printf '%s\n' "$OUT" | grep -c '^IN-FORCE$\|^NOT-IN-FORCE$')" 2
+OUT="$(kt "sleep() { :; }; kube_ctl() { jq -r '.metadata.annotations[\"portcullis.io/policy-check\"]' > '$WORK/pif-ann'; echo . >> '$WORK/pif'; [ \$(wc -l < '$WORK/pif') -ge 3 ] && echo \"denied: ValidatingAdmissionPolicy 'portcullis-fencing-pods' with binding x denied request: portcullis-fencing-pods generation 0123456789abcdef is in force\" >&2; return 1; }; _ha_policy_in_force portcullis-fencing portcullis-fencing-pods 0123456789abcdef && echo IN-FORCE
+  _ha_policy_in_force portcullis-fencing portcullis-fencing-pods fedcba9876543210 || echo OLD-GEN
+  kube_ctl() { cat >/dev/null; return 0; }; _ha_policy_in_force portcullis-fencing portcullis-fencing-pods 0123456789abcdef || echo NOT-IN-FORCE")"
+expect_eq "_ha_policy_in_force: refused by the policy with its generation (after two misses) → in force; another generation's refusal (an older copy) or admitted → not in force; the probe pod carries the generation" \
+  "$(printf '%s\n' "$OUT" | grep -c '^IN-FORCE$\|^OLD-GEN$\|^NOT-IN-FORCE$'):$(cat "$WORK/pif-ann")" 3:fedcba9876543210
 # ha_fencing_ready (the jq over SNR's agents → per node ready), fail closed.
 FR_CFG='{"spec":{"watchdogFilePath":"/dev/watchdog","safeTimeToAssumeNodeRebootedSeconds":150}}'
 fr() { kt "_ha_deploy_ready() { [ -z \"\${STUB_MGR_DOWN:-}\" ]; }; kube_ctl() { case \"\$*\" in *'get nodes'*) printf '%s' '{\"items\":[{\"metadata\":{\"name\":\"m1\"}},{\"metadata\":{\"name\":\"m2\"}}]}' ;;

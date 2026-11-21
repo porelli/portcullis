@@ -86,6 +86,11 @@ spec:
         && has(variables.c.volumeMounts[0].readOnly) && variables.c.volumeMounts[0].readOnly
         && !has(variables.c.volumeMounts[0].subPath) && !has(variables.c.volumeMounts[0].subPathExpr)
   validations:
+    # The in-force check (round 3 nit): the CLI substitutes this file's own
+    # generation (_ha_policy_text) and probes with a pod annotated with it,
+    # so an older copy of this policy never passes for the one applied.
+    - expression: "!has(object.metadata.annotations) || !('portcullis.io/policy-check' in object.metadata.annotations) || object.metadata.annotations['portcullis.io/policy-check'] != '@POLICY_GENERATION@'"
+      message: "portcullis-ha-probe-pods generation @POLICY_GENERATION@ is in force"
     - expression: "variables.sub != 'ephemeralcontainers'"
       message: "no ephemeral container in portcullis-ha-probe"
     - expression: "variables.shape && variables.identity && variables.podSecurity && variables.containerSecurity && variables.host"
