@@ -185,6 +185,9 @@ func randomSecret(n int) (string, error) {
 // and no rotation was asked for.
 type Result struct {
 	APIKey string
+	// ViewerPassword is the admin view account's new password (never
+	// logged; the job writes it to the viewer secret file).
+	ViewerPassword string
 }
 
 // Apply runs the base plan as the recovery admin (c), idempotently.
@@ -271,19 +274,21 @@ func Apply(ctx context.Context, c *stalwart.Client, p Params, rotateKey bool, lo
 	}}); err != nil {
 		return res, err
 	}
-	// The WebUI is re-created at every start if missing: disable, never destroy.
+	// The WebUI is re-created at every start if missing (never destroy
+	// it): only the read-only admin view (contract §19.13) reaches it, at
+	// /admin, from the bundle pinned in the mailctl image.
 	apps, err := getAll(ctx, c, "Application")
 	if err != nil {
 		return res, err
 	}
-	off := map[string]map[string]any{}
+	upd = map[string]map[string]any{}
 	for _, a := range apps {
-		if string(a["enable"]) != "false" {
-			off[str(a, "id")] = map[string]any{"enable": false}
+		if pt := differs(a, WebUIApplication(), nil); len(pt) > 0 {
+			upd[str(a, "id")] = pt
 		}
 	}
-	if len(off) > 0 {
-		r, err := c.Set(ctx, "Application", nil, off, nil)
+	if len(upd) > 0 {
+		r, err := c.Set(ctx, "Application", nil, upd, nil)
 		if err := checkSet("Application", r, err); err != nil {
 			return res, err
 		}
@@ -298,6 +303,11 @@ func Apply(ctx context.Context, c *stalwart.Client, p Params, rotateKey bool, lo
 		return res, err
 	}
 	res.APIKey = key
+	// The admin view's account (contract §19.13): a new password on every
+	// plan run, handed to the job to write for the admin-view service.
+	if res.ViewerPassword, err = ensureViewer(ctx, c, ids["Domain"][ParkingDomain], ids["Role"][ViewerRole]); err != nil {
+		return res, err
+	}
 	if err := c.Action(ctx, "ReloadSettings"); err != nil {
 		return res, fmt.Errorf("ReloadSettings: %w", err)
 	}
@@ -397,6 +407,94 @@ func ensureAccount(ctx context.Context, c *stalwart.Client, domainID, roleID str
 		return "", err
 	}
 	return r.CreatedID("m"), nil
+}
+
+// ViewerName is the admin view account's login.
+const ViewerName = ViewerAccount + "@" + ParkingDomain
+
+// ensureViewer makes the admin view's account (contract §19.13) on the
+// parking domain with the viewer role only, and gives it a new random
+// password (returned, never logged). Only the recovery admin can: the
+// role holds reads mailctl's own role lacks.
+func ensureViewer(ctx context.Context, c *stalwart.Client, domainID, roleID string) (string, error) {
+	if domainID == "" || roleID == "" {
+		return "", errors.New("the parking domain or the viewer role has no id")
+	}
+	pw, err := randomSecret(32)
+	if err != nil {
+		return "", err
+	}
+	want := map[string]any{
+		"description": "Portcullis read-only mail admin view",
+		"credentials": list(map[string]any{"@type": "Password", "secret": pw}),
+		"roles":       map[string]any{"@type": "Custom", "roleIds": set(roleID)},
+		"permissions": map[string]any{"@type": "Inherit"},
+	}
+	id, err := viewerAccount(ctx, c, domainID)
+	if err != nil {
+		return "", err
+	}
+	var r stalwart.SetResult
+	if id != "" {
+		r, err = c.Set(ctx, "Account", nil, map[string]map[string]any{id: want}, nil)
+	} else {
+		want["@type"], want["name"], want["domainId"] = "User", ViewerAccount, domainID
+		r, err = c.Set(ctx, "Account", map[string]any{"v": want}, nil, nil)
+	}
+	if err := checkSet("Account", r, err); err != nil {
+		return "", err
+	}
+	return pw, nil
+}
+
+// viewerAccount is the admin view account's id on the parking domain
+// ("" when there is none).
+func viewerAccount(ctx context.Context, c *stalwart.Client, parking string) (string, error) {
+	accts, err := getAll(ctx, c, "Account")
+	if err != nil {
+		return "", err
+	}
+	for _, a := range accts {
+		if str(a, "name") == ViewerAccount && str(a, "domainId") == parking {
+			return str(a, "id"), nil
+		}
+	}
+	return "", nil
+}
+
+// ResetViewer gives the admin view's account a new password on a marked
+// store whose viewer secret file is lost (like MintKey: no other object is
+// touched). A store without the account or the viewer role (made before
+// the admin view existed) answers "" and no error: the admin view stays
+// unavailable there, mail is unaffected.
+func ResetViewer(ctx context.Context, c *stalwart.Client) (string, error) {
+	doms, err := getAll(ctx, c, "Domain")
+	if err != nil {
+		return "", err
+	}
+	parking := ""
+	for _, d := range doms {
+		if strings.EqualFold(str(d, "name"), ParkingDomain) {
+			parking = str(d, "id")
+		}
+	}
+	roles, err := getAll(ctx, c, "Role")
+	if err != nil {
+		return "", err
+	}
+	roleID := ""
+	for _, r := range roles {
+		if str(r, "description") == ViewerRole {
+			roleID = str(r, "id")
+		}
+	}
+	if parking == "" || roleID == "" {
+		return "", nil
+	}
+	if id, err := viewerAccount(ctx, c, parking); err != nil || id == "" {
+		return "", err
+	}
+	return ensureViewer(ctx, c, parking, roleID)
 }
 
 // ensureAPIKey makes mailctl's one API key (Inherit, pinned to the
@@ -533,8 +631,8 @@ func VerifyGone(ctx context.Context, url string, cr Credentials) error {
 // StoreEmpty (Ruling R-H2b): the document-less base plan runs only on a
 // store with no data — no account but mailctl's and no domain but the
 // plan's own (the parking domain, p.PrimaryDomain): a first plan that
-// failed half way may run again. mailctl's account counts only on the
-// parking domain. Anything else on an unmarked store (a lost marker)
+// failed half way may run again. mailctl's and the admin view's accounts
+// count only on the parking domain. Anything else on an unmarked store (a lost marker)
 // fails closed: the plan would downgrade a live server's settings.
 func StoreEmpty(ctx context.Context, c *stalwart.Client, p Params) error {
 	own := map[string]bool{}
@@ -556,7 +654,7 @@ func StoreEmpty(ctx context.Context, c *stalwart.Client, p Params) error {
 		return err
 	}
 	for _, a := range accts {
-		if str(a, "name") != MailctlAccount || parking == "" || str(a, "domainId") != parking {
+		if (str(a, "name") != MailctlAccount && str(a, "name") != ViewerAccount) || parking == "" || str(a, "domainId") != parking {
 			return errors.New("the store has accounts but no bootstrap marker: refusing the base plan (restore the marker or the store; Ruling R-H2b)")
 		}
 	}

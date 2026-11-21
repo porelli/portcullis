@@ -1,9 +1,16 @@
-{{- /* lldap (compose: lldap). */ -}}
+{{- /* lldap (compose: lldap). As compose: not the image's entrypoint (it
+copies the upstream template, whose key_seed is a PUBLIC default, into
+/data/lldap_config.toml), configured by env only, the key protecting stored
+passwords derived from this install's seed: the CLI's Secret secrets-lldap
+(secrets/lldap/key-seed) through LLDAP_KEY_SEED_FILE, LLDAP_KEY_FILE empty
+(a missing / empty / unreadable seed = LLDAP refuses to start). */ -}}
 {{- $s := dict
-  "name" "lldap" "uid" .Values.uids.lldap "gid" .Values.uids.lldap
+  "name" "lldap" "uid" .Values.uids.lldap "gid" .Values.uids.lldap "fsGroup" .Values.uids.lldap
   "memory" "256Mi" "nets" (list "portcullis") "egress" true
-  "hashes" (list "portcullis-env")
-  "health" (dict "test" (list "/app/lldap" "healthcheck" "--config-file" "/data/lldap_config.toml") "interval" 5 "timeout" 3 "retries" 5)
+  "hashes" (list "portcullis-env" "secrets-lldap")
+  "command" (list "tini" "--" "/app/lldap")
+  "args" (list "run" "--config-file" "/dev/null")
+  "health" (dict "test" (list "/app/lldap" "healthcheck" "--config-file" "/dev/null") "interval" 5 "timeout" 3 "retries" 5)
   "ports" (list (dict "name" "http" "port" 17170) (dict "name" "ldap" "port" 3890))
   "env" (list
     (dict "name" "LLDAP_JWT_SECRET" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "LLDAP_JWT_SECRET")))
@@ -11,13 +18,18 @@
     (dict "name" "LLDAP_LDAP_BASE_DN" "value" .Values.lldap.baseDN)
     (dict "name" "LLDAP_LDAP_USER_DN" "value" "admin")
     (dict "name" "LLDAP_LDAP_USER_EMAIL" "value" "admin@portcullis.local")
-    (dict "name" "LLDAP_HTTP_URL" "value" (printf "https://directory.%s" (include "portcullis.domain" .))))
+    (dict "name" "LLDAP_HTTP_URL" "value" (printf "https://directory.%s" (include "portcullis.domain" .)))
+    (dict "name" "LLDAP_DATABASE_URL" "value" "sqlite:///data/users.db?mode=rwc")
+    (dict "name" "LLDAP_KEY_SEED_FILE" "value" "/run/portcullis/lldap/key-seed")
+    (dict "name" "LLDAP_KEY_FILE" "value" ""))
   "mounts" (list
     (dict "name" "data" "mountPath" "/data")
-    (dict "name" "tmp" "mountPath" "/tmp"))
+    (dict "name" "tmp" "mountPath" "/tmp")
+    (dict "name" "key-seed" "mountPath" "/run/portcullis/lldap" "readOnly" true))
   "volumes" (list
     (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "lldap-data"))
-    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory"))
+    (dict "name" "key-seed" "secret" (dict "secretName" "secrets-lldap" "defaultMode" 288 "items" (list (dict "key" "key-seed" "path" "key-seed")))))
 -}}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---

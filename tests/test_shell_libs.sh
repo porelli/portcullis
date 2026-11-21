@@ -1276,20 +1276,22 @@ mkdir -p "$B/secrets/vault-unseal" "$B/certs"
 echo 'PORTCULLIS_DOMAIN=x' > "$B/.env"
 echo '{"root_token":"r","unseal_keys_b64":["k"]}' > "$B/secrets/vault-init.json"
 printf k > "$B/secrets/vault-unseal/unseal-key"
+mkdir -p "$B/secrets/lldap"; printf 'U0VFRC1TRUVELVNFRUQtU0VFRC1TRUVELVNFRUQtU0VFRC1TRUVELVNFRUQtU0VF' > "$B/secrets/lldap/key-seed"
 echo snap > "$B/vault.snap"; echo PGDMP > "$B/postgres.dump"; echo 'with space' > "$B/certs/a b.crt"
 _BACKUP_CFG='{"services":{"hub":{"image":"hub:1"},"keycloak":{"image":"kc:2"}}}'
 _backup_manifest "$B"
 expect_eq "manifest: format + every file" "$(jq -c '[.format, (.files | keys)]' "$B/MANIFEST.json")" \
-  '[1,[".env","certs/a b.crt","postgres.dump","secrets/vault-init.json","secrets/vault-unseal/unseal-key","vault.snap"]]'
+  '[1,[".env","certs/a b.crt","postgres.dump","secrets/lldap/key-seed","secrets/vault-init.json","secrets/vault-unseal/unseal-key","vault.snap"]]'
 expect_eq "manifest: hub image recorded" "$(jq -r .hub_image "$B/MANIFEST.json")" hub:1
 expect_eq "manifest: keycloak image recorded" "$(jq -r .keycloak_image "$B/MANIFEST.json")" kc:2
 expect_eq "MANIFEST.json records runtime {name, version}" "$(jq -c .runtime "$B/MANIFEST.json")" '{"name":"docker","version":"29.0.0"}'
 expect_ok "manifest: checksums verify" _backup_check_manifest "$B"
 echo tampered >> "$B/postgres.dump"
 expect_fail "manifest: a modified file fails" _backup_check_manifest "$B"
-expect_ok "layout: complete backup accepted" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
+echo lldap > "$B/lldap_data.tar.gz"
+expect_ok "layout: complete backup accepted" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/users.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
 rm "$B/secrets/vault-unseal/unseal-key"
-expect_fail "layout: missing unseal key rejected" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
+expect_fail "layout: missing unseal key rejected" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/users.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
 
 BACKUP_ROOT="$WORK/backups"
 mkdir -p "$BACKUP_ROOT"/{20260101-000000,20260102-000000,20260103-000000,pre-restore-20260101-000000,offsite-20260101-000000,20260104-000000.partial}
@@ -3147,6 +3149,7 @@ expect_eq "dns_main_env_uri without the file: nothing, exit 0 under set -euo pip
   "$(dt 'set -euo pipefail; u="$(dns_main_env_uri)"; echo "got:$u"')" "got:
 rc=0"
 SJ="$(dt "set -euo pipefail; require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
+        lldap_key_seed_problem() { :; }; lldap_key_seed_runtime_problems() { :; }
         proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
         vault_admin_env() { return 1; }
         dns_status_json() { cat '$DNSR'; }; dns_traefik_account_uri() { :; }
@@ -3606,6 +3609,7 @@ SPX_OUT="$(PATH="$WORK/spxbin:$PATH" PORTCULLIS_ROOT="$SPX" bash -c '
   done
   export CONTAINER_RUNTIME=docker PORTCULLIS_PUBLIC_IPV4=203.0.113.9 PORTCULLIS_PUBLIC_IPV6= \
     FORWARD_AUTH_REDIS_PASSWORD=a FORWARD_AUTH_EXT_REDIS_PASSWORD=b PORTCULLIS_DOMAIN=ci.example.org
+  lldap_key_seed_generate  # init makes it (never stack_prepare: up refuses without it)
   stack_prepare' _ "$HERE/.." 2>&1)"; SPX_RC=$?
 expect_eq "stack_prepare in a fresh root (docker stubbed) succeeds" "$SPX_RC" 0
 [ "$SPX_RC" = 0 ] || printf '%s\n' "$SPX_OUT" | tail -n 5
@@ -3615,7 +3619,7 @@ while IFS= read -r src; do
   if [ -n "$(git -C "$HERE/.." ls-files -- "$src" | head -n1)" ] || [ -e "$SPX/$src" ]; then continue; fi
   SPX_MISSING="$SPX_MISSING $src"
 done < <(sed -n 's/.*type: bind, source: *\([^,}]*\).*/\1/p' "$HERE/../docker-compose.podman-selinux.yml" | sort -u)
-expect_eq "every SELinux-overlay bind source is in git or made by stack_prepare" "$SPX_MISSING" ""
+expect_eq "every SELinux-overlay bind source is in git or made by stack_prepare (or init: the LLDAP key seed)" "$SPX_MISSING" ""
 expect_eq "the overlay has bind sources to check" "$(grep -c 'type: bind, source:' "$HERE/../docker-compose.podman-selinux.yml" | awk '{print ($1 >= 45)}')" 1
 
 # ── vexec: VAULT_TOKEN by name only while it is in the environment (Podman's
@@ -5731,6 +5735,104 @@ expect_eq "link status: a peer silent for 10 min → stale, a problem" \
   "$(ls_json on "${LST/\"handshake\":\"$NOW\"/\"handshake\":\"$OLD\"}" | jq -c '{problem, s: [.peers[] | .stale]}')" '{"problem":true,"s":[true,false]}'
 expect_eq "link status: the role on, wg not answering → a problem" "$(ls_json on '' | jq -c '{up, problem}')" '{"up":false,"problem":true}'
 expect_eq "link status: link null in a fresh status.json → down" "$(ls_json on "{\"version\":1,\"written\":\"$NOW\",\"link\":null}" | jq -c '{up, problem}')" '{"up":false,"problem":true}'
+
+# ── LLDAP's key seed (users.sh): per install, never the public default ──
+# shellcheck source=../scripts/lib/users.sh
+source "$HERE/../scripts/lib/users.sh"
+# shellcheck source=../scripts/lib/stack.sh
+source "$HERE/../scripts/lib/stack.sh"
+KS_ROOT="$WORK/ks-root"; mkdir -p "$KS_ROOT"
+KS_OUT="$(PORTCULLIS_ROOT="$KS_ROOT" lldap_key_seed_generate 2>&1)"
+KS_F="$KS_ROOT/secrets/lldap/key-seed"
+# 64 bytes and one 64-character line: no newline.
+expect_eq "lldap key seed: init makes 64 base64 characters (48 CSPRNG bytes), no newline" \
+  "$(wc -c < "$KS_F" | tr -d ' '):$(LC_ALL=C grep -c '^[A-Za-z0-9+/]\{64\}$' "$KS_F")" "64:1"
+expect_eq "lldap key seed: file 0600, directory 0700 as made" "$(file_mode "$KS_F"):$(file_mode "${KS_F%/*}")" "600:700"
+case "$KS_OUT" in *"$(cat "$KS_F")"*) t_fail "lldap key seed: the seed was printed" ;; *) t_pass "lldap key seed: never printed" ;; esac
+KS_OLD="$(cat "$KS_F")"
+PORTCULLIS_ROOT="$KS_ROOT" lldap_key_seed_generate >/dev/null 2>&1
+expect_eq "lldap key seed: a present seed is kept (never regenerated)" "$(cat "$KS_F")" "$KS_OLD"
+KS_OTHER="$(PORTCULLIS_ROOT="$WORK/ks-other" lldap_key_seed_generate >/dev/null 2>&1; cat "$WORK/ks-other/secrets/lldap/key-seed")"
+[ "$KS_OTHER" != "$KS_OLD" ] && t_pass "lldap key seed: each install gets its own" || t_fail "lldap key seed: two installs share a seed"
+rm -f "$STUB_DIR/calls"
+( PORTCULLIS_ROOT="$KS_ROOT"; _owner_of() { echo "$(id -u):9999"; }; lldap_key_seed_fix_perms ) >/dev/null 2>&1
+expect_eq "lldap key seed: fix_perms → file 0640, directory 0700" "$(file_mode "$KS_F"):$(file_mode "${KS_F%/*}")" "640:700"
+expect_ok "lldap key seed: group 1000 (the -rootless lldap) through ct_own" grep -q "chown $(id -u):1000 /t/0\$" "$STUB_DIR/calls"
+expect_eq "lldap key seed: a good seed has no problem" "$(PORTCULLIS_ROOT="$KS_ROOT" lldap_key_seed_problem)" ""
+ksp() { ( PORTCULLIS_ROOT="$WORK/ks-bad"; rm -rf "$PORTCULLIS_ROOT"; mkdir -p "$PORTCULLIS_ROOT/secrets/lldap"; eval "$1"; lldap_key_seed_problem ); }
+case "$(ksp ':')" in *"missing or empty"*) t_pass "lldap key seed: missing → problem" ;; *) t_fail "lldap key seed: missing" ;; esac
+case "$(ksp ': > "$PORTCULLIS_ROOT/secrets/lldap/key-seed"')" in *"missing or empty"*) t_pass "lldap key seed: empty → problem" ;; *) t_fail "lldap key seed: empty" ;; esac
+case "$(ksp 'printf "RanD0m STR1ng" > "$PORTCULLIS_ROOT/secrets/lldap/key-seed"')" in *"public default seed"*) t_pass "lldap key seed: the upstream public default → problem" ;; *) t_fail "lldap key seed: public default" ;; esac
+case "$(ksp 'printf "short-seed-123" > "$PORTCULLIS_ROOT/secrets/lldap/key-seed"')" in *"too short (14 characters"*) t_pass "lldap key seed: under 32 bytes of base64 → problem" ;; *) t_fail "lldap key seed: short" ;; esac
+case "$(ksp 'mkdir "$PORTCULLIS_ROOT/secrets/lldap/key-seed"')" in *"is a directory"*) t_pass "lldap key seed: a directory (made by Docker) → problem" ;; *) t_fail "lldap key seed: directory" ;; esac
+KS_REQ="$( (PORTCULLIS_ROOT="$WORK/ks-none"; lldap_key_seed_require) 2>&1; echo "rc=$?")"
+case "$KS_REQ" in *"Refusing to start LLDAP without its own key seed"*"rc=1"*) t_pass "lldap key seed: require fails closed" ;; *) t_fail "lldap key seed require: $KS_REQ" ;; esac
+KS_UP="$( (PORTCULLIS_ROOT="$WORK/ks-none"; VAULT_INIT_FILE="$KS_F"; env_require() { :; }; require_cmd() { :; }
+  runtime_check() { echo REACHED-RUNTIME; }; stack_up) 2>&1; echo "rc=$?")"
+case "$KS_UP" in *REACHED-RUNTIME*) t_fail "up without a key seed went on: $KS_UP" ;; *"Refusing to start LLDAP"*"rc=1"*) t_pass "up refuses without LLDAP's key seed, before anything starts" ;; *) t_fail "up without a seed: $KS_UP" ;; esac
+# shellcheck disable=SC2034  # read by upgrade_run
+KS_UG="$( (PORTCULLIS_ROOT="$WORK/ks-none"; VAULT_INIT_FILE="$KS_F"; env_require() { :; }; require_cmd() { :; }; env_generate_missing() { :; }
+  runtime_check() { echo REACHED-RUNTIME; }; upgrade_run true) 2>&1; echo "rc=$?")"
+case "$KS_UG" in *REACHED-RUNTIME*) t_fail "upgrade without a key seed went on" ;; *"Refusing to start LLDAP"*"rc=1"*) t_pass "upgrade refuses without LLDAP's key seed" ;; *) t_fail "upgrade without a seed: $KS_UG" ;; esac
+# The running container (status): what LLDAP really has.
+KS_RT="$( ( rt_running() { return 0; }; rt_exec() { printf '%s\n' "$@" > "$WORK/ks-exec"; printf 'checked\n'; }; lldap_key_seed_runtime_problems ) )"
+expect_eq "lldap key seed (container): all well → nothing" "$KS_RT" ""
+expect_ok "lldap key seed (container): only the public default goes on argv, no secret" sh -c "grep -qx 'RanD0m STR1ng' '$WORK/ks-exec' && ! grep -q '$KS_OLD' '$WORK/ks-exec'"
+KS_RT="$( ( rt_running() { return 0; }; rt_exec() { printf 'plain-env\nno-seed-file\nkey-file\nconfig-default\nchecked\n'; }; lldap_key_seed_runtime_problems ) )"
+expect_eq "lldap key seed (container): plain env, no seed file, a key file and the default in lldap_config.toml are each a problem" \
+  "$(printf '%s\n' "$KS_RT" | grep -c .):$(printf '%s' "$KS_RT" | grep -c 'public default key_seed')" "4:1"
+KS_RT="$( ( rt_running() { return 0; }; rt_exec() { return 1; }; lldap_key_seed_runtime_problems ) )"
+case "$KS_RT" in *"couldn't be checked"*) t_pass "lldap key seed (container): a failed exec is a problem (fail closed)" ;; *) t_fail "lldap key seed exec failure: $KS_RT" ;; esac
+expect_eq "lldap key seed (container): LLDAP not running → nothing here (status shows LLDAP down)" \
+  "$( ( rt_running() { return 1; }; lldap_key_seed_runtime_problems ) )" ""
+# A backup without the seed is incomplete (its users.db can't start without it).
+KB="$WORK/ks-backup"; mkdir -p "$KB/secrets/vault-unseal"
+printf '{"format":%s}' "$BACKUP_FORMAT" > "$KB/MANIFEST.json"
+for f in .env vault.snap postgres.dump secrets/vault-unseal/unseal-key; do echo x > "$KB/$f"; done
+echo '{"root_token":"t","unseal_keys_b64":["k"]}' > "$KB/secrets/vault-init.json"
+KS_BK="$( (_backup_check_layout "$KB") 2>&1; echo "rc=$?")"
+case "$KS_BK" in *"lacks secrets/lldap/key-seed"*"rc=1"*) t_pass "backup layout: no LLDAP key seed → incomplete backup" ;; *) t_fail "backup layout seed: $KS_BK" ;; esac
+mkdir -p "$KB/secrets/lldap"; cp "$KS_F" "$KB/secrets/lldap/key-seed"
+KS_BK="$( (_backup_check_layout "$KB") 2>&1; echo "rc=$?")"
+case "$KS_BK" in *"lacks lldap_data.tar.gz"*"rc=1"*) t_pass "backup layout: a seed without its users.db archive → incomplete (never this host's users.db with the backup's seed)" ;; *) t_fail "backup layout lldap_data: $KS_BK" ;; esac
+echo x > "$KB/lldap_data.tar.gz"
+kbl() { (_backup_check_layout "$1"); }  # a subshell: fail exits
+expect_ok "backup layout: the seed and lldap_data.tar.gz → complete" kbl "$KB"
+printf 'short-seed' > "$KB/secrets/lldap/key-seed"
+KS_BK="$( (_backup_check_layout "$KB") 2>&1; echo "rc=$?")"
+case "$KS_BK" in *"in the backup, secrets/lldap/key-seed is too short"*"refusing to restore it"*"rc=1"*) t_pass "backup layout: a seed LLDAP can't use is refused before anything changes" ;; *) t_fail "backup layout bad seed: $KS_BK" ;; esac
+printf 'RanD0m STR1ng' > "$KB/secrets/lldap/key-seed"
+case "$( (_backup_check_layout "$KB") 2>&1)" in *"public default seed"*) t_pass "backup layout: the public default seed is refused" ;; *) t_fail "backup layout default seed" ;; esac
+# A hand-made seed that isn't base64 (long enough) is a problem too.
+case "$(ksp 'printf "%064d!" 0 > "$PORTCULLIS_ROOT/secrets/lldap/key-seed"')" in *"is not base64"*) t_pass "lldap key seed: not base64 → problem" ;; *) t_fail "lldap key seed: charset" ;; esac
+# init never replaces a seed file: an empty one is refused, not rewritten.
+KS_E="$WORK/ks-empty"; mkdir -p "$KS_E/secrets/lldap"; : > "$KS_E/secrets/lldap/key-seed"
+KS_GEN="$( (PORTCULLIS_ROOT="$KS_E"; lldap_key_seed_generate) 2>&1; echo "rc=$?")"
+case "$KS_GEN" in *"missing or empty"*"rc=1"*) t_pass "lldap key seed: init refuses an existing (empty) seed file instead of replacing it" ;; *) t_fail "init empty seed: $KS_GEN" ;; esac
+expect_eq "lldap key seed: the empty file is left as it was" "$(wc -c < "$KS_E/secrets/lldap/key-seed" | tr -d ' ')" 0
+expect_eq "lldap key seed: generation hard-links (ln never overwrites) and checks 64 characters" \
+  "$(declare -f lldap_key_seed_generate | grep -c 'ln "$tmp" "$f"'):$(declare -f lldap_key_seed_generate | grep -c '!= 64')" "1:1"
+# init on docker refuses a seed made next to an lldap_data holding a users.db.
+KS_O="$WORK/ks-olddata"; rm -rf "$KS_O"; mkdir -p "$KS_O"
+KS_OLD_OUT="$( (PORTCULLIS_ROOT="$KS_O"; lldap_key_seed_generate >/dev/null; docker() { echo "docker $*" >> "$WORK/ks-old-calls"; return 0; }
+  lldap_key_seed_new_on_old_data) 2>&1; echo "rc=$?")"
+case "$KS_OLD_OUT" in *"already holds a users.db"*"rc=1"*) t_pass "init: a new seed next to an existing users.db → refused up front" ;; *) t_fail "init old data: $KS_OLD_OUT" ;; esac
+expect_eq "init: the seed just made is removed again (a re-run behaves the same)" "$([ -e "$KS_O/secrets/lldap/key-seed" ] && echo kept || echo removed)" removed
+expect_ok "init: the users.db probe is read-only, no network, no capability" grep -q -- '--network none --read-only --cap-drop ALL .*type=volume,src=portcullis_lldap_data,dst=/v,readonly .* test -e /v/users.db' "$WORK/ks-old-calls"
+KS_OLD_OUT="$( (PORTCULLIS_ROOT="$KS_O"; lldap_key_seed_generate >/dev/null; docker() { case "$*" in "volume inspect"*) return 1 ;; esac; return 0; }
+  lldap_key_seed_new_on_old_data; echo "kept:$([ -s "$KS_O/secrets/lldap/key-seed" ] && echo yes)") 2>&1; echo "rc=$?")"
+case "$KS_OLD_OUT" in *"kept:yes"*"rc=0"*) t_pass "init: no lldap_data volume → the new seed stays" ;; *) t_fail "init no volume: $KS_OLD_OUT" ;; esac
+# shellcheck disable=SC2034  # read by lldap_key_seed_new_on_old_data
+KS_OLD_OUT="$( (PORTCULLIS_ROOT="$KS_O"; LLDAP_KEY_SEED_MADE=false; docker() { echo CALLED; }; lldap_key_seed_new_on_old_data; echo no-probe) 2>&1)"
+expect_eq "init: a seed that was already there → no probe" "$KS_OLD_OUT" no-probe
+# compose / chart / overlay: one mechanism everywhere (LLDAP_KEY_SEED_FILE).
+CY="$HERE/../docker-compose.yml"
+expect_eq "compose lldap: the seed by file, no key file, no plain seed, no image entrypoint, no config file" \
+  "$(yq -o=json '.services.lldap' "$CY" | jq -c '[.environment.LLDAP_KEY_SEED_FILE, .environment.LLDAP_KEY_FILE, (.environment | has("LLDAP_KEY_SEED")), .entrypoint, .command, (.volumes | index("./secrets/lldap/key-seed:/run/portcullis/lldap/key-seed:ro") != null), .healthcheck.test[-1]]')" \
+  '["/run/portcullis/lldap/key-seed","",false,["tini","--","/app/lldap"],["run","--config-file","/dev/null"],true,"/dev/null"]'
+expect_eq "the SELinux overlay labels the seed for LLDAP alone (Z)" \
+  "$(grep -c 'source: ./secrets/lldap/key-seed, target: /run/portcullis/lldap/key-seed, read_only: true, bind: {selinux: Z}' "$HERE/../docker-compose.podman-selinux.yml")" 1
+expect_eq "nothing else mounts LLDAP's seed" "$(grep -c '^ *- \./secrets/lldap' "$CY")" 1
 
 echo ""
 echo "$PASS passed, $FAIL failed"

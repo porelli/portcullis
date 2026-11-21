@@ -76,7 +76,9 @@ func ApplyDoc(ctx context.Context, c *stalwart.Client, doc *state.Doc) (bool, er
 			continue
 		}
 		if s.Object == "SystemSettings" {
-			patch := map[string]any{"defaultHostname": p.Hostname}
+			// includeSecrets re-asserted false on every document (contract
+			// §19.13: masking depends on it).
+			patch := map[string]any{"defaultHostname": p.Hostname, "includeSecrets": false}
 			// The default domain follows the primary domain once it exists
 			// (the bootstrap left the parking domain there).
 			if id, err := domainID(ctx, c, p.PrimaryDomain); err != nil {

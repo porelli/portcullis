@@ -32,6 +32,149 @@ users_secret_files() {
     || (umask 077 && cat "$s/enroll/invite-api-secret" > "$s/hub/invite/secret")
 }
 
+# ── LLDAP's key seed ───────────────────────────────────────
+#
+# LLDAP derives the OPAQUE server key that protects every stored password
+# from key_seed. The upstream image's config template ships a PUBLIC
+# default seed ("RanD0m STR1ng"): with it, anyone holding users.db (a
+# backup's lldap_data archive) can attack the stored passwords offline
+# without any server secret. So each install has its own seed:
+#
+#   secrets/lldap/key-seed   48 CSPRNG bytes, base64 (64 characters, no
+#                            newline). Made once by init (0600), then
+#                            operator-owned, group 1000 (the -rootless
+#                            image's lldap), 0640; the directory 0700.
+#                            Backed up and restored with secrets/.
+#
+# LLDAP reads it through LLDAP_KEY_SEED_FILE (its env provider's _FILE
+# form: never argv, never a plain env value); LLDAP_KEY_FILE is empty, so a
+# missing, empty or unreadable seed makes LLDAP refuse to start instead of
+# writing a random key file. The image's entrypoint is not used (it copies
+# the template, public seed included, into /data/lldap_config.toml):
+# LLDAP runs with --config-file /dev/null and is configured by env only.
+# A new seed invalidates every stored LLDAP password (LLDAP refuses to
+# start until forced): it is NEVER regenerated on an existing install.
+LLDAP_KEY_SEED_PUBLIC_DEFAULT="RanD0m STR1ng"
+LLDAP_KEY_SEED_MIN=44   # base64 of 32 bytes
+
+lldap_key_seed_file() { printf '%s/secrets/lldap/key-seed' "$PORTCULLIS_ROOT"; }
+
+# lldap_key_seed_problem [file] — why LLDAP would run without a usable
+# per-install seed (one line, never the seed), or nothing when the file
+# (default: this install's; restore checks the backup's) is fine.
+# shellcheck disable=SC2120  # backup.sh passes the backup's file
+lldap_key_seed_problem() {
+  local f="${1:-}" n
+  [ -n "$f" ] || f="$(lldap_key_seed_file)"
+  if [ -d "$f" ]; then echo "secrets/lldap/key-seed is a directory (made by Docker?): remove it and restore the file from a backup"; return 0; fi
+  if [ ! -s "$f" ]; then echo "secrets/lldap/key-seed is missing or empty: LLDAP would have no seed"; return 0; fi
+  if [ ! -r "$f" ]; then echo "secrets/lldap/key-seed is not readable"; return 0; fi
+  n="$(wc -c < "$f" | tr -d ' ')"
+  if [ "$(cat "$f")" = "$LLDAP_KEY_SEED_PUBLIC_DEFAULT" ]; then echo "secrets/lldap/key-seed is LLDAP's public default seed"; return 0; fi
+  if [ "$n" -lt "$LLDAP_KEY_SEED_MIN" ]; then echo "secrets/lldap/key-seed is too short ($n characters, at least $LLDAP_KEY_SEED_MIN: 32 random bytes, base64)"; return 0; fi
+  if [ "$(LC_ALL=C tr -d 'A-Za-z0-9+/=' < "$f" | wc -c | tr -d ' ')" != 0 ]; then echo "secrets/lldap/key-seed is not base64 (made by hand? generate it with openssl rand -base64 48)"; return 0; fi
+  return 0
+}
+
+# lldap_key_seed_require — fail closed (up / upgrade / init) when the seed
+# isn't usable. Existing installs are fixed by hand (LLDAP_KEY_SEED_DOC).
+LLDAP_KEY_SEED_DOC="docs/operations/hardening.md#lldaps-key-seed"
+lldap_key_seed_require() {
+  local p
+  p="$(lldap_key_seed_problem)"
+  [ -z "$p" ] || fail "LLDAP: $p. Refusing to start LLDAP without its own key seed ($LLDAP_KEY_SEED_DOC)."
+}
+
+# lldap_key_seed_generate — init only: the seed when there is no file at
+# all. It never replaces one: a present file (even an empty one) is only
+# checked (lldap_key_seed_require). Written to a 0600 temporary file,
+# checked to be 64 characters, then hard-linked into place (ln refuses an
+# existing target, so a concurrent writer can't be overwritten either).
+# Sets LLDAP_KEY_SEED_MADE=true when it made one.
+# shellcheck disable=SC2034  # LLDAP_KEY_SEED_MADE is read by stack.sh
+lldap_key_seed_generate() {
+  local f d tmp
+  LLDAP_KEY_SEED_MADE=false
+  f="$(lldap_key_seed_file)"
+  d="${f%/*}"
+  [ ! -d "$f" ] || fail "$f is a directory (made by Docker): remove it (rmdir) and run again"
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    (umask 077 && mkdir -p "$d")
+    chmod 700 "$d"
+    tmp="$(umask 077 && mktemp "$d/.key-seed.XXXXXX")"
+    if ! openssl rand -base64 48 | tr -d '\n' > "$tmp" || [ "$(wc -c < "$tmp" | tr -d ' ')" != 64 ]; then
+      rm -f "$tmp"
+      fail "could not generate secrets/lldap/key-seed"
+    fi
+    chmod 600 "$tmp"
+    if ! ln "$tmp" "$f" 2>/dev/null; then
+      rm -f "$tmp"
+      fail "secrets/lldap/key-seed appeared while it was being generated: not overwriting it"
+    fi
+    rm -f "$tmp"
+    LLDAP_KEY_SEED_MADE=true
+    ok "Generated secrets/lldap/key-seed (protects LLDAP's stored passwords; backed up with secrets/)."
+  fi
+  lldap_key_seed_require
+}
+
+# lldap_key_seed_new_on_old_data — init (docker / podman), right after
+# lldap_key_seed_generate made a seed: refuse when lldap_data already holds
+# a users.db. Its passwords are bound to another key (an install made
+# before the seed, or one whose seed was lost): LLDAP would refuse to
+# start, late, at the health wait. The seed just made is removed again, so
+# a re-run behaves the same; the fix is by hand (LLDAP_KEY_SEED_DOC).
+lldap_key_seed_new_on_old_data() {
+  local vol="${COMPOSE_PROJECT_NAME:-portcullis}_lldap_data"
+  _rt_docker_only
+  [ "${LLDAP_KEY_SEED_MADE:-false}" = true ] || return 0
+  docker volume inspect "$vol" >/dev/null 2>&1 || return 0
+  ct_run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+    --mount "type=volume,src=$vol,dst=/v,readonly" "$PORTCULLIS_HELPER_IMAGE" test -e /v/users.db >/dev/null 2>&1 || return 0
+  rm -f "$(lldap_key_seed_file)"
+  fail "LLDAP: the volume $vol already holds a users.db, but this install had no secrets/lldap/key-seed. A new seed would void its stored passwords (LLDAP refuses to start). Restore the seed from a backup, or fix it by hand ($LLDAP_KEY_SEED_DOC). The seed just made was removed again; nothing was started."
+}
+
+# lldap_key_seed_fix_perms — called by secrets_fix_perms: the directory
+# 0700 (single-file bind, nothing traverses it), the file 0640 group 1000.
+lldap_key_seed_fix_perms() {
+  local f
+  f="$(lldap_key_seed_file)"
+  [ -d "${f%/*}" ] || return 0
+  chmod 700 "${f%/*}"
+  [ -f "$f" ] || return 0
+  chmod 640 "$f"
+  ct_own "$(ct_operator_id):$CT_UID_LLDAP" "$f"
+}
+
+# lldap_key_seed_runtime_problems — what the RUNNING LLDAP container has
+# (one problem per line, never a value): a plain LLDAP_KEY_SEED in its
+# environment, no readable LLDAP_KEY_SEED_FILE, LLDAP_KEY_FILE set, or a
+# key_seed in /data/lldap_config.toml (the image template's public default,
+# left there by the old entrypoint, or any other). Nothing when LLDAP
+# doesn't run (status shows that) or all is well.
+lldap_key_seed_runtime_problems() {
+  local out
+  rt_running lldap 2>/dev/null || return 0
+  # shellcheck disable=SC2016  # expanded by the container's sh
+  out="$(rt_exec lldap -- sh -c '
+    [ -z "${LLDAP_KEY_SEED+x}" ] || echo plain-env
+    { [ -n "${LLDAP_KEY_SEED_FILE:-}" ] && [ -s "$LLDAP_KEY_SEED_FILE" ] && [ -r "$LLDAP_KEY_SEED_FILE" ]; } || echo no-seed-file
+    [ -z "${LLDAP_KEY_FILE:-}" ] || echo key-file
+    c=/data/lldap_config.toml
+    if [ -f "$c" ] && grep -Eq "^[[:space:]]*key_seed[[:space:]]*=" "$c"; then
+      if grep -Fq "$1" "$c"; then echo config-default; else echo config-seed; fi
+    fi
+    echo checked' _ "$LLDAP_KEY_SEED_PUBLIC_DEFAULT" 2>/dev/null)" || true
+  case "$out" in *checked*) ;; *) echo "the LLDAP container's key seed couldn't be checked (exec failed)"; return 0 ;; esac
+  case "$out" in *plain-env*) echo "LLDAP_KEY_SEED is set in the LLDAP container's environment (the seed belongs in secrets/lldap/key-seed, read through LLDAP_KEY_SEED_FILE)" ;; esac
+  case "$out" in *no-seed-file*) echo "the LLDAP container has no readable LLDAP_KEY_SEED_FILE (recreate it: ./portcullis up)" ;; esac
+  case "$out" in *key-file*) echo "LLDAP_KEY_FILE is set in the LLDAP container (it must be empty: the seed is the key)" ;; esac
+  case "$out" in *config-default*) echo "/data/lldap_config.toml in lldap_data carries LLDAP's public default key_seed: delete that file ($LLDAP_KEY_SEED_DOC)" ;; esac
+  case "$out" in *config-seed*) echo "/data/lldap_config.toml in lldap_data carries a key_seed: delete that file (the seed is secrets/lldap/key-seed only)" ;; esac
+  return 0
+}
+
 # _lldap_login — prints an LLDAP JWT for the LLDAP admin (LLDAP_ADMIN_PASSWORD).
 _lldap_login() {
   env_require LLDAP_ADMIN_PASSWORD

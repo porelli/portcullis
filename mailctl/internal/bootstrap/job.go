@@ -46,6 +46,10 @@ type Job struct {
 	DataDir string // job_data: the job's own files (.server-image)
 	// KeyFile is where the API key goes (MAILCTL_API_KEY_FILE, 0640).
 	KeyFile string
+	// ViewerFile is where the admin view account's password goes
+	// (MAILCTL_VIEWER_SECRET_FILE, 0640, the viewer key volume; contract
+	// §19.13). "" = no admin view: the password is never written.
+	ViewerFile string
 	// StoreDir is the server's store volume as the job mounts it
 	// (MAILCTL_STORE_DIR): the lock and the base-plan marker live there
 	// (Ruling T17-c: the plan runs once per store).
@@ -103,6 +107,12 @@ func writeMarker(store string, now time.Time) error {
 // directory synced, so a crash leaves the old key or the new one, never a
 // torn one (M1).
 func writeKeyFile(path, key string) error { return writeReplace(path, []byte(key), 0o640) }
+
+// viewerFileInPlace: the viewer secret file holds a password.
+func viewerFileInPlace(path string) bool {
+	b, err := os.ReadFile(path)
+	return err == nil && len(strings.TrimSpace(string(b))) >= 16
+}
 
 // writeReplace writes b to a temporary file beside path, fsyncs it,
 // renames it over path and fsyncs the directory.
@@ -246,18 +256,17 @@ func (j *Job) Run(ctx context.Context) (err error) {
 	}
 	defer unlock()
 	if !markerValid(j.StoreDir) {
-		if err := j.recovery(ctx, func(c *stalwart.Client) (string, error) {
+		if err := j.recovery(ctx, func(c *stalwart.Client) (Result, error) {
 			p := j.Params
 			if p.ClientIP == "" {
 				p.ClientIP = state.ClientIPPreserved
 			}
 			if err := StoreEmpty(ctx, c, p); err != nil {
-				return "", err
+				return Result{}, err
 			}
 			// Always a new key (L-a): a half-done first plan may have left a
 			// key in the store that the key file doesn't hold.
-			res, err := Apply(ctx, c, p, true, j.logf)
-			return res.APIKey, err
+			return Apply(ctx, c, p, true, j.logf)
 		}); err != nil {
 			return err
 		}
@@ -269,18 +278,32 @@ func (j *Job) Run(ctx context.Context) (err error) {
 	}
 	// Ruling R2-N2b: the key is judged through the recovery admin, never
 	// used (it is pinned to the adapter's address).
-	return j.recovery(ctx, func(c *stalwart.Client) (string, error) {
+	return j.recovery(ctx, func(c *stalwart.Client) (Result, error) {
+		var res Result
+		// The admin view's password (contract §19.13): a lost viewer
+		// secret file gets a new password only, like the key.
+		if j.ViewerFile != "" && !viewerFileInPlace(j.ViewerFile) {
+			pw, err := ResetViewer(ctx, c)
+			if err != nil {
+				return res, err
+			}
+			if pw == "" {
+				j.logf("bootstrap: the store has no admin view account (it predates it): the read-only admin view stays unavailable")
+			}
+			res.ViewerPassword = pw
+		}
 		b, _ := os.ReadFile(j.keyFile())
 		ok, err := KeyInPlace(ctx, c, j.Params.MailctlIP, strings.TrimSpace(string(b)))
 		if err != nil {
-			return "", err
+			return res, err
 		}
 		if ok {
-			j.logf("bootstrap: the store is bootstrapped and its API key is in place; nothing to do")
-			return "", nil
+			j.logf("bootstrap: the store is bootstrapped and its API key is in place")
+			return res, nil
 		}
 		j.logf("bootstrap: the API key is missing or out of scope: a new key only (the store's settings untouched)")
-		return MintKey(ctx, c, j.Params.MailctlIP)
+		res.APIKey, err = MintKey(ctx, c, j.Params.MailctlIP)
+		return res, err
 	})
 }
 
@@ -308,7 +331,7 @@ func (j *Job) normalEnv() []string {
 // nonce in SessionFile) running step as the recovery admin; the key step
 // answers (if any) is written; then one normal start must refuse the
 // recovery login. The key itself is never used here (Ruling R2-N2b).
-func (j *Job) recovery(ctx context.Context, step func(*stalwart.Client) (string, error)) (err error) {
+func (j *Job) recovery(ctx context.Context, step func(*stalwart.Client) (Result, error)) (err error) {
 	pw, err := recoveryPassword()
 	if err != nil {
 		return err
@@ -338,15 +361,21 @@ func (j *Job) recovery(ctx context.Context, step func(*stalwart.Client) (string,
 	if err := j.waitReady(ctx); err != nil {
 		return err
 	}
-	key, err := step(stalwart.New(j.URL, stalwart.Basic(RecoveryUser, pw)))
+	res, err := step(stalwart.New(j.URL, stalwart.Basic(RecoveryUser, pw)))
 	if err != nil {
 		return err
 	}
-	if key != "" {
-		if err := writeKeyFile(j.keyFile(), key); err != nil {
+	if res.APIKey != "" {
+		if err := writeKeyFile(j.keyFile(), res.APIKey); err != nil {
 			return fmt.Errorf("writing the API key: %w", err)
 		}
 		j.logf("bootstrap: a new API key written")
+	}
+	if res.ViewerPassword != "" && j.ViewerFile != "" {
+		if err := writeKeyFile(j.ViewerFile, res.ViewerPassword); err != nil {
+			return fmt.Errorf("writing the admin view's password: %w", err)
+		}
+		j.logf("bootstrap: a new admin view password written")
 	}
 	stopped = true
 	if err := stop(); err != nil {

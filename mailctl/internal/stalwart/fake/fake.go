@@ -32,11 +32,20 @@ type Server struct {
 	Now     func() time.Time
 	HTTP    *httptest.Server
 	secrets int
+	// Written is every create and update as sent (before the fake drops
+	// secrets), for the secret data-flow checks.
+	Written []Write
 	// QueryMode breaks /query paging for the fail-closed tests: "" is
 	// Stalwart's (position, limit, total), "ignore-position" repeats the
 	// first page, "no-total" leaves the total out, "short" answers an
 	// empty page after the first.
 	QueryMode string
+}
+
+// Write is one create or update the fake received.
+type Write struct {
+	Object string
+	Fields map[string]any
 }
 
 // New starts the fake on a loopback port.
@@ -108,6 +117,20 @@ func (s *Server) putLocked(st string, fields map[string]any) string {
 	id := fmt.Sprintf("i%d", s.next)
 	s.objs[st][id] = normalize(fields)
 	return id
+}
+
+// Stores returns copies of every stored object, by store ("<Object>" or
+// "<Object>@<account>"), for the secret data-flow checks.
+func (s *Server) Stores() map[string][]map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string][]map[string]any{}
+	for st, objs := range s.objs {
+		for _, o := range objs {
+			out[st] = append(out[st], normalize(o))
+		}
+	}
+	return out
 }
 
 // Objects returns copies of every object of a type (AppPassword: of one
@@ -335,6 +358,7 @@ func (s *Server) setLocked(method, obj, st string, args map[string]json.RawMessa
 		created, notCreated := map[string]any{}, map[string]any{}
 		for _, cid := range cids {
 			o := create[cid]
+			s.Written = append(s.Written, Write{obj, normalize(o)})
 			if obj == "Action" {
 				s.Calls = append(s.Calls, method+" "+fmt.Sprint(o["@type"]))
 				s.next++
@@ -392,6 +416,7 @@ func (s *Server) setLocked(method, obj, st string, args map[string]json.RawMessa
 	if len(update) > 0 {
 		updated, notUpdated := map[string]any{}, map[string]any{}
 		for id, p := range update {
+			s.Written = append(s.Written, Write{obj, normalize(p)})
 			s.Calls = append(s.Calls, method+" update")
 			if st != obj && s.objs[st][id] == nil && id != "singleton" {
 				notUpdated[id] = map[string]any{"type": "notFound"}

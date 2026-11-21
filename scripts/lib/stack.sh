@@ -229,6 +229,10 @@ init_run() {
   # shellcheck disable=SC2086
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   runtime_name >/dev/null
+  # LLDAP's per-install key seed (users.sh): with the secrets, so an
+  # --env-only install has it too (0600 until stack_prepare gives it the
+  # lldap group: --env-only never calls the engine).
+  lldap_key_seed_generate
 
   if [ "$env_only" = true ]; then
     ok ".env is ready. Review it, then run ./portcullis init to set up the stack."
@@ -243,6 +247,9 @@ init_run() {
     kube_init_cluster
   else
     network_check
+    # A seed made just now next to an lldap_data that has a users.db: refuse
+    # before anything starts (users.sh).
+    lldap_key_seed_new_on_old_data
   fi
 
   if [ "$skip_dns" = true ] || [ "${DNS_PROVIDER:-none}" = none ]; then
@@ -524,6 +531,7 @@ stack_up() {
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   require_cmd docker jq curl
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
+  lldap_key_seed_require
   ! mail_slot_open || mail_refuse_kube
   runtime_check
   runtime_require_host
@@ -564,6 +572,7 @@ upgrade_run() {
   # shellcheck disable=SC2086
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
+  lldap_key_seed_require
   ! mail_slot_open || mail_refuse_kube
   runtime_check
   runtime_require_host

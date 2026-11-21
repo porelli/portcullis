@@ -315,3 +315,50 @@ func TestBootstrapJobRecoveryPasswordAlwaysAccepted(t *testing.T) {
 		}
 	}
 }
+
+// The admin view's password (contract §19.13): the plan writes it 0640
+// to ViewerFile; a marked store keeps it as long as the file holds one
+// and a lost file gets a new password only (the account's credentials,
+// nothing else).
+func TestBootstrapJobViewerSecret(t *testing.T) {
+	s := &jobServer{f: newFake()}
+	j := newJob(t, s)
+	j.ViewerFile = filepath.Join(t.TempDir(), "viewer-password")
+	if err := j.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(j.ViewerFile)
+	pw, _ := os.ReadFile(j.ViewerFile)
+	if err != nil || fi.Mode().Perm() != 0o640 || len(pw) < 40 {
+		t.Fatalf("viewer file %v %v %d bytes", err, fi, len(pw))
+	}
+	sets := func() []string {
+		s.f.mu.Lock()
+		defer s.f.mu.Unlock()
+		var out []string
+		for _, c := range s.f.calls {
+			if strings.Contains(c, "/set") {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	s.f.calls = nil
+	if err := j.Run(context.Background()); err != nil || len(sets()) != 0 {
+		t.Fatalf("second run: %v sets %v", err, sets())
+	}
+	if b, _ := os.ReadFile(j.ViewerFile); string(b) != string(pw) {
+		t.Fatal("the viewer password changed on a run that didn't lose it")
+	}
+	os.Remove(j.ViewerFile)
+	s.f.calls = nil
+	if err := j.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(sets(), ","); got != "x:Account/set update" {
+		t.Fatalf("lost viewer file: sets %s", got)
+	}
+	if b, _ := os.ReadFile(j.ViewerFile); len(b) < 40 || string(b) == string(pw) {
+		t.Fatal("no new viewer password")
+	}
+}

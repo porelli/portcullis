@@ -5,8 +5,8 @@
 # behaviour (bash -e).
 set -e
 set -o pipefail
+./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
 docker compose up -d postgres lldap
-./portcullis vault init
 ./portcullis pki setup --with-server-cert
 ./portcullis config apply --bundle-only
 printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml

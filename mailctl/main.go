@@ -10,6 +10,7 @@
 //	mailctl healthcheck                        exit 0 when the API answers /healthz on loopback
 //	mailctl bootstrap --job -- <server argv…>  the template's one-off bootstrap job
 //	mailctl export --former <former-id>        one former account as mbox on stdout
+//	mailctl admin-view [healthcheck]           the read-only mail admin view's proxy (contract §19.13)
 //
 // Unknown subcommands exit 2.
 package main
@@ -49,10 +50,11 @@ import (
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/state"
 	"github.com/portcullis/mailctl/internal/tlsprobe"
+	"github.com/portcullis/mailctl/internal/viewer"
 	"github.com/portcullis/mailctl/internal/wellknown"
 )
 
-const usage = `usage: mailctl [serve | healthcheck | bootstrap --job -- <server argv…> | export --former <former-id>]`
+const usage = `usage: mailctl [serve | healthcheck | bootstrap --job -- <server argv…> | export --former <former-id> | admin-view [healthcheck]]`
 
 func main() { os.Exit(run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr)) }
 
@@ -77,6 +79,8 @@ func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
 		return bootstrapCmd(args[1:], env, stderr)
 	case cmd == "export":
 		return exportCmd(args[1:], env, stdout, stderr)
+	case cmd == "admin-view":
+		return adminViewCmd(args[1:], env, stderr)
 	default:
 		fmt.Fprintln(stderr, usage)
 		return 2
@@ -370,7 +374,7 @@ func jobFor(cfg config.Config, argv []string, stderr io.Writer) (*bootstrap.Job,
 		return nil, err
 	}
 	logger := logx.New(stderr)
-	return &bootstrap.Job{URL: cfg.JobLocalURL, DataDir: cfg.DataDir, KeyFile: cfg.APIKeyFile, StoreDir: cfg.StoreDir, SessionFile: cfg.JobSessionFile, ServerImage: cfg.ServerImage,
+	return &bootstrap.Job{URL: cfg.JobLocalURL, DataDir: cfg.DataDir, KeyFile: cfg.APIKeyFile, ViewerFile: cfg.ViewerSecretFile, StoreDir: cfg.StoreDir, SessionFile: cfg.JobSessionFile, ServerImage: cfg.ServerImage,
 		Params: p, Start: childServer(argv, stderr), Logf: logger.Printf}, nil
 }
 
@@ -420,7 +424,7 @@ func planParams(cfg config.Config) (bootstrap.Params, error) {
 	if err != nil {
 		return bootstrap.Params{}, err
 	}
-	return bootstrap.Params{MailctlIP: cfg.MailIP, ResolverIP: res.Addr(), ResolverPort: int(res.Port()),
+	return bootstrap.Params{MailctlIP: cfg.MailIP, ViewerIP: cfg.ViewerIP, ResolverIP: res.Addr(), ResolverPort: int(res.Port()),
 		RulesURL: "http://" + cfg.RulesAddr + spamrules.Path, MetricsUser: metrics.User, HTTPLookups: lookups}, nil
 }
 
@@ -472,4 +476,67 @@ func hostOf(p state.Persistent) string {
 		return ""
 	}
 	return p.Doc.MailHostname
+}
+
+// adminViewCmd is `mailctl admin-view` (contract §19.13): the read-only
+// mail admin view's proxy, run as a service of its own (never the
+// adapter: it holds no API key and no slot file). `admin-view
+// healthcheck` exits 0 when it answers /healthz on loopback.
+func adminViewCmd(args []string, env func(string) string, stderr io.Writer) int {
+	if len(args) == 1 && args[0] == "healthcheck" {
+		addr := env("MAILCTL_ADMINVIEW_ADDR")
+		if addr == "" {
+			addr = ":8090"
+		}
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return 1
+		}
+		resp, err := (&http.Client{Timeout: 3 * time.Second}).Get("http://127.0.0.1:" + port + "/healthz")
+		if err != nil {
+			return 1
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return 1
+		}
+		return 0
+	}
+	if len(args) != 0 {
+		fmt.Fprintln(stderr, "usage: mailctl admin-view [healthcheck]")
+		return 2
+	}
+	cfg, err := config.LoadAdminView(env)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl admin-view: refusing to start: %v\n", err)
+		return 1
+	}
+	logger := logx.New(stderr)
+	logx.AddSecret(cfg.RouteKey)
+	tsec, err := api.ReadSecret(cfg.TicketKeyFile, 32)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl admin-view: refusing to start: the ticket key: %v\n", err)
+		return 1
+	}
+	logx.AddSecret(tsec)
+	p, err := viewer.New(cfg.Upstream, cfg.Host, cfg.SecretFile, cfg.SPKIs, viewer.Gate{TraefikIP: cfg.TraefikIP, Key: cfg.RouteKey, Group: cfg.AdminGroup},
+		viewer.Tickets{Secret: []byte(tsec), UsedFile: cfg.UsedFile}, logx.AddSecret, logger.Printf)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl admin-view: %v\n", err)
+		return 1
+	}
+	_, port, _ := net.SplitHostPort(cfg.Addr)
+	bind, err := viewer.BindAddr(cfg.TraefikIP)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl admin-view: refusing to start: %v\n", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	logger.Printf("admin-view: serving the read-only mail admin view for %s on %s:%s (Traefik %s only)", cfg.Host, bind, port, cfg.TraefikIP)
+	if err := viewer.Serve(ctx, bind, port, p); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Fprintf(stderr, "mailctl admin-view: %v\n", err)
+		return 1
+	}
+	return 0
 }
