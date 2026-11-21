@@ -27,7 +27,7 @@ services:
   # The worker's engine API for the agent: the same image, sections and
   # limits as the primary's socket-proxy-hub (contract §6, §17.4).
   socket-proxy-agent:
-    image: ghcr.io/linuxserver/socket-proxy:3.4.7@sha256:4e5e59efd3338205561c54262581992036e5a36ccca97d487b1d4ec41f9adc58
+    image: ghcr.io/linuxserver/socket-proxy:3.4.7@sha256:18289eeb306e8e3b70901ffec23eafbb318d73b4514d0bd737dbfc7c5b4fe506
     <<: *hardening
     cap_add: [SYS_CHROOT]
     read_only: true
