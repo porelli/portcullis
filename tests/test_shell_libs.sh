@@ -4576,7 +4576,8 @@ vstate() {
 vshrink() { # vshrink <live replicas> <healthy map json> <extra code> [want: HA on = 3]
   rm -f "$VSH"/calls "$VSH"/peers "$VSH"/state "$VSH"/k "$VSH"/*.fail; printf 'vault-0\nvault-1\nvault-2\n' > "$VSH/peers"
   vstate "${2:-}" > "$VSH/state"; rm -f "$VSH/state.next"
-  kt "export VAULT_TOKEN=s.shrink-tok KUBE_VAULT_REMOVE_WAIT=0 ${4:+PORTCULLIS_HA=on}
+  kt "export VAULT_TOKEN=s.shrink-tok KUBE_VAULT_REMOVE_WAIT=0 KUBE_VAULT_PROVE_WAIT=${VPROVE:-7} ${4:+PORTCULLIS_HA=on}
+    _kube_vault_age() { echo ${VAGE:-9}; }
     kube_ctl() { echo \"\$*\" >> '$VSH/k'; case \"\$*\" in
       *'get statefulset vault -o jsonpath={.spec.replicas}') echo $1 ;;
       *'get configmap portcullis-vault-shrink -o json') [ -e '$VSH/rec' ] && jq -n --rawfile d '$VSH/rec' '{data: {dropped: \$d}}' || { echo 'Error from server (NotFound)'; return 1; } ;;
@@ -4598,8 +4599,11 @@ expect_eq "vault voters 3 → 1 (HA off), all healthy: vault-2 then vault-1 remo
 rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":true,"vault-1":false,"vault-2":true}')"
 expect_eq "vault voters 3 → 1 with vault-1 down (re-review I-a): the unhealthy vault-1 removed first, so {vault-0, vault-2} keeps its quorum" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(removals)" "rc=0:vault-1,vault-2"
-rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-1":{"healthy":true,"status":"voter","last_contact":"4.2s"},"vault-2":{"healthy":true,"status":"voter","last_contact":"850µs"}}')"
-expect_eq "vault voters 3 → 1 with vault-1 lost seconds ago (re-review 2 M-2): autopilot still says healthy, but 4.2 s since its last contact → counted down, removed first; the leader's 0s and 850µs count as up" \
+rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-1":{"healthy":true,"status":"voter","last_contact":"7.5s"},"vault-2":{"healthy":true,"status":"voter","last_contact":"850µs"}}')"
+expect_eq "vault voters 3 → 1, vault-1 still healthy to autopilot but 7.5 s since its last echo (past the 5 s heartbeat + 2; re-review 2 M-2) → counted down, removed first; the leader's 0s and 850µs count as up" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(removals)" "rc=0:vault-1,vault-2"
+rm -f "$VSH/rec"; OUT="$(VAGE=3 VPROVE=3 vshrink 3 '{"vault-0":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-1":{"healthy":true,"status":"voter","last_contact":"2.5s"},"vault-2":{"healthy":true,"status":"voter","last_contact":"0.5s"}}')"
+expect_eq "vault voters 3 → 1, vault-1 lost just before HA off (no echo since the round began 3 s ago, autopilot still healthy) → counted down, removed first; vault-2 echoed 0.5 s ago → up" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(removals)" "rc=0:vault-1,vault-2"
 rm -f "$VSH/rec"; OUT="$(vshrink 3 '{"vault-0":{"healthy":true,"status":"voter","last_contact":"1m2s"},"vault-1":{"healthy":true,"status":"leader","last_contact":"0s"},"vault-2":true}')"
 case "$OUT" in *"would leave no quorum after removing vault-2 (down: vault-0), its failure tolerance below 0"*"rc=1") t_pass "vault voters 3 → 1, the kept vault-0 stale-healthy (1m2s since its last contact) → refused before any removal" ;; *) t_fail "shrink stale kept: $OUT" ;; esac

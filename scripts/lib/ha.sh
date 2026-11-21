@@ -1423,22 +1423,32 @@ _kube_vault_shrink_record() {
     return 1
   fi
 }
-# _KUBE_VAULT_PLAN_JQ — from autopilot's state (env S), the raft peers (P)
-# and the voters kept (K): {plan, bad}. plan = the peers to drop, the
-# unhealthy first, then highest first; bad = the first step after which
-# the healthy voters are no majority of what is left (failure tolerance
-# below 0), with the ones counted down. Healthy (re-review 2 M-2): autopilot
-# says healthy AND it is the leader or its last contact is under 2 s —
-# autopilot keeps a lost voter "healthy" for its threshold (~14 s live), a
-# stale contact shows in a few. last_contact is Go's Duration.String()
-# (Vault v2.2.1 physical/raft ReadableDuration: "0s", "3.1ms", "850µs",
-# "1m2s"); unreadable = not healthy.
+# _KUBE_VAULT_PLAN_JQ — from autopilot's state (env S), the raft peers (P),
+# the voters kept (K) and the seconds since this round began (AGE):
+# {plan, bad, unproven}. plan = the peers to drop, the down ones first, then
+# highest first; bad = the first step after which the up voters are no
+# majority of what is left (failure tolerance below 0), with the ones
+# counted down; unproven = voters not yet seen alive this round.
+# Up (re-review 2 M-2, checked against Vault v2.2.1): autopilot says
+# healthy AND it is the leader, or it echoed since this round began and
+# within the heartbeat plus 2 s. last_contact is the leader's
+# now − LastHeartbeat (physical/raft/raft_autopilot.go:491), a follower
+# echoes every clusterHeartbeatInterval, 5 s by default
+# (vault/request_forwarding.go:411): a healthy follower reads 0–5 s (seen
+# live: 0.8–4.9 s), and autopilot itself calls a lost one healthy for
+# ~14 s. "Since this round began" (last_contact + 1 s ≤ AGE) means a voter
+# lost before the round can't count up. The Duration.String() forms:
+# "0s", "3.1ms", "850µs", "1m2s"; unreadable = down.
 _KUBE_VAULT_PLAN_JQ='
   def secs: if type != "string" then null else
       [scan("([0-9]+(?:\\.[0-9]+)?)(ns|us|µs|ms|h|m|s)")] as $p
       | if ($p | length) == 0 then null
         else $p | map((.[0] | tonumber) * ({"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600}[.[1]])) | add end end;
-  def up($s): ($s.healthy == true) and ($s.status == "leader" or (($s.last_contact | secs) as $d | $d != null and $d < 2));
+  (env.AGE | tonumber) as $age
+  | def up($s): ($s.healthy == true) and ($s.status == "leader"
+      or (($s.last_contact | secs) as $d | $d != null and $d < 7 and $d + 1 <= $age));
+  def maybe($s): ($s.healthy == true) and ($s.status != "leader")
+      and (($s.last_contact | secs) as $d | $d != null and $d < 7 and $d + 1 > $age);
   (env.S | fromjson | .data.servers) as $st
   | (env.P | split(" ") | map(select(. != ""))) as $peers
   | (env.K | split(" ") | map(select(. != ""))) as $keep
@@ -1449,25 +1459,35 @@ _KUBE_VAULT_PLAN_JQ='
         (.cfg - [$x]) as $c | ($c | map(select(. as $p | up($st[$p] // {})))) as $h
         | {cfg: $c, bad: (if ($h | length) < (($c | length) / 2 | floor) + 1 then {step: $x, down: ($c - $h)} else null end)}
       end)) as $r
-  | {plan: $plan, bad: $r.bad}'
+  | {plan: $plan, bad: $r.bad, unproven: ($peers | map(select(. as $p | maybe($st[$p] // {}))))}'
+# Seconds since <epoch> (a function: the tests set the clock).
+_kube_vault_age() { echo $(( $(date +%s) - $1 )); }
 
 # _kube_vault_shrink_read <keep> — through vault-0: the raft peers and
-# autopilot's state, then the plan (_KVS_PLAN, _KVS_BAD_STEP, _KVS_DOWN);
-# 1 when either can't be read; a peer this chart doesn't know fails.
+# autopilot's state, re-read each second until every voter is seen alive
+# this round or KUBE_VAULT_PROVE_WAIT (7 s: the heartbeat + 2) has passed,
+# then the plan (_KVS_PLAN, _KVS_BAD_STEP, _KVS_DOWN); 1 when either can't
+# be read; a peer this chart doesn't know fails.
 _kube_vault_shrink_read() {
-  local peers state out id
-  _KVS_PLAN=""; _KVS_BAD_STEP=""; _KVS_DOWN=""; _KVS_WHY=""
-  peers="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '.data.config.servers[].node_id' 2>/dev/null)" \
-    && [ -n "$peers" ] || { _KVS_WHY="can't read Vault's raft peers"; return 1; }
-  for id in $peers; do
-    [[ "$id" =~ ^vault-[0-9]+$ ]] || fail "Vault's raft has a peer $id that isn't a voter of this chart: refusing to lower its voters (nothing deployed)"
+  local peers state out id t0 age
+  t0="$(date +%s)"
+  while :; do
+    _KVS_PLAN=""; _KVS_BAD_STEP=""; _KVS_DOWN=""; _KVS_WHY=""
+    peers="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '.data.config.servers[].node_id' 2>/dev/null)" \
+      && [ -n "$peers" ] || { _KVS_WHY="can't read Vault's raft peers"; return 1; }
+    for id in $peers; do
+      [[ "$id" =~ ^vault-[0-9]+$ ]] || fail "Vault's raft has a peer $id that isn't a voter of this chart: refusing to lower its voters (nothing deployed)"
+    done
+    state="$(vexec read -format=json sys/storage/raft/autopilot/state 2>/dev/null)" \
+      && printf '%s' "$state" | jq -e '.data.servers | type == "object"' >/dev/null 2>&1 \
+      || { _KVS_WHY="can't read Vault's autopilot state (which voters are healthy)"; return 1; }
+    age="$(_kube_vault_age "$t0")"
+    # shellcheck disable=SC2086  # one id per word
+    out="$(S="$state" P="$(printf '%s ' $peers)" K="$1" AGE="$age" jq -nc "$_KUBE_VAULT_PLAN_JQ" 2>/dev/null)" \
+      || { _KVS_WHY="can't plan from Vault's autopilot state"; return 1; }
+    [ "$(printf '%s' "$out" | jq '.unproven | length')" != 0 ] && [ "$age" -lt "${KUBE_VAULT_PROVE_WAIT:-7}" ] || break
+    sleep 1
   done
-  state="$(vexec read -format=json sys/storage/raft/autopilot/state 2>/dev/null)" \
-    && printf '%s' "$state" | jq -e '.data.servers | type == "object"' >/dev/null 2>&1 \
-    || { _KVS_WHY="can't read Vault's autopilot state (which voters are healthy)"; return 1; }
-  # shellcheck disable=SC2086  # one id per word
-  out="$(S="$state" P="$(printf '%s ' $peers)" K="$1" jq -nc "$_KUBE_VAULT_PLAN_JQ" 2>/dev/null)" \
-    || { _KVS_WHY="can't plan from Vault's autopilot state"; return 1; }
   _KVS_PLAN="$(printf '%s' "$out" | jq -r '.plan | join(" ")')"
   _KVS_BAD_STEP="$(printf '%s' "$out" | jq -r '.bad.step // empty')"
   _KVS_DOWN="$(printf '%s' "$out" | jq -r '(.bad.down // []) | join(" ")')"
