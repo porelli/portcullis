@@ -298,7 +298,14 @@ func (j *Job) Run(ctx context.Context) (err error) {
 			return res, err
 		}
 		if ok {
-			j.logf("bootstrap: the store is bootstrapped and its API key is in place")
+			// The CI and e2e checks read these lines (build-and-test-mail-
+			// service.sh, e2e-podman-mail.sh): "; nothing to do" only when
+			// the run changed nothing.
+			if res.ViewerPassword != "" {
+				j.logf("bootstrap: the store is bootstrapped and its API key is in place; a new admin view password only")
+			} else {
+				j.logf("bootstrap: the store is bootstrapped and its API key is in place; nothing to do")
+			}
 			return res, nil
 		}
 		j.logf("bootstrap: the API key is missing or out of scope: a new key only (the store's settings untouched)")
