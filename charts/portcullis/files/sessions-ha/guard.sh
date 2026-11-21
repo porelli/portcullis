@@ -96,11 +96,17 @@ if [ "$m" = "$me" ]; then
     start="$(date +%s)" last=""
     while :; do
       if n="$(ask_master)"; then last="$n"; [ "$n" = "$me" ] || { m="$n"; break; }; else last=""; fi
-      if [ "$(elapsed)" -ge "$WAIT" ] && [ -z "$last" ]; then
+      # One reading of the clock per round (found under load: two readings
+      # could straddle the deadline — the silence check saw it not yet due,
+      # the next one due — and a silent round started this pod as the
+      # master). Past the wait, silence refuses; only the Sentinels still
+      # naming this pod starts it.
+      t="$(elapsed)"
+      if [ "$t" -ge "$WAIT" ] && [ -z "$last" ]; then
         named "no two Sentinels answer after the failover: refusing to start (never a master on silence)"
         exit 1
       fi
-      if [ "$(elapsed)" -ge "$WAIT" ]; then
+      if [ "$t" -ge "$WAIT" ]; then
         # The Sentinels refuse a replica whose link was down longer than 10
         # × down-after (valkey src/sentinel.c sentinelSelectReplica: found
         # live after a long DNS outage): they'd never fail over, and this

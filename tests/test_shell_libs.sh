@@ -1709,6 +1709,15 @@ expect_eq "sessions guard: a Sentinel naming a host that isn't one of the two Va
   "$(guard "evil.example.org" "")" "rc=1"
 expect_eq "sessions guard: every Sentinel silent after the FAILOVER → refused (exit 1), never a master config (review I1)" \
   "$(touch "$GD/silent-after"; guard "$P1" "$REP0" "$P0"; rm -f "$GD/silent-after")$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
+# Found under load (CI): two clock readings in one round could straddle the
+# deadline, so a silent round started the pod as the master. A clock that
+# advances 1 s per reading (GUARD_WAIT=2) put the old code exactly there.
+mkdir -p "$GD/clock"; printf '#!/bin/sh\nn=$(cat "$GD_DIR/clock/n" 2>/dev/null || echo 0); echo $((n + 1)) > "$GD_DIR/clock/n"; echo $((1000 + n))\n' > "$GD/clock/date"; chmod +x "$GD/clock/date"
+OUT="$(rm -f "$GD/calls" "$GD/failed-over" "$GD/conf" "$GD/clock/n"; printf '%s' "$P1" > "$GD/master"; printf '%s' "$REP0" > "$GD/peer"; printf '%s\n' "$P0" > "$GD/after"; touch "$GD/silent-after"
+  ( export PATH="$GD/clock:$GD/bin:$PATH" GD_DIR="$GD" POD_NAMESPACE=portcullis POD_NAME=sessions-1 GUARD_WAIT=2 GUARD_CONF="$GD/conf" GUARD_TERMLOG="$GD/term"
+    sh "$HERE/../charts/portcullis/files/sessions-ha/guard.sh" ) >/dev/null 2>&1; echo "rc=$?"; rm -f "$GD/silent-after")"
+expect_eq "sessions guard: silent after the FAILOVER with the deadline falling between two clock readings → still refused, no config (one reading per round)" \
+  "$OUT$(test -e "$GD/conf" && echo conf || echo noconf)$(grep -c 'no two Sentinels answer after the failover' "$GD/term")" "rc=1noconf1"
 expect_eq "sessions guard: one Sentinel alone names another master (the others silent) → no two agreeing answers, refused (review M2)" \
   "$(printf '%s' - > "$GD/master-1"; printf '%s' - > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
 expect_eq "sessions guard: two of three Sentinels agree (the third names this pod) → the two decide: a replica of their master" \
