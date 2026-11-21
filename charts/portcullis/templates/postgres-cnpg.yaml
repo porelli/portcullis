@@ -76,6 +76,12 @@ spec:
       isWALArchiver: true
       parameters:
         barmanObjectName: portcullis-backup
+        {{- /* This install's own archive path (review I1): the plugin
+        defaults serverName to the Cluster's name, so a re-made or restored
+        cluster would hit the previous one's archive (refused as not empty)
+        or share it. */}}
+        {{- if not (regexMatch "^portcullis-pg-[0-9a-f]{8}$" ($bk.serverName | default ""))}}{{ fail "backup.cnpg.serverName must be portcullis-pg-<the install id's first 8 hex>" }}{{ end }}
+        serverName: {{ $bk.serverName }}
   {{- end }}
   bootstrap:
     initdb:
@@ -204,10 +210,25 @@ spec:
   policyTypes: ["Egress"]
   egress:
     - to:
+        {{- if $bk.publicEgress }}
+        {{- /* The destination's addresses rotate (review I3): any public
+        address on 443, never the private / cluster ranges the CLI lists. */}}
+        {{- if ne (int $bk.port) 443 }}{{ fail "backup.cnpg.publicEgress is for port 443 only" }}{{ end }}
+        {{- range (list "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10" "169.254.0.0/16" "127.0.0.0/8") }}
+        {{- if not (has . $bk.publicExcept) }}{{ fail (printf "backup.cnpg.publicExcept lacks %s" .) }}{{ end }}
+        {{- end }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range $bk.publicExcept }}
+              - {{ . }}
+              {{- end }}
+        {{- else }}
         {{- range (required "backup.cnpg.endpointCIDRs is required" $bk.endpointCIDRs) }}
         {{- if not (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/32$" .) }}{{ fail (printf "backup.cnpg.endpointCIDRs: %s isn't one IPv4 address (/32)" .) }}{{ end }}
         - ipBlock:
             cidr: {{ . }}
+        {{- end }}
         {{- end }}
       ports:
         - protocol: TCP

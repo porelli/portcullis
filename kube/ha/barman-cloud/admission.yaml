@@ -1,0 +1,73 @@
+# portcullis-barman-rbac (plan Task 26 review M4): RBAC can't name a
+# create, so the barman-cloud plugin's `roles` / `rolebindings` create in
+# cnpg-system (kube/ha/barman-cloud/rbac.yaml) would let it bind its own
+# Role (Secret read in cnpg-system) to any subject. This policy admits, for
+# the plugin's ServiceAccount only, exactly the pair the pinned v0.16.0
+# writes per Cluster (internal/cnpgi/operator/specs/role.go):
+#   - name portcullis-pg-barman-cloud (GetRBACName of the Cluster
+#     portcullis-pg), in cnpg-system;
+#   - the Role: rules only on barmancloud.cnpg.io objectstores (get, list,
+#     watch), objectstores/status (update) and core secrets (get, list,
+#     watch), every rule with resourceNames (BuildRoleRules);
+#   - the RoleBinding: roleRef exactly that Role, subjects exactly the
+#     Cluster's ServiceAccount portcullis-pg in cnpg-system
+#     (BuildRoleBinding).
+# Anything else it creates or updates there is refused. The subject's
+# namespace is read as subjects[0]['namespace']: k3s 1.37 answers "no such
+# key" for the escaped __namespace__ form (measured). The first
+# validation refuses the CLI's in-force check of this policy's generation
+# (ha.sh _ha_barman_policy_in_force). tests/ha_admission_vectors.json
+# holds the vectors.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-barman-rbac
+  labels: {app.kubernetes.io/managed-by: portcullis}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: cnpg-system}
+    resourceRules:
+      - apiGroups: [rbac.authorization.k8s.io]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [roles, rolebindings]
+  matchConditions:
+    - name: the-plugin
+      expression: "request.userInfo.username == 'system:serviceaccount:cnpg-system:plugin-barman-cloud'"
+  variables:
+    - name: isRole
+      expression: "request.resource.resource == 'roles'"
+    - name: roleOk
+      expression: >-
+        has(object.rules) && size(object.rules) > 0 && object.rules.all(r,
+          has(r.resourceNames) && size(r.resourceNames) > 0 && !has(r.nonResourceURLs)
+          && has(r.apiGroups) && size(r.apiGroups) == 1 && has(r.resources) && size(r.resources) == 1
+          && ((r.apiGroups[0] == 'barmancloud.cnpg.io' && r.resources[0] == 'objectstores' && r.verbs.all(v, v in ['get', 'list', 'watch']))
+           || (r.apiGroups[0] == 'barmancloud.cnpg.io' && r.resources[0] == 'objectstores/status' && r.verbs.all(v, v == 'update'))
+           || (r.apiGroups[0] == '' && r.resources[0] == 'secrets' && r.verbs.all(v, v in ['get', 'list', 'watch']))))
+    - name: bindingOk
+      expression: >-
+        has(object.roleRef) && object.roleRef.kind == 'Role' && object.roleRef.name == 'portcullis-pg-barman-cloud'
+        && object.roleRef.apiGroup == 'rbac.authorization.k8s.io'
+        && has(object.subjects) && size(object.subjects) == 1 && object.subjects[0].kind == 'ServiceAccount'
+        && object.subjects[0].name == 'portcullis-pg'
+        && 'namespace' in object.subjects[0] && object.subjects[0]['namespace'] == 'cnpg-system'
+        && (!has(object.subjects[0].apiGroup) || object.subjects[0].apiGroup == '')
+  validations:
+    - expression: "!(has(object.metadata.annotations) && 'portcullis.io/policy-check' in object.metadata.annotations && object.metadata.annotations['portcullis.io/policy-check'] == '@POLICY_GENERATION@')"
+      message: "portcullis-barman-rbac generation @POLICY_GENERATION@ is in force"
+    - expression: "object.metadata.name == 'portcullis-pg-barman-cloud'"
+      message: "portcullis-barman-rbac: the barman-cloud plugin writes only the Role / RoleBinding portcullis-pg-barman-cloud"
+    - expression: "variables.isRole ? variables.roleOk : variables.bindingOk"
+      message: "portcullis-barman-rbac: only the Cluster's objectstore / secret read, by name, bound to the ServiceAccount portcullis-pg"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-barman-guard-rbac
+  labels: {app.kubernetes.io/managed-by: portcullis}
+spec:
+  policyName: portcullis-barman-rbac
+  validationActions: [Deny]

@@ -2181,7 +2181,7 @@ _backup_restore_kube() {
     # LLDAP is on Postgres here: no lldap_data volume (see _kube_restore_pg).
     [ "$key" != lldap_data ] || continue
     info "Restoring volume $key..."
-    _kube_restore_volume "$dir" "$key" "$uid" "$gid" || fail "could not restore volume $key"
+    _kube_restore_volume_t26 "$dir" "$key" "$uid" "$gid" || fail "could not restore volume $key"
   done
   info "Emptying hub-secrets (a restore voids every per-person credential)..."
   _kube_empty_volume hub_secrets "$CT_UID_HUB" "$CT_UID_HUB" || fail "could not empty hub-secrets"

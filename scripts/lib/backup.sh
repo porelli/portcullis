@@ -618,7 +618,11 @@ backup_dest_url_problem() {
 # into _BD_SCHEME, _BD_HOST (with port), _BD_BUCKET, _BD_PREFIX ("" or
 # "a/b"), _BD_ENDPOINT (scheme://host).
 backup_dest_parts() {
-  local u="${PORTCULLIS_BACKUP_S3_URL%/}" rest path
+  local u="${PORTCULLIS_BACKUP_S3_URL%/}" rest path p
+  # Checked at every use (review I2): a URL edited into .env, or set under
+  # HUB_DEV=1 (http), is refused here, never used (fail closed).
+  p="$(backup_dest_url_problem "$u")"
+  [ -z "$p" ] || fail "PORTCULLIS_BACKUP_S3_URL in .env: $p (refusing to use it)"
   _BD_SCHEME="${u%%://*}"; rest="${u#*://}"
   _BD_HOST="${rest%%/*}"; path="${rest#"$_BD_HOST"/}"
   _BD_BUCKET="${path%%/*}"; _BD_PREFIX=""
@@ -635,6 +639,7 @@ backup_dest_sub() { printf '%s/%s' "${PORTCULLIS_BACKUP_S3_URL%/}" "$1"; }
 # exported here); fails closed on a missing / malformed file.
 backup_dest_read() {
   local f line k
+  backup_dest_parts
   f="$(backup_dest_file)"
   [ -s "$f" ] || fail "the backup destination is set (PORTCULLIS_BACKUP_S3_URL) but $BACKUP_DEST_FILE_REL is missing: ./portcullis backup destination set"
   _BD_AWS_ACCESS_KEY_ID="" _BD_AWS_SECRET_ACCESS_KEY="" _BD_AWS_DEFAULT_REGION=""
@@ -645,6 +650,7 @@ backup_dest_read() {
     printf -v "_BD_$k" '%s' "${line#*=}"
   done < "$f"
   [ -n "$_BD_AWS_ACCESS_KEY_ID" ] && [ -n "$_BD_AWS_SECRET_ACCESS_KEY" ] || fail "$BACKUP_DEST_FILE_REL lacks AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+  case "$_BD_AWS_ACCESS_KEY_ID" in *:*) fail "$BACKUP_DEST_FILE_REL: AWS_ACCESS_KEY_ID has a ':' (it would split curl's user value)" ;; esac
   [ -n "$_BD_AWS_DEFAULT_REGION" ] || _BD_AWS_DEFAULT_REGION=us-east-1
 }
 
@@ -677,10 +683,16 @@ _backup_dest_curl() {
 
 # backup_dest_test — writes one object under <url>/ and deletes it.
 backup_dest_test() {
-  local key code t
   require_cmd curl
   [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ] || fail "no backup destination is set (./portcullis backup destination set)"
   backup_dest_read
+  _backup_dest_probe
+}
+
+# _backup_dest_probe — the test itself, with the _BD_* credentials already
+# in variables (set tests a candidate before anything is written: review M1).
+_backup_dest_probe() {
+  local key code t
   key="$(backup_dest_sub ".portcullis-test-$(date +%s)-$(openssl rand -hex 4)")"
   t="$(mktemp)"; printf 'portcullis destination test %s\n' "$(date -u +%FT%TZ)" > "$t"
   code="$(_backup_dest_curl PUT "$key" -H 'Content-Type: text/plain' -H "x-amz-content-sha256: $(_kube_sha "$t")" --data-binary @"$t")"
@@ -705,12 +717,18 @@ backup_dest_set() {
     case "$k" in AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_DEFAULT_REGION) ;; *) fail "unknown line on stdin (only AWS_ACCESS_KEY_ID=, AWS_SECRET_ACCESS_KEY=, AWS_DEFAULT_REGION=)" ;; esac
     [[ "${line#*=}" =~ ^[A-Za-z0-9+/=._~:-]{1,256}$ ]] || fail "the value of $k on stdin is empty, too long or has a character a credential doesn't"
     case "$k" in
-      AWS_ACCESS_KEY_ID) id="${line#*=}" ;;
+      AWS_ACCESS_KEY_ID) id="${line#*=}"; case "$id" in *:*) fail "AWS_ACCESS_KEY_ID on stdin has a ':' (no access key id does)" ;; esac ;;
       AWS_SECRET_ACCESS_KEY) sec="${line#*=}" ;;
       AWS_DEFAULT_REGION) reg="${line#*=}"; [[ "$reg" =~ ^[a-z0-9-]{2,32}$ ]] || fail "AWS_DEFAULT_REGION on stdin isn't a region name" ;;
     esac
   done
   [ -n "$id" ] && [ -n "$sec" ] || fail "stdin needs AWS_ACCESS_KEY_ID=… and AWS_SECRET_ACCESS_KEY=… lines"
+  # The candidate is tested from variables first (review M1): a refused
+  # write or delete leaves the file and .env as they were.
+  PORTCULLIS_BACKUP_S3_URL="$url" backup_dest_parts
+  _BD_AWS_ACCESS_KEY_ID="$id" _BD_AWS_SECRET_ACCESS_KEY="$sec" _BD_AWS_DEFAULT_REGION="${reg:-us-east-1}"
+  PORTCULLIS_BACKUP_S3_URL="$url" _backup_dest_probe
+  PORTCULLIS_BACKUP_S3_URL="$url" backup_dest_egress_resolve || fail "the backup destination: see above (nothing was written)"
   f="$(backup_dest_file)"
   (umask 077 && mkdir -p "${f%/*}")
   tmp="$(umask 077 && mktemp "${f%/*}/.backup-destination.XXXXXX")"
@@ -719,7 +737,6 @@ backup_dest_set() {
   env_set PORTCULLIS_BACKUP_S3_URL "$url"
   export PORTCULLIS_BACKUP_S3_URL="$url"
   ok "Backup destination set: $url (credentials in $BACKUP_DEST_FILE_REL, 0600)."
-  backup_dest_test
   kube_backup_destination_sync || fail "could not sync the destination to the cluster (Secret backup-destination): run ./portcullis up"
   ha_longhorn_backup_target
   info "Run ./portcullis up to apply it to the release (the Hub's HUB_BACKUP_DESTINATION; in HA CloudNativePG's archive and Longhorn's backup target)."
@@ -758,7 +775,8 @@ backup_dest_unset() {
   rm -f "$(backup_dest_file)"
   kube_backup_destination_sync || warn "could not remove the cluster's Secret backup-destination: delete it by hand"
   ha_longhorn_backup_target
-  ok "Backup destination removed (the bucket's contents are kept). Run ./portcullis up to apply it to the release."
+  ok "Backup destination removed (the bucket's contents are kept)."
+  warn "Until ./portcullis up, the release still names it: CloudNativePG's WAL archive fails (its Secret is gone). Run ./portcullis up now."
 }
 
 cmd_backup_destination() {

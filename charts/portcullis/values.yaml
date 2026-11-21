@@ -191,7 +191,10 @@ backup:
     destinationPath: ""
     endpointURL: ""
     port: 443
+    serverName: ""
     endpointCIDRs: []
+    publicEgress: false
+    publicExcept: []
     retention: 30d
     schedule: "0 15 3 * * *"
 

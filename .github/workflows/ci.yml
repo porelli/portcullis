@@ -6005,7 +6005,7 @@ jobs:
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-k3s,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-k3s ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-k3s,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-k3s ')
     runs-on: ubuntu-26.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -6046,6 +6046,9 @@ jobs:
       - name: Docker → Kubernetes restore round trip
         timeout-minutes: 30
         run: bash .github/ci/e2e-k3s-phases.sh restore
+      - name: The backup destination (S3 outside the cluster; CNPG archive, core offsite, Longhorn)
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh dest
       - name: Collect logs and events
         if: failure()
         run: bash .github/ci/e2e-k3s-collect.sh

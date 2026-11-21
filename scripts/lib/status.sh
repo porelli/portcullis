@@ -265,6 +265,10 @@ status_run() {
     [ "$(printf '%s' "$kx" | jq -r '.crashing != null and (.crashing | length) == 0')" = true ] || problems=1
     # The cluster check the Hub reads: missing, failed or 24 h old = it refuses.
     kube_cluster_check_lines "$(printf '%s' "$kx" | jq -c '.cluster_check')" >/dev/null || problems=1
+    # The backup destination (plan Task 26, review I1 / I3): Postgres not
+    # archiving or Longhorn's target unavailable is a problem.
+    kx="$(printf '%s' "$kx" | jq -c --argjson b "$(kube_backup_status_json)" '. + {backup_destination: $b}')"
+    kube_backup_status_lines "$(printf '%s' "$kx" | jq -c '.backup_destination')" >/dev/null || problems=1
   else
     # A docker error is a problem too (fail closed), shown as one line.
     shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
@@ -440,6 +444,7 @@ status_run() {
       done < <(printf '%s' "$kx" | jq -r '.crashing[] | [.namespace, .deployment, .reason, (.restarts | tostring)] | @tsv')
     fi
     kube_cluster_check_lines "$(printf '%s' "$kx" | jq -c '.cluster_check')" || true
+    kube_backup_status_lines "$(printf '%s' "$kx" | jq -c '.backup_destination')" || true
   fi
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
   if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi

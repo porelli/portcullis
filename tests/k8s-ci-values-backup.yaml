@@ -8,4 +8,5 @@ backup:
     destinationPath: s3://ci-bucket/portcullis/cnpg
     endpointURL: https://s3.example.org
     port: 443
+    serverName: portcullis-pg-0b0e2b3c
     endpointCIDRs: ["203.0.113.7/32", "203.0.113.8/32"]

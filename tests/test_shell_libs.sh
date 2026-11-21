@@ -6639,21 +6639,24 @@ groups bb
 memberships cc
 hash_count 2
 hashes dd
-attributes ee'
+attributes ee
+rows:users ff
+rows:groups 11'
 # The fakes: _kube_pg_exec answers the emptiness check ($LC_TABLES), the
 # columns, the dump (kept), the target summary ($LC_DST); the Python and
 # create_schema are stubbed.
 lconv() { kt "_lldap_convert_schema() { echo \"SCHEMA \$(cat \"\$1\" | wc -c)\" >> '$LC/calls'; }
-  _lldap_convert_py() { echo \"PY \$1\" >> '$LC/calls'; case \"\$1\" in sql) printf 'BEGIN;\nINSERT 1;\nCOMMIT;\n' ;; summary) printf '%s\n' \"\$LC_SRC\" ;; esac; }
+  _lldap_convert_py() { echo \"PY \$1\" >> '$LC/calls'; case \"\$1\" in sql) printf 'BEGIN;\nINSERT 1;\nCOMMIT;\n' ;; summary) printf '%s\n' \"\$LC_SRC\" ;; rowsql) echo 'select rows;' ;; esac; }
   _kube_pg_exec() { echo \"PG \$*\" >> '$LC/calls'; case \"\$*\" in *pg_tables*) echo \"\${LC_TABLES:-0}\" ;; *information_schema*) echo '{\"users\":{\"uuid\":\"text\"}}' ;;
-      'psql -X -q -v ON_ERROR_STOP=1 -d lldap_restore -f -') cat > '$LC/dump.sql' ;;
+      'psql -X -q -v ON_ERROR_STOP=1 -v VERBOSITY=terse -v SHOW_CONTEXT=never -d lldap_restore -f -') cat > '$LC/dump.sql'
+        [ -z \"\${LC_DUMP_ERR:-}\" ] || { printf '%s\n' \"\$LC_DUMP_ERR\" >&2; return 3; } ;;
       'psql -XtAq -d lldap_restore -f -') cat > '$LC/cleanup.sql' ;; *'-f -') cat > /dev/null; printf '%s\n' \"\$LC_DST\" ;; esac; }
   lldap_convert_sqlite_to_pg '$LC/users.db' '$LC/url'" 2>&1; }
 rm -f "$LC/calls"; OUT="$(LC_SRC="$SUMS" LC_DST="$SUMS" lconv)"
 case "$OUT" in *"3 user(s), 2 password hash(es)"*"rc=0") t_pass "lldap_convert: equal summaries → converted" ;; *) t_fail "lldap_convert ok: $OUT" ;; esac
 expect_eq "lldap_convert: create_schema, the dump into the target, then both summaries (in that order)" \
-  "$(grep -o '^SCHEMA\|^PY sql\|^PY summary\|ON_ERROR_STOP=1 -d lldap_restore -f -' "$LC/calls" | tr '\n' ';')" "SCHEMA;PY sql;ON_ERROR_STOP=1 -d lldap_restore -f -;PY summary;ON_ERROR_STOP=1 -d lldap_restore -f -;"
-for k in users uuids groups memberships hash_count hashes attributes; do
+  "$(grep -o '^SCHEMA\|^PY [a-z]*\|VERBOSITY=terse\|ON_ERROR_STOP=1 -d lldap_restore -f -' "$LC/calls" | tr '\n' ';')" "SCHEMA;PY sql;VERBOSITY=terse;PY summary;ON_ERROR_STOP=1 -d lldap_restore -f -;PY rowsql;ON_ERROR_STOP=1 -d lldap_restore -f -;"
+for k in users uuids groups memberships hash_count hashes attributes rows:users rows:groups; do
   rm -f "$LC/calls"; OUT="$(LC_SRC="$SUMS" LC_DST="$(printf '%s\n' "$SUMS" | sed "s/^$k .*/$k XX/")" lconv)"
   case "$OUT" in *"LLDAP conversion changed $(_lldap_convert_what "$k"): nothing was switched"*"rc=1") t_pass "lldap_convert: a different $k → refused naming it" ;; *) t_fail "lldap_convert diff $k: $OUT" ;; esac
 done
@@ -6670,8 +6673,55 @@ expect_eq "lldap_convert: the target URL (its password) never on argv or in outp
 printf 'not sqlite' > "$LC/bad.db"
 OUT="$(kt "lldap_convert_sqlite_to_pg '$LC/bad.db' '$LC/url'" 2>&1)"
 case "$OUT" in *"is not a SQLite database"*"rc=1") t_pass "lldap_convert: a non-SQLite file refused" ;; *) t_fail "lldap_convert bad db: $OUT" ;; esac
-expect_eq "lldap_convert: the create_schema pod gets the URL from a temporary Secret (--from-file), labelled lldap-schema, its log cut of credentials" \
-  "$(declare -f _lldap_convert_schema | grep -c -- '--from-file="$st/s"'):$(declare -f _lldap_convert_schema | grep -c '"portcullis.io/component": "lldap-schema"'):$(declare -f _lldap_convert_schema | grep -c "s#://\[^/@ \]\*@#://\*\*\*@#g")" "1:1:1"
+expect_eq "lldap_convert: the pods get the URL from a temporary Secret (--from-file), labelled lldap-schema + lldap-convert, their log cut of credentials" \
+  "$(declare -f _lldap_convert_pod | grep -c -- '--from-file="$st/s"'):$(declare -f _lldap_convert_pod | grep -c '"portcullis.io/component": "lldap-schema", "portcullis.io/lldap-convert": "true"'):$(declare -f _lldap_convert_pod | grep -c "s#://\[^/@ \]\*@#://\*\*\*@#g")" "1:1:1"
+# Review M6: Postgres' errors print only the ERROR line, quoted data cut.
+rm -f "$LC/calls"; OUT="$(LC_DUMP_ERR='psql:<stdin>:7: ERROR:  invalid input syntax for type boolean: "HASHSECRET-77fe" in "users"
+DETAIL:  Failing row contains (alice, HASHSECRET-77fe, x).
+LINE 1: INSERT INTO "users" VALUES (HASHSECRET-77fe)' LC_SRC="$SUMS" LC_DST="$SUMS" lconv)"
+case "$OUT" in *"Postgres: invalid input syntax for type boolean: \"…\" in \"users\""*"Postgres refused the dump"*"rc=1") t_pass "lldap_convert: a refused dump prints only its ERROR line, values cut (no DETAIL / LINE)" ;; *) t_fail "lldap_convert pg error: $OUT" ;; esac
+expect_eq "lldap_convert: no row content of a refused dump in the output" "$(printf '%s' "$OUT" | grep -c 'HASHSECRET\|DETAIL\|LINE 1' || true)" 0
+# Review M3 + M2 on the real Python: a users.db without a private-key hash
+# is refused; the full-row digests normalise per target type (a timestamp
+# with nanoseconds and an offset, bytea, booleans, NULL).
+if command -v python3 >/dev/null && python3 -c 'import sqlite3' 2>/dev/null; then
+  PYD="$WORK/lpy"; rm -rf "$PYD"; mkdir -p "$PYD"
+  python3 - "$PYD/u.db" <<'PY'
+import sqlite3, sys
+d = sqlite3.connect(sys.argv[1])
+d.executescript("""create table metadata (version integer, private_key_hash blob, private_key_location text);
+insert into metadata values (11, NULL, NULL);
+create table users (user_id text, uuid text, password_hash blob, creation_date text, flag integer);
+insert into users values ('a', 'u-1', x'0102', '2026-11-21T16:22:53.3628605+00:00', 1);
+insert into users values ('b', 'u-2', NULL, '2026-11-21 16:22:53', 0);
+create table groups (group_id integer, display_name text, uuid text);
+create table memberships (user_id text, group_id integer);""")
+d.commit()
+PY
+  echo '{"users":{"user_id":"character varying","uuid":"character varying","password_hash":"bytea","creation_date":"timestamp without time zone","flag":"boolean"},"groups":{"group_id":"integer","display_name":"text","uuid":"text"},"memberships":{"user_id":"text","group_id":"integer"},"metadata":{}}' > "$PYD/cols"
+  pyrun() { { cat "$PYD/cols"; cat "$PYD/u.db"; } | python3 -c "$_LLDAP_CONVERT_PY" "$1" "users groups memberships" 2>&1; echo "rc=$?"; }
+  OUT="$(pyrun sql)"
+  case "$OUT" in *"users.db has no private-key hash: LLDAP would accept any seed (refused)"*) t_pass "lldap_convert (python): a users.db without a private-key hash → refused" ;; *) t_fail "lldap_convert no hash: $OUT" ;; esac
+  want="$(printf '%s\n' "$(printf 'a\x1fu-1\x1f0102\x1f2026-11-21 16:22:53.362860\x1ftrue')" "$(printf 'b\x1fu-2\x1f\x01\x1f2026-11-21 16:22:53.000000\x1ffalse')" | LC_ALL=C sort | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.read().rstrip("\n").encode()).hexdigest())')"
+  expect_eq "lldap_convert (python): full-row digest = the rows normalised by target type (µs half-even, wall time, bytea hex, booleans, NULL)" \
+    "$(pyrun summary | awk '$1 == "rows:users" {print $2}')" "$want"
+  expect_eq "lldap_convert (python): the Postgres side normalises the same way" \
+    "$(pyrun rowsql | grep -c "to_char(\"creation_date\", 'YYYY-MM-DD HH24:MI:SS.US')\|encode(\"password_hash\", 'hex')")" 1
+fi
+# Review M8: the converted lldap_restore never outlives a failed restore.
+OUT="$(kt "kube_lldap_convert_backup() { KUBE_LLDAP_CONVERTED=true; }; _kube_pg_exec() { echo \"PG \$*\" >> '$LC/m8'; }
+  rm -f '$LC/m8'; mkdir -p '$LC/b'; printf x > '$LC/b/lldap_data.tar.gz'; kube_lldap_convert_preflight '$LC/b'; fail 'a later step failed'")"
+expect_eq "kube restore: a failure after the conversion drops lldap_restore (EXIT trap)" "$(grep -c '^PG dropdb --if-exists --force lldap_restore$' "$LC/m8"):$(printf '%s' "$OUT" | tail -n1)" "1:rc=1"
+# The queued early check: the backup's seed against its users.db, before anything changes.
+OUT="$(kt "_kube_pg_wait() { :; }; _kube_pg_fresh_db() { :; }; LLDAP_PG_PASSWORD=x
+  lldap_convert_sqlite_to_pg() { :; }; _lldap_convert_pod() { echo \"POD \$2 \$3\" >> '$LC/sc'; [ \"\$2\" != seedcheck ]; }
+  _kube_pg_exec() { echo \"PG \$*\" >> '$LC/sc'; }; tar() { mkdir -p \"\${4}\" && printf 'SQLite format 3' > \"\${4}/users.db\"; }
+  rm -f '$LC/sc'; mkdir -p '$LC/b/secrets/lldap'; printf s > '$LC/b/secrets/lldap/key-seed'; kube_lldap_convert_backup '$LC/b'")"
+case "$OUT" in *"the backup's key seed doesn't open its users.db"*"nothing was switched"*"rc=1") t_pass "kube restore: the backup's seed checked against its converted users.db (refused → nothing switched)" ;; *) t_fail "seed check: $OUT" ;; esac
+expect_eq "kube restore: the seed check runs LLDAP with the BACKUP's seed, and a refusal drops lldap_restore" \
+  "$(grep -c "^POD seedcheck $LC/b/secrets/lldap/key-seed$" "$LC/sc"):$(grep -c '^PG dropdb --if-exists --force lldap_restore$' "$LC/sc")" "1:1"
+expect_eq "lldap_convert: the seed check is LLDAP's own run + healthcheck readiness on the backup's seed (a temporary Secret)" \
+  "$(declare -f _lldap_convert_pod | grep -c '"/app/lldap", "run", "--config-file", "/dev/null"'):$(declare -f _lldap_convert_pod | grep -c 'readinessProbe: {exec: {command: \["/app/lldap", "healthcheck"')" "1:1"
 expect_eq "kube restore: the conversion runs before the Hub is stopped (a refusal changes nothing)" \
   "$(declare -f _backup_restore_kube | awk '/kube_lldap_convert_preflight/ {c=NR} /Stopping the Hub/ {h=NR} END {print (c && h > c) ? "first" : "no"}')" first
 expect_eq "kube restore: the replaced databases dropped only after the stack is healthy" \
@@ -7014,10 +7064,11 @@ CSTUB
 chmod +x "$BD/bin/curl"
 BD_KEY="AKIATESTKEY0000SECRET1" BD_SEC="wJalrXUtnFEMI/K7MDENG/bPxRfiCYsecretKEY99"
 bdk() { rm -f "$BD/curl-argv" "$BD/curl-stdin"; k_fixtures; : > "$KS/kube/ns-cnpg-system.json"
-  kt "export PORTCULLIS_ROOT='$BD/root' BD_DIR='$BD' PATH='$BD/bin':\$PATH PORTCULLIS_KUBE_NODE_ADDRESSES=\${BD_NODES-198.51.100.1}; env_load 2>/dev/null || true; $1"; }
+  kt "export PORTCULLIS_ROOT=\"\${BD_ROOT:-$BD/root}\" BD_DIR='$BD' PATH='$BD/bin':\$PATH PORTCULLIS_KUBE_NODE_ADDRESSES=\${BD_NODES-198.51.100.1} BACKUP_DEST_RESOLVE_WAIT=0
+    getent() { echo '203.0.113.50 STREAM s3.example.org'; }; env_load 2>/dev/null || true; $1"; }
 OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_DEFAULT_REGION=eu-west-1\n' "$BD_KEY" "$BD_SEC" \
   | bdk "backup_dest_set https://s3.example.org/pc-bucket/site-a")"
-case "$OUT" in *"Backup destination set: https://s3.example.org/pc-bucket/site-a"*"wrote and deleted a test object"*"rc=0") t_pass "backup destination set: stored, tested, synced" ;; *) t_fail "backup destination set: $OUT" ;; esac
+case "$OUT" in *"wrote and deleted a test object"*"Backup destination set: https://s3.example.org/pc-bucket/site-a"*"rc=0") t_pass "backup destination set: tested, then stored, synced" ;; *) t_fail "backup destination set: $OUT" ;; esac
 expect_eq "backup destination set: credentials never on argv (stdin only) — not in curl's or kubectl's argv, nor in the output" \
   "$(cat "$BD/curl-argv" "$KS/kubectl-calls" 2>/dev/null | grep -c "$BD_KEY\|$BD_SEC" || true):$(printf '%s' "$OUT" | grep -c "$BD_KEY\|$BD_SEC" || true)" "0:0"
 expect_eq "backup destination set: the key pair reaches curl on its stdin config (-K -), SigV4 with the region" \
@@ -7049,11 +7100,56 @@ OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket/sit
 case "$OUT" in *"isn't the backup destination's"*"rc=1") t_pass "restic: another BACKUP_REPOSITORY next to the destination is refused" ;; *) t_fail "restic two repositories: $OUT" ;; esac
 # The chart's values and the Hub's record.
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9:9000/pc-bucket/site-a; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 0; }; kube_backup_values \$f; jq -c .backup \$f")"
-case "$OUT" in *'{"destination":true,"cnpg":{"enabled":true,"destinationPath":"s3://pc-bucket/site-a/cnpg","endpointURL":"https://203.0.113.9:9000","port":9000,"endpointCIDRs":["203.0.113.9/32"],'*) t_pass "kube_backup_values: the destination, CNPG's path and endpoint under <url>/cnpg" ;; *) t_fail "kube_backup_values: $OUT" ;; esac
+case "$OUT" in *'{"destination":true,"cnpg":{"enabled":true,"destinationPath":"s3://pc-bucket/site-a/cnpg","endpointURL":"https://203.0.113.9:9000","port":9000,"serverName":"portcullis-pg-0b0e2b3c","publicEgress":false,"endpointCIDRs":["203.0.113.9/32"],'*) t_pass "kube_backup_values: the destination, CNPG's path and endpoint under <url>/cnpg" ;; *) t_fail "kube_backup_values: $OUT" ;; esac
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 1; }; kube_backup_values \$f; jq -c '.backup | [.destination, .cnpg.enabled]' \$f")"
 case "$OUT" in *'[true,false]'*) t_pass "kube_backup_values: no CNPG archive while the plugin isn't ready" ;; *) t_fail "kube_backup_values no plugin: $OUT" ;; esac
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=; f=\$(mktemp); echo '{}' > \$f; kube_backup_values \$f; jq -c '.backup | [.destination, .cnpg.enabled]' \$f")"
 case "$OUT" in *'[false,false]'*) t_pass "kube_backup_values: no destination → nothing" ;; *) t_fail "kube_backup_values none: $OUT" ;; esac
+# Review M1: a refused test leaves no file and .env as it was.
+mkdir -p "$BD/root2/secrets"; printf 'CONTAINER_RUNTIME=kubernetes\n' > "$BD/root2/.env"
+OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$BD_KEY" "$BD_SEC" | BD_ROOT="$BD/root2" STUB_CURL_PUT=403 bdk "backup_dest_set https://s3.example.org/pc-bucket")"
+expect_eq "backup destination set: after a 403, no credentials file and .env unchanged (tested from variables first)" \
+  "$(printf '%s' "$OUT" | tail -n1):$(test -e "$BD/root2/secrets/backup-destination.env" && echo file || echo nofile):$(cat "$BD/root2/.env")" "rc=1:nofile:CONTAINER_RUNTIME=kubernetes"
+OUT="$(printf 'AWS_ACCESS_KEY_ID=AKIA:X\nAWS_SECRET_ACCESS_KEY=%s\n' "$BD_SEC" | BD_ROOT="$BD/root2" bdk "backup_dest_set https://s3.example.org/pc-bucket")"
+case "$OUT" in *"AWS_ACCESS_KEY_ID on stdin has a ':'"*"rc=1") t_pass "backup destination set: a ':' in the key id refused (curl's user value)" ;; *) t_fail "key id colon: $OUT" ;; esac
+# Review I2: https checked at every use — an http URL in .env without HUB_DEV is refused.
+for fn in "f=\$(mktemp); echo '{}' > \$f; kube_backup_values \$f" "BACKUP_PASSWORD=x _restic_require" ": > '$KS/kube/ns-longhorn-system.json'; ha_longhorn_backup_target" "backup_dest_test"; do
+  OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=http://203.0.113.9/pc-bucket; unset HUB_DEV; $fn")"
+  case "$OUT" in *"PORTCULLIS_BACKUP_S3_URL in .env: the destination must be https://"*"rc=1") t_pass "backup destination: http in .env without HUB_DEV refused at use (${fn%%;*})" ;; *) t_fail "http at use (${fn%%;*}): $OUT" ;; esac
+done
+# Review I1: the archive's serverName from the install id.
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 0; }; kube_backup_values \$f; jq -r .backup.cnpg.serverName \$f")"
+expect_eq "kube_backup_values: serverName = portcullis-pg-<install id's first 8 hex>" "$(printf '%s\n' "$OUT" | head -n1)" "portcullis-pg-0b0e2b3c"
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCULLIS_KUBE_INSTALL_ID=bogus; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 0; }; kube_backup_values \$f")"
+case "$OUT" in *"isn't a uuid"*"rc=1") t_pass "kube_backup_values: no install id → refused (never a shared archive path)" ;; *) t_fail "serverName no id: $OUT" ;; esac
+# Review I3: rotating addresses → any public address on 443; stable → pinned.
+ROT="getent() { n=\$(cat '$BD/rot' 2>/dev/null || echo 0); echo \$((n + 1)) > '$BD/rot'; echo \"52.0.0.\$((n % 3 + 1)) STREAM\"; }"
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket; $ROT; backup_dest_egress_resolve; echo \"MODE=\$_BD_EGRESS_MODE\"; printf '%s\n' \"\$_BD_EGRESS_EXCEPT\"")"
+expect_eq "backup egress: a rotating name → public, 5 lookups" "$(printf '%s\n' "$OUT" | grep -c '^MODE=public$'):$(cat "$BD/rot")" "1:5"
+expect_eq "backup egress (public): RFC 1918, CGNAT, link-local, loopback, the pod / service / mesh CIDRs, the nodes and API endpoints excepted" \
+  "$(for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8 10.42.0.0/24 10.43.0.0/16 10.215.0.0/24 198.51.100.1/32 10.1.0.4/32; do printf '%s\n' "$OUT" | grep -qx "$c" || echo "missing $c"; done)" ""
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org:9000/pc-bucket; $ROT; backup_dest_egress_resolve")"
+case "$OUT" in *"addresses rotate"*"its port is 9000 (refused)"*"rc=1") t_pass "backup egress: rotating addresses on a port other than 443 → refused" ;; *) t_fail "rotating 9000: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; backup_dest_egress_resolve; echo \"MODE=\$_BD_EGRESS_MODE \$_BD_EGRESS_CIDRS\"")"
+expect_eq "backup egress: a stable name → pinned /32s" "$(printf '%s\n' "$OUT" | grep '^MODE=')" "MODE=pinned 203.0.113.50/32"
+OUT="$(rm -f "$BD/rot"; bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket; $ROT; _ha_backup_egress longhorn-system backup-destination-manager '{\"matchLabels\":{\"app\":\"longhorn-manager\"}}'")"
+expect_eq "_ha_backup_egress (public): the exact pods, 0.0.0.0/0 minus the private ranges, 443" \
+  "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(.kind? == "NetworkPolicy") | [.spec.podSelector, .spec.egress[0].to[0].ipBlock.cidr, (.spec.egress[0].to[0].ipBlock.except | index("10.0.0.0/8") != null), .spec.egress[0].ports]')" \
+  '[{"matchLabels":{"app":"longhorn-manager"}},"0.0.0.0/0",true,[{"protocol":"TCP","port":443}]]'
+# Security review: empty / invalid API endpoints or node addresses refuse.
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCULLIS_KUBE_API_ENDPOINTS=; backup_dest_cidrs")"
+case "$OUT" in *"PORTCULLIS_KUBE_API_ENDPOINTS unknown: the backup destination can't be checked (refused)"*"rc=1") t_pass "backup_dest_cidrs: no API endpoints → refused" ;; *) t_fail "no api: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCULLIS_KUBE_API_ENDPOINTS='10.1.0.999:6443'; backup_dest_cidrs")"
+case "$OUT" in *"the cluster address 10.1.0.999"*"isn't an IPv4 address"*"rc=1") t_pass "backup_dest_cidrs: an API endpoint that isn't an IPv4 → refused" ;; *) t_fail "bad api: $OUT" ;; esac
+OUT="$(BD_NODES='198.51.100.1 node-x' bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; backup_dest_cidrs")"
+case "$OUT" in *"the cluster address node-x"*"rc=1") t_pass "backup_dest_cidrs: a node address that isn't an IPv4 → refused" ;; *) t_fail "bad node: $OUT" ;; esac
+# Review I1 / I3: status — not archiving, Longhorn unavailable, the public-egress notice.
+OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"public","cnpg":{"archiving":false,"last_backup":true,"message":"WAL upload failed"},"longhorn":{"available":false}}'; echo "rc=$?" ) )"
+expect_eq "status: Postgres not archiving and Longhorn's target unavailable are problems; public egress a notice" \
+  "$(printf '%s\n' "$OUT" | grep -c '^fail backup destination: Postgres isn.t archiving (WAL upload failed)'):$(printf '%s\n' "$OUT" | grep -c '^fail backup destination: Longhorn'):$(printf '%s\n' "$OUT" | grep -c '^warn backup egress: any public address on 443 (the destination.s addresses rotate)'):$(printf '%s\n' "$OUT" | tail -n1)" "1:1:1:rc=1"
+OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"pinned","cnpg":{"archiving":true,"last_backup":true,"message":""},"longhorn":{"available":true}}'; echo "rc=$?" ) )"
+expect_eq "status: archiving + an available target → ok" "$(printf '%s\n' "$OUT" | grep -c '^ok '):$(printf '%s\n' "$OUT" | tail -n1)" "2:rc=0"
+expect_eq "status runs the backup destination's check on Kubernetes" "$(grep -c 'kube_backup_status_lines' "$HERE/../scripts/lib/status.sh")" 2
 # Security ruling: the backup egress reaches exactly the endpoint, from the exact pods.
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.ci.invalid/pc-bucket; getent() { [ \"\$1 \$2\" = 'ahostsv4 s3.ci.invalid' ] && printf '198.51.100.20 STREAM s3.ci.invalid\n198.51.100.21 STREAM\n198.51.100.20 DGRAM\n'; }; backup_dest_cidrs")"
 expect_eq "backup_dest_cidrs: a host name resolved now, each IPv4 a /32, unique" "$(printf '%s\n' "$OUT" | tr '\n' ' ')" "198.51.100.20/32 198.51.100.21/32 rc=0 "
@@ -7087,7 +7183,7 @@ for d in "https://203.0.113.9/pc-bucket" ""; do
 done
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; _ha_backup_egress longhorn-system x '{}'")"
 case "$OUT" in *"a pod selector naming the component is required"*"rc=1") t_pass "_ha_backup_egress: a namespace-wide selector is refused" ;; *) t_fail "_ha_backup_egress {}: $OUT" ;; esac
-OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=http://203.0.113.9/pc-bucket; _ha_backup_egress longhorn-system backup-destination-manager '{\"matchLabels\":{\"app\":\"longhorn-manager\"}}'")"
+OUT="$(bdk "export HUB_DEV=1 PORTCULLIS_BACKUP_S3_URL=http://203.0.113.9/pc-bucket; _ha_backup_egress longhorn-system backup-destination-manager '{\"matchLabels\":{\"app\":\"longhorn-manager\"}}'")"
 expect_eq "_ha_backup_egress: the exact pods, the endpoint's /32 and port only" \
   "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(.kind? == "NetworkPolicy") | [.spec.podSelector, .spec.egress]')" \
   '[{"matchLabels":{"app":"longhorn-manager"}},[{"to":[{"ipBlock":{"cidr":"203.0.113.9/32"}}],"ports":[{"protocol":"TCP","port":80}]}]]'

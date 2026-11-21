@@ -18128,5 +18128,561 @@
     "value": "self-node-remediation"
    }
   ]
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: the plugin's Role (pinned BuildRoleRules)",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "Role",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores/status"
+     ],
+     "verbs": [
+      "update"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resourceNames": [
+      "backup-destination"
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac",
+  "update": true
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: the plugin's RoleBinding (pinned BuildRoleBinding)",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "portcullis-pg-barman-cloud"
+   },
+   "subjects": [
+    {
+     "apiGroup": "",
+     "kind": "ServiceAccount",
+     "name": "portcullis-pg",
+     "namespace": "cnpg-system"
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a Role of another name",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "Role",
+   "metadata": {
+    "name": "other",
+    "namespace": "cnpg-system"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores/status"
+     ],
+     "verbs": [
+      "update"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resourceNames": [
+      "backup-destination"
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a RoleBinding of another name",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "other",
+    "namespace": "cnpg-system"
+   },
+   "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "portcullis-pg-barman-cloud"
+   },
+   "subjects": [
+    {
+     "apiGroup": "",
+     "kind": "ServiceAccount",
+     "name": "portcullis-pg",
+     "namespace": "cnpg-system"
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a Role rule without resourceNames",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "Role",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores/status"
+     ],
+     "verbs": [
+      "update"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "also_refused_by": "is attempting to grant RBAC permissions not currently held",
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a Role reading pods",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "Role",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores/status"
+     ],
+     "verbs": [
+      "update"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resourceNames": [
+      "backup-destination"
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resourceNames": [
+      "x"
+     ],
+     "resources": [
+      "pods"
+     ],
+     "verbs": [
+      "get"
+     ]
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "also_refused_by": "is attempting to grant RBAC permissions not currently held",
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a Role writing secrets",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "Role",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores/status"
+     ],
+     "verbs": [
+      "update"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resourceNames": [
+      "backup-destination"
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "update"
+     ]
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a binding of its own Role portcullis-barman-cloud",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "portcullis-barman-cloud"
+   },
+   "subjects": [
+    {
+     "apiGroup": "",
+     "kind": "ServiceAccount",
+     "name": "portcullis-pg",
+     "namespace": "cnpg-system"
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a binding to a ServiceAccount in another namespace",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "portcullis-pg-barman-cloud"
+   },
+   "subjects": [
+    {
+     "apiGroup": "",
+     "kind": "ServiceAccount",
+     "name": "portcullis-pg",
+     "namespace": "portcullis"
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a binding to a second subject",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "portcullis-pg-barman-cloud"
+   },
+   "subjects": [
+    {
+     "apiGroup": "",
+     "kind": "ServiceAccount",
+     "name": "portcullis-pg",
+     "namespace": "cnpg-system"
+    },
+    {
+     "kind": "ServiceAccount",
+     "name": "x",
+     "namespace": "cnpg-system"
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac"
+ },
+ {
+  "allowed": false,
+  "also_refused_by": "not found",
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a binding to a ClusterRole",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "ClusterRole",
+    "name": "portcullis-pg-barman-cloud"
+   },
+   "subjects": [
+    {
+     "apiGroup": "",
+     "kind": "ServiceAccount",
+     "name": "portcullis-pg",
+     "namespace": "cnpg-system"
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a binding to a user",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "portcullis-pg-barman-cloud"
+   },
+   "subjects": [
+    {
+     "apiGroup": "rbac.authorization.k8s.io",
+     "kind": "User",
+     "name": "mallory"
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac"
  }
 ]

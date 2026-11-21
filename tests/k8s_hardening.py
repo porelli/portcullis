@@ -1769,6 +1769,34 @@ def check_backup_egress():
             F.add(f"backup egress: portcullis-pg-backup reaches {to} (exactly the endpoint's /32s)")
         if [p for e in sp["egress"] for p in e.get("ports", [])] != [{"protocol": "TCP", "port": bk["backup"]["cnpg"]["port"]}]:
             F.add("backup egress: portcullis-pg-backup's port isn't the destination's")
+    # Review I1: the archive's serverName is this install's (the CLI derives
+    # it from PORTCULLIS_KUBE_INSTALL_ID); none / another shape is refused.
+    cl = K.by_kind(docs, "Cluster")[0]
+    plug = [p for p in cl["spec"].get("plugins", []) if p["name"] == "barman-cloud.cloudnative-pg.io"]
+    if len(plug) != 1 or plug[0]["parameters"].get("serverName") != bk["backup"]["cnpg"]["serverName"] \
+            or not re.match(r"^portcullis-pg-[0-9a-f]{8}$", plug[0]["parameters"].get("serverName", "")):
+        F.add(f"backup: the plugin's serverName {plug} (portcullis-pg-<install id>)")
+    for sn in ("", "portcullis-pg", "other"):
+        bad = copy.deepcopy(vals); bad["backup"]["cnpg"]["serverName"] = sn
+        try:
+            K.render(bad, "templates/postgres-cnpg.yaml"); F.add(f"backup: serverName {sn!r} renders (want refused)")
+        except subprocess.CalledProcessError:
+            pass
+    # Review I3: rotating addresses → any public address on 443, the private
+    # and cluster ranges excepted; another port refused.
+    pub = copy.deepcopy(vals)
+    exc = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8", "0.0.0.0/8", "10.42.0.0/24", "10.43.0.0/16", "10.215.0.0/24", "198.51.100.1/32"]
+    pub["backup"]["cnpg"].update({"publicEgress": True, "endpointCIDRs": [], "publicExcept": exc})
+    pp = [d for d in K.by_kind(K.render(pub, "templates/postgres-cnpg.yaml"), "NetworkPolicy") if d["metadata"]["name"] == "portcullis-pg-backup"]
+    if not pp or pp[0]["spec"]["egress"] != [{"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": exc}}], "ports": [{"protocol": "TCP", "port": 443}]}] \
+            or pp[0]["spec"]["podSelector"] != {"matchLabels": {"cnpg.io/cluster": "portcullis-pg", "cnpg.io/podRole": "instance"}}:
+        F.add(f"backup egress (public): {pp and pp[0]['spec']}")
+    for mut in ({"port": 8443}, {"publicExcept": exc[1:]}):
+        bad = copy.deepcopy(pub); bad["backup"]["cnpg"].update(mut)
+        try:
+            K.render(bad, "templates/postgres-cnpg.yaml"); F.add(f"backup egress (public): {mut} renders (want refused)")
+        except subprocess.CalledProcessError:
+            pass
     bad = copy.deepcopy(vals); bad["backup"]["cnpg"]["endpointCIDRs"] = ["0.0.0.0/0"]
     try:
         K.render(bad, "templates/postgres-cnpg.yaml")
@@ -1835,7 +1863,7 @@ def barman_problems(docs):
     env = {e["name"]: e.get("value") for e in c.get("env", [])}
     if env.get("WATCH_NAMESPACE") != K.CNPG_NS:
         out.append(f"barman: WATCH_NAMESPACE {env.get('WATCH_NAMESPACE')} (want {K.CNPG_NS})")
-    if not re.match(r"^ghcr\.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0\.16\.0@sha256:[0-9a-f]{64}$", env.get("SIDECAR_IMAGE") or ""):
+    if env.get("SIDECAR_IMAGE") != "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.16.0@sha256:c669259e20ed1e11fad821f735c396c19d929985aa05b9544b13ecc8b5a386d0":
         out.append(f"barman: SIDECAR_IMAGE {env.get('SIDECAR_IMAGE')} (the pinned sidecar by digest)")
     sc = c.get("securityContext") or {}
     if sc.get("allowPrivilegeEscalation") is not False or sc.get("readOnlyRootFilesystem") is not True or (sc.get("capabilities") or {}).get("drop") != ["ALL"]:

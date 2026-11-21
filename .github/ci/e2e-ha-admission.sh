@@ -41,6 +41,14 @@ docs = [d for f in sys.argv[1:] for d in yaml.safe_load_all(open(f)) if d]
 print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in docs if d["metadata"]["name"] in ("portcullis-node-labels", "portcullis-nodes-guard-labels")]}))' \
   kube/admission/policies.yaml kube/admission/bindings.yaml \
   | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
+# portcullis-barman-rbac (Task 26 review M4) with the plugin's Role (its
+# create right), in cnpg-system, confirmed in force.
+kubectl --context "$ctx" create namespace cnpg-system --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
+lib 'HA_DIR=kube/ha KUBE_BARMAN_NS=cnpg-system; _ha_barman_policy_apply' || { echo "FAIL - portcullis-barman-rbac isn't in force"; exit 1; }
+# The Role the plugin makes for the Cluster (its pinned shape, made here as
+# the CLI): a RoleBinding create needs the Role it names to exist.
+jq -c '.[] | select(.policy == "portcullis-barman-rbac" and .allowed and .object.kind == "Role") | .object' tests/ha_admission_vectors.json \
+  | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
 node="$(kubectl --context "$ctx" get nodes -o jsonpath='{.items[0].metadata.name}')"
 node2="$(kubectl --context "$ctx" get nodes -o jsonpath='{.items[1].metadata.name}')"
 [ -n "$node2" ] || { echo "FAIL - the node vectors need two Nodes"; exit 1; }
@@ -67,6 +75,12 @@ while IFS= read -r v; do
     out="$(kubectl --context "$ctx" -n "$ns" get pod "$pn" -o json | jq --argjson e "$(jq -c .ephemeralContainers <<<"$v")" '.spec.ephemeralContainers = $e' \
       | kubectl --context "$ctx" replace --subresource=ephemeralcontainers --dry-run=server -f - 2>&1)" && got=true || got=false
     kubectl --context "$ctx" -n "$ns" delete pod "$pn" --wait=false >/dev/null 2>&1 || true
+  elif jq -e '.object' <<<"$v" >/dev/null; then
+    # An object created as an identity (Task 26 review M4: the barman plugin's RBAC).
+    as=(--as "$(jq -r .as.user <<<"$v")")
+    while IFS= read -r g; do as+=(--as-group "$g"); done < <(jq -r '.as.groups[]' <<<"$v")
+    verb=create; [ "$(jq -r '.update // false' <<<"$v")" != true ] || verb=replace
+    out="$(jq -c .object <<<"$v" | kubectl --context "$ctx" "${as[@]}" "$verb" --dry-run=server -f - 2>&1)" && got=true || got=false
   else
     out="$(jq -c .pod <<<"$v" | sed "s|$pinned|$img|g" | kubectl --context "$ctx" create --dry-run=server -f - 2>&1)" && got=true || got=false
   fi

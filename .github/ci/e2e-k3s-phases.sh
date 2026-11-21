@@ -26,6 +26,15 @@
 #            Docker phase's, the fixture's passwords bind, Keycloak links
 #            them by the same entryUUID); the host's kubernetes keys kept,
 #            the CA chain the Docker phase's, Keycloak signs in, status clean
+#   dest     the backup destination (plan Task 26 review M7): an S3 outside
+#            the cluster's network (rclone serve s3, pinned, in netns ext
+#            198.51.100.2, HUB_DEV=1 for http), backup destination set (the
+#            test credentials on stdin), cert-manager + the barman-cloud
+#            plugin, up: Postgres archiving (ContinuousArchiving, a completed
+#            plugin Backup, WAL objects), the core offsite (host restic,
+#            pinned) and its record for the Hub, Longhorn and a Longhorn
+#            backup (E2E_K3S_SKIP_LONGHORN=1 skips that part: a local
+#            container without the host's iscsi_tcp), status clean
 # Output goes through redact (setup links); no secret is printed.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -140,6 +149,9 @@ docker)
     gid="$(printf '%s' "$gids" | jq --arg g "${m%%:*}" '.data.groups[] | select(.displayName == $g) | .id')"
     lldap_gql http://127.0.0.1:17170 "mutation { addUserToGroup(userId: \"${m#*:}\", groupId: $gid) { ok } }" | jq -e '.data.addUserToGroup.ok' >/dev/null || fail "could not add ${m#*:} to ${m%%:*}"
   done
+  # An instance backup inside hub_data (Docker keeps them there; Kubernetes
+  # on hub-backups: the restore moves them, Task 26 queued item).
+  docker run --rm --network none -u 10001:10001 -v portcullis_hub_data:/vol "$ALPINE" sh -c 'mkdir -p /vol/backups/rt-inst && umask 077 && printf rt-instance-backup > /vol/backups/rt-inst/20261121T000000Z.tar'
   COMPOSE_FILE=docker-compose.yml:docker-compose.ci.yml ./portcullis backup
   B="$(find backups -mindepth 1 -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
   jq -e '.runtime.name == "docker"' "$B/MANIFEST.json" >/dev/null || fail "the Docker backup's MANIFEST.json"
@@ -314,7 +326,100 @@ restore)
   kid="$(curl -sf --max-time 20 -H @<(printf 'Authorization: Bearer %s\n' "$ktok") "http://127.0.0.1:$kport/admin/realms/portcullis/users?username=rt-alice&exact=true" | jq -r '.[0].attributes.LDAP_ID[0] // empty')"
   [ "$kid" = "$(awk '$1 == "U" && $2 == "rt-alice" { print $3 }' "$RUNNER_TEMP/rt-lldap-src.txt")" ] || fail "test_lldap_convert_keeps_uuids: Keycloak's rt-alice has LDAP_ID '$kid', not the Docker backup's uuid"
   [ "$(pgp -c "select count(*) from pg_database where datname like '%\_pre\_restore' or datname like '%\_restore'")" = 0 ] || fail "the restore left _restore / _pre_restore databases"
+  # The Docker backup's instance backup is on hub-backups now, not hidden in hub-state.
+  pod="ib-$RANDOM"
+  N="$pod" IMG="$ALPINE" jq -n '{apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: "portcullis", labels: {"portcullis.io/component": "volume-helper"}},
+    spec: {restartPolicy: "Never", automountServiceAccountToken: false, securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, seccompProfile: {type: "RuntimeDefault"}},
+      containers: [{name: "c", image: env.IMG, command: ["sleep", "300"], resources: {limits: {memory: "32Mi"}, requests: {memory: "32Mi"}},
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},
+        volumeMounts: [{name: "b", mountPath: "/b"}, {name: "s", mountPath: "/s"}]}],
+      volumes: [{name: "b", persistentVolumeClaim: {claimName: "hub-backups"}}, {name: "s", persistentVolumeClaim: {claimName: "hub-state"}}]}}' | K create -f - >/dev/null
+  K -n portcullis wait --for=condition=Ready "pod/$pod" --timeout=180s >/dev/null
+  [ "$(K -n portcullis exec "$pod" -- cat /b/rt-inst/20261121T000000Z.tar)" = rt-instance-backup ] && K -n portcullis exec "$pod" -- sh -c '[ ! -e /s/backups/rt-inst ]' \
+    || fail "the Docker backup's instance backup isn't on hub-backups (or is still in hub-state)"
+  K -n portcullis delete pod "$pod" --wait=false >/dev/null
   echo "PASS: test_lldap_convert_keeps_uuids: the Docker backup's LLDAP converted into CNPG (uuids, password hashes and memberships equal the source, rt-alice and rt-bob bind with their passwords, Keycloak links rt-alice by the same entryUUID); host keys kept, status clean, the CA chain the Docker phase's, Keycloak signs in"
   ;;
-*) echo "usage: $0 docker|init|seed|hub|vpn|restore" >&2; exit 2 ;;
+dest)
+  # The test S3 is plain http (no CA to hand the pods): every CLI use of the
+  # destination needs HUB_DEV=1 (review I2 refuses http otherwise).
+  export HUB_DEV=1
+  RC_ZIP_SHA=b00f00b3266c3764413afe599d3ec316f6f43b3e0ea8a0bc1d186d2133e46df7
+  RESTIC_BZ2_SHA=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
+  t="$RUNNER_TEMP/s3"; mkdir -p "$t/data/e2e-bucket"; chmod 700 "$t"
+  curl -fsSL -o "$t/rclone.zip" https://github.com/rclone/rclone/releases/download/v1.76.0/rclone-v1.76.0-linux-amd64.zip
+  echo "$RC_ZIP_SHA  $t/rclone.zip" | sha256sum -c --quiet - || fail "rclone isn't its pinned release asset"
+  python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("rclone-v1.76.0-linux-amd64/rclone", sys.argv[2])' "$t/rclone.zip" "$t"
+  chmod +x "$t/rclone-v1.76.0-linux-amd64/rclone"
+  curl -fsSL -o "$t/restic.bz2" https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
+  echo "$RESTIC_BZ2_SHA  $t/restic.bz2" | sha256sum -c --quiet - || fail "restic isn't its pinned release asset"
+  python3 -c 'import bz2, sys; open(sys.argv[2], "wb").write(bz2.open(sys.argv[1]).read())' "$t/restic.bz2" "$t/restic"
+  sudo install -m 0755 "$t/restic" /usr/local/bin/restic
+  # Test credentials (this run only, a 0600 file, masked).
+  (umask 077 && printf 'AWS_ACCESS_KEY_ID=E2E%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$(openssl rand -hex 8 | tr a-f A-F)" "$(openssl rand -hex 24)" > "$t/creds")
+  while IFS='=' read -r _ v; do echo "::add-mask::$v"; done < "$t/creds"
+  # rclone reads its key pair from the environment (a CSV-quoted pair) out
+  # of a 0600 file sourced inside the netns' shell: never argv.
+  (umask 077 && printf "RCLONE_AUTH_KEY='\"%s,%s\"'\n" "$(sed -n 's/^AWS_ACCESS_KEY_ID=//p' "$t/creds")" "$(sed -n 's/^AWS_SECRET_ACCESS_KEY=//p' "$t/creds")" > "$t/rc.env")
+  sudo ip netns exec ext ip route replace default via 198.51.100.1
+  # shellcheck disable=SC2016,SC2024  # expanded by the netns shell; the log is the runner's own file
+  sudo ip netns exec ext bash -c 'set -a; . "$1"; set +a; exec "$2" serve s3 --addr 198.51.100.2:9000 "$3"' _ "$t/rc.env" "$t/rclone-v1.76.0-linux-amd64/rclone" "$t/data" > "$t/rclone.log" 2>&1 &
+  for _ in $(seq 1 30); do curl -s -o /dev/null --max-time 2 http://198.51.100.2:9000/ && break; sleep 1; done
+  HUB_DEV=1 ./portcullis backup destination set http://198.51.100.2:9000/e2e-bucket/k3s < "$t/creds" 2>&1 | redact
+  HUB_DEV=1 ./portcullis backup destination show | grep -q 'credentials: set' || fail "backup destination show: no credentials"
+  ! HUB_DEV=1 ./portcullis backup destination show | grep -qF "$(sed -n 's/^AWS_SECRET_ACCESS_KEY=//p' "$t/creds" | cut -c1-12)" || fail "backup destination show printed the secret"
+  K -n cnpg-system get secret backup-destination -o json | jq -e '.data | keys == ["AWS_ACCESS_KEY_ID","AWS_DEFAULT_REGION","AWS_ENDPOINTS","AWS_SECRET_ACCESS_KEY"]' >/dev/null || fail "the Secret backup-destination in cnpg-system"
+  # The HA-only installs the archive needs (Task 31 runs them in ha enable).
+  HUB_DEV=1 bash -c 'source scripts/lib/common.sh; env_load; runtime_export >/dev/null 2>&1 || true; ha_install_certmanager && ha_install_barman' 2>&1 | tail -n 3
+  HUB_DEV=1 ./portcullis up 2>&1 | redact | tail -n 5
+  K -n cnpg-system get networkpolicy portcullis-pg-backup -o json | jq -e --arg c 198.51.100.2/32 '.spec.podSelector.matchLabels == {"cnpg.io/cluster": "portcullis-pg", "cnpg.io/podRole": "instance"} and .spec.egress == [{"ports": [{"port": 9000, "protocol": "TCP"}], "to": [{"ipBlock": {"cidr": $c}}]}]' >/dev/null \
+    || fail "portcullis-pg-backup isn't the instance pods to the destination's /32 on 9000"
+  sn="$(K -n cnpg-system get cluster portcullis-pg -o json | jq -r '.spec.plugins[0].parameters.serverName')"
+  [ "$sn" = "portcullis-pg-$(grep '^PORTCULLIS_KUBE_INSTALL_ID=' .env | cut -d= -f2 | cut -c1-8)" ] || fail "the archive's serverName $sn isn't this install's"
+  for _ in $(seq 1 120); do
+    a="$(K -n cnpg-system get cluster portcullis-pg -o json | jq -r '[.status.conditions[]? | select(.type == "ContinuousArchiving")][0].status // ""')"
+    b="$(K -n cnpg-system get backups.postgresql.cnpg.io -o json | jq -r '[.items[] | select(.spec.method == "plugin" and .status.phase == "completed")] | length')"
+    [ "$a" = True ] && [ "${b:-0}" -ge 1 ] && break; sleep 5
+  done
+  [ "$a" = True ] && [ "${b:-0}" -ge 1 ] || fail "Postgres isn't archiving (ContinuousArchiving=$a, completed plugin backups ${b:-0})"
+  pp="$(K -n cnpg-system get cluster portcullis-pg -o jsonpath='{.status.currentPrimary}')"
+  K -n cnpg-system exec "$pp" -c postgres -- psql -XtAq -c 'select pg_switch_wal()' >/dev/null
+  for _ in $(seq 1 30); do [ "$(find "$t/data/e2e-bucket/k3s/cnpg/$sn/wals" -name '*.gz' 2>/dev/null | wc -l)" -ge 2 ] && break; sleep 2; done
+  [ -n "$(find "$t/data/e2e-bucket/k3s/cnpg/$sn/base" -name data.tar.gz 2>/dev/null)" ] && [ "$(find "$t/data/e2e-bucket/k3s/cnpg/$sn/wals" -name '*.gz' | wc -l)" -ge 2 ] \
+    || fail "no base backup / WAL objects under <url>/cnpg/$sn"
+  echo "PASS: CloudNativePG archives to the destination: ContinuousArchiving, a completed plugin backup, base + WAL objects under <url>/cnpg/$sn, the egress exact"
+  ./portcullis backup --offsite 2>&1 | redact | tail -n 3
+  [ -s "$t/data/e2e-bucket/k3s/core/config" ] || fail "no restic repository at <url>/core"
+  K -n portcullis get configmap portcullis-backup-status -o jsonpath='{.data.last_success}' | grep -qE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T' || fail "no portcullis-backup-status record for the Hub"
+  echo "PASS: the core offsite went to <url>/core (restic), recorded for the Hub's backup_stale"
+  if [ "${E2E_K3S_SKIP_LONGHORN:-}" = 1 ]; then
+    echo "SKIPPED: Longhorn and a Longhorn backup (E2E_K3S_SKIP_LONGHORN=1)"
+  else
+    sudo apt-get install -y -qq open-iscsi nfs-common >/dev/null && sudo systemctl start iscsid && sudo modprobe iscsi_tcp
+    HUB_DEV=1 bash -c 'source scripts/lib/common.sh; env_load; runtime_export >/dev/null 2>&1 || true; ha_install_snapshotter && ha_install_longhorn' 2>&1 | tail -n 3
+    for _ in $(seq 1 60); do [ "$(K -n longhorn-system get backuptargets.longhorn.io default -o jsonpath='{.status.available}')" = true ] && break; sleep 5; done
+    [ "$(K -n longhorn-system get backuptargets.longhorn.io default -o jsonpath='{.status.available}')" = true ] || fail "Longhorn's backup target isn't available"
+    K create namespace e2e-lh >/dev/null
+    printf '%s\n' "apiVersion: v1" "kind: PersistentVolumeClaim" "metadata: {name: lhv, namespace: e2e-lh}" \
+      "spec: {accessModes: [ReadWriteOnce], storageClassName: portcullis-core-replicated, resources: {requests: {storage: 1Gi}}}" | K apply -f - >/dev/null
+    N=lhw IMG="$ALPINE" jq -n '{apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: "e2e-lh"},
+      spec: {securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: "RuntimeDefault"}},
+        containers: [{name: "w", image: env.IMG, command: ["sh", "-c", "echo e2e > /d/m && sleep 3600"], resources: {limits: {memory: "32Mi"}, requests: {memory: "32Mi"}},
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}, volumeMounts: [{name: "d", mountPath: "/d"}]}],
+        volumes: [{name: "d", persistentVolumeClaim: {claimName: "lhv"}}]}}' | K create -f - >/dev/null
+    K -n e2e-lh wait --for=condition=Ready pod/lhw --timeout=300s >/dev/null || fail "the Longhorn volume's pod didn't start"
+    V="$(K -n e2e-lh get pvc lhv -o jsonpath='{.spec.volumeName}')"
+    printf '%s\n' "apiVersion: longhorn.io/v1beta2" "kind: Snapshot" "metadata: {name: e2e-snap, namespace: longhorn-system}" "spec: {volume: $V, createSnapshot: true}" | K apply -f - >/dev/null
+    for _ in $(seq 1 60); do [ "$(K -n longhorn-system get snapshots.longhorn.io e2e-snap -o jsonpath='{.status.readyToUse}')" = true ] && break; sleep 2; done
+    printf '%s\n' "apiVersion: longhorn.io/v1beta2" "kind: Backup" "metadata: {name: e2e-backup, namespace: longhorn-system, labels: {backup-volume: $V}}" "spec: {snapshotName: e2e-snap, labels: {}}" | K apply -f - >/dev/null
+    for _ in $(seq 1 60); do s="$(K -n longhorn-system get backups.longhorn.io e2e-backup -o jsonpath='{.status.state}')"; case "$s" in Completed|Error) break ;; esac; sleep 3; done
+    [ "$s" = Completed ] && [ -n "$(find "$t/data/e2e-bucket/k3s/longhorn" -name '*.blk' 2>/dev/null | head -n1)" ] || fail "the Longhorn backup to <url>/longhorn: ${s:-no state}"
+    K delete namespace e2e-lh --wait=false >/dev/null
+    echo "PASS: Longhorn's backup target = <url>/longhorn, a Longhorn backup completed (blocks in the bucket)"
+  fi
+  status_wait 600
+  jq -e '.backup_destination.cnpg.archiving == true' /tmp/status.json >/dev/null || fail "status doesn't show Postgres archiving"
+  echo "PASS: backup destination end to end (status clean, archiving)"
+  ;;
+*) echo "usage: $0 docker|init|seed|hub|vpn|restore|dest" >&2; exit 2 ;;
 esac

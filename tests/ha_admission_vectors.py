@@ -310,6 +310,42 @@ def vectors():
                     ("out-of-service with another value", {"key": "node.kubernetes.io/out-of-service", "value": "x", "effect": "NoExecute"}),
                     ("the round-4 wrong key medik8s.io/remediation", {"key": "medik8s.io/remediation", "value": "self-node-remediation", "effect": "NoExecute"})):
         out.append({"policy": NL, "name": f"SNR's manager adds {what}", "allowed": False, "node": True, "as": manager_id, "taints_add": [t]})
+    # portcullis-barman-rbac (Task 26 review M4): the barman-cloud plugin's
+    # Role / RoleBinding creates in cnpg-system, as the plugin.
+    BR, plugin = "portcullis-barman-rbac", {"user": "system:serviceaccount:cnpg-system:plugin-barman-cloud", "groups": []}
+    meta = {"name": "portcullis-pg-barman-cloud", "namespace": "cnpg-system"}
+    role = {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": dict(meta), "rules": [
+        {"apiGroups": ["barmancloud.cnpg.io"], "resources": ["objectstores"], "resourceNames": ["portcullis-backup"], "verbs": ["get", "watch", "list"]},
+        {"apiGroups": ["barmancloud.cnpg.io"], "resources": ["objectstores/status"], "resourceNames": ["portcullis-backup"], "verbs": ["update"]},
+        {"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["backup-destination"], "verbs": ["get", "watch", "list"]}]}
+    rb = {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": dict(meta),
+          "subjects": [{"kind": "ServiceAccount", "apiGroup": "", "name": "portcullis-pg", "namespace": "cnpg-system"}],
+          "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "portcullis-pg-barman-cloud"}}
+
+    def obj(name, base, fn=None, allowed=False, also=None):
+        o = copy.deepcopy(base)
+        if fn:
+            fn(o)
+        v = {"policy": BR, "name": name, "allowed": allowed, "as": plugin, "object": o}
+        # The Role exists (a RoleBinding create needs it): its own vectors are updates.
+        if o["kind"] == "Role" and o["metadata"]["name"] == "portcullis-pg-barman-cloud":
+            v["update"] = True
+        if also:
+            v["also_refused_by"] = also  # RBAC's own check may come first
+        out.append(v)
+    obj("barman: the plugin's Role (pinned BuildRoleRules)", role, allowed=True)
+    obj("barman: the plugin's RoleBinding (pinned BuildRoleBinding)", rb, allowed=True)
+    obj("barman: a Role of another name", role, lambda o: o["metadata"].update(name="other"))
+    obj("barman: a RoleBinding of another name", rb, lambda o: o["metadata"].update(name="other"))
+    obj("barman: a Role rule without resourceNames", role, lambda o: o["rules"][2].pop("resourceNames"))
+    esc = "is attempting to grant RBAC permissions not currently held"
+    obj("barman: a Role reading pods", role, lambda o: o["rules"].append({"apiGroups": [""], "resources": ["pods"], "resourceNames": ["x"], "verbs": ["get"]}), also=esc)
+    obj("barman: a Role writing secrets", role, lambda o: o["rules"][2].update(verbs=["get", "update"]), also=esc)
+    obj("barman: a binding of its own Role portcullis-barman-cloud", rb, lambda o: o["roleRef"].update(name="portcullis-barman-cloud"))
+    obj("barman: a binding to a ServiceAccount in another namespace", rb, lambda o: o["subjects"][0].update(namespace="portcullis"))
+    obj("barman: a binding to a second subject", rb, lambda o: o["subjects"].append({"kind": "ServiceAccount", "name": "x", "namespace": "cnpg-system"}))
+    obj("barman: a binding to a ClusterRole", rb, lambda o: o["roleRef"].update(kind="ClusterRole", name="portcullis-pg-barman-cloud"), also="not found")
+    obj("barman: a binding to a user", rb, lambda o: o["subjects"].__setitem__(0, {"kind": "User", "apiGroup": "rbac.authorization.k8s.io", "name": "mallory"}))
     return out
 
 
