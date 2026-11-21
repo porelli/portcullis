@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -344,16 +345,26 @@ func TestBootstrapJobViewerSecret(t *testing.T) {
 		return out
 	}
 	s.f.calls = nil
+	var logs []string
+	j.Logf = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
 	if err := j.Run(context.Background()); err != nil || len(sets()) != 0 {
 		t.Fatalf("second run: %v sets %v", err, sets())
+	}
+	// The CI checks' line (build-and-test-mail-service.sh, e2e-podman-mail.sh).
+	if got := strings.Join(logs, "\n"); !strings.Contains(got, "its API key is in place; nothing to do") {
+		t.Fatalf("second run logged %q", got)
 	}
 	if b, _ := os.ReadFile(j.ViewerFile); string(b) != string(pw) {
 		t.Fatal("the viewer password changed on a run that didn't lose it")
 	}
 	os.Remove(j.ViewerFile)
 	s.f.calls = nil
+	logs = nil
 	if err := j.Run(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if got := strings.Join(logs, "\n"); strings.Contains(got, "nothing to do") || !strings.Contains(got, "a new admin view password only") {
+		t.Fatalf("lost viewer file run logged %q", got)
 	}
 	if got := strings.Join(sets(), ","); got != "x:Account/set update" {
 		t.Fatalf("lost viewer file: sets %s", got)
