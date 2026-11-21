@@ -10,8 +10,15 @@
 #   @API_ADDR@      VAULT_API_ADDR (default http://vault:8200)
 #   @CLUSTER_ADDR@  VAULT_CLUSTER_ADDR (default http://vault:8201)
 #   @RETRY_JOIN@    one retry_join block per peer in VAULT_RAFT_PEERS (space
-#                   separated host names; this node itself left out); none
-#                   on compose (a single node)
+#                   separated host names; this node itself left out), over
+#                   https to the peer's join listener only, trusting just
+#                   VAULT_JOIN_TLS_DIR/ca.crt; none on compose (one node)
+#   @JOIN_LISTENER@ with VAULT_JOIN_TLS_DIR (Kubernetes: the CLI's private
+#                   join CA, scripts/lib/ha.sh kube_vault_join_tls_prepare):
+#                   a TLS-only listener on :8202 for the peers' retry_join —
+#                   the answer to a join carries the raft TLS keyring (vault
+#                   v2.2.1 vault/raft.go joinRaftSendAnswer), so it never
+#                   crosses the pod network in clear; nothing on compose
 #
 # No service_registration (plan Task 25, found live): Vault v2.2.1's
 # "kubernetes" registration patches its pod's labels synchronously while
@@ -56,6 +63,7 @@ listener "tcp" {
   cluster_address = "0.0.0.0:8201"
   tls_disable     = true
 }
+@JOIN_LISTENER@
 
 # Prometheus metrics at /v1/sys/metrics?format=prometheus (monitoring
 # profile). Reading them needs a token with the portcullis-metrics policy

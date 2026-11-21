@@ -861,13 +861,22 @@ def sessions_problems(docs, ha):
 def render_vault_hcl(env, pod):
     """vault/entrypoint.sh render with a voter's env (the chart's values,
     $(VAULT_RAFT_NODE_ID) as the kubelet expands it)."""
+    import tempfile
+    tls = tempfile.mkdtemp(prefix="vtls")
+    for f in ("ca.crt", "tls.crt", "tls.key"):
+        open(os.path.join(tls, f), "w").close()
     e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PORTCULLIS_VAULT_TEMPLATE": str(K.ROOT / "vault" / "vault.hcl.tmpl")}
     for k, v in env.items():
         e[k] = pod if v.get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") == "metadata.name" else \
             K.NS if v.get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") == "metadata.namespace" else \
             str(v.get("value", "")).replace("$(VAULT_RAFT_NODE_ID)", pod)
+    if e.get("VAULT_JOIN_TLS_DIR") != "/vault/tls":
+        return None  # the chart's mount (the join CA) is what's checked
+    e["VAULT_JOIN_TLS_DIR"] = tls
     r = subprocess.run(["sh", str(K.ROOT / "vault" / "entrypoint.sh"), "render"], env=e, capture_output=True, text=True)
-    return r.stdout if r.returncode == 0 else None
+    import shutil
+    shutil.rmtree(tls, ignore_errors=True)
+    return r.stdout.replace(tls, "/vault/tls") if r.returncode == 0 else None
 
 
 def vault_problems(docs, ha):
@@ -903,13 +912,18 @@ def vault_problems(docs, ha):
         if hcl is None:
             out.append(f"{tag}: {pod}'s vault.hcl doesn't render")
             continue
-        joins = re.findall(r'leader_api_addr = "http://([a-z0-9.-]+):8200"', hcl)
+        joins = re.findall(r'leader_api_addr\s*=\s*"https://([a-z0-9.-]+):8202"\s*leader_ca_cert_file\s*=\s*"/vault/tls/ca.crt"', hcl)
+        if re.search(r'leader_api_addr\s*=\s*"http://', hcl) or 'address       = "0.0.0.0:8202"' not in hcl or 'tls_cert_file = "/vault/tls/tls.crt"' not in hcl:
+            out.append(f"{tag}: {pod}: retry_join over https to the TLS join listener :8202 only (review M1)")
         want = [f"vault-{j}.vault-internal" for j in range(n) if j != i]
         if f'node_id = "{pod}"' not in hcl or joins != want:
             out.append(f"{tag}: {pod}: node_id / retry_join {joins} (want node_id {pod}, retry_join {want})")
         if f'api_addr     = "http://{pod}.vault-internal:8200"' not in hcl or f'cluster_addr = "http://{pod}.vault-internal:8201"' not in hcl \
                 or re.search(r"^\s*service_registration\b", hcl, re.M):
             out.append(f"{tag}: {pod}: api / cluster address on vault-internal, no service_registration")
+    vols = {v["name"]: v for v in sp.get("volumes", [])}
+    if vols.get("join-tls", {}).get("secret", {}).get("secretName") != "secrets-vault-join-tls":
+        out.append(f"{tag}: the join TLS from Secret secrets-vault-join-tls at /vault/tls")
     if env.get("VAULT_RAFT_NODE_ID", {}).get("valueFrom") != {"fieldRef": {"fieldPath": "metadata.name"}}:
         out.append(f"{tag}: VAULT_RAFT_NODE_ID from the pod name (downward API)")
     if sp.get("automountServiceAccountToken") is not False or sp.get("serviceAccountName") not in (None, "default") \

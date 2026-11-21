@@ -5,7 +5,9 @@ the nodes (each voter's PVC is node-local, portcullis-core) and tolerating
 the small taint (the third voter on the small node, spec §6). The config is
 vault/vault.hcl.tmpl, rendered by vault/entrypoint.sh at every start:
 node_id = the pod name, api / cluster address = <pod>.vault-internal (the
-headless Service, also while sealed), one retry_join per other voter. No
+headless Service, also while sealed), one retry_join per other voter, over
+https to the TLS-only join listener :8202 (the CLI's private join CA,
+Secret secrets-vault-join-tls; review M1). No
 Kubernetes service registration, no ServiceAccount token, no API access:
 Vault v2.2.1's registration blocks its own leadership on the API (found
 live, vault.hcl.tmpl), so the CLI finds the leader by asking the voters
@@ -17,25 +19,29 @@ unsealed voter; a standby forwards to the leader). */ -}}
 {{- $s := dict
   "name" "vault" "uid" .Values.uids.vault "gid" .Values.uids.vaultGroup "pin" true
   "memory" "512Mi" "nets" (list "portcullis") "egress" true
-  "hashes" (list "config-vault" "secrets-vault-unseal")
+  "hashes" (list "config-vault" "secrets-vault-unseal" "secrets-vault-join-tls")
   "command" (list "/bin/sh" "/vault/portcullis/entrypoint.sh")
   "health" (dict "test" (list "vault" "status") "interval" 5 "timeout" 3 "retries" 5 "startPeriod" 30)
-  "ports" (list (dict "name" "vault" "port" 8200) (dict "name" "cluster" "port" 8201))
+  "ports" (list (dict "name" "vault" "port" 8200) (dict "name" "cluster" "port" 8201) (dict "name" "join" "port" 8202))
   "env" (list
     (dict "name" "VAULT_ADDR" "value" "http://127.0.0.1:8200")
     (dict "name" "SKIP_SETCAP" "value" "true")
     (dict "name" "VAULT_RAFT_NODE_ID" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
     (dict "name" "VAULT_API_ADDR" "value" "http://$(VAULT_RAFT_NODE_ID).vault-internal:8200")
     (dict "name" "VAULT_CLUSTER_ADDR" "value" "http://$(VAULT_RAFT_NODE_ID).vault-internal:8201")
-    (dict "name" "VAULT_RAFT_PEERS" "value" (join " " $peers)))
+    (dict "name" "VAULT_RAFT_PEERS" "value" (join " " $peers))
+    (dict "name" "VAULT_JOIN_TLS_DIR" "value" "/vault/tls"))
   "mounts" (list
     (dict "name" "data" "mountPath" "/vault/file")
     (dict "name" "config" "mountPath" "/vault/portcullis" "readOnly" true)
     (dict "name" "unseal" "mountPath" "/vault/unseal" "readOnly" true)
+    (dict "name" "join-tls" "mountPath" "/vault/tls" "readOnly" true)
     (dict "name" "tmp" "mountPath" "/tmp"))
   "volumes" (list
     (dict "name" "config" "configMap" (dict "name" "config-vault" "items" (.Values.configItems.vault | default list)))
     (dict "name" "unseal" "secret" (dict "secretName" "secrets-vault-unseal" "defaultMode" 288))
+    (dict "name" "join-tls" "secret" (dict "secretName" "secrets-vault-join-tls" "defaultMode" 288
+      "items" (list (dict "key" "ca.crt" "path" "ca.crt") (dict "key" "tls.crt" "path" "tls.crt") (dict "key" "tls.key" "path" "tls.key"))))
     (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
   "statefulSet" (dict "replicas" $n "serviceName" "vault-internal"
     "claims" (list (dict "name" "data" "uid" .Values.uids.vault "gid" .Values.uids.vaultGroup "mode" "0750")))
@@ -78,3 +84,6 @@ spec:
     - name: cluster
       port: 8201
       targetPort: 8201
+    - name: join
+      port: 8202
+      targetPort: 8202

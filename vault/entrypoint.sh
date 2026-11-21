@@ -35,7 +35,10 @@ log() { echo "portcullis-vault: $*" >&2; }
 #   VAULT_API_ADDR / VAULT_CLUSTER_ADDR  http://<host>:<port> (default
 #                       http://vault:8200 / :8201)
 #   VAULT_RAFT_PEERS    the voters' host names, space separated; this node
-#                       (its node id, alone or as the first label) left out
+#                       (its node id, alone or as the first label) left out;
+#                       joined over https only, so it needs VAULT_JOIN_TLS_DIR
+#   VAULT_JOIN_TLS_DIR  ca.crt / tls.crt / tls.key: the join listener (:8202)
+#                       and the CA retry_join trusts
 render() {
   node_id="${VAULT_RAFT_NODE_ID:-portcullis-vault-1}"
   api_addr="${VAULT_API_ADDR:-http://vault:8200}"
@@ -44,12 +47,28 @@ render() {
   for a in "$api_addr" "$cluster_addr"; do
     printf '%s\n' "$a" | grep -Eqx 'http://[a-z0-9][a-z0-9.-]{0,252}:[0-9]{1,5}' || { log "address $a: http://<host>:<port> only"; return 1; }
   done
+  tls="${VAULT_JOIN_TLS_DIR:-}" jl=""
+  if [ -n "$tls" ]; then
+    printf '%s\n' "$tls" | grep -Eqx '/[a-z0-9/_-]{1,100}' || { log "VAULT_JOIN_TLS_DIR $tls: an absolute path only"; return 1; }
+    for f in ca.crt tls.crt tls.key; do [ -r "$tls/$f" ] || { log "no $tls/$f: the join listener needs it"; return 1; }; done
+    jl="
+# The peers' retry_join (https only): the CLI's private join CA.
+listener \"tcp\" {
+  address       = \"0.0.0.0:8202\"
+  tls_cert_file = \"$tls/tls.crt\"
+  tls_key_file  = \"$tls/tls.key\"
+  tls_min_version = \"tls12\"
+}
+"
+  fi
   joins=""
   for p in ${VAULT_RAFT_PEERS:-}; do
     printf '%s\n' "$p" | grep -Eqx '[a-z0-9][a-z0-9.-]{0,252}' || { log "VAULT_RAFT_PEERS entry $p: a host name only"; return 1; }
     case "$p" in "$node_id" | "$node_id".*) continue ;; esac
+    [ -n "$jl" ] || { log "VAULT_RAFT_PEERS without VAULT_JOIN_TLS_DIR: retry_join runs over https only"; return 1; }
     joins="$joins  retry_join {
-    leader_api_addr = \"http://$p:8200\"
+    leader_api_addr     = \"https://$p:8202\"
+    leader_ca_cert_file = \"$tls/ca.crt\"
   }
 "
   done
@@ -57,6 +76,7 @@ render() {
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       @RETRY_JOIN@) printf '%s' "$joins" ;;
+      @JOIN_LISTENER@) printf '%s' "$jl" ;;
       *) printf '%s\n' "$line" | sed -e "s|@NODE_ID@|$node_id|g" -e "s|@API_ADDR@|$api_addr|g" -e "s|@CLUSTER_ADDR@|$cluster_addr|g" ;;
     esac
   done < "$TEMPLATE"

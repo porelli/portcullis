@@ -1259,6 +1259,7 @@ kube_cluster_setup() {
   # Postgres' operator (plan Task 23, D8: every install), before the chart
   # sends its Cluster to the operator's webhook.
   ha_install_cnpg
+  ! kube_ha_on || ha_coredns  # cluster DNS on every node at main (ha.sh)
 
   info "Cluster setup: Traefik CRDs ($(basename "$crds" .yaml))..."
   _kube_apply_files "$crds" || fail "could not apply the Traefik CRDs"
@@ -1395,7 +1396,7 @@ KUBE_ENV_SECRETS="POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD
 # the endpoint CA's key, the host-specific addresses.
 _kube_sync_skip() {
   case "$1" in
-    kube/*|vault-init.json|domains/certs-endpoint/ca.key|domains/last-public-ipv4|domains/last-public-ipv6|domains/acme-relax.env|domains/public-ips.env|domains/main-domain.env|.gitkeep|*/.gitkeep) return 0 ;;
+    kube/*|vault-init.json|vault-join-tls/ca.key|vault-join-tls/sans|domains/certs-endpoint/ca.key|domains/last-public-ipv4|domains/last-public-ipv6|domains/acme-relax.env|domains/public-ips.env|domains/main-domain.env|.gitkeep|*/.gitkeep) return 0 ;;
   esac
   return 1
 }
@@ -1555,6 +1556,7 @@ kube_sync_secrets() {
   # LLDAP's server key (ha.sh): made once, synced as secrets-lldap-key.
   kube_lldap_server_key
   kube_sessions_ha_prepare  # the session store's HA configs (ha.sh)
+  kube_vault_join_tls_prepare  # Vault's join listener TLS (ha.sh)
   kube_sync_stage
   _K_HASHES='{}'
   live="$_K_STAGE/.live" want="$_K_STAGE/.live/want.json"
@@ -1762,6 +1764,7 @@ _rtk_up() {
   fi
   kube_render_values
   vf="$(kube_values_file)"
+  kube_vault_shrink_prepare  # fewer voters: their raft peers removed first (ha.sh)
   info "helm upgrade --install $KUBE_RELEASE${wait[*]:+ (waits up to 10 minutes)}..."
   kube_helm upgrade --install "$KUBE_RELEASE" "$PORTCULLIS_HOME/charts/portcullis" -n "$(kube_ns)" \
     --skip-crds ${wait[@]+"${wait[@]}"} -f "$vf" >&2 || rc=$?
@@ -1770,6 +1773,7 @@ _rtk_up() {
     return "$rc"
   fi
   (umask 077 && printf '%s\n' "$_K_IMAGES" > "$(kube_digests_file)")
+  kube_vault_shrink_finish
   kube_cluster_check
   kube_forward_core
 }
@@ -1860,13 +1864,13 @@ _rtk_volume_in() {
 # never sees a trusted proxy); exports VAULT_ADDR / KEYCLOAK_URL. Each
 # forwarder dies with this shell (a watcher), no trap needed.
 kube_forward_core() {
-  local svc port var pf
+  local svc port var pf target
   for svc in vault:8200:VAULT_ADDR keycloak:8080:KEYCLOAK_URL; do
     IFS=: read -r svc port var <<< "$svc"
     rt_running "$svc" || continue
     # Vault: the leader's pod, else vault-0 (ha.sh kube_vault_pod_set).
-    [ "$svc" != vault ] || kube_vault_pod_set
-    pf="$(_kube_forward "$([ "$svc" != vault ] || echo "pod/${_K_VAULT_POD:-vault-0}")${svc#vault}" "$port")" || { warn "no port-forward to $svc:$port"; continue; }
+    case "$svc" in vault) kube_vault_pod_set; target="pod/${_K_VAULT_POD:-vault-0}" ;; *) target="$svc" ;; esac
+    pf="$(_kube_forward "$target" "$port")" || { warn "no port-forward to $svc:$port"; continue; }
     export "$var=http://127.0.0.1:$pf"
   done
 }

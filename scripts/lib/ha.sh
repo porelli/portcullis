@@ -1286,7 +1286,9 @@ _rtk_kind() {
 }
 
 # _rtk_replicas <service> — the replicas a start scales a stopped workload
-# to (the chart's: Vault's voters 3 in HA, the session store 2; else 1).
+# to: Vault's voters (3 in HA) and the session store's (2 in HA) as the
+# chart renders them; any other service 1 (Keycloak and the gates in HA too:
+# the next `up` gives them the chart's count back).
 _rtk_replicas() {
   case "$1" in
     vault) if kube_ha_on; then echo 3; else echo 1; fi ;;
@@ -1312,6 +1314,9 @@ _kube_with_forward() {
   # $! is the process to end.
   kubectl --context "$PORTCULLIS_KUBE_CONTEXT" -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$port" >"$log" 2>&1 &
   pid=$!
+  # The CLI killed meanwhile (by pid): the forward ends with it (review N2).
+  local parent=$$
+  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
   for ((i = 0; i < 100; i++)); do
     lp="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> .*/\1/p' "$log" | head -n1)"
     [ -z "$lp" ] || break
@@ -1333,4 +1338,148 @@ _kube_empty_vault() {
     kube_ctl -n "$(kube_ns)" exec "$pod" -- find /vol -mindepth 1 -maxdepth 1 -exec rm -rf {} + || { _kube_helper_done "$pod"; return 1; }
     _kube_helper_done "$pod"
   done
+}
+
+# ── Vault's join listener TLS (plan Task 25, review M1) ──
+
+# retry_join posts the raft challenge and its answer to leader_api_addr,
+# and the answer carries the raft cluster's TLS keyring (vault v2.2.1
+# vault/raft.go joinRaftSendAnswer). So the voters' join listener (:8202,
+# vault.hcl.tmpl) is TLS-only, and retry_join trusts exactly this CA
+# (leader_ca_cert_file). secrets/vault-join-tls/ (0700, files 0600): a
+# private CA made here (EC P-256, 10 years, renewed with a year left; its
+# key never leaves this host: _kube_sync_skip) and one server certificate
+# for every voter's name (vault-<n>.vault-internal, short and FQDN), valid
+# until the CA expires, renewed with 30 days left or when the names
+# change; synced as Secret secrets-vault-join-tls (ca.crt, tls.crt,
+# tls.key), mounted in the Vault pods only.
+KUBE_VAULT_MAX_VOTERS=3
+_kube_vault_tls_sans() {
+  local i ns; ns="$(kube_ns)"
+  for ((i = 0; i < KUBE_VAULT_MAX_VOTERS; i++)); do
+    printf 'DNS:vault-%s.vault-internal,DNS:vault-%s.vault-internal.%s.svc,DNS:vault-%s.vault-internal.%s.svc.cluster.local,' "$i" "$i" "$ns" "$i" "$ns"
+  done | sed 's/,$//'
+}
+kube_vault_join_tls_prepare() {
+  local d sans days end cnf
+  d="$PORTCULLIS_ROOT/secrets/vault-join-tls"
+  (umask 077 && mkdir -p "$d")
+  chmod 700 "$d"
+  sans="$(_kube_vault_tls_sans)"
+  cnf="$(mktemp)"
+  printf '[ca]\nbasicConstraints = critical,CA:TRUE,pathlen:0\nkeyUsage = critical,keyCertSign,cRLSign\nsubjectKeyIdentifier = hash\n[req]\ndistinguished_name = dn\nprompt = no\n[dn]\nCN = Portcullis Vault join CA\n[server]\nbasicConstraints = critical,CA:FALSE\nkeyUsage = critical,digitalSignature\nextendedKeyUsage = serverAuth\nsubjectAltName = %s\n' "$sans" > "$cnf"
+  if [ ! -s "$d/ca.key" ] || ! openssl x509 -checkend $((365 * 86400)) -noout -in "$d/ca.crt" >/dev/null 2>&1; then
+    (umask 077 \
+      && openssl ecparam -name prime256v1 -genkey -noout -out "$d/ca.key.new" 2>/dev/null \
+      && openssl req -x509 -new -key "$d/ca.key.new" -days 3650 -sha256 -config "$cnf" -extensions ca -out "$d/ca.crt.new" 2>/dev/null) \
+      || { rm -f "$cnf" "$d/ca.key.new" "$d/ca.crt.new"; fail "could not create Vault's join CA (openssl)"; }
+    mv -f "$d/ca.key.new" "$d/ca.key"; mv -f "$d/ca.crt.new" "$d/ca.crt"
+    rm -f "$d/tls.crt"
+  fi
+  if [ ! -s "$d/tls.key" ] || ! openssl x509 -checkend $((30 * 86400)) -noout -in "$d/tls.crt" >/dev/null 2>&1 \
+     || ! openssl verify -CAfile "$d/ca.crt" "$d/tls.crt" >/dev/null 2>&1 || [ "$(cat "$d/sans" 2>/dev/null)" != "$sans" ]; then
+    end="$(to_epoch "$(openssl x509 -noout -enddate -in "$d/ca.crt" | cut -d= -f2)")"
+    days=$(( (end - $(date +%s)) / 86400 )); [ "$days" -ge 1 ] || days=1
+    (umask 077 \
+      && openssl ecparam -name prime256v1 -genkey -noout -out "$d/tls.key.new" 2>/dev/null \
+      && openssl req -new -key "$d/tls.key.new" -subj "/CN=vault-internal" -out "$d/tls.csr" 2>/dev/null \
+      && openssl x509 -req -in "$d/tls.csr" -CA "$d/ca.crt" -CAkey "$d/ca.key" -set_serial "0x$(openssl rand -hex 16)" \
+           -days "$days" -sha256 -extfile "$cnf" -extensions server -out "$d/tls.crt.new" 2>/dev/null) \
+      || { rm -f "$cnf" "$d/tls.csr" "$d/tls.key.new" "$d/tls.crt.new"; fail "could not create Vault's join certificate (openssl)"; }
+    mv -f "$d/tls.key.new" "$d/tls.key"; mv -f "$d/tls.crt.new" "$d/tls.crt"
+    (umask 077 && printf '%s' "$sans" > "$d/sans")
+  fi
+  rm -f "$cnf" "$d/tls.csr"
+  chmod 600 "$d"/*
+}
+
+# ── fewer Vault voters (HA off; plan Task 25, review M3) ──
+
+# kube_vault_shrink_prepare — before the chart lowers StatefulSet vault's
+# replicas (HA off: 3 → 1), the voters it drops leave raft first: `vault
+# operator raft remove-peer` for every configured peer outside vault-0 …
+# vault-<want−1>, highest first (a removed leader steps down), then the
+# peers must be exactly those kept. Without it vault-0 keeps a 3-voter
+# configuration and no quorum: Vault stays down. Anything unreadable or a
+# failed removal refuses the change (nothing deployed). _KUBE_VAULT_SHRINK
+# = the dropped pods, for kube_vault_shrink_finish.
+_KUBE_VAULT_SHRINK=""
+kube_vault_shrink_prepare() {
+  local cur want peers id keep i
+  _KUBE_VAULT_SHRINK=""
+  cur="$(kube_ctl -n "$(kube_ns)" get statefulset vault -o jsonpath='{.spec.replicas}' 2>/dev/null)" || cur=""
+  [[ "$cur" =~ ^[0-9]+$ ]] || return 0        # no Vault yet (a first install)
+  want="$(_rtk_replicas vault)"
+  [ "$cur" -gt "$want" ] || return 0
+  vault_admin_env >/dev/null 2>&1 || fail "lowering Vault's voters ($cur → $want) needs its root token (secrets/vault-init.json): refusing (nothing deployed)"
+  # Through vault-0, the voter that stays (a standby forwards to the
+  # leader; a removed peer's own API would answer no more).
+  _K_VAULT_POD=vault-0
+  peers="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '.data.config.servers[].node_id' 2>/dev/null)" \
+    && [ -n "$peers" ] || fail "can't read Vault's raft peers: refusing to lower its voters $cur → $want (nothing deployed)"
+  keep=""; for ((i = 0; i < want; i++)); do keep="$keep vault-$i"; done
+  for id in $(printf '%s\n' "$peers" | sort -r); do
+    case " $keep " in *" $id "*) continue ;; esac
+    [[ "$id" =~ ^vault-[0-9]+$ ]] || fail "Vault's raft has a peer $id that isn't a voter of this chart: refusing to lower its voters (nothing deployed)"
+    info "Vault: removing raft peer $id (voters $cur → $want)..."
+    vexec operator raft remove-peer "$id" >/dev/null 2>&1 || fail "could not remove Vault's raft peer $id: refusing to lower its voters (nothing deployed)"
+    _KUBE_VAULT_SHRINK="$_KUBE_VAULT_SHRINK $id"
+    sleep "${KUBE_VAULT_REMOVE_WAIT:-5}"
+  done
+  peers="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '[.data.config.servers[].node_id] | sort | join(" ")' 2>/dev/null)"
+  [ "$peers" = "$(printf '%s\n' $keep | sort | paste -sd' ' -)" ] \
+    || fail "Vault's raft peers are '$peers' after the removals, not '${keep# }': refusing to lower its voters (nothing deployed)"
+}
+
+# kube_vault_shrink_finish — after the chart dropped them: each removed
+# voter's PVC emptied (its raft data names a cluster it left; a later HA
+# on starts it fresh, and it joins by retry_join).
+kube_vault_shrink_finish() {
+  local id pod
+  for id in $_KUBE_VAULT_SHRINK; do
+    kube_ctl -n "$(kube_ns)" wait --for=delete "pod/$id" --timeout=180s >/dev/null 2>&1 || true
+    pod="$(_kube_helper_pod "data-$id" "100:1000" rw "$PORTCULLIS_HELPER_IMAGE")" || fail "could not empty data-$id (the removed voter's raft data)"
+    kube_ctl -n "$(kube_ns)" exec "$pod" -- find /vol -mindepth 1 -maxdepth 1 -exec rm -rf {} + || { _kube_helper_done "$pod"; fail "could not empty data-$id"; }
+    _kube_helper_done "$pod"
+  done
+  _KUBE_VAULT_SHRINK=""
+}
+
+# ── cluster DNS in HA (plan Task 25, controller ruling 3) ──
+
+# ha_coredns — k3s's packaged CoreDNS (one replica: losing its node stops
+# all cluster DNS, ~6 min measured; with a replica on a lost node half the
+# lookups still go there until its endpoint leaves, and Valkey's Sentinels
+# sit in TILT on the failed lookups: ~100 s instead of ~9 s). In HA:
+#   - Deployment coredns (kube-system): one replica per node at the primary
+#     site (at least 2), required there (portcullis.io/site), the small
+#     taint tolerated (the small node runs a Sentinel and a Vault voter),
+#     k3s's own hostname spread (DoNotSchedule) keeps them one per node;
+#   - Service kube-dns: trafficDistribution PreferSameNode — a pod's
+#     lookups go to its own node's CoreDNS, so a lost node never answers
+#     another node's pods (falling back cluster-wide only when its own is
+#     down);
+#   - PodDisruptionBudget coredns (ours): minAvailable 1.
+# What k3s keeps of it (v1.37.2+k3s1, pinned source): pkg/deploy
+# controller.go re-applies manifests/coredns.yaml only when its checksum
+# changes (:244-246), through wrangler's three-way apply, which leaves the
+# fields its manifest doesn't set (replicas, affinity, the Service's
+# trafficDistribution). Its tolerations list is in the manifest, so a k3s
+# upgrade resets ours until the next `up` / `kube check` re-applies this.
+KUBE_COREDNS_SMALL_TOL='{"key": "portcullis.io/small", "operator": "Exists", "effect": "NoSchedule"}'
+ha_coredns() {
+  local n dep tols patch
+  n="$(kube_ctl get nodes -l "portcullis.io/site=$KUBE_PRIMARY_SITE" -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null)" || n=""
+  [[ "$n" =~ ^[0-9]+$ ]] || fail "can't count the nodes at $KUBE_PRIMARY_SITE for CoreDNS (nothing deployed)"
+  [ "$n" -ge 2 ] || n=2
+  dep="$(kube_ctl -n kube-system get deployment coredns -o json 2>/dev/null)" || fail "no Deployment kube-system/coredns (k3s's packaged CoreDNS): HA needs it (nothing deployed)"
+  tols="$(printf '%s' "$dep" | T="$KUBE_COREDNS_SMALL_TOL" jq -c '(.spec.template.spec.tolerations // []) as $t | (env.T | fromjson) as $s | if any($t[]; . == $s) then $t else $t + [$s] end')"
+  patch="$(N="$n" T="$tols" SITE="$KUBE_PRIMARY_SITE" jq -cn '{spec: {replicas: (env.N | tonumber), template: {spec: {tolerations: (env.T | fromjson),
+      affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions: [{key: "portcullis.io/site", operator: "In", values: [env.SITE]}]}]}}}}}}}')"
+  kube_ctl -n kube-system patch deployment coredns --type=merge -p "$patch" >/dev/null || fail "could not spread CoreDNS over $KUBE_PRIMARY_SITE (nothing deployed)"
+  kube_ctl -n kube-system patch service kube-dns --type=merge -p '{"spec": {"trafficDistribution": "PreferSameNode"}}' >/dev/null \
+    || fail "could not set kube-dns's trafficDistribution PreferSameNode (nothing deployed)"
+  jq -n '{apiVersion: "policy/v1", kind: "PodDisruptionBudget", metadata: {name: "coredns", namespace: "kube-system", labels: {"app.kubernetes.io/managed-by": "portcullis"}},
+      spec: {minAvailable: 1, selector: {matchLabels: {"k8s-app": "kube-dns"}}}}' | _ha_apply || fail "could not apply CoreDNS's PodDisruptionBudget (nothing deployed)"
+  _kube_applied_set ha.coredns "$n"
 }

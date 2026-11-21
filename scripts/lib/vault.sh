@@ -105,6 +105,9 @@ vault_no_value() {
 # vault_admin — admin token + a `vault` command, or fail.
 vault_admin() {
   vault_admin_env || exit 1
+  # Kubernetes: the leader looked up once here, in the caller's shell, so
+  # every later vexec (often inside a $(…)) reuses it (review N4).
+  ! _rt_is_kube || kube_vault_pod_set
   vault_use_container_cli || exit 1
 }
 

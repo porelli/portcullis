@@ -4531,6 +4531,64 @@ t0="$(date +%s)"; OUT="$(kt "_kube_bounded 1 sh -c 'sleep 30; echo late' | cat; 
 expect_eq "_kube_bounded: a hung command (and its child holding the pipe) is cut at the bound" "$(printf '%s\n' "$OUT" | head -n1):$(( $(date +%s) - t0 < 10 ))" "after:1"
 t0="$(date +%s)"; OUT="$(kt "_kube_bounded 20 echo quick | cat")"
 expect_eq "_kube_bounded: a quick command returns at once (the watchdog holds no pipe)" "$(printf '%s\n' "$OUT" | head -n1):$(( $(date +%s) - t0 < 10 ))" "quick:1"
+# Fewer voters (HA off, review M3): the dropped voters leave raft first,
+# highest first, through vault-0; the kept set checked; any failure refuses.
+VSH="$WORK/vshrink"; rm -rf "$VSH"; mkdir -p "$VSH"
+vshrink() { # vshrink <live replicas> <extra code>
+  rm -f "$VSH"/*; printf 'vault-0\nvault-1\nvault-2\n' > "$VSH/peers"
+  kt "export VAULT_TOKEN=s.shrink-tok KUBE_VAULT_REMOVE_WAIT=0
+    kube_ctl() { case \"\$*\" in *'get statefulset vault -o jsonpath={.spec.replicas}') echo $1 ;; *) return 1 ;; esac; }
+    vexec() { echo \"\$* @\${_K_VAULT_POD:-}\" >> '$VSH/calls'; case \"\$1 \$2 \$3\" in
+      'operator raft list-peers') [ ! -e '$VSH/list.fail' ] || return 1; jq -Rn '{data: {config: {servers: [inputs | {node_id: .}]}}}' < '$VSH/peers' ;;
+      'operator raft remove-peer') [ ! -e '$VSH/remove.fail' ] || return 1; grep -vx \"\$4\" '$VSH/peers' > '$VSH/p.tmp'; mv '$VSH/p.tmp' '$VSH/peers' ;;
+    esac; }
+    ${2:-}
+    kube_vault_shrink_prepare; echo \"shrink=\$_KUBE_VAULT_SHRINK\""
+}
+OUT="$(vshrink 3)"
+expect_eq "vault voters 3 → 1 (HA off): vault-2 then vault-1 removed from raft through vault-0, the peers then exactly vault-0" \
+  "$(printf '%s\n' "$OUT" | grep '^shrink='):$(grep -o 'remove-peer vault-[0-9] @vault-0' "$VSH/calls" | paste -sd, -):$(paste -sd, "$VSH/peers")" "shrink= vault-2 vault-1:remove-peer vault-2 @vault-0,remove-peer vault-1 @vault-0:vault-0"
+OUT="$(vshrink 1)"
+expect_eq "vault voters unchanged → no raft call" "$(printf '%s\n' "$OUT" | tail -n1):$(test -e "$VSH/calls" && echo calls || echo none)" "rc=0:none"
+OUT="$(vshrink 3 "touch '$VSH/list.fail'")"
+case "$OUT" in *"can't read Vault's raft peers: refusing"*"rc=1") t_pass "vault voters 3 → 1, the peers unreadable → refused, nothing deployed" ;; *) t_fail "shrink list fail: $OUT" ;; esac
+OUT="$(vshrink 3 "touch '$VSH/remove.fail'")"
+case "$OUT" in *"could not remove Vault's raft peer vault-2: refusing"*"rc=1") t_pass "vault voters 3 → 1, a removal fails → refused" ;; *) t_fail "shrink remove fail: $OUT" ;; esac
+OUT="$(vshrink 3 "printf 'vault-0\nvault-1\nstranger\n' > '$VSH/peers'")"
+case "$OUT" in *"a peer stranger that isn't a voter of this chart"*"rc=1") t_pass "vault voters: a raft peer the chart doesn't know → refused, never removed blindly" ;; *) t_fail "shrink stranger: $OUT" ;; esac
+OUT="$(kt "_KUBE_VAULT_SHRINK=' vault-2 vault-1'; kube_ctl() { echo \"\$*\" >> '$VSH/k'; }; _kube_helper_pod() { echo \"helper-\$1\"; }; _kube_helper_done() { echo \"done \$1\" >> '$VSH/k'; }; kube_vault_shrink_finish")"
+expect_eq "vault voters lowered: each removed voter's PVC emptied after its pod is gone" \
+  "$(grep -cE 'wait --for=delete pod/vault-[12]' "$VSH/k"):$(grep -cE 'exec helper-data-vault-[12] -- find /vol' "$VSH/k")" "2:2"
+# The join listener's TLS (review M1): a private CA here, one server
+# certificate for every voter's name, the CA key never synced.
+JT="$WORK/jtls"; rm -rf "$JT"; mkdir -p "$JT/secrets"
+kt "PORTCULLIS_ROOT='$JT'; kube_vault_join_tls_prepare" >/dev/null
+JD="$JT/secrets/vault-join-tls"
+expect_eq "vault join TLS: 0700, the files 0600, the certificate verifies against the CA, serverAuth, every voter's name" \
+  "$(file_mode "$JD"):$(file_mode "$JD/ca.key"):$(file_mode "$JD/tls.key"):$(openssl verify -CAfile "$JD/ca.crt" "$JD/tls.crt" 2>&1 | grep -c ': OK$'):$(openssl x509 -in "$JD/tls.crt" -noout -text | grep -c 'TLS Web Server Authentication'):$(openssl x509 -in "$JD/tls.crt" -noout -ext subjectAltName | grep -o 'vault-[0-9].vault-internal,' | sort -u | wc -l | tr -d ' ')" "700:600:600:1:1:3"
+SUM="$(cat "$JD"/*.crt | openssl dgst -sha256 -r)"
+kt "PORTCULLIS_ROOT='$JT'; kube_vault_join_tls_prepare" >/dev/null
+expect_eq "vault join TLS: kept on the next run (not reissued)" "$(cat "$JD"/*.crt | openssl dgst -sha256 -r)" "$SUM"
+expect_eq "vault join TLS: the CA key and the names file are never synced; the certificate and its key are" \
+  "$(kt "_kube_sync_skip vault-join-tls/ca.key && echo skip; _kube_sync_skip vault-join-tls/sans && echo skip; _kube_sync_skip vault-join-tls/tls.key || echo sync" | grep -c -E '^(skip|sync)$')" 3
+# Cluster DNS in HA (controller ruling 3): one CoreDNS per node at main
+# (at least 2), required there, the small taint tolerated once (k3s's own
+# tolerations kept), PreferSameNode on kube-dns, a PDB.
+CD="$WORK/coredns"; rm -rf "$CD"; mkdir -p "$CD"
+printf '%s' '{"spec":{"template":{"spec":{"tolerations":[{"key":"CriticalAddonsOnly","operator":"Exists"},{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}}}' > "$CD/dep.json"
+cdns() { rm -f "$CD/k" "$CD/apply"; kt "kube_ctl() { echo \"\$*\" >> '$CD/k'; case \"\$*\" in *'get nodes -l portcullis.io/site=main -o json') printf '{\"items\":[%s]}' '$1' ;; *'get deployment coredns -o json') cat '$CD/dep.json' ;; *' patch '*) [ -z '${2:-}' ] || return 1 ;; esac; }; _ha_apply() { cat > '$CD/apply'; }; ha_coredns"; }
+OUT="$(cdns '{},{},{}')"
+P="$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //')"
+expect_eq "HA CoreDNS: 3 nodes at main → 3 replicas, required at main, k3s's tolerations kept + the small one, PreferSameNode, a PDB minAvailable 1" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(printf '%s' "$P" | jq -c '[.spec.replicas, (.spec.template.spec.tolerations | length), (.spec.template.spec.tolerations | map(.key) | index("portcullis.io/small") != null), .spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values]'):$(grep -c 'patch service kube-dns --type=merge -p {"spec": {"trafficDistribution": "PreferSameNode"}}' "$CD/k"):$(jq -c '[.kind, .metadata.namespace, .spec.minAvailable]' "$CD/apply")" \
+  'rc=0:[3,3,true,["main"]]:1:["PodDisruptionBudget","kube-system",1]'
+OUT="$(cdns '{}')"
+expect_eq "HA CoreDNS: one node at main → still 2 replicas" "$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //' | jq -c .spec.replicas)" 2
+printf '%s' '{"spec":{"template":{"spec":{"tolerations":[{"key":"portcullis.io/small","operator":"Exists","effect":"NoSchedule"}]}}}}' > "$CD/dep.json"
+OUT="$(cdns '{},{}')"
+expect_eq "HA CoreDNS: the small toleration added once (idempotent)" "$(grep 'patch deployment coredns' "$CD/k" | sed 's/.* -p //' | jq -c '.spec.template.spec.tolerations | length')" 1
+OUT="$(cdns '{},{}' fail)"
+case "$OUT" in *"could not spread CoreDNS"*"rc=1") t_pass "HA CoreDNS: a refused patch → refused (nothing deployed)" ;; *) t_fail "coredns patch fail: $OUT" ;; esac
 OUT="$(kt "kube_ctl() { return 1; }; kube_vault_pod")"
 expect_eq "kube_vault_pod: no leader (not initialised, or none answers) → vault-0" "$(printf '%s\n' "$OUT" | head -n1)" "vault-0"
 
