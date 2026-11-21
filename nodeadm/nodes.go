@@ -288,6 +288,9 @@ func (s *Server) handleCordon(on bool) func(http.ResponseWriter, *http.Request) 
 			}
 		}
 		if err := s.patchNode(r.Context(), id, map[string]any{"spec": map[string]any{"unschedulable": on}}); err != nil {
+			if on {
+				s.unmark(r.Context(), id) // round 5 nit 3: no mark left on an uncordoned node
+			}
 			return err
 		}
 		if !on {
@@ -298,6 +301,15 @@ func (s *Server) handleCordon(on bool) func(http.ResponseWriter, *http.Request) 
 		s.log.Info("node cordon", "node", id, "unschedulable", on)
 		w.WriteHeader(http.StatusNoContent)
 		return nil
+	}
+}
+
+// unmark rolls the maintenance mark back after a cordon that failed
+// (review round 5 nit 3); a failure is logged (the mark alone excludes
+// nothing: remediate.go needs it AND spec.unschedulable).
+func (s *Server) unmark(ctx context.Context, id string) {
+	if err := s.mutate(ctx, func(st *nodeadmState) error { delete(st.Maintenance, id); return nil }); err != nil {
+		s.log.Warn("couldn't roll back a maintenance mark after a failed cordon", "node", id, "err", redact(err.Error()))
 	}
 }
 
@@ -390,6 +402,7 @@ func (s *Server) drain(ctx context.Context, id string) error {
 		return err
 	}
 	if err := s.patchNode(ctx, id, map[string]any{"spec": map[string]any{"unschedulable": true}}); err != nil {
+		s.unmark(ctx, id)
 		return err
 	}
 	start := time.Now()

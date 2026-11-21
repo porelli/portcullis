@@ -121,15 +121,16 @@ type Server struct {
 	nonces     map[string]nonceRec  // enrol nonces (single use, 60 s)
 	joinNonces map[string]time.Time // signed-request nonces (5 min)
 
-	snapMu    sync.Mutex
-	degraded  map[string]time.Time // Longhorn volume → first seen not healthy
-	lastPrim  string
-	addrMu    sync.Mutex
-	addrState addrPublished
-	kickCh    chan struct{}
-	remHold   string // the remediation round's last hold (logged on change)
-	remMu     sync.Mutex
-	remStuck  []string // the last round's stuck remediations (snapshot errors)
+	snapMu     sync.Mutex
+	degraded   map[string]time.Time // Longhorn volume → first seen not healthy
+	lastPrim   string
+	addrMu     sync.Mutex
+	addrState  addrPublished
+	kickCh     chan struct{}
+	remHold    string // the remediation round's last hold (logged on change)
+	remMu      sync.Mutex
+	remStuck   []string // the last round's stuck remediations (snapshot errors)
+	remUnknown []string // the last round's unknown Nodes (snapshot errors)
 }
 
 // pkiState holds the pki_node CA and nodeadm's own node-nodeadm

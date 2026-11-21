@@ -48,17 +48,16 @@ const (
 	clockSkew = time.Minute
 	// fenceTime: T_fence, SNR's safeTimeToAssumeNodeRebootedSeconds
 	// (kube/ha/fencing/config.yaml): a remediation counts as "fenced, kept"
-	// only this long after its creation (server-set) AND with the
-	// out-of-service taint on its node — never on Succeeded alone, which is
-	// status (review round 4 I1).
+	// only Succeeded AND this long after its (server-set) creation AND its
+	// node still NotReady (review round 5 I1). Not the out-of-service taint:
+	// SNR v0.13.0 lifts it BEFORE it sets Succeeded (useOutOfServiceTaint,
+	// then handleRebootCompletedPhase); since round 4 only SNR's manager
+	// writes the status.
 	fenceTime    = 150 * time.Second
 	snrManagedBy = "portcullis-nodeadm"
 	// labelExclude: SNR's own opt-out label (its manager skips a node
 	// carrying it; an admin's, set through nodeadm).
 	labelExclude = "remediation.medik8s.io/exclude-from-remediation"
-	// taintOutOfService: the taint SNR's manager puts once the node is
-	// assumed rebooted (the OutOfServiceTaint strategy).
-	taintOutOfService = "node.kubernetes.io/out-of-service"
 	// phaseFencingStarted: SNR's first phase (an unset phase is it too).
 	phaseFencingStarted = "Fencing-Started"
 )
@@ -83,8 +82,6 @@ type remediationNode struct {
 	// ExcludeLabel: SNR's exclude-from-remediation label alone — the one
 	// exclusion SNR itself honours (review round 4 M1).
 	ExcludeLabel bool
-	// OutOfService: node.kubernetes.io/out-of-service is on the node.
-	OutOfService bool
 	// LastRemediated: its last remediation's start from nodeadm's own
 	// state (zero = never).
 	LastRemediated time.Time
@@ -113,11 +110,11 @@ type remediationPlan struct {
 //   - a node Ready again whose remediation Succeeded (or is
 //     remediationStale old Ready) → its CR is removed (SNR then lifts its
 //     taints); a node gone → its CR removed after remediationStale;
-//   - a fenced remediation of a node still down — Succeeded AND the
-//     out-of-service taint on the node AND fenceTime since its creation —
-//     is KEPT (removing it would lift the taint) but no longer counts as
-//     in progress (review I3: a node fenced for good never blocks the
-//     next; round 4 I1: status alone never proves the fencing);
+//   - a fenced remediation of a node still down — Succeeded AND fenceTime
+//     since its creation AND the node NotReady — is KEPT (removing it
+//     would make SNR recover the node) but no longer counts as in progress
+//     (review I3: a node fenced for good never blocks the next; round 5
+//     I1: the order SNR v0.13.0 really uses, see fenceTime);
 //   - no new remediation while one is in progress (not yet Succeeded);
 //   - no new remediation while more than half of the primary site's nodes
 //     are unhealthy (a partition's minority, or a site-wide outage, never
@@ -153,7 +150,7 @@ func planRemediation(nodes []remediationNode, crs []remediationCR, primary strin
 		case !known && now.Sub(c.Created) >= remediationStale:
 			// The node is gone (removed): its remediation with it.
 			p.Delete = append(p.Delete, c.Name)
-		case c.Succeeded && known && n.OutOfService && now.Sub(c.Created) >= fenceTime:
+		case c.Succeeded && known && !n.Ready && now.Sub(c.Created) >= fenceTime:
 			// Fenced and still down: kept, not in progress.
 		case known && n.ExcludeLabel && (c.Phase == "" || c.Phase == phaseFencingStarted):
 			p.Stuck = append(p.Stuck, c.Name+": labelled exclude-from-remediation before its fencing began (SNR skips it)")
@@ -212,21 +209,28 @@ func planRemediation(nodes []remediationNode, crs []remediationCR, primary strin
 }
 
 // remediationInputs reads the nodes, the pods' PVCs and the existing
-// SelfNodeRemediations (fail closed: an unreadable input = no round).
-func (s *Server) remediationInputs(ctx context.Context) ([]remediationNode, []remediationCR, error) {
+// SelfNodeRemediations (fail closed: an unreadable input = no round). Only
+// known Nodes are inputs (review round 5 M2): one nodeadm enrolled and
+// labelled (its record Labelled, or Removed: still a member until gone),
+// or the cluster's first node, which the CLI labels and nodeadm has no
+// record of (no record, and a portcullis.io/site label: node identities
+// can't set it, portcullis-node-labels) — never one still carrying the
+// registration taint. Any other Node is returned in unknown: never
+// counted in the >1/2 guard nor remediated, reported.
+func (s *Server) remediationInputs(ctx context.Context) ([]remediationNode, []remediationCR, []string, error) {
 	cl, err := s.clusterNodes(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	st, err := s.load(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// Longhorn's volumes attached per node (the replicated tier).
 	replicated := map[string]bool{}
 	vl, err := s.dyn.Resource(gvrLonghornVolume).Namespace(s.cfg.LonghornNS).List(ctx, metav1.ListOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if vl != nil {
 		for _, v := range vl.Items {
@@ -236,17 +240,17 @@ func (s *Server) remediationInputs(ctx context.Context) ([]remediationNode, []re
 		}
 	}
 	var nodes []remediationNode
+	var unknown []string
 	for _, c := range cl {
-		rn := remediationNode{Name: c.Name, Site: c.Site, Class: c.Class, Ready: c.Ready, Replicated: replicated[c.Name]}
 		rec := st.Nodes[c.Name]
+		if !knownNode(c.Node, rec) {
+			unknown = append(unknown, c.Name)
+			continue
+		}
+		rn := remediationNode{Name: c.Name, Site: c.Site, Class: c.Class, Ready: c.Ready, Replicated: replicated[c.Name]}
 		rn.ExcludeLabel = c.Node.Labels[labelExclude] == "true"
 		rn.Excluded = (c.Node.Spec.Unschedulable && st.Maintenance[c.Name]) || rn.ExcludeLabel ||
 			st.Ops[c.Name] != nil || (rec != nil && rec.Removed)
-		for _, t := range c.Node.Spec.Taints {
-			if t.Key == taintOutOfService {
-				rn.OutOfService = true
-			}
-		}
 		rn.LastRemediated = st.Remediations[c.Name]
 		for _, cond := range c.Node.Status.Conditions {
 			if cond.Type == corev1.NodeReady {
@@ -260,7 +264,7 @@ func (s *Server) remediationInputs(ctx context.Context) ([]remediationNode, []re
 	}
 	l, err := s.dyn.Resource(gvrSNR).Namespace(s.cfg.FencingNS).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var crs []remediationCR
 	for _, o := range l.Items {
@@ -275,7 +279,21 @@ func (s *Server) remediationInputs(ctx context.Context) ([]remediationNode, []re
 		}
 		crs = append(crs, c)
 	}
-	return nodes, crs, nil
+	sort.Strings(unknown)
+	return nodes, crs, unknown, nil
+}
+
+// knownNode: a Node the storm guard counts (remediationInputs).
+func knownNode(n *corev1.Node, rec *nodeRecord) bool {
+	for _, t := range n.Spec.Taints {
+		if t.Key == taintUnlabelled {
+			return false
+		}
+	}
+	if rec != nil {
+		return rec.Labelled || rec.Removed
+	}
+	return n.Labels[labelSite] != ""
 }
 
 // remediate is one round (leader only; every write under the fence).
@@ -283,7 +301,7 @@ func (s *Server) remediate(ctx context.Context) {
 	if !s.leader.Leading() || s.dyn == nil || s.cfg.FencingNS == "" {
 		return
 	}
-	nodes, crs, err := s.remediationInputs(ctx)
+	nodes, crs, unknown, err := s.remediationInputs(ctx)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			s.log.Warn("remediation: inputs unreadable, no round (fail closed)", "err", redact(err.Error()))
@@ -307,6 +325,12 @@ func (s *Server) remediate(ctx context.Context) {
 		}
 	}
 	s.remStuck = p.Stuck
+	if strings.Join(unknown, "|") != strings.Join(s.remUnknown, "|") {
+		for _, x := range unknown {
+			s.log.Warn("unknown node registered: never counted or fenced", "node", x)
+		}
+	}
+	s.remUnknown = unknown
 	s.remMu.Unlock()
 	if p.Hold != "" {
 		if s.remHold != p.Hold {
@@ -360,9 +384,12 @@ func (s *Server) remediateLoop(ctx context.Context) {
 func (s *Server) remediationErrors() []string {
 	s.remMu.Lock()
 	defer s.remMu.Unlock()
-	out := make([]string, 0, len(s.remStuck))
+	out := make([]string, 0, len(s.remStuck)+len(s.remUnknown))
 	for _, x := range s.remStuck {
 		out = append(out, "remediation of node "+x+": fencing that node needs an admin")
+	}
+	for _, x := range s.remUnknown {
+		out = append(out, "unknown node registered: "+x+" (not enrolled and labelled by nodeadm: never counted or fenced; remove it, or finish its labelling)")
 	}
 	return out
 }

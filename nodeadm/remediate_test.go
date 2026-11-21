@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -24,9 +27,7 @@ func rn(name, site, class string, ready bool, agoS int, replicated bool) remedia
 
 func with(n remediationNode, f func(*remediationNode)) remediationNode { f(&n); return n }
 
-// oos: the out-of-service taint on the node; exl: SNR's exclude label
-// (also maintenance, as remediationInputs sets it).
-func oos(n remediationNode) remediationNode { n.OutOfService = true; return n }
+// exl: SNR's exclude label (also maintenance, as remediationInputs sets it).
 func exl(n remediationNode) remediationNode { n.ExcludeLabel, n.Excluded = true, true; return n }
 
 func TestPlanRemediationGuard(t *testing.T) {
@@ -49,18 +50,15 @@ func TestPlanRemediationGuard(t *testing.T) {
 		{"in progress and another due: held", []remediationNode{rn("m1", "main", "cloud", false, 300, true), rn("m2", "main", "home", true, 3600, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", false, 300, true), rn("m5", "main", "cloud", true, 3600, true)},
 			[]remediationCR{{Name: "m1", Created: ago(1)}}, remediationPlan{Hold: "a remediation is in progress (m1)"}},
 		// Review I3: fenced for good, then a second node dies → remediated.
-		{"fenced and still down (Succeeded + out-of-service + T_fence), then a second node dies → the second remediated, the first kept",
-			[]remediationNode{oos(rn("m1", "main", "cloud", false, 1800, true)), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+		// Round 5 I1: fenced = Succeeded AND T_fence since creation AND still NotReady.
+		{"fenced and still down (Succeeded, T_fence passed), then a second node dies → the second remediated, the first kept",
+			[]remediationNode{rn("m1", "main", "cloud", false, 1800, true), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
 			[]remediationCR{{Name: "m1", Created: ago(29), Succeeded: true}}, remediationPlan{Create: "m2"}},
-		// Round 4 I1: Succeeded is status — never proof of a fencing alone.
-		{"Succeeded but no out-of-service taint (a forged status): still in progress, the next held",
+		{"Succeeded but younger than T_fence (100 s): still in progress, the next held",
 			[]remediationNode{rn("m1", "main", "cloud", false, 600, true), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
-			[]remediationCR{{Name: "m1", Created: ago(1), Succeeded: true}}, remediationPlan{Hold: "a remediation is in progress (m1)"}},
-		{"Succeeded with the taint but younger than T_fence: still in progress",
-			[]remediationNode{oos(rn("m1", "main", "cloud", false, 600, true)), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
 			[]remediationCR{{Name: "m1", Created: remNow.Add(-100 * time.Second), Succeeded: true}}, remediationPlan{Hold: "a remediation is in progress (m1)"}},
-		{"Succeeded, the taint, T_fence passed (151 s): fenced, the next remediated",
-			[]remediationNode{oos(rn("m1", "main", "cloud", false, 600, true)), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
+		{"Succeeded, T_fence passed (151 s), node still NotReady: fenced, the next remediated",
+			[]remediationNode{rn("m1", "main", "cloud", false, 600, true), rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)},
 			[]remediationCR{{Name: "m1", Created: remNow.Add(-151 * time.Second), Succeeded: true}}, remediationPlan{Create: "m2"}},
 		// Review I3 + M2: an edge site's WAN drops — never fenced, main still remediated.
 		{"edge WAN down: the edge node never remediated, and a main node dying meanwhile is",
@@ -235,32 +233,148 @@ func TestRemediateMaintenanceMark(t *testing.T) {
 	}
 }
 
-// TestRemediationInputsFenceFacts (round 4 I1, M1): the round reads the
-// out-of-service taint from the Node, SNR's exclude label on its own, and
-// the CR's phase.
+// TestRemediationInputsFenceFacts (round 4 M1, round 5 M2): the round
+// reads SNR's exclude label on its own and the CR's phase; only known
+// Nodes are inputs — the harness's three (no record, CLI-labelled like the
+// first node), a nodeadm-enrolled one once Labelled — and the others (no
+// site label, the registration taint, enrolled but not yet labelled) are
+// unknown: never counted, never remediated, in the snapshot's errors.
 func TestRemediationInputsFenceFacts(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	n2, _ := h.kube.CoreV1().Nodes().Get(ctx, "n2", metav1.GetOptions{})
-	n2.Spec.Taints = append(n2.Spec.Taints, corev1.Taint{Key: taintOutOfService, Value: "nodeshutdown", Effect: corev1.TaintEffectNoExecute})
 	n2.Labels[labelExclude] = "true"
 	h.kube.CoreV1().Nodes().Update(ctx, n2, metav1.UpdateOptions{})
+	down := func(n *corev1.Node) *corev1.Node {
+		n.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionUnknown, LastTransitionTime: metav1.NewTime(vecNow.Add(-time.Hour))}}
+		return n
+	}
+	fake := down(mkNode(nodeSpec{"x1", "agent", "home", "", "10.215.0.41", nil, nil, false, false}))
+	delete(fake.Labels, labelSite)
+	reg := down(mkNode(nodeSpec{"x2", "agent", "home", "main", "10.215.0.42", nil, nil, false, false}))
+	reg.Spec.Taints = []corev1.Taint{{Key: taintUnlabelled, Value: "true", Effect: corev1.TaintEffectNoSchedule}}
+	pend := down(mkNode(nodeSpec{"x3", "agent", "home", "main", "10.215.0.43", nil, nil, false, false}))
+	enr := mkNode(nodeSpec{"x4", "agent", "home", "main", "10.215.0.44", nil, nil, true, false})
+	for _, n := range []*corev1.Node{fake, reg, pend, enr} {
+		if _, err := h.kube.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["x3"] = &nodeRecord{Role: "agent", Class: "home", Site: "main", Serial: "11:22"}
+		st.Nodes["x4"] = &nodeRecord{Role: "agent", Class: "home", Site: "main", Serial: "33:44", Labelled: true}
+	})
 	cr := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "self-node-remediation.medik8s.io/v1alpha1", "kind": "SelfNodeRemediation",
 		"metadata": map[string]any{"name": "n2", "namespace": "portcullis-fencing"}, "status": map[string]any{"phase": "Pre-Reboot-Completed"}}}
 	h.s.dyn = dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{gvrSNR: "SelfNodeRemediationList", gvrLonghornVolume: "VolumeList"}, cr)
-	nodes, crs, err := h.s.remediationInputs(ctx)
+	nodes, crs, unknown, err := h.s.remediationInputs(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var names []string
 	var got remediationNode
 	for _, n := range nodes {
+		names = append(names, n.Name)
 		if n.Name == "n2" {
 			got = n
 		}
 	}
-	if !got.OutOfService || !got.ExcludeLabel || !got.Excluded || len(crs) != 1 || crs[0].Phase != "Pre-Reboot-Completed" {
+	if strings.Join(names, ",") != "n1,n2,n3,x4" || strings.Join(unknown, ",") != "x1,x2,x3" {
+		t.Fatalf("known %v, unknown %v", names, unknown)
+	}
+	if !got.ExcludeLabel || !got.Excluded || len(crs) != 1 || crs[0].Phase != "Pre-Reboot-Completed" {
 		t.Fatalf("inputs: %+v %+v", got, crs)
+	}
+	// Through a round: the three unknown down Nodes are neither remediated
+	// nor counted (3 of 7 down would be no storm anyway; x1..x3 alone would
+	// be a storm of 3 of 4 known+unknown main nodes), and they are reported.
+	h.s.dyn = dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvrSNR: "SelfNodeRemediationList", gvrLonghornVolume: "VolumeList"})
+	h.s.remediate(ctx)
+	if l, _ := h.s.dyn.Resource(gvrSNR).Namespace("portcullis-fencing").List(ctx, metav1.ListOptions{}); len(l.Items) != 0 {
+		t.Fatalf("an unknown Node was remediated: %v", l.Items[0].GetName())
+	}
+	errs := strings.Join(h.s.remediationErrors(), "\n")
+	for _, x := range []string{"x1", "x2", "x3"} {
+		if !strings.Contains(errs, "unknown node registered: "+x+" ") {
+			t.Fatalf("not reported: %s\n%s", x, errs)
+		}
+	}
+	if !strings.Contains(h.logs.String(), "unknown node registered") {
+		t.Fatalf("not logged: %s", h.logs.String())
+	}
+}
+
+// TestUnknownNodesNeverCountedInTheGuard (round 5 M2): fake NotReady Nodes
+// can't make a real dead node's fencing a "storm".
+func TestUnknownNodesNeverCountedInTheGuard(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	n2, _ := h.kube.CoreV1().Nodes().Get(ctx, "n2", metav1.GetOptions{})
+	n2.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionUnknown, LastTransitionTime: metav1.NewTime(vecNow.Add(-time.Minute))}}
+	h.kube.CoreV1().Nodes().UpdateStatus(ctx, n2, metav1.UpdateOptions{})
+	for i := 1; i <= 4; i++ {
+		f := mkNode(nodeSpec{fmt.Sprintf("fake%d", i), "agent", "home", "", fmt.Sprintf("10.215.0.%d", 50+i), nil, nil, false, false})
+		delete(f.Labels, labelSite)
+		h.kube.CoreV1().Nodes().Create(ctx, f, metav1.CreateOptions{})
+	}
+	d := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvrSNR: "SelfNodeRemediationList", gvrLonghornVolume: "VolumeList"})
+	h.s.dyn = d
+	h.s.remediate(ctx)
+	l, _ := d.Resource(gvrSNR).Namespace("portcullis-fencing").List(ctx, metav1.ListOptions{})
+	if len(l.Items) != 1 || l.Items[0].GetName() != "n2" {
+		t.Fatalf("the real dead node wasn't fenced (fakes counted?): %d %s", len(l.Items), h.logs.String())
+	}
+}
+
+// TestFencedFollowsSNRsOrder (round 5 I1): SNR v0.13.0's OutOfServiceTaint
+// strategy, as its source orders it (internal/controller/
+// selfnoderemediation_controller.go): prepareReboot puts
+// remediation.medik8s.io/self-node-remediation:NoSchedule and sets
+// Pre-Reboot-Completed; waitForNodeRebooted (safe time 150 s) sets
+// Reboot-Completed; useOutOfServiceTaint puts the out-of-service taint,
+// waits for the node's pods and attachments to go, then REMOVES it;
+// handleRebootCompletedPhase only then sets Fencing-Completed and
+// Succeeded. nodeadm counts the remediation in progress through every step
+// before Succeeded and frees the next one only after it, with the node
+// still NotReady.
+func TestFencedFollowsSNRsOrder(t *testing.T) {
+	created := remNow.Add(-10 * time.Minute)
+	others := []remediationNode{rn("m2", "main", "home", false, 60, true), rn("m3", "main", "cloud", true, 3600, true), rn("m4", "main", "cloud", true, 3600, true), rn("m5", "main", "cloud", true, 3600, true)}
+	steps := []struct {
+		at        time.Duration // since the CR's creation
+		phase     string
+		succeeded bool
+		fenced    bool
+	}{
+		{0, "", false, false},                                   // created
+		{2 * time.Second, "Fencing-Started", false, false},      // the finalizer added
+		{3 * time.Second, "Pre-Reboot-Completed", false, false}, // NoSchedule taint, TimeAssumedRebooted
+		{153 * time.Second, "Reboot-Completed", false, false},   // safe time passed; out-of-service taint put
+		{170 * time.Second, "Reboot-Completed", false, false},   // pods / attachments gone; the taint removed
+		{171 * time.Second, "Fencing-Completed", true, true},    // Succeeded (after the taint is gone)
+	}
+	for _, st := range steps {
+		now := created.Add(st.at)
+		m1 := remediationNode{Name: "m1", Site: "main", Class: "cloud", Ready: false, Since: created.Add(-time.Minute), Replicated: true}
+		m2 := others[0]
+		m2.Since = now.Add(-time.Minute)
+		nodes := append([]remediationNode{m1, m2}, others[1:]...)
+		p := planRemediation(nodes, []remediationCR{{Name: "m1", Created: created, Succeeded: st.succeeded, Phase: st.phase}}, primarySite, now)
+		if st.fenced && p.Create != "m2" {
+			t.Errorf("at %s (%s, Succeeded): m1 fenced, m2 should be remediated: %+v", st.at, st.phase, p)
+		}
+		if !st.fenced && (p.Create != "" || p.Hold != "a remediation is in progress (m1)") {
+			t.Errorf("at %s (%s): m1 still in progress: %+v", st.at, st.phase, p)
+		}
+	}
+	// Succeeded but the node Ready again: removed (SNR recovers it).
+	p := planRemediation([]remediationNode{rn("m1", "main", "cloud", true, 10, true), rn("m3", "main", "cloud", true, 3600, true)},
+		[]remediationCR{{Name: "m1", Created: created, Succeeded: true, Phase: "Fencing-Completed"}}, primarySite, remNow)
+	if strings.Join(p.Delete, ",") != "m1" {
+		t.Fatalf("Ready again: %+v", p)
 	}
 }
 
@@ -279,5 +393,71 @@ func TestDropRemovedPrunesRemediationState(t *testing.T) {
 	st := h.state(t)
 	if st.Nodes["n9"] != nil || !st.Remediations["n9"].IsZero() || st.Maintenance["n9"] || st.Remediations["n2"].IsZero() {
 		t.Fatalf("after the drop: node %v, remediations %v, maintenance %v", st.Nodes["n9"], st.Remediations, st.Maintenance)
+	}
+}
+
+// TestCordonRollsTheMarkBack (round 5 nit 3): a cordon whose Node patch
+// fails leaves no maintenance mark (the cordon API and drain); a cordon
+// that works leaves it, an uncordon drops it.
+func TestCordonRollsTheMarkBack(t *testing.T) {
+	h := newHarness(t)
+	h.kube.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("refused")
+	})
+	if w := h.internal(clientHub, "POST", "/v1/nodes/n1/cordon", map[string]any{}); w.Code < 400 {
+		t.Fatalf("the failed cordon answered %d", w.Code)
+	}
+	h.internal(clientHub, "POST", "/v1/nodes/n2/drain", map[string]any{})
+	if st := h.state(t); st.Maintenance["n1"] || st.Maintenance["n2"] {
+		t.Fatalf("a mark was left after a failed cordon: %v", st.Maintenance)
+	}
+	h.kube.ReactionChain = h.kube.ReactionChain[1:]
+	if w := h.internal(clientHub, "POST", "/v1/nodes/n1/cordon", map[string]any{}); w.Code != http.StatusNoContent {
+		t.Fatalf("cordon: %d %s", w.Code, w.Body)
+	}
+	if !h.state(t).Maintenance["n1"] {
+		t.Fatal("no mark after a cordon")
+	}
+	if w := h.internal(clientHub, "POST", "/v1/nodes/n1/uncordon", map[string]any{}); w.Code != http.StatusNoContent || h.state(t).Maintenance["n1"] {
+		t.Fatalf("uncordon: %d, mark %v", w.Code, h.state(t).Maintenance)
+	}
+}
+
+// TestManagerRuleJudgesEveryNodeSpecField (round 5 nit 2): the manager's
+// rule in portcullis-node-labels compares every v1 NodeSpec field of the
+// vendored k8s.io/api but taints (judged by the taint allowlist), so a new
+// NodeSpec field can't pass unjudged.
+func TestManagerRuleJudgesEveryNodeSpecField(t *testing.T) {
+	b, err := os.ReadFile("../kube/admission/policies.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	i := strings.Index(s, "request.userInfo.username != 'system:serviceaccount:portcullis-fencing:self-node-remediation-controller-manager'")
+	j := strings.Index(s, "message: SNR's manager may only put or lift")
+	if i < 0 || j < i {
+		t.Fatal("the manager's rule isn't in policies.yaml")
+	}
+	rule := s[i:j]
+	ty := reflect.TypeOf(corev1.NodeSpec{})
+	for k := 0; k < ty.NumField(); k++ {
+		name := strings.Split(ty.Field(k).Tag.Get("json"), ",")[0]
+		if name == "podPreemptionPolicy" {
+			// Reviewed exception: alpha in k8s.io/api v0.37, forbidden while
+			// the InPlacePodVerticalScalingSchedulerPreemption gate is off (the
+			// default; Portcullis never enables it), and absent from the
+			// servers' schemas below 1.37 — a CEL reference would make the
+			// policy fail to compile on the 1.33 floor.
+			continue
+		}
+		if name == "taints" {
+			if !strings.Contains(rule, "variables.newOtherTaints") {
+				t.Error("the manager's rule doesn't judge spec.taints")
+			}
+			continue
+		}
+		if !strings.Contains(rule, "object.spec."+name) {
+			t.Errorf("the manager's rule doesn't judge spec.%s (NodeSpec of the vendored k8s.io/api)", name)
+		}
 	}
 }
