@@ -6,6 +6,13 @@ RUN go mod download && go mod verify
 COPY *.go ./
 COPY internal/ ./internal/
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /mailctl .
+# Stalwart's web admin bundle for the read-only mail admin view (contract
+# §19.13), pinned by version and sha256: Stalwart loads it from the file
+# (the template copies it next to mailctl), never from the internet.
+ARG WEBUI_VERSION=v2.1.0
+ARG WEBUI_SHA256=c3627184e3d8dcc42acd49cff0f20d4ac3425a90e875bac83775e4eefbfc1286
+RUN wget -q -O /webui.zip "https://github.com/stalwartlabs/webui/releases/download/${WEBUI_VERSION}/webui.zip" \
+ && echo "${WEBUI_SHA256}  /webui.zip" | sha256sum -c -
 
 # alpine:3.24.3
 FROM docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
@@ -20,7 +27,8 @@ RUN apk add --no-cache ca-certificates \
  && adduser -S -D -H -u 10010 -G mailctl mailctl \
  && mkdir -p /data && chown 10010:10010 /data && chmod 0700 /data
 COPY --from=builder /mailctl /usr/local/bin/mailctl
+COPY --from=builder /webui.zip /usr/share/mailctl/webui.zip
 USER 10010:10010
 VOLUME /data
-EXPOSE 8080 8081 8082 9100
+EXPOSE 8080 8081 8082 8090 9100
 ENTRYPOINT ["mailctl"]

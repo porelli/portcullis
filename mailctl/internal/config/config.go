@@ -49,6 +49,13 @@ type Config struct {
 	PublicIPv4 netip.Addr // PORTCULLIS_MAIL_PUBLIC_IPV4: core's detected address, passed by the Hub (empty: the address checks are unknown)
 	PublicIPv6 netip.Addr // PORTCULLIS_MAIL_PUBLIC_IPV6
 
+	// The read-only admin view (contract §19.13), the bootstrap job only
+	// (LoadJob): where the viewer's password goes (MAILCTL_VIEWER_SECRET_FILE,
+	// "" = no admin view) and the admin-view proxy's internal address
+	// (MAILCTL_ADMINVIEW_IP), the only client of the admin-view listener.
+	ViewerSecretFile string
+	ViewerIP         netip.Addr
+
 	JobSessionFile string // the bootstrap job only (LoadJob)
 	// JobLocalURL is how the bootstrap job reaches the server it runs in
 	// its own container: loopback only (MAILCTL_JOB_LOCAL_URL, Ruling
@@ -214,6 +221,21 @@ func LoadJob(env func(string) string) (Config, error) {
 	if !plainHTTPURL(c.JobLocalURL, true) {
 		return c, fmt.Errorf("MAILCTL_JOB_LOCAL_URL=%q is not http://<loopback ip>:<port>", c.JobLocalURL)
 	}
+	c.ViewerSecretFile = strings.TrimSpace(env("MAILCTL_VIEWER_SECRET_FILE"))
+	if c.ViewerSecretFile != "" {
+		if !filepath.IsAbs(c.ViewerSecretFile) || filepath.Clean(c.ViewerSecretFile) != c.ViewerSecretFile {
+			return c, fmt.Errorf("MAILCTL_VIEWER_SECRET_FILE=%q is not a clean absolute file path", c.ViewerSecretFile)
+		}
+		v := get(env, "MAILCTL_ADMINVIEW_IP", "172.31.255.5")
+		ip, err := netip.ParseAddr(v)
+		if err != nil || !ip.Is4() {
+			return c, fmt.Errorf("MAILCTL_ADMINVIEW_IP=%q is not an IPv4 address", v)
+		}
+		if ip == c.MailIP {
+			return c, fmt.Errorf("MAILCTL_ADMINVIEW_IP=%q is the adapter's own address: the admin view has its own", v)
+		}
+		c.ViewerIP = ip
+	}
 	c.ServerImage = strings.TrimSpace(env("MAILCTL_SERVER_IMAGE"))
 	if strings.ContainsAny(c.ServerImage, " \t\n") {
 		return c, fmt.Errorf("MAILCTL_SERVER_IMAGE=%q is not an image reference", c.ServerImage)
@@ -286,4 +308,55 @@ func plainHTTPURL(raw string, loopback bool) bool {
 	}
 	ap, err := netip.ParseAddrPort(u.Host)
 	return err == nil && ap.Port() != 0 && (!loopback || ap.Addr().IsLoopback())
+}
+
+// AdminView is `mailctl admin-view`'s configuration (contract §19.13):
+// the read-only mail admin view's proxy, a service of its own.
+type AdminView struct {
+	Addr       string // MAILCTL_ADMINVIEW_ADDR: where Traefik reaches it (":8090")
+	Upstream   string // MAILCTL_ADMINVIEW_UPSTREAM: Stalwart's admin-view listener (https://<ip>:<port>)
+	Host       string // PORTCULLIS_MAIL_ADMIN_HOST: the admin view's hostname (the Hub's override)
+	SecretFile string // MAILCTL_VIEWER_SECRET_FILE: the viewer's password
+	// SPKIs: PORTCULLIS_MAIL_TLS_SPKI, the mail certificate's SPKI SHA-256
+	// values (comma-separated hex, the Hub's override): the hop to
+	// Stalwart is pinned to them.
+	SPKIs []string
+}
+
+// LoadAdminView reads the admin view's configuration; every value is
+// checked (fail closed).
+func LoadAdminView(env func(string) string) (AdminView, error) {
+	var a AdminView
+	a.Addr = get(env, "MAILCTL_ADMINVIEW_ADDR", ":8090")
+	if err := listenAddr("MAILCTL_ADMINVIEW_ADDR", a.Addr); err != nil {
+		return a, err
+	}
+	a.Upstream = strings.TrimSuffix(get(env, "MAILCTL_ADMINVIEW_UPSTREAM", "https://172.31.255.2:8443"), "/")
+	u, err := url.Parse(a.Upstream)
+	if err != nil || u.Scheme != "https" || u.Path != "" || u.User != nil || u.RawQuery != "" || u.Port() == "" {
+		return a, fmt.Errorf("MAILCTL_ADMINVIEW_UPSTREAM=%q is not https://<ip>:<port>", a.Upstream)
+	}
+	if ip, err := netip.ParseAddr(u.Hostname()); err != nil || !ip.Is4() {
+		return a, fmt.Errorf("MAILCTL_ADMINVIEW_UPSTREAM=%q is not https://<ip>:<port>", a.Upstream)
+	}
+	a.Host = strings.ToLower(strings.TrimSpace(env("PORTCULLIS_MAIL_ADMIN_HOST")))
+	if a.Host == "" {
+		return a, errors.New("PORTCULLIS_MAIL_ADMIN_HOST is required (the Hub's override sets it on the wired provider)")
+	}
+	if !validHostname(a.Host) || !strings.Contains(a.Host, ".") {
+		return a, fmt.Errorf("PORTCULLIS_MAIL_ADMIN_HOST=%q is not a hostname", a.Host)
+	}
+	a.SecretFile = get(env, "MAILCTL_VIEWER_SECRET_FILE", "")
+	if a.SecretFile == "" || !filepath.IsAbs(a.SecretFile) || filepath.Clean(a.SecretFile) != a.SecretFile {
+		return a, fmt.Errorf("MAILCTL_VIEWER_SECRET_FILE=%q is not a clean absolute file path", a.SecretFile)
+	}
+	for _, p := range strings.Split(env("PORTCULLIS_MAIL_TLS_SPKI"), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			a.SPKIs = append(a.SPKIs, p)
+		}
+	}
+	if len(a.SPKIs) == 0 {
+		return a, errors.New("PORTCULLIS_MAIL_TLS_SPKI is required (the Hub's override sets the mail certificate's SPKI): the hop to the mail server is pinned to it")
+	}
+	return a, nil
 }

@@ -154,3 +154,35 @@ func TestServerURLsStrict(t *testing.T) {
 		t.Fatalf("%v %v", c.StalwartURL, err)
 	}
 }
+
+// The admin view's proxy (contract §19.13) refuses to start on any bad
+// or missing value: the host, the secret file, the pinned SPKI and an
+// upstream that isn't https to an IPv4 address.
+func TestLoadAdminView(t *testing.T) {
+	good := map[string]string{"PORTCULLIS_MAIL_ADMIN_HOST": "mail-admin.example.org", "MAILCTL_VIEWER_SECRET_FILE": "/run/portcullis/viewer-key/viewer-password",
+		"PORTCULLIS_MAIL_TLS_SPKI": strings.Repeat("ab", 32)}
+	a, err := LoadAdminView(func(k string) string { return good[k] })
+	if err != nil || a.Addr != ":8090" || a.Upstream != "https://172.31.255.2:8443" || len(a.SPKIs) != 1 {
+		t.Fatalf("%+v %v", a, err)
+	}
+	for k, v := range map[string]string{"PORTCULLIS_MAIL_ADMIN_HOST": "", "MAILCTL_VIEWER_SECRET_FILE": "rel/path", "PORTCULLIS_MAIL_TLS_SPKI": " ",
+		"MAILCTL_ADMINVIEW_UPSTREAM": "http://172.31.255.2:8443", "MAILCTL_ADMINVIEW_ADDR": "nope"} {
+		env := map[string]string{}
+		for kk, vv := range good {
+			env[kk] = vv
+		}
+		env[k] = v
+		if _, err := LoadAdminView(func(x string) string { return env[x] }); err == nil {
+			t.Errorf("%s=%q accepted", k, v)
+		}
+	}
+	for _, u := range []string{"https://stalwart:8443", "https://172.31.255.2", "https://172.31.255.2:8443/x", "https://u@172.31.255.2:8443"} {
+		env := map[string]string{"MAILCTL_ADMINVIEW_UPSTREAM": u}
+		for kk, vv := range good {
+			env[kk] = vv
+		}
+		if _, err := LoadAdminView(func(x string) string { return env[x] }); err == nil {
+			t.Errorf("upstream %q accepted", u)
+		}
+	}
+}

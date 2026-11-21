@@ -61,3 +61,56 @@ func TestMailctlRoleCanGrantUserRole(t *testing.T) {
 		}
 	}
 }
+
+// The viewer role (contract §19.13) is exactly authenticate plus every
+// sys<Object>Get / sys<Object>Query of the schema snapshot whose object
+// isn't in ViewerDenied: no write, action, task, live, protocol or blob
+// permission ever, and every allowed read present (a schema bump that adds
+// an object fails here until it is judged).
+func TestViewerRoleReadOnlyExact(t *testing.T) {
+	s := loadSnapshot(t)
+	denied := map[string]bool{}
+	for _, o := range ViewerDenied {
+		denied[o] = true
+	}
+	want := []string{"authenticate"}
+	for _, v := range s.Enums["Permission"] {
+		n := v.Name
+		if !strings.HasPrefix(n, "sys") {
+			continue
+		}
+		obj, ok := strings.CutSuffix(n, "Get")
+		if !ok {
+			obj, ok = strings.CutSuffix(n, "Query")
+		}
+		if ok && !denied[strings.TrimPrefix(obj, "sys")] {
+			want = append(want, n)
+		}
+	}
+	got := append([]string(nil), ViewerRolePermissions...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ViewerRolePermissions\n got %v\nwant %v", got, want)
+	}
+	for _, p := range got {
+		if p == "authenticate" {
+			continue
+		}
+		for _, bad := range []string{"Create", "Update", "Destroy"} {
+			if strings.HasSuffix(p, bad) {
+				t.Errorf("viewer holds the write %s", p)
+			}
+		}
+		if !strings.HasPrefix(p, "sys") {
+			t.Errorf("viewer holds the non-management %s", p)
+		}
+	}
+	seen := map[string]bool{}
+	for _, p := range ViewerRolePermissions {
+		if seen[p] {
+			t.Errorf("duplicate %s", p)
+		}
+		seen[p] = true
+	}
+}

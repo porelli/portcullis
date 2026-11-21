@@ -83,8 +83,68 @@ var MailctlRolePermissions = func() []string {
 	return out
 }()
 
+// ViewerRolePermissions is the role portcullis-viewer: the read-only
+// mail admin view (contract §19.13). authenticate plus the Get and Query
+// permission of every management object of v1.1.0 except
+// ViewerDenied's, and nothing else: no Create, Update, Destroy, action,
+// task, live*, impersonate, jmap*, imap*, pop3*, sieve*, dav*, email* or
+// fetchAnyBlob permission. Stalwart masks every secret field on a read
+// ("****"; includeSecrets stays false), and the bootstrap job (the
+// recovery admin) is the only one that can grant it: mailctl's own role
+// lacks most of these reads and every sysRole* permission.
+var ViewerRolePermissions = []string{
+	"authenticate",
+	"sysAccountGet", "sysAccountQuery", "sysAccountSettingsGet", "sysAcmeProviderGet", "sysAcmeProviderQuery",
+	"sysAddressBookGet", "sysAiModelGet", "sysAiModelQuery", "sysAlertGet", "sysAlertQuery", "sysAllowedIpGet",
+	"sysAllowedIpQuery", "sysApplicationGet", "sysApplicationQuery", "sysArfExternalReportGet",
+	"sysArfExternalReportQuery", "sysAsnGet", "sysAuthenticationGet", "sysBlobStoreGet", "sysBlockedIpGet",
+	"sysBlockedIpQuery", "sysCacheGet", "sysCalendarGet", "sysCalendarAlarmGet", "sysCalendarSchedulingGet",
+	"sysCertificateGet", "sysCertificateQuery", "sysClusterNodeGet", "sysClusterNodeQuery",
+	"sysClusterRoleGet", "sysClusterRoleQuery", "sysCoordinatorGet", "sysDataRetentionGet", "sysDataStoreGet",
+	"sysDirectoryGet", "sysDirectoryQuery", "sysDkimReportSettingsGet", "sysDkimSignatureGet",
+	"sysDkimSignatureQuery", "sysDmarcExternalReportGet", "sysDmarcExternalReportQuery",
+	"sysDmarcInternalReportGet", "sysDmarcInternalReportQuery", "sysDmarcReportSettingsGet",
+	"sysDnsResolverGet", "sysDnsServerGet", "sysDnsServerQuery", "sysDomainGet", "sysDomainQuery",
+	"sysDsnReportSettingsGet", "sysEmailGet", "sysEncryptionGet", "sysEventTracingLevelGet",
+	"sysEventTracingLevelQuery", "sysExternalPublicKeyGet", "sysExternalPublicKeyQuery", "sysFileStorageGet",
+	"sysHttpGet", "sysHttpFormGet", "sysHttpLookupGet", "sysHttpLookupQuery", "sysImapGet",
+	"sysInMemoryStoreGet", "sysIndexQueueStatusGet", "sysIndexQueueStatusQuery", "sysJmapGet",
+	"sysMailingListGet", "sysMailingListQuery", "sysMemoryLookupKeyGet", "sysMemoryLookupKeyQuery",
+	"sysMemoryLookupKeyValueGet", "sysMemoryLookupKeyValueQuery", "sysMetadataGet", "sysMetricGet",
+	"sysMetricQuery", "sysMetricsGet", "sysMetricsStoreGet", "sysMtaConnectionStrategyGet",
+	"sysMtaConnectionStrategyQuery", "sysMtaDeliveryScheduleGet", "sysMtaDeliveryScheduleQuery",
+	"sysMtaExtensionsGet", "sysMtaHookGet", "sysMtaHookQuery", "sysMtaInboundSessionGet",
+	"sysMtaInboundThrottleGet", "sysMtaInboundThrottleQuery", "sysMtaMilterGet", "sysMtaMilterQuery",
+	"sysMtaOutboundStrategyGet", "sysMtaOutboundThrottleGet", "sysMtaOutboundThrottleQuery",
+	"sysMtaQueueQuotaGet", "sysMtaQueueQuotaQuery", "sysMtaRouteGet", "sysMtaRouteQuery", "sysMtaStageAuthGet",
+	"sysMtaStageConnectGet", "sysMtaStageDataGet", "sysMtaStageEhloGet", "sysMtaStageMailGet",
+	"sysMtaStageRcptGet", "sysMtaStsGet", "sysMtaTlsStrategyGet", "sysMtaTlsStrategyQuery",
+	"sysMtaVirtualQueueGet", "sysMtaVirtualQueueQuery", "sysNetworkListenerGet", "sysNetworkListenerQuery",
+	"sysOAuthClientGet", "sysOAuthClientQuery", "sysOidcProviderGet", "sysPublicKeyGet", "sysPublicKeyQuery",
+	"sysQueuedMessageGet", "sysQueuedMessageQuery", "sysReportSettingsGet", "sysRoleGet", "sysRoleQuery",
+	"sysSearchGet", "sysSearchStoreGet", "sysSecurityGet", "sysSenderAuthGet", "sysSharingGet",
+	"sysSieveSystemInterpreterGet", "sysSieveSystemScriptGet", "sysSieveSystemScriptQuery",
+	"sysSieveUserInterpreterGet", "sysSmimeTrustAnchorGet", "sysSmimeTrustAnchorQuery", "sysSpamAiGet",
+	"sysSpamClassifierGet", "sysSpamDnsblServerGet", "sysSpamDnsblServerQuery", "sysSpamDnsblSettingsGet",
+	"sysSpamFileExtensionGet", "sysSpamFileExtensionQuery", "sysSpamPyzorGet", "sysSpamRuleGet",
+	"sysSpamRuleQuery", "sysSpamSettingsGet", "sysSpamTagGet", "sysSpamTagQuery", "sysSpfReportSettingsGet",
+	"sysStoreLookupGet", "sysStoreLookupQuery", "sysSystemSettingsGet", "sysTaskGet", "sysTaskQuery",
+	"sysTaskManagerGet", "sysTenantGet", "sysTenantQuery", "sysTlsExternalReportGet",
+	"sysTlsExternalReportQuery", "sysTlsInternalReportGet", "sysTlsInternalReportQuery",
+	"sysTlsReportSettingsGet", "sysTracerGet", "sysTracerQuery", "sysTracingStoreGet", "sysWebDavGet",
+	"sysWebHookGet", "sysWebHookQuery",
+}
+
+// ViewerDenied are the management objects whose reads the viewer never
+// gets: credentials and their metadata (AccountPassword, ApiKey,
+// AppPassword, Passkey, OAuthGrant, Bootstrap, SymmetricKey, Enterprise),
+// people's data (SpamTrainingSample, ArchivedItem, MaskedEmail,
+// SieveUserScript) and the server's logs and traces (Log, Trace).
+var ViewerDenied = []string{"AccountPassword", "ApiKey", "AppPassword", "Passkey", "OAuthGrant", "Bootstrap", "SymmetricKey",
+	"Enterprise", "SpamTrainingSample", "ArchivedItem", "MaskedEmail", "SieveUserScript", "Log", "Trace"}
+
 func init() {
-	for _, l := range [][]string{MailPasswordPermissions, ExportPermissions, MailctlRolePermissions} {
+	for _, l := range [][]string{MailPasswordPermissions, ExportPermissions, MailctlRolePermissions, ViewerRolePermissions} {
 		for _, p := range l {
 			Used = append(Used, Use{Enum: "Permission", Value: p})
 		}

@@ -208,7 +208,7 @@ func TestBasePlanDeletesDefaultListeners(t *testing.T) {
 	seedDefaults(f)
 	run(t, f, params(), false)
 	got := strings.Join(sorted(f.named("NetworkListener", "name")), ",")
-	if got != "imaps,management,metrics,smtp,submission,submissions" {
+	if got != "admin-view,imaps,management,metrics,smtp,submission,submissions" {
 		t.Fatalf("listeners %s", got)
 	}
 	for _, o := range f.objs["NetworkListener"] {
@@ -230,9 +230,12 @@ func TestBasePlanDeletesDefaultListeners(t *testing.T) {
 	if got := sorted(f.named("Tracer", "@type")); strings.Join(got, ",") != "Stdout" {
 		t.Fatalf("tracers %v", got)
 	}
+	// The web admin only at /admin, from the pinned bundle (contract
+	// §19.13): never the /account self-service, never a download.
 	for _, a := range f.objs["Application"] {
-		if a["enable"] != false {
-			t.Fatal("the WebUI is still enabled")
+		prefixes, _ := a["urlPrefix"].(map[string]any)
+		if a["enable"] != true || len(prefixes) != 1 || prefixes["/admin"] != true || a["resourceUrl"] != "file://"+WebUIBundle {
+			t.Fatalf("the WebUI is %v", a)
 		}
 	}
 	for _, d := range f.objs["Domain"] {
@@ -625,5 +628,103 @@ func TestKeyInPlaceRealShapes(t *testing.T) {
 	defer srv.Close()
 	if ok, _ := KeyInPlace(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")), ip, "API_x1"); ok {
 		t.Fatal("two keys judged in place")
+	}
+}
+
+// The admin view (contract §19.13): the viewer role holds exactly the
+// read-only list, its account sits on the parking domain with that role
+// alone and a password the plan hands back, and the admin-view listener
+// answers only the proxy's address.
+func TestBasePlanViewer(t *testing.T) {
+	f := newFake()
+	p := params()
+	p.ViewerIP = netip.MustParseAddr("172.31.255.5")
+	res := run(t, f, p, false)
+	if len(res.ViewerPassword) < 40 {
+		t.Fatalf("viewer password %q", res.ViewerPassword)
+	}
+	var roleID string
+	for id, r := range f.objs["Role"] {
+		if r["description"] != ViewerRole {
+			continue
+		}
+		roleID = id
+		perms := r["enabledPermissions"].(map[string]any)
+		if len(perms) != len(stalwart.ViewerRolePermissions) {
+			t.Fatalf("viewer role holds %d permissions, want %d", len(perms), len(stalwart.ViewerRolePermissions))
+		}
+		for p := range perms {
+			if strings.HasSuffix(p, "Create") || strings.HasSuffix(p, "Update") || strings.HasSuffix(p, "Destroy") {
+				t.Errorf("viewer role holds %s", p)
+			}
+		}
+	}
+	if roleID == "" {
+		t.Fatal("no viewer role")
+	}
+	var parking string
+	for id, d := range f.objs["Domain"] {
+		if d["name"] == ParkingDomain {
+			parking = id
+		}
+	}
+	found := false
+	for _, a := range f.objs["Account"] {
+		if a["name"] != ViewerAccount {
+			continue
+		}
+		found = true
+		roles := a["roles"].(map[string]any)
+		ids := roles["roleIds"].(map[string]any)
+		if a["domainId"] != parking || roles["@type"] != "Custom" || len(ids) != 1 || ids[roleID] != true {
+			t.Fatalf("viewer account %v", a)
+		}
+	}
+	if !found {
+		t.Fatal("no viewer account")
+	}
+	rules := fmt.Sprint(p.AllowedEndpoints())
+	if !strings.Contains(rules, "listener == 'admin-view' && remote_ip == '172.31.255.5'") {
+		t.Fatalf("no admin-view rule: %s", rules)
+	}
+	// A second run keeps one viewer account (a new password, no create).
+	res2 := run(t, f, p, false)
+	n := 0
+	for _, a := range f.objs["Account"] {
+		if a["name"] == ViewerAccount {
+			n++
+		}
+	}
+	if n != 1 || res2.ViewerPassword == res.ViewerPassword {
+		t.Fatalf("%d viewer accounts after a second run, password changed: %v", n, res2.ViewerPassword != res.ViewerPassword)
+	}
+	// ResetViewer on the bootstrapped store: a new password, nothing else.
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	pw, err := ResetViewer(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")))
+	if err != nil || len(pw) < 40 {
+		t.Fatalf("ResetViewer: %q %v", pw, err)
+	}
+	// No admin view rule without the proxy's address.
+	if strings.Contains(fmt.Sprint(params().AllowedEndpoints()), "admin-view") {
+		t.Fatal("admin-view rule without a ViewerIP")
+	}
+}
+
+// A store from before the admin view: ResetViewer answers "" (the view
+// stays unavailable) and writes nothing.
+func TestResetViewerWithoutViewer(t *testing.T) {
+	f := newFake()
+	f.put("Domain", map[string]any{"name": ParkingDomain})
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	pw, err := ResetViewer(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")))
+	if err != nil || pw != "" {
+		t.Fatalf("ResetViewer: %q %v", pw, err)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "/set") {
+			t.Fatalf("wrote %s", c)
+		}
 	}
 }
