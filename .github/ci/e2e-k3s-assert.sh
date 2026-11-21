@@ -114,6 +114,36 @@ for ns in "$NS" "$APPS"; do
   done
 done
 [ "$(K auth can-i get secrets -n cnpg-system --as="$SA" 2>/dev/null || true)" = yes ] || fail "the CNPG operator can't read its own namespace's Secrets (the check above proves nothing)"
+# Review I2: its webhook rights are its own two configurations only.
+for k in mutatingwebhookconfigurations validatingwebhookconfigurations; do
+  [ "$(K auth can-i patch "$k/portcullis-not-cnpg" --as="$SA" 2>/dev/null || true)" = no ] || fail "the CNPG operator can patch any $k"
+  [ "$(K auth can-i patch "$k" --as="$SA" 2>/dev/null || true)" = no ] || fail "the CNPG operator can patch $k by any name"
+done
+[ "$(K auth can-i patch validatingwebhookconfigurations/cnpg-validating-webhook-configuration-cnpg-system --as="$SA" 2>/dev/null || true)" = yes ] \
+  || fail "the CNPG operator can't patch its own validating webhook configuration (its CA bundle)"
+# Review M1: LLDAP runs on the key file, never a seed, and a different key
+# is refused at start (the empty LLDAP_KEY_SEED keeps holding).
+K -n "$NS" logs deploy/lldap -c lldap 2>/dev/null | grep -q 'key_seed was given' && fail "LLDAP logs that a key_seed was given (the template's public seed would be the key)"
+LIMG="$(K -n "$NS" get deploy lldap -o jsonpath='{.spec.template.spec.containers[0].image}')"
+N=e2e-lldap-otherkey IMG="$LIMG" jq -n '{apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: "portcullis", labels: {"e2e-k3s": "probe", "portcullis.io/component": "lldap-schema"}},
+  spec: {restartPolicy: "Never", automountServiceAccountToken: false, enableServiceLinks: false, priorityClassName: "portcullis-core",
+    securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: {type: "RuntimeDefault"}},
+    volumes: [{name: "k", emptyDir: {medium: "Memory"}}],
+    initContainers: [{name: "otherkey", image: env.IMG, workingDir: "/k", command: ["sh", "-c", "/app/lldap create_schema >/dev/null 2>&1; test -s /k/server_key"],
+      env: [{name: "LLDAP_DATABASE_URL", value: "sqlite:///k/x.db?mode=rwc"}, {name: "LLDAP_KEY_FILE", value: "/k/server_key"}, {name: "LLDAP_KEY_SEED", value: ""}, {name: "LLDAP_JWT_SECRET", value: "e2e-not-a-secret"}],
+      volumeMounts: [{name: "k", mountPath: "/k"}], resources: {limits: {memory: "128Mi"}, requests: {memory: "128Mi"}},
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}],
+    containers: [{name: "lldap", image: env.IMG, workingDir: "/k", command: ["/app/lldap", "run"],
+      env: [{name: "LLDAP_DATABASE_URL", valueFrom: {secretKeyRef: {name: "portcullis-pg-lldap", key: "LLDAP_DATABASE_URL"}}},
+            {name: "LLDAP_KEY_FILE", value: "/k/server_key"}, {name: "LLDAP_KEY_SEED", value: ""},
+            {name: "LLDAP_JWT_SECRET", valueFrom: {secretKeyRef: {name: "portcullis-env", key: "LLDAP_JWT_SECRET"}}},
+            {name: "LLDAP_LDAP_USER_PASS", valueFrom: {secretKeyRef: {name: "portcullis-env", key: "LLDAP_ADMIN_PASSWORD"}}}],
+      volumeMounts: [{name: "k", mountPath: "/k"}], resources: {limits: {memory: "128Mi"}, requests: {memory: "128Mi"}},
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}' | K create -f - >/dev/null
+for _ in $(seq 1 90); do [ "$(K -n "$NS" get pod e2e-lldap-otherkey -o jsonpath='{.status.phase}')" = Failed ] && break; sleep 2; done
+[ "$(K -n "$NS" get pod e2e-lldap-otherkey -o jsonpath='{.status.phase}')" = Failed ] || fail "LLDAP started with another server key (phase $(K -n "$NS" get pod e2e-lldap-otherkey -o jsonpath='{.status.phase}'))"
+K -n "$NS" logs e2e-lldap-otherkey -c lldap 2>/dev/null | grep -q 'private key' || fail "LLDAP with another server key failed, but not on its key check"
+K -n "$NS" delete pod e2e-lldap-otherkey --wait=false >/dev/null
 K -n "$NS" get deploy lldap -o json | jq -e '[.spec.template.spec.volumes[] | select(.persistentVolumeClaim)] == [] and ([.spec.template.spec.containers[0].env[] | select(.name == "LLDAP_DATABASE_URL") | .valueFrom.secretKeyRef.name] == ["portcullis-pg-lldap"])' >/dev/null \
   || fail "LLDAP has a PVC or no LLDAP_DATABASE_URL from portcullis-pg-lldap"
 K -n "$NS" get pvc lldap-data >/dev/null 2>&1 && fail "the PVC lldap-data exists (LLDAP is on Postgres)"
@@ -128,7 +158,7 @@ OPIP="$(K -n cnpg-system get pods -l app.kubernetes.io/name=cloudnative-pg -o js
 if dial "$NS" e2e-kclike "$OPIP" 9443; then fail "a core pod reaches the CNPG webhook :9443"; fi
 # (Keycloak's label puts the probe behind the keycloak Service: gone at once.)
 K -n "$NS" delete pod e2e-kclike --wait=false >/dev/null
-pass "Postgres on CNPG: cnpg-system restricted, every pod portcullis-core, no superuser Secret, the operator's rights end at cnpg-system, LLDAP on Postgres (no PVC, its schema Job done), only Keycloak / LLDAP reach :5432, nobody in the core namespace reaches :8000 or the webhook"
+pass "Postgres on CNPG: cnpg-system restricted, every pod portcullis-core, no superuser Secret, the operator's rights end at cnpg-system (webhooks: its own two), LLDAP never on a seed and refusing another key, LLDAP on Postgres (no PVC, its schema Job done), only Keycloak / LLDAP reach :5432, nobody in the core namespace reaches :8000 or the webhook"
 
 # ── PVC ownership on the node (K3) ──
 own() { # own <pvc> — uid:gid:mode of its directory on the node

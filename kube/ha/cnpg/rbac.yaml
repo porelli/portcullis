@@ -1,0 +1,311 @@
+# The CloudNativePG operator's RBAC (plan Task 23, review I2), applied by
+# ./portcullis (ha_install_cnpg, server-side) before the chart, which runs
+# with rbac.create: false. The rules are the vendored chart's (0.29.2,
+# config.clusterWide false: its Role in cnpg-system and its cluster-wide
+# rules), with one change: the chart lets the operator get / patch EVERY
+# mutating / validating webhook configuration (to inject its CA bundle);
+# here only its own two, by resourceNames (their names carry the namespace
+# suffix: ENABLE_WEBHOOK_NAMESPACE_SUFFIX). tests/k8s_hardening.py
+# check_cnpg holds the Role equal to the chart's and the ClusterRole to
+# exactly these rules; e2e-k3s checks `auth can-i` live.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-cnpg-operator
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    app.kubernetes.io/name: cloudnative-pg
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - mutatingwebhookconfigurations
+  resourceNames:
+  - cnpg-mutating-webhook-configuration-cnpg-system
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - validatingwebhookconfigurations
+  resourceNames:
+  - cnpg-validating-webhook-configuration-cnpg-system
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - postgresql.cnpg.io
+  resources:
+  - clusterimagecatalogs
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-cnpg-operator
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    app.kubernetes.io/name: cloudnative-pg
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: portcullis-cnpg-operator
+subjects:
+- kind: ServiceAccount
+  name: cnpg-cloudnative-pg
+  namespace: cnpg-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-cnpg-operator
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    app.kubernetes.io/name: cloudnative-pg
+  namespace: cnpg-system
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - configmaps
+  - secrets
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ''
+  resources:
+  - configmaps/status
+  - secrets/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ''
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ''
+  resources:
+  - persistentvolumeclaims
+  - pods
+  - pods/exec
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - ''
+  resources:
+  - pods/status
+  verbs:
+  - get
+- apiGroups:
+  - ''
+  resources:
+  - serviceaccounts
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - monitoring.coreos.com
+  resources:
+  - podmonitors
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - postgresql.cnpg.io
+  resources:
+  - backups
+  - clusters
+  - databaseroles
+  - databases
+  - poolers
+  - publications
+  - scheduledbackups
+  - subscriptions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - postgresql.cnpg.io
+  resources:
+  - failoverquorums
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - postgresql.cnpg.io
+  resources:
+  - backups/status
+  - databases/status
+  - publications/status
+  - scheduledbackups/status
+  - subscriptions/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - postgresql.cnpg.io
+  resources:
+  - imagecatalogs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - postgresql.cnpg.io
+  resources:
+  - clusters/finalizers
+  - databaseroles/finalizers
+  - poolers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - postgresql.cnpg.io
+  resources:
+  - clusters/status
+  - databaseroles/status
+  - poolers/status
+  - failoverquorums/status
+  verbs:
+  - get
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  - roles
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshots
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-cnpg-operator
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    app.kubernetes.io/name: cloudnative-pg
+  namespace: cnpg-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-cnpg-operator
+subjects:
+- kind: ServiceAccount
+  name: cnpg-cloudnative-pg
+  namespace: cnpg-system

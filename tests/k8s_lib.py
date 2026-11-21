@@ -104,14 +104,30 @@ def cnpg_cluster(docs):
     return next((d for d in docs if d.get("kind") == "Cluster" and d["metadata"]["name"] == PG_CLUSTER), None)
 
 
-def render_cnpg():
+def render_cnpg(*extra):
     """The CloudNativePG operator as ./portcullis installs it (ha_install_cnpg):
     the vendored chart with the vendored values file, release cnpg in
-    CNPG_NS."""
+    CNPG_NS (extra: helm flags, e.g. the chart's own RBAC for a comparison)."""
     helm = os.environ.get("HELM", "helm")
     out = subprocess.run([helm, "template", "cnpg", str(ROOT / "kube" / "ha" / "cnpg" / "cloudnative-pg-0.29.2.tgz"), "-n", CNPG_NS,
-                          "-f", str(ROOT / "kube" / "ha" / "cnpg" / "values.yaml")], check=True, capture_output=True, text=True).stdout
+                          "-f", str(ROOT / "kube" / "ha" / "cnpg" / "values.yaml"), *extra], check=True, capture_output=True, text=True).stdout
     return [doc for doc in yaml.safe_load_all(out) if doc]
+
+
+# The API server's webhook sources the static checks assume (what
+# kube_apiserver_sources gives on the CI values' cluster: the endpoint and
+# the node's pod-range gateways).
+CNPG_API_SOURCES = "10.1.0.4 10.42.0.0 10.42.0.1"
+
+
+def cnpg_policies():
+    """cnpg-system's own NetworkPolicies as the CLI applies them (ha.sh
+    ha_cnpg_policies, review I4) for the CI values' API endpoints."""
+    import json
+    api = " ".join(yaml.safe_load((ROOT / "tests" / "k8s-ci-values.yaml").read_text())["apiEndpoints"])
+    out = subprocess.run(["bash", "-c", 'source "$1/scripts/lib/common.sh"; ha_cnpg_policies "$2" "$3"', "_", str(ROOT), api, CNPG_API_SOURCES],
+                         check=True, capture_output=True, text=True).stdout
+    return json.loads(out)["items"]
 
 
 def placement_specs(docs):

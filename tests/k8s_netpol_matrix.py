@@ -298,18 +298,27 @@ def check_postgres():
     internet); the instances talk to each other on 5432 / 8000 and to the
     API server; the operator reaches the API server and the instances' 8000
     (not 5432), and its webhook :9443 admits only the API server's
-    addresses (cnpg.apiServerSources): no pod, not the internet; nothing
+    addresses (K.CNPG_API_SOURCES; the CLI's ha_cnpg_policies): no pod, not the internet; nothing
     else reaches the operator. Without and with HA."""
     vals = K.yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values.yaml").read_text())
-    srcs = vals["cnpg"]["apiServerSources"]
+    srcs = K.CNPG_API_SOURCES.split()
     api = [(e.split(":")[0], int(e.split(":")[1])) for e in vals["apiEndpoints"]]
     for ha in (False, True):
         docs = K.render({"ha": {"enabled": ha}})
-        pols = K.by_kind(docs, "NetworkPolicy")
+        # cnpg-system's deny / DNS / operator flows are the CLI's (review I4),
+        # the instances' the chart's: judged together, and the chart renders
+        # none of the CLI's.
+        mine = K.cnpg_policies()
+        chart_cnpg = {p["metadata"]["name"] for p in K.by_kind(docs, "NetworkPolicy") if p["metadata"]["namespace"] == K.CNPG_NS}
+        if chart_cnpg != {"portcullis-pg"}:
+            F.add(f"postgres: the chart's cnpg-system policies {sorted(chart_cnpg)} (only portcullis-pg; the rest is the CLI's)")
+        pols = K.by_kind(docs, "NetworkPolicy") + mine
         pods = {}
         for name, ns, labels, spec, _ in K.pod_specs(docs):
             ports = [(p["containerPort"], p.get("protocol", "TCP")) for c in spec["containers"] for p in c.get("ports", [])]
             pods[name] = Peer(name, ns, labels, ports)
+        if not any(p["metadata"]["name"] == "default-deny" and p["spec"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]} for p in mine):
+            F.add("postgres: the CLI's cnpg-system policies have no default-deny of both directions")
         if "lldap-schema" not in pods:
             F.add("postgres: no lldap-schema Job pod rendered")
             return

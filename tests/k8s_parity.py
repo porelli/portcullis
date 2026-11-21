@@ -670,8 +670,9 @@ def pg_problems(docs, vals):
     Job; in HA 2 LLDAP replicas."""
     out = []
     ha = bool((vals.get("ha") or {}).get("enabled"))
-    nsp = int((vals.get("ha") or {}).get("nonSmallNodesAtPrimary") or 0)
-    want_n = max(1, min(3, nsp)) if ha else 1
+    nsp = int((vals.get("cnpg") or {}).get("nodesAtPrimary") or 0)
+    floor = int((vals.get("cnpg") or {}).get("minInstances") or 0)
+    want_n = max(max(1, min(3, nsp)) if ha else 1, floor)
     for d in docs:
         if d.get("kind") in ("Deployment", "StatefulSet", "Service", "PersistentVolumeClaim") and d["metadata"]["name"] in ("postgres", "postgres-data", "lldap-data"):
             out.append(f"{d['kind']} {d['metadata']['name']}: Postgres is the CNPG Cluster (no compose-shaped postgres, no lldap-data)")
@@ -741,8 +742,11 @@ def check_postgres():
     check bites (mutation tests)."""
     ha_vals = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
     for label, vals in (("postgres", {}), ("postgres (ha)", ha_vals),
-                        ("postgres (ha, 3 nodes)", dict(ha_vals, ha=dict(ha_vals["ha"], nonSmallNodesAtPrimary=3))),
-                        ("postgres (ha, 1 node)", dict(ha_vals, ha=dict(ha_vals["ha"], nonSmallNodesAtPrimary=1)))):
+                        ("postgres (ha, 3 nodes)", dict(ha_vals, cnpg={"nodesAtPrimary": 3})),
+                        ("postgres (ha, 1 node)", dict(ha_vals, cnpg={"nodesAtPrimary": 1})),
+                        # Review I1: never below the live Cluster's instances.
+                        ("postgres (ha, 1 node, 3 live)", dict(ha_vals, cnpg={"nodesAtPrimary": 1, "minInstances": 3})),
+                        ("postgres (no ha, 2 live)", {"cnpg": {"minInstances": 2}})):
         for p in pg_problems(K.render(vals), vals):
             F.add(f"{label}: {p}")
     docs = K.render(ha_vals)

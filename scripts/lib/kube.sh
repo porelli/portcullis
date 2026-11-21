@@ -1634,12 +1634,13 @@ kube_render_values() {
   local mon=false wg=false
   case ",${COMPOSE_PROFILES:-}," in *,monitoring,*) mon=true ;; esac
   case ",${COMPOSE_PROFILES:-}," in *,wg,*) wg=true ;; esac
-  local ha=false nsp=0 apisrc
+  local ha=false nsp=0 pgn=0 pgmin=0
   if kube_ha_on; then ha=true; nsp="$(kube_nonsmall_at_primary)"; fi
   [[ "$nsp" =~ ^[0-9]+$ ]] || nsp=0
-  # The CNPG webhook's only peers (plan Task 23): fail closed without them.
-  apisrc="$(kube_apiserver_sources)"
-  [ -n "$apisrc" ] || fail "can't read the API server's addresses (the API endpoints, the control-plane nodes' pod ranges): the CNPG webhook would admit nobody"
+  # CNPG's instance count (ha.sh, review I1): labelled nodes, a floor at the
+  # live Cluster's; unreadable → refused.
+  if kube_ha_on; then pgn="$(kube_pg_nodes_at_primary)" || exit 1; fi
+  pgmin="$(kube_pg_min_instances)" || exit 1
   jq -n --argjson images "$_K_IMAGES" --argjson hashes "${_K_HASHES:-{\}}" --argjson items "${_K_ITEMS:-{\}}" \
     --argjson mon "$mon" --argjson wg "$wg" --argjson ha "$ha" --argjson nsp "$nsp" --arg psite "$KUBE_PRIMARY_SITE" --arg dnsname "${DNS_PROVIDER:-}" \
     --arg domain "$PORTCULLIS_DOMAIN" --arg pod "$PORTCULLIS_POD_CIDR" --arg svc "$PORTCULLIS_SERVICE_CIDR" \
@@ -1660,7 +1661,7 @@ kube_render_values() {
     --arg kca "${KEYCLOAK_ADMIN:-admin}" --arg bdn "${LLDAP_BASE_DN:-dc=portcullis,dc=local}" \
     --arg roots "${HUB_OVERRIDE_BIND_ROOTS:-}" --arg ipg "${INVITE_PROTECTED_GROUPS:-}" --arg pdn "${PORTAL_DISPLAY_NAME:-Portcullis}" \
     --arg ttl "${CLIENT_CERT_TTL:-720h}" --arg warn "${CERT_EXPIRY_WARN_DAYS:-7}" --arg imp "${IMPERSONATION_MAX_MINUTES:-30}" \
-    --arg apisrc "$apisrc" --arg smtp "${ALERT_SMTP_FROM:-}" --arg ret "${PROMETHEUS_RETENTION:-30d}" --arg apps "$(kube_apps_ns)" '
+    --argjson pgn "$pgn" --argjson pgmin "$pgmin" --arg smtp "${ALERT_SMTP_FROM:-}" --arg ret "${PROMETHEUS_RETENTION:-30d}" --arg apps "$(kube_apps_ns)" '
     def words: split(" ") | map(select(. != ""));
     {domain: $domain, podCIDR: $pod, serviceCIDR: $svc, apiEndpoints: ($api | words), nodeAddresses: ($nodes | words),
      traefikServiceIP: $tip, traefikVPNServiceIP: $tvip, wgEdgeServiceIP: $weip,
@@ -1678,7 +1679,7 @@ kube_render_values() {
            certExpiryWarnDays: $warn, impersonationMaxMinutes: $imp, selfImage: $images.hub, appsNamespace: $apps},
      alerting: {smtpFrom: $smtp}, appsNamespace: $apps,
      ha: {enabled: $ha, nonSmallNodesAtPrimary: $nsp, primarySite: $psite},
-     cnpg: {apiServerSources: ($apisrc | words)},
+     cnpg: {nodesAtPrimary: $pgn, minInstances: $pgmin},
      dnsProvider: (if ($dnsname | test("^[a-z0-9-]{1,32}$")) then $dnsname else "" end)}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
     || fail "could not write $f"
   kube_nodeadm_values "$f"
@@ -1745,6 +1746,7 @@ _rtk_up() {
   kube_sync_secrets
   kube_cluster_setup
   kube_pg_sync_secrets
+  kube_lldap_schema_retry
   if [ -z "${_K_PROBED:-}" ]; then
     kube_netpol_probe || fail "NetworkPolicy enforcement isn't proven (see above): nothing deployed"
     _K_PROBED=1
@@ -2143,7 +2145,7 @@ _backup_restore_kube() {
   # databases replaced by the dumps (Keycloak and LLDAP are at 0), and a
   # fresh Vault (emptied in place, as its owner).
   kube_pg_sync_secrets
-  _kube_restore_pg "$dir"
+  _kube_restore_pg "$dir" "$pre"
   _kube_empty_volume vault_data 100 1000 || fail "could not empty vault-data"
   _kube_restore_vault "$dir"
   for spec in $BACKUP_FILE_VOLUMES; do
@@ -2162,7 +2164,8 @@ _backup_restore_kube() {
   vault_init false
   rt_up || warn "some services did not start — check ./portcullis status"
   wait_healthy 300 vault postgres lldap keycloak
-  ok "Restore complete. Previous .env/secrets/certs: $pre. Verify with ./portcullis status"
+  _kube_pg_drop_pre_restore
+  ok "Restore complete. Previous .env/secrets/certs and databases: $pre. Verify with ./portcullis status"
   [ -z "${RESTORE_STOPPED_APPS:-}" ] || warn "Scaled to 0 for the restore and NOT started again: $RESTORE_STOPPED_APPS (their file-share passwords were voided). Start each one from the Hub."
   # Always the last line, as on docker / podman.
   _restore_lost_devices_note

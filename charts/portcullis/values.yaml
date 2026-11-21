@@ -165,13 +165,15 @@ ha:
 # the Cluster portcullis-pg in this namespace (the operator's, installed by
 # ./portcullis: ha_install_cnpg), 1 instance, in HA min(3, the non-small
 # nodes at the primary site); databases keycloak and lldap.
-# apiServerSources: the addresses the API server's webhook calls come from
-# (kube_apiserver_sources: the API endpoints and each server's pod-range
-# gateway addresses), the only peers of the operator's webhook port.
+# minInstances: the live Cluster's spec.instances (kube_render_values;
+# review I1: a render never shrinks it, only `node remove` does).
+# nodesAtPrimary: the labelled non-small nodes at main, Ready or not
+# (kube_pg_nodes_at_primary; HA only).
 cnpg:
   namespace: cnpg-system
-  apiServerSources: []
   storageSize: 5Gi
+  nodesAtPrimary: 0
+  minInstances: 0
 
 # The measured memory peaks, MiB (user ruling 2026-11-19, plan Amendment 2):
 # the higher of the test server's `docker stats` (spike-cluster.md, "H7")

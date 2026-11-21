@@ -78,6 +78,12 @@ lldap_has() { # lldap_has <base> <user> <true|false> — the user is (not) in LL
   [ "$(printf '%s' "$out" | jq --arg u "$2" '[.data.users[].id] | index($u) != null')" = "$3" ]
 }
 
+lldap_login() { # lldap_login <base> <user> <password> — the user's password binds (HTTP 200; nothing printed)
+  local code
+  code="$(U="$2" PW="$3" jq -n '{username: env.U, password: env.PW}' | curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1/auth/simple/login" -H 'Content-Type: application/json' -d @- || true)"
+  [ "$code" = 200 ]
+}
+
 kc_signin() { # kc_signin — Keycloak's admin signs in (password grant on master, admin-cli) through a port-forward; the password from .env on stdin
   local pw port code out
   pw="$(grep '^KEYCLOAK_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$pw"
@@ -195,6 +201,15 @@ restore)
   # selects) restored into the cluster; then the Docker phase's backup.
   lport="$(pf_svc lldap 17170)"
   bash .github/ci/lldap-create-person.sh k8s-person "http://127.0.0.1:$lport"
+  # Review M9: k8s-person gets a password (a CI test value), so the restore
+  # is proven by its bind (OPAQUE under the restored server key).
+  kpw="$(openssl rand -hex 16)"; echo "::add-mask::$kpw"
+  tok="$(lldap_token "http://127.0.0.1:$lport")"; echo "::add-mask::$tok" >&2
+  # lldap_set_password takes the token on its argv only: inside the LLDAP pod,
+  # a short-lived token of this CI stack (the password itself through env).
+  printf '%s\n%s\n' "$tok" "$kpw" | K -n portcullis exec -i deploy/lldap -c lldap -- sh -c 'read -r T; read -r P; LLDAP_USER_PASSWORD="$P" exec /app/lldap_set_password -b http://127.0.0.1:17170 -t "$T" -u k8s-person' >/dev/null \
+    || fail "could not set k8s-person's password"
+  lldap_login "http://127.0.0.1:$lport" k8s-person "$kpw" || fail "k8s-person doesn't sign in to LLDAP before the backup"
   ./portcullis backup 2>&1 | redact
   B="$(find backups -mindepth 1 -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
   for f in postgres.dump lldap.dump; do [ "$(head -c 5 "$B/$f" 2>/dev/null)" = PGDMP ] || fail "the Kubernetes backup has no custom-format $f"; done
@@ -207,8 +222,11 @@ restore)
   status_wait 600
   lport="$(pf_svc lldap 17170)"
   lldap_has "http://127.0.0.1:$lport" k8s-person true || fail "k8s-person isn't back in LLDAP after the restore (lldap.dump into CNPG)"
+  lldap_login "http://127.0.0.1:$lport" k8s-person "$kpw" || fail "k8s-person's password doesn't bind after the restore (the restored hash under the restored server key)"
+  K -n cnpg-system exec "$(K -n cnpg-system get cluster portcullis-pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -XtAq -c "select count(*) from pg_database where datname like '%\_pre\_restore' or datname like '%\_restore'" | grep -qx 0 \
+    || fail "the restore left keycloak/lldap _restore or _pre_restore databases"
   kc_signin || exit 1
-  echo "PASS: test_restore_into_cnpg: a Kubernetes backup (pg_dump keycloak + lldap) restored into CNPG; LLDAP has k8s-person again, Keycloak signs in"
+  echo "PASS: test_restore_into_cnpg: a Kubernetes backup (pg_dump keycloak + lldap) restored into CNPG through <db>_restore and a rename; LLDAP has k8s-person again and its password binds, Keycloak signs in, no leftover database"
   # The Docker phase's backup: Keycloak's dump into CNPG; its LLDAP is
   # SQLite, whose conversion into Postgres is plan Task 26's restore step
   # (until then LLDAP starts empty: --allow-empty-lldap).

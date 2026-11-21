@@ -4338,6 +4338,13 @@ case "$*" in
   "get configmap portcullis-admission-params-"*" -o json") g="${3#portcullis-admission-params-}"; cat "$K/params-$g.json" 2>/dev/null || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
   "get configmap portcullis-admission-params-"*" -o name") g="${3#portcullis-admission-params-}"; [ -e "$K/params-$g.json" ] && echo "configmap/$3" || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
   "get validatingadmissionpolicybinding -l portcullis.io/params-generation="*" -o json") g="${4#*=}"; cat "$K/bindings-$g.json" 2>/dev/null || echo '{"items":[]}' ;;
+  # CNPG (Task 23): the live Cluster (NotFound unless a fixture) and the
+  # labelled nodes at main (review I1).
+  "get cluster.postgresql.cnpg.io portcullis-pg -o json")
+    [ ! -e "$K/pg-cluster.fail" ] || { echo 'Error from server (Forbidden)' >&2; exit 1; }
+    cat "$K/pg-cluster.json" 2>/dev/null || { echo 'Error from server (NotFound): clusters.postgresql.cnpg.io "portcullis-pg" not found' >&2; exit 1; } ;;
+  "get nodes -l portcullis.io/site=main,portcullis.io/class in (home,cloud) -o json")
+    [ ! -e "$K/pg-nodes.fail" ] || exit 1; cat "$K/pg-nodes.json" 2>/dev/null || echo '{"items":[]}' ;;
   *) [ -n "${STUB_KUBE_SCRIPT:-}" ] && . "$STUB_KUBE_SCRIPT" ;;
 esac
 exit 0
@@ -5002,8 +5009,10 @@ expect_eq "cluster setup: every one of the ten bindings probed with its own obje
 expect_eq "cluster setup: the five namespaces with PSA labels and K11's label + install annotation (server-side)" \
   "$(jq -cs '[.[] | select(.kind == "Namespace") | [.metadata.name, .metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["portcullis.io/install"]]]' < <(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object")' 2>/dev/null))" \
   '[["portcullis","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-apps","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-storage","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-edge","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-ingress","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"]]'
+# (10.1.0.4/32 three times: the storage namespace's API egress, and
+# cnpg-system's operator policy — its API egress and its webhook source.)
 expect_eq "cluster setup: CRDs and VAPs applied server-side (never Helm), bindings.yaml never applied under its own names, the storage API egress to each endpoint" \
-  "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*/bindings.json' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:0:1:1"
+  "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*/bindings.json' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:0:1:3"
 expect_eq "cluster setup: applied.json records every step (0600)" \
   "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.cnpg cluster.crds cluster.namespaces cluster.params cluster.priorities cluster.storage:600"
 rm -f "$KS/order"
@@ -6198,7 +6207,7 @@ expect_eq "link status: link null in a fresh status.json → down" "$(ls_json on
 
 # ── HA Task 23: Postgres on CloudNativePG (scripts/lib/ha.sh) ──
 CN="$WORK/cnpg"; rm -rf "$CN"; mkdir -p "$CN/kube/ha/cnpg" "$CN/charts/portcullis"
-cp "$HERE/../kube/ha/cnpg/cloudnative-pg-0.29.2.tgz" "$HERE/../kube/ha/cnpg/values.yaml" "$CN/kube/ha/cnpg/"
+cp "$HERE/../kube/ha/cnpg/cloudnative-pg-0.29.2.tgz" "$HERE/../kube/ha/cnpg/values.yaml" "$HERE/../kube/ha/cnpg/rbac.yaml" "$CN/kube/ha/cnpg/"
 cp "$HERE/../charts/portcullis/namespaces.json" "$CN/charts/portcullis/"
 k_fixtures; rm -f "$KS/helm-calls" "$KS/kubectl-calls"; mkdir -p "$WORK/cnroot/secrets"
 OUT="$(kt "PORTCULLIS_HOME='$CN' PORTCULLIS_ROOT='$WORK/cnroot'; ha_install_cnpg")"
@@ -6223,8 +6232,6 @@ expect_eq "kube_apiserver_sources: the API endpoints and each server's pod-range
   "$(printf '%s\n' "$OUT" | head -n1)" "10.1.0.4 10.42.0.0 10.42.0.1 10.42.1.0 10.42.1.1"
 OUT="$(kt "PORTCULLIS_KUBE_API_ENDPOINTS=; kube_ctl() { return 1; }; kube_apiserver_sources; echo \"[\$(kube_apiserver_sources)]\"")"
 expect_eq "kube_apiserver_sources: nothing readable → empty (kube_render_values then refuses)" "$(printf '%s\n' "$OUT" | grep -c '^\[\]$')" 1
-expect_eq "kube_render_values: refuses without the API server's addresses (the CNPG webhook would admit nobody)" \
-  "$(declare -f kube_render_values | grep -c 'the CNPG webhook would admit nobody')" 1
 k_fixtures; k15_root; rm -f "$KS/order"
 OUT="$(kt "$K15_ENV LLDAP_PG_PASSWORD=LLPG-SECRET-888; kube_pg_sync_secrets" </dev/null)"
 expect_eq "kube_pg_sync_secrets: the roles' basic-auth Secrets in cnpg-system and LLDAP's URL Secret in the core namespace, built --from-file" \
@@ -6239,17 +6246,76 @@ OUT="$(kt "$K15_ENV; kube_images_ready() { echo NO-IMAGES; }; kube_ctl() { echo 
 expect_eq "kube_lldap_server_key: a present key is kept (no pod)" "$(printf '%s\n' "$OUT" | grep -c 'KCTL\|NO-IMAGES' || true):$(cat "$K15/secrets/lldap-key/server_key")" "0:LLDAP-SERVER-KEY"
 expect_eq "kube_lldap_server_key: the key read with exec cat into a 0600 file, never a pod's logs" \
   "$(declare -f kube_lldap_server_key | grep -c ' logs '):$(declare -f kube_lldap_server_key | grep -c 'exec "$name" -c keygen')" "0:1"
-PGX="$WORK/pgx"; rm -rf "$PGX"; mkdir -p "$PGX/b1" "$PGX/b2"
+PGX="$WORK/pgx"; rm -rf "$PGX"; mkdir -p "$PGX/b1" "$PGX/b2" "$PGX/pre"
 printf 'PGDMPkc' > "$PGX/b1/postgres.dump"; printf 'PGDMPll' > "$PGX/b1/lldap.dump"
 printf 'PGDMPkc' > "$PGX/b2/postgres.dump"; printf 'tar' > "$PGX/b2/lldap_data.tar.gz"
-pgx() { kt "_kube_pg_wait() { :; }; _kube_pg_roles_wait() { echo \"PG roles-wait \$1\" >> '$PGX/calls'; }; _kube_pg_exec() { echo \"PG \$*\" >> '$PGX/calls'; case \"\$1\" in pg_restore) cat > '$PGX/in-'\"\$2\" ;; esac; }; kube_ctl() { echo \"KCTL \$*\" >> '$PGX/calls'; }; _kube_restore_pg '$1'" 2>&1; }
-rm -f "$PGX/calls"; OUT="$(pgx "$PGX/b1")"
-expect_eq "_kube_restore_pg (test_restore_into_cnpg): keycloak and lldap emptied, then pg_restore'd as their own roles in one transaction; LLDAP's schema Jobs removed" \
-  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c '^PG dropdb --if-exists --force keycloak$\|^PG createdb -O keycloak keycloak$\|^PG pg_restore -d keycloak --no-owner --no-privileges --role=keycloak --exit-on-error --single-transaction$\|^PG dropdb --if-exists --force lldap$\|^PG pg_restore -d lldap --no-owner --no-privileges --role=lldap --exit-on-error --single-transaction$' "$PGX/calls"):$(cat "$PGX/in--d" 2>/dev/null | head -c 7):$(grep -c 'KCTL -n portcullis delete job -l portcullis.io/component=lldap-schema' "$PGX/calls")" "rc=0:5:PGDMPll:1"
-rm -f "$PGX/calls"; OUT="$(pgx "$PGX/b2")"
-case "$OUT" in *"This backup's LLDAP is SQLite (lldap_data.tar.gz, made on Docker / Podman): it isn't converted into Postgres on Kubernetes yet, so LLDAP starts empty."*"rc=0") t_pass "_kube_restore_pg: a Docker backup → Keycloak restored, LLDAP's database emptied with a warning (the conversion is Task 26)" ;; *) t_fail "restore pg docker backup: $OUT" ;; esac
-expect_eq "_kube_restore_pg: waits for the operator to apply the restored roles' passwords (300 s)" "$(grep -c '^PG roles-wait 300$' "$PGX/calls")" 1
-expect_eq "_kube_restore_pg: a Docker backup's lldap volume never restored into Postgres here" "$(grep -c 'pg_restore -d lldap' "$PGX/calls" || true)" 0
+# _kube_pg_exec's fake: every call logged; pg_dump prints a dump; a
+# pg_restore into $PGX_FAIL fails (fault injection); the swap's SQL kept.
+pgx() { kt "_kube_pg_wait() { :; }; _kube_pg_roles_wait() { echo \"PG roles-wait \$1\" >> '$PGX/calls'; }
+  _kube_pg_exec() { echo \"PG \$*\" >> '$PGX/calls'; case \"\$1\" in pg_dump) printf PGDMPlive ;; pg_restore) cat > '$PGX/in-'\"\$3\"; [ \"\$3\" != \"\${PGX_FAIL:-}\" ] || return 1 ;; psql) cat > '$PGX/swap.sql' ;; esac; }
+  kube_ctl() { echo \"KCTL \$*\" >> '$PGX/calls'; }; _kube_restore_pg '$1' '$PGX/pre'" 2>&1; }
+rm -f "$PGX/calls" "$PGX/swap.sql"; OUT="$(pgx "$PGX/b1")"
+expect_eq "_kube_restore_pg (test_restore_into_cnpg): the live keycloak and lldap dumped into the pre-restore dir first (review I3)" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(head -n2 "$PGX/calls" | tr '\n' ';'):$(cat "$PGX/pre/postgres.dump"):$(cat "$PGX/pre/lldap.dump")" \
+  "rc=0:PG pg_dump -d keycloak -Fc;PG pg_dump -d lldap -Fc;:PGDMPlive:PGDMPlive"
+expect_eq "_kube_restore_pg: each dump into <db>_restore as its own role in one transaction, never into the live database" \
+  "$(grep -c '^PG pg_restore -d keycloak_restore --no-owner --no-privileges --role=keycloak --exit-on-error --single-transaction$\|^PG pg_restore -d lldap_restore --no-owner --no-privileges --role=lldap --exit-on-error --single-transaction$' "$PGX/calls"):$(grep -cE '^PG (pg_restore -d|dropdb .*) (keycloak|lldap)$' "$PGX/calls" || true):$(cat "$PGX/in-lldap_restore")" "2:0:PGDMPll"
+expect_eq "_kube_restore_pg: then one transaction renames live → <db>_pre_restore and <db>_restore → live; Jobs removed; passwords waited for" \
+  "$(grep -c '^alter database' "$PGX/swap.sql"):$(grep -c '^PG psql -X -q -v ON_ERROR_STOP=1 -1 -d postgres$' "$PGX/calls"):$(grep -c 'KCTL -n portcullis delete job -l portcullis.io/component=lldap-schema' "$PGX/calls"):$(grep -c '^PG roles-wait 300$' "$PGX/calls")" "4:1:1:1"
+# Fault injection (review I3): a broken lldap.dump → the live pair untouched.
+rm -f "$PGX/calls" "$PGX/swap.sql"; OUT="$(PGX_FAIL=lldap_restore pgx "$PGX/b1")"
+case "$OUT" in *"pg_restore of lldap.dump failed: the live databases are untouched (their dumps before this restore: $PGX/pre/postgres.dump, $PGX/pre/lldap.dump)"*"rc=1") t_pass "_kube_restore_pg: a pg_restore failure refuses naming the pre-restore dumps" ;; *) t_fail "restore fault: $OUT" ;; esac
+expect_eq "_kube_restore_pg: after a failed pg_restore no rename, no drop of a live database, the half-made copies dropped" \
+  "$(test -e "$PGX/swap.sql" && echo swapped || echo none):$(grep -cE '^PG dropdb .* (keycloak|lldap)$' "$PGX/calls" || true):$(grep -c '^PG dropdb --if-exists --force keycloak_restore$\|^PG dropdb --if-exists --force lldap_restore$' "$PGX/calls")" "none:0:4"
+rm -f "$PGX/calls" "$PGX/swap.sql"; OUT="$(pgx "$PGX/b2")"
+case "$OUT" in *"This backup's LLDAP is SQLite (lldap_data.tar.gz, made on Docker / Podman): it isn't converted into Postgres on Kubernetes yet, so LLDAP starts empty."*"rc=0") t_pass "_kube_restore_pg: a Docker backup → Keycloak restored, LLDAP an empty lldap_restore swapped in, with a warning (the conversion is Task 26)" ;; *) t_fail "restore pg docker backup: $OUT" ;; esac
+expect_eq "_kube_restore_pg: a Docker backup's lldap volume never restored into Postgres here" "$(grep -c 'pg_restore -d lldap' "$PGX/calls" || true):$(grep -c '^alter database' "$PGX/swap.sql")" "0:4"
+expect_eq "kube restore: the replaced databases dropped only after the stack is healthy" \
+  "$(declare -f _backup_restore_kube | awk '/wait_healthy 300/ {w=NR} /_kube_pg_drop_pre_restore/ {d=NR} END {print (w && d > w) ? "after" : "no"}')" after
+# Review I1: CNPG's instances follow the labelled nodes, never readiness;
+# unreadable → refused; never below the live Cluster's (but KUBE_PG_SHRINK=1).
+k_fixtures
+echo '{"items":[{"status":{"conditions":[{"type":"Ready","status":"True"}]}},{"status":{"conditions":[{"type":"Ready","status":"False"}]}},{"status":{}}]}' > "$KS/kube/pg-nodes.json"
+echo '{"spec":{"instances":3}}' > "$KS/kube/pg-cluster.json"
+OUT="$(kt "kube_pg_nodes_at_primary; kube_pg_min_instances; KUBE_PG_SHRINK=1 kube_pg_min_instances")"
+expect_eq "kube_pg_nodes_at_primary: NotReady and unknown nodes count (3 labelled); kube_pg_min_instances: the live 3 (0 with KUBE_PG_SHRINK=1)" "$(printf '%s\n' "$OUT" | head -n3 | tr '\n' ' ')" "3 3 0 "
+touch "$KS/kube/pg-nodes.fail" "$KS/kube/pg-cluster.fail"
+OUT="$(kt "kube_pg_nodes_at_primary || echo REFUSED; kube_pg_min_instances || echo REFUSED")"
+expect_eq "unreadable nodes or Cluster → refused, never 0" "$(printf '%s\n' "$OUT" | grep -c '^REFUSED$')" 2
+rm -f "$KS/kube/pg-nodes.fail" "$KS/kube/pg-cluster.fail" "$KS/kube/pg-cluster.json"
+OUT="$(kt "kube_pg_min_instances")"
+expect_eq "kube_pg_min_instances: no Cluster yet (NotFound) → 0" "$(printf '%s\n' "$OUT" | head -n1)" 0
+k15_root; echo '{"spec":{"instances":2}}' > "$KS/kube/pg-cluster.json"
+OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on; kube_nonsmall_at_primary() { echo 1; }; _K_IMAGES='{}'; kube_render_values; jq -c .cnpg \"$K15/secrets/kube/values.yaml\"")"
+expect_eq "kube_render_values (HA, one main node NotReady): CNPG's input is the labelled count and its floor the live instances (no scale-down)" \
+  "$(printf '%s\n' "$OUT" | head -n1)" '{"nodesAtPrimary":3,"minInstances":2}'
+touch "$KS/kube/pg-nodes.fail"
+OUT="$(kt "$K15_ENV; export PORTCULLIS_HA=on; _K_IMAGES='{}'; kube_render_values" 2>&1)"
+case "$OUT" in *"can't read the nodes at main: Postgres' instance count would be a guess (nothing rendered)"*"rc=1") t_pass "kube_render_values (HA): unreadable nodes → refused" ;; *) t_fail "render pg nodes unreadable: $OUT" ;; esac
+rm -f "$KS/kube/pg-nodes.fail" "$KS/kube/pg-cluster.json"
+# Review M3: the primary is the Cluster's currentPrimary, the one Running pod labelled so.
+pp() { kt "kube_ctl() { case \"\$*\" in *'get cluster'*) echo '{\"status\":{\"currentPrimary\":\"$1\"}}' ;; *'get pods'*) echo '$2' ;; esac; }; kube_pg_primary || echo NONE"; }
+P1='{"metadata":{"name":"portcullis-pg-1"},"status":{"phase":"Running"}}'; P2='{"metadata":{"name":"portcullis-pg-2"},"status":{"phase":"Running"}}'
+expect_eq "kube_pg_primary: currentPrimary = the one Running labelled pod → it; a stale second label, a mismatch or no status → none" \
+  "$(pp portcullis-pg-1 "{\"items\":[$P1]}" | head -n1) $(pp portcullis-pg-1 "{\"items\":[$P1,$P2]}" | head -n1) $(pp portcullis-pg-2 "{\"items\":[$P1]}" | head -n1) $(pp '' "{\"items\":[$P1]}" | head -n1)" \
+  "portcullis-pg-1 NONE NONE NONE"
+# Review M5: a Failed schema Job is removed before the release (Helm makes it again).
+OUT="$(kt "kube_ctl() { case \"\$*\" in *'get jobs'*) echo '{\"items\":[{\"metadata\":{\"name\":\"lldap-schema-a\"},\"status\":{\"conditions\":[{\"type\":\"Failed\",\"status\":\"True\"}]}},{\"metadata\":{\"name\":\"lldap-schema-b\"},\"status\":{\"succeeded\":1}}]}' ;; *) echo \"KCTL \$*\" >> '$WORK/retry-calls' ;; esac; }; rm -f '$WORK/retry-calls'; kube_lldap_schema_retry")"
+expect_eq "kube_lldap_schema_retry: only the Failed Job deleted" "$(tr '\n' ';' < "$WORK/retry-calls")" "KCTL -n portcullis delete job lldap-schema-a;"
+expect_eq "rt_up: Failed schema Jobs removed after the cluster setup, before the release" \
+  "$(declare -f _rtk_up | awk '/kube_lldap_schema_retry/ {r=NR} /kube_helm upgrade/ {h=NR} END {print (r && h > r) ? "before" : "no"}')" before
+# Review I4: cnpg-system's deny and the operator's flows from the CLI, before the operator.
+k_fixtures; mkdir -p "$WORK/cnroot/secrets"; cp "$HERE/../kube/ha/cnpg/values.yaml" "$CN/kube/ha/cnpg/"
+OUT="$(kt "PORTCULLIS_HOME='$CN' PORTCULLIS_ROOT='$WORK/cnroot'; kube_ctl() { echo \"K \$*\" >> '$WORK/cn-order'; case \"\$*\" in *'apply'*'-f -') cat > '$WORK/cn-pol.json' ;; *'get nodes'*) return 1 ;; esac; }; kube_helm() { echo \"H \$*\" >> '$WORK/cn-order'; }; kube_namespace_apply() { echo \"NS \$1\" >> '$WORK/cn-order'; }; rm -f '$WORK/cn-order'; ha_install_cnpg")"
+expect_eq "ha_install_cnpg: namespace → its NetworkPolicies → the operator's RBAC → helm (review I2, I4)" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -v 'get nodes' "$WORK/cn-order" | sed -E 's/^(NS|K|H) .*(apply --server-side --force-conflicts --field-manager=portcullis-cli -f -|rbac.yaml|upgrade --install cnpg).*/\1 \2/; s/^NS .*/NS/' | tr '\n' ';')" \
+  "rc=0:NS;K apply --server-side --force-conflicts --field-manager=portcullis-cli -f -;K rbac.yaml;H upgrade --install cnpg;"
+expect_eq "ha_install_cnpg: default-deny, kube-dns and cnpg-operator (its webhook from the API endpoint only here), all in cnpg-system" \
+  "$(jq -c '[.items[] | [.metadata.namespace, .metadata.name]]' "$WORK/cn-pol.json"):$(jq -c '[.items[] | select(.metadata.name == "cnpg-operator") | .spec.ingress[0].from[].ipBlock.cidr]' "$WORK/cn-pol.json")" \
+  '[["cnpg-system","default-deny"],["cnpg-system","kube-dns"],["cnpg-system","cnpg-operator"]]:["10.1.0.4/32"]'
+OUT="$(kt "PORTCULLIS_HOME='$CN' PORTCULLIS_ROOT='$WORK/cnroot' PORTCULLIS_KUBE_API_ENDPOINTS=; kube_ctl() { echo \"K \$*\"; return 1; }; kube_helm() { echo HELM-RAN; }; ha_install_cnpg" 2>&1)"
+case "$OUT" in *"the CNPG webhook would admit nobody (nothing installed)"*"rc=1") t_pass "ha_install_cnpg: no API server address → refused before anything" ;; *) t_fail "cnpg no sources: $OUT" ;; esac
+expect_eq "ha_install_cnpg: refused → no helm, no apply" "$(printf '%s\n' "$OUT" | grep -c 'HELM-RAN\|K apply' || true)" 0
 OUT="$(kt "_kube_pg_exec() { echo 3; }; _kube_pg_lldap_count; _kube_pg_exec() { echo 'ERROR: relation \"users\" does not exist'; return 1; }; _kube_pg_lldap_count")"
 expect_eq "the restore's LLDAP guard on Kubernetes counts LLDAP's users in Postgres; no schema → missing" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "3 missing "
 OUT="$(kt "_kube_pg_exec() { echo \"PG \$*\"; }; rt_exec postgres -- pg_dump -d keycloak -Fc; rt_exec -i postgres -- pg_restore --list")"

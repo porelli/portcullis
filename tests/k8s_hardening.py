@@ -351,7 +351,7 @@ def gate_shape_problems(docs, vals=None):
     return out
 
 
-DO_NOT_SCHEDULE = {"group-gate", "mcp-gate", "alertmanager", "keycloak"}
+DO_NOT_SCHEDULE = {"group-gate", "mcp-gate", "alertmanager", "keycloak", "lldap"}
 
 
 def check_traefik_peer():
@@ -526,10 +526,11 @@ def check_cnpg():
     """Plan Task 23 (spec §7.4, ruling I5, security): the vendored operator
     chart is the pinned release asset (and ha.sh pins the same sha256 and
     image digest); its render runs the pinned image by digest, every pod
-    portcullis-core and restricted, namespaced: its only Role is in
-    cnpg-system, its cluster-wide rules read nodes / clusterimagecatalogs
-    and patch its own webhook configurations only (no Secret, pod or exec
-    right in the core or apps namespace); its webhooks name its own Service.
+    portcullis-core and restricted, namespaced, the chart's RBAC off; ours
+    (kube/ha/cnpg/rbac.yaml) is the chart's Role in cnpg-system verbatim
+    and its cluster-wide rules with the webhook configurations narrowed by
+    resourceNames to its own two (review I2: no Secret, pod, exec or other
+    webhook right outside cnpg-system); its webhooks name its own Service.
     The Cluster (every render): portcullis-core, its image by digest, no
     superuser."""
     import hashlib
@@ -557,18 +558,38 @@ def check_cnpg():
             env = {e["name"]: e.get("value") for e in sp["containers"][0].get("env", [])}
             if env.get("WATCH_NAMESPACE") != K.CNPG_NS or env.get("OPERATOR_IMAGE_NAME") != CNPG_IMAGE:
                 F.add(f"cnpg: the operator watches {env.get('WATCH_NAMESPACE')} (want {K.CNPG_NS} only) and copies {env.get('OPERATOR_IMAGE_NAME')}")
-    roles = [d for d in docs if d.get("kind") == "Role"]
-    if [r["metadata"]["namespace"] for r in roles] != [K.CNPG_NS]:
-        F.add(f"cnpg: Roles in {[r['metadata'].get('namespace') for r in roles]} (one, in {K.CNPG_NS})")
-    bound = {b["roleRef"]["name"] for b in docs if b.get("kind") == "ClusterRoleBinding"}
-    allowed = {("", "nodes"), ("admissionregistration.k8s.io", "mutatingwebhookconfigurations"),
-               ("admissionregistration.k8s.io", "validatingwebhookconfigurations"), ("postgresql.cnpg.io", "clusterimagecatalogs")}
-    for cr in (d for d in docs if d.get("kind") == "ClusterRole" and d["metadata"]["name"] in bound):
-        for r in cr.get("rules", []):
-            for g in r.get("apiGroups", []):
-                for res in r.get("resources", []):
-                    if (g, res) not in allowed or set(r.get("verbs", [])) - {"get", "list", "watch", "patch"}:
-                        F.add(f"cnpg: the bound ClusterRole {cr['metadata']['name']} grants {r.get('verbs')} on {g}/{res} cluster-wide")
+    # Review I2: the chart's RBAC is off; ours (kube/ha/cnpg/rbac.yaml) is the
+    # chart's Role verbatim and its cluster-wide rules with the webhook
+    # configurations narrowed by resourceNames to the operator's own two.
+    if [d["kind"] for d in docs if d.get("kind") in ("Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding")]:
+        F.add("cnpg: the chart renders RBAC (rbac.create must be false: kube/ha/cnpg/rbac.yaml is the operator's)")
+    mine = [d for d in yaml.safe_load_all((K.ROOT / "kube" / "ha" / "cnpg" / "rbac.yaml").read_text()) if d]
+    chart = K.render_cnpg("--set", "rbac.create=true")
+    sa = next(d for d in docs if d.get("kind") == "ServiceAccount")["metadata"]
+    hooks = {d["kind"]: d["metadata"]["name"] for d in docs if d.get("kind") in ("MutatingWebhookConfiguration", "ValidatingWebhookConfiguration")}
+    roles = [d for d in mine if d["kind"] == "Role"]
+    chart_role = [d for d in chart if d.get("kind") == "Role"]
+    if len(roles) != 1 or roles[0]["metadata"].get("namespace") != K.CNPG_NS or len(chart_role) != 1 or roles[0]["rules"] != chart_role[0]["rules"]:
+        F.add("cnpg: rbac.yaml's one Role (in cnpg-system) must be the chart's namespaced rules verbatim")
+    want_cr = [{"apiGroups": [""], "resources": ["nodes"], "verbs": ["get", "list", "watch"]},
+               {"apiGroups": ["admissionregistration.k8s.io"], "resources": ["mutatingwebhookconfigurations"],
+                "resourceNames": [hooks.get("MutatingWebhookConfiguration")], "verbs": ["get", "patch"]},
+               {"apiGroups": ["admissionregistration.k8s.io"], "resources": ["validatingwebhookconfigurations"],
+                "resourceNames": [hooks.get("ValidatingWebhookConfiguration")], "verbs": ["get", "patch"]},
+               {"apiGroups": ["postgresql.cnpg.io"], "resources": ["clusterimagecatalogs"], "verbs": ["get", "list", "watch"]}]
+    crs = [d for d in mine if d["kind"] == "ClusterRole"]
+    if len(crs) != 1 or crs[0]["rules"] != want_cr:
+        F.add(f"cnpg: rbac.yaml's ClusterRole must be exactly {want_cr} (webhook configurations by resourceNames, review I2)")
+    for r in (r for cr in crs for r in cr.get("rules", [])):
+        if any(res.endswith("webhookconfigurations") for res in r.get("resources", [])) and not r.get("resourceNames"):
+            F.add("cnpg: a webhook-configuration rule without resourceNames (every webhook in the cluster)")
+    for b in (d for d in mine if d["kind"] in ("RoleBinding", "ClusterRoleBinding")):
+        ref = {"RoleBinding": "Role", "ClusterRoleBinding": "ClusterRole"}[b["kind"]]
+        if b["roleRef"]["kind"] != ref or b["roleRef"]["name"] not in {d["metadata"]["name"] for d in mine if d["kind"] == ref} \
+                or b["subjects"] != [{"kind": "ServiceAccount", "name": sa["name"], "namespace": K.CNPG_NS}]:
+            F.add(f"cnpg: {b['kind']} {b['metadata']['name']} binds {b['roleRef']} to {b['subjects']} (want its {ref} to the operator's ServiceAccount {sa['name']})")
+    if sorted(d["kind"] for d in mine) != ["ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding"]:
+        F.add(f"cnpg: rbac.yaml holds {sorted(d['kind'] for d in mine)} (one Role, ClusterRole and their bindings)")
     for w in (d for d in docs if d.get("kind") in ("MutatingWebhookConfiguration", "ValidatingWebhookConfiguration")):
         for h in w["webhooks"]:
             svc = h["clientConfig"].get("service") or {}

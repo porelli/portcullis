@@ -52,7 +52,9 @@ replicas (a PDB, spread). */ -}}
   "initContainers" (list (dict "name" "wait-schema" "image" $pgimg "imagePullPolicy" "IfNotPresent"
     "command" (list "sh" "-c" $wait) "env" $pgenv "resources" $small "securityContext" $sec))
 -}}
-{{- if .Values.ha.enabled }}{{ $_ := set $s "replicas" 2 }}{{ end }}
+{{- /* Review M6: two LLDAPs on one node are one failure from no sign-in
+(Keycloak federates to it), as Keycloak's review M2: DoNotSchedule. */ -}}
+{{- if .Values.ha.enabled }}{{ $_ := set $s "replicas" 2 }}{{ $_ = set $s "spread" "DoNotSchedule" }}{{ end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
 apiVersion: v1

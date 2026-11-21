@@ -9,3 +9,6 @@ ha:
 nodeadm:
   enabled: true
   image: ghcr.io/porelli/portcullis-nodeadm@sha256:4444444444444444444444444444444444444444444444444444444444444444
+# CNPG's input (kube_pg_nodes_at_primary: labelled, Ready or not; review I1).
+cnpg:
+  nodesAtPrimary: 2

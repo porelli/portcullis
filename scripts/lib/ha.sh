@@ -34,6 +34,8 @@ KUBE_CNPG_RELEASE="cnpg"
 KUBE_CNPG_CHART="kube/ha/cnpg/cloudnative-pg-0.29.2.tgz"
 KUBE_CNPG_CHART_SHA256="9df3f074ecaa8af10277ad155899470618ea9a565d7c7c48187bdc7887655960"
 KUBE_CNPG_VALUES="kube/ha/cnpg/values.yaml"
+# The operator's RBAC (review I2: the chart runs with rbac.create false).
+KUBE_CNPG_RBAC="kube/ha/cnpg/rbac.yaml"
 KUBE_CNPG_IMAGE_DIGEST="sha256:f96f6be3d81ec93819b443c665c575c609342fca840df90d4d87dae314a5b913"
 # The rw Service's selector (the primary) and its DNS name.
 KUBE_PG_PRIMARY_SELECTOR="cnpg.io/cluster=$KUBE_PG_CLUSTER,cnpg.io/instanceRole=primary"
@@ -52,16 +54,50 @@ ha_cnpg_pins_ok() {
   _K_ERR=""
 }
 
+# ha_cnpg_policies <api endpoints (ip:port words)> <API server sources
+# (ip words)> — cnpg-system's own NetworkPolicies as a JSON List (review
+# I4: the CLI's, applied before the operator runs and outliving the core
+# release): default deny; kube-dns for every pod; the operator
+# (app.kubernetes.io/name=cloudnative-pg) reaches the API endpoints and
+# the instances' status port 8000, and its webhook :9443 admits only the
+# API server's addresses. The instances' flows are the core chart's
+# (templates/postgres-cnpg.yaml). tests/k8s_netpol_matrix.py judges them.
+ha_cnpg_policies() {
+  NS="$KUBE_CNPG_NS" API="$1" SRC="$2" jq -n '
+    def words: split(" ") | map(select(. != ""));
+    def meta($n): {name: $n, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}};
+    {apiVersion: "v1", kind: "List", items: [
+      {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: meta("default-deny"),
+       spec: {podSelector: {}, policyTypes: ["Ingress", "Egress"]}},
+      {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: meta("kube-dns"),
+       spec: {podSelector: {}, policyTypes: ["Egress"],
+              egress: [{to: [{namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": "kube-system"}}, podSelector: {matchLabels: {"k8s-app": "kube-dns"}}}],
+                        ports: [{protocol: "UDP", port: 53}, {protocol: "TCP", port: 53}]}]}},
+      {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: meta("cnpg-operator"),
+       spec: {podSelector: {matchLabels: {"app.kubernetes.io/name": "cloudnative-pg"}}, policyTypes: ["Ingress", "Egress"],
+              ingress: [{from: [env.SRC | words | .[] | {ipBlock: {cidr: (. + "/32")}}], ports: [{protocol: "TCP", port: 9443}]}],
+              egress: ([env.API | words | .[] | split(":") as $p | {to: [{ipBlock: {cidr: ($p[0] + "/32")}}], ports: [{protocol: "TCP", port: ($p[1] | tonumber)}]}]
+                       + [{to: [{podSelector: {matchLabels: {"cnpg.io/cluster": "portcullis-pg"}}}], ports: [{protocol: "TCP", port: 8000}]}])}}]}'
+}
+
 # ha_install_cnpg — the operator (idempotent: every run re-applies, as the
-# rest of kube_cluster_setup): cnpg-system with its PSA labels, then the
-# pinned chart with the vendored values file (--wait: the webhook answers
-# before the core chart's Cluster is sent).
+# rest of kube_cluster_setup): cnpg-system with its PSA labels, its
+# NetworkPolicies (ha_cnpg_policies, before anything runs there), the
+# operator's RBAC (kube/ha/cnpg/rbac.yaml), then the pinned chart with the
+# vendored values file (--wait: the webhook answers before the core
+# chart's Cluster is sent).
 ha_install_cnpg() {
-  local psa
+  local psa src
   ha_cnpg_pins_ok || fail "the CloudNativePG pins don't hold: $_K_ERR (nothing installed)"
+  src="$(kube_apiserver_sources)"
+  [ -n "$src" ] || fail "can't read the API server's addresses (the API endpoints, the control-plane nodes' pod ranges): the CNPG webhook would admit nobody (nothing installed)"
   psa="$(kube_psa cnpg)" || exit 1
   # shellcheck disable=SC2086  # three single-word levels
   kube_namespace_apply "$KUBE_CNPG_NS" $psa || fail "could not create the namespace $KUBE_CNPG_NS"
+  ha_cnpg_policies "${PORTCULLIS_KUBE_API_ENDPOINTS:-}" "$src" \
+    | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \
+    || fail "could not apply $KUBE_CNPG_NS's NetworkPolicies (nothing installed)"
+  _kube_apply_files "$PORTCULLIS_HOME/$KUBE_CNPG_RBAC" || fail "could not apply the CloudNativePG operator's RBAC ($KUBE_CNPG_RBAC)"
   info "Cluster setup: CloudNativePG operator ($KUBE_CNPG_CHART)..."
   kube_helm upgrade --install "$KUBE_CNPG_RELEASE" "$PORTCULLIS_HOME/$KUBE_CNPG_CHART" -n "$KUBE_CNPG_NS" \
     -f "$PORTCULLIS_HOME/$KUBE_CNPG_VALUES" --history-max 3 --wait --timeout 5m >/dev/null \
@@ -85,14 +121,54 @@ kube_apiserver_sources() {
   printf '%s\n%s\n' "$ep" "$nodes" | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
 }
 
-# kube_pg_primary — the primary instance's pod name (the one portcullis-pg-rw
-# selects); exit 1 when there is none.
+# kube_pg_primary — the primary instance's pod name: the Cluster's
+# status.currentPrimary, and only when it is the one Running pod labelled
+# primary (review M3: a stale label on a lost node's pod, or two primaries
+# mid-failover, is no answer); exit 1 otherwise.
 kube_pg_primary() {
-  local p
+  local cur p
+  cur="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null | jq -r '.status.currentPrimary // empty' 2>/dev/null || true)"
+  [ -n "$cur" ] || return 1
   p="$(kube_ctl -n "$KUBE_CNPG_NS" get pods -l "$KUBE_PG_PRIMARY_SELECTOR" -o json 2>/dev/null \
-    | jq -r '[.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")] | .[0].metadata.name // empty' 2>/dev/null || true)"
-  [ -n "$p" ] || return 1
+    | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | if length == 1 and .[0].status.phase == "Running" then .[0].metadata.name else empty end' 2>/dev/null || true)"
+  [ -n "$p" ] && [ "$p" = "$cur" ] || return 1
   printf '%s\n' "$p"
+}
+
+# kube_pg_nodes_at_primary — the labelled non-small nodes at the primary
+# site, Ready or not (review I1: CNPG's instances follow the layout, never
+# a moment's readiness); refuses (exit 1, a message) when unreadable.
+kube_pg_nodes_at_primary() {
+  local n
+  n="$(kube_ctl get nodes -l "portcullis.io/site=$KUBE_PRIMARY_SITE,portcullis.io/class in (home,cloud)" -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null || true)"
+  [[ "$n" =~ ^[0-9]+$ ]] || { warn "can't read the nodes at $KUBE_PRIMARY_SITE: Postgres' instance count would be a guess (nothing rendered)"; return 1; }
+  printf '%s\n' "$n"
+}
+
+# kube_pg_min_instances — the live Cluster's spec.instances (0 before it
+# exists), the render's floor (review I1): only the node-remove path
+# (KUBE_PG_SHRINK=1, plan Tasks 30/31) renders fewer. Unreadable refuses.
+kube_pg_min_instances() {
+  local out rc=0
+  [ "${KUBE_PG_SHRINK:-}" != 1 ] || { echo 0; return 0; }
+  out="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>&1)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    case "$out" in *NotFound*|*"not found"*) echo 0; return 0 ;; esac
+    warn "can't read the Cluster $KUBE_CNPG_NS/$KUBE_PG_CLUSTER: Postgres' instance count could shrink (nothing rendered)"; return 1
+  fi
+  out="$(printf '%s' "$out" | jq -r '.spec.instances // 0' 2>/dev/null || true)"
+  [[ "$out" =~ ^[0-9]+$ ]] || { warn "the Cluster $KUBE_CNPG_NS/$KUBE_PG_CLUSTER has no readable spec.instances (nothing rendered)"; return 1; }
+  printf '%s\n' "$out"
+}
+
+# kube_lldap_schema_retry — a Failed LLDAP schema Job is deleted before the
+# release (review M5): Helm then makes it again under the same name.
+kube_lldap_schema_retry() {
+  local j
+  for j in $(kube_ctl -n "$(kube_ns)" get jobs -l portcullis.io/component=lldap-schema -o json 2>/dev/null \
+      | jq -r '.items[] | select(any(.status.conditions[]?; .type == "Failed" and .status == "True")) | .metadata.name' 2>/dev/null); do
+    kube_ctl -n "$(kube_ns)" delete job "$j" >/dev/null 2>&1 || warn "could not remove the failed Job $j"
+  done
 }
 
 # _kube_pg_health — rt_health postgres on Kubernetes: missing (no Cluster),
@@ -163,6 +239,7 @@ kube_pg_sync_secrets() {
 # the pinned LLDAP image (a throwaway SQLite database, LLDAP_KEY_FILE in a
 # memory emptyDir; the dummy JWT secret / admin password it needs to start
 # are no secrets), read with exec cat into the file, never through a log.
+# In HA the pod is pinned like the data (review M2): main, never small.
 kube_lldap_server_key() {
   local d="$PORTCULLIS_ROOT/secrets/lldap-key" img name ns tmp rc=0
   [ -s "$d/server_key" ] && return 0
@@ -185,6 +262,8 @@ kube_lldap_server_key() {
          resources: {limits: {memory: "128Mi"}, requests: {memory: "128Mi"}},
          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}' \
     | jq '.spec.initContainers = [.spec.containers[0] | .name = "mkdir" | .command = ["mkdir", "-p", "/k/new"] | del(.env) | del(.workingDir)]' \
+    | HA="$(kube_ha_on && echo on || true)" SITE="$KUBE_PRIMARY_SITE" jq 'if env.HA == "on" then .spec.affinity = {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions: [
+        {key: "portcullis.io/site", operator: "In", values: [env.SITE]}, {key: "portcullis.io/class", operator: "NotIn", values: ["small"]}]}]}}} else . end' \
     | kube_ctl create -f - >/dev/null || fail "the LLDAP key pod was refused (see above)"
   if ! kube_ctl -n "$ns" wait --for=condition=Ready "pod/$name" --timeout="${KUBE_POD_WAIT:-180}s" >/dev/null 2>&1; then
     _kube_pod_diag "$name"
@@ -209,44 +288,75 @@ _kube_pg_dump() {
   [ "$(head -c 5 "$2")" = PGDMP ] || fail "pg_dump of $1 is not a custom-format dump"
 }
 
-# _kube_pg_reset_db <db> <owner> — the database dropped (its sessions
-# ended) and made again empty, owned by its role: the restore's "new
-# cluster" (D8: no migration of an existing one, the dump replaces it).
-# (The operator's Database lldap may make it again first: an empty one it
-# made, owned by lldap, counts.)
-_kube_pg_reset_db() {
-  _kube_pg_exec dropdb --if-exists --force "$1" >/dev/null || return 1
-  _kube_pg_exec createdb -O "$2" "$1" >/dev/null 2>&1 && return 0
-  [ "$(_kube_pg_exec psql -XtAq -c "select pg_get_userbyid(datdba) from pg_database where datname = '$1'" 2>/dev/null)" = "$2" ]
+# _kube_pg_fresh_db <db> <owner> — an empty database owned by its role
+# (dropped first when it exists; for the restore's <db>_restore only).
+_kube_pg_fresh_db() {
+  _kube_pg_exec dropdb --if-exists --force "$1" >/dev/null && _kube_pg_exec createdb -O "$2" "$1" >/dev/null
 }
 
-# _kube_pg_restore <dump> <db> <owner> — the dump into the emptied database,
-# every object owned by the database's role (--no-owner --role), in one
-# transaction, stopping at the first error.
-_kube_pg_restore() {
-  _kube_pg_reset_db "$2" "$3" || fail "could not empty the database $2"
-  _kube_pg_exec pg_restore -d "$2" --no-owner --no-privileges --role="$3" --exit-on-error --single-transaction < "$1" \
-    || fail "pg_restore of $2 failed"
+# _kube_pg_swap — the restored databases take the live names in ONE
+# transaction (review I3): keycloak / lldap → <db>_pre_restore,
+# <db>_restore → <db>; their sessions ended first (Keycloak, LLDAP and the
+# Hub are at 0; a straggler is terminated). A rename refused (a session
+# came back) is retried, the live pair untouched until it commits.
+_kube_pg_swap() {
+  local i
+  _kube_pg_exec dropdb --if-exists --force keycloak_pre_restore >/dev/null && _kube_pg_exec dropdb --if-exists --force lldap_pre_restore >/dev/null || return 1
+  for i in 1 2 3 4 5; do
+    _kube_pg_exec psql -X -q -v ON_ERROR_STOP=1 -1 -d postgres >/dev/null <<'SQL' && return 0
+select pg_terminate_backend(pid) from pg_stat_activity where datname in ('keycloak', 'lldap', 'keycloak_restore', 'lldap_restore') and pid <> pg_backend_pid();
+alter database keycloak rename to keycloak_pre_restore;
+alter database lldap rename to lldap_pre_restore;
+alter database keycloak_restore rename to keycloak;
+alter database lldap_restore rename to lldap;
+SQL
+    sleep 2
+  done
+  return 1
 }
 
-# _kube_restore_pg <dir> — restore on Kubernetes: Postgres' primary up,
-# keycloak from postgres.dump; lldap from lldap.dump when the backup has one
-# (a Kubernetes backup), else emptied (a Docker / Podman backup's LLDAP is
-# SQLite in lldap_data.tar.gz: its conversion into Postgres is the restore
-# step of plan Task 26, not done here) — LLDAP's schema Jobs are deleted so
-# the release runs them again on the emptied database.
+# _kube_pg_drop_pre_restore — after the restored stack is healthy: the
+# databases the restore replaced (their dumps stay in the pre-restore dir).
+_kube_pg_drop_pre_restore() {
+  _kube_pg_exec dropdb --if-exists --force keycloak_pre_restore >/dev/null 2>&1 \
+    && _kube_pg_exec dropdb --if-exists --force lldap_pre_restore >/dev/null 2>&1 \
+    || warn "could not drop keycloak_pre_restore / lldap_pre_restore (the restore's replaced databases): drop them by hand"
+}
+
+# _kube_restore_pg <dir> <pre> — restore on Kubernetes (review I3: the live
+# databases are never dropped before their replacements are whole):
+#   1. the live keycloak and lldap dumped into <pre> (the pre-restore copy;
+#      unreadable → nothing changed);
+#   2. each dump pg_restore'd into <db>_restore, owned by its role
+#      (--no-owner --role, one transaction, the first error stops it); lldap
+#      from lldap.dump (a Kubernetes backup), else an empty lldap_restore
+#      (a Docker / Podman backup's LLDAP is SQLite: its conversion is plan
+#      Task 26's restore step) — any failure drops the half-made copies
+#      and refuses, the live pair untouched;
+#   3. _kube_pg_swap; then LLDAP's schema Jobs deleted (the release makes
+#      them again) and the restored roles' passwords waited for.
 _kube_restore_pg() {
-  local dir="$1"
+  local dir="$1" pre="$2" db dump
   info "Restoring the databases into the CNPG cluster $KUBE_PG_CLUSTER (pg_restore)..."
-  _kube_pg_wait 600 || fail "the Postgres primary ($KUBE_CNPG_NS/$KUBE_PG_CLUSTER) doesn't accept connections"
-  _kube_pg_restore "$dir/postgres.dump" keycloak keycloak
-  if [ -s "$dir/lldap.dump" ]; then
-    _kube_pg_restore "$dir/lldap.dump" lldap lldap
-  else
-    _kube_pg_reset_db lldap lldap || fail "could not empty the database lldap"
-    [ ! -f "$dir/lldap_data.tar.gz" ] \
-      || warn "This backup's LLDAP is SQLite (lldap_data.tar.gz, made on Docker / Podman): it isn't converted into Postgres on Kubernetes yet, so LLDAP starts empty."
-  fi
+  _kube_pg_wait 600 || fail "the Postgres primary ($KUBE_CNPG_NS/$KUBE_PG_CLUSTER) doesn't accept connections: nothing restored"
+  _kube_pg_dump keycloak "$pre/postgres.dump"
+  _kube_pg_dump lldap "$pre/lldap.dump"
+  for db in keycloak lldap; do
+    dump="$dir/postgres.dump"; [ "$db" = keycloak ] || dump="$dir/lldap.dump"
+    if ! _kube_pg_fresh_db "${db}_restore" "$db"; then
+      _kube_pg_exec dropdb --if-exists --force keycloak_restore >/dev/null 2>&1 || true
+      fail "could not make the database ${db}_restore: the live databases are untouched"
+    fi
+    [ "$db" = keycloak ] || [ -s "$dump" ] || continue
+    if ! _kube_pg_exec pg_restore -d "${db}_restore" --no-owner --no-privileges --role="$db" --exit-on-error --single-transaction < "$dump"; then
+      _kube_pg_exec dropdb --if-exists --force keycloak_restore >/dev/null 2>&1 || true
+      _kube_pg_exec dropdb --if-exists --force lldap_restore >/dev/null 2>&1 || true
+      fail "pg_restore of ${dump##*/} failed: the live databases are untouched (their dumps before this restore: $pre/postgres.dump, $pre/lldap.dump)"
+    fi
+  done
+  [ -s "$dir/lldap.dump" ] || [ ! -f "$dir/lldap_data.tar.gz" ] \
+    || warn "This backup's LLDAP is SQLite (lldap_data.tar.gz, made on Docker / Podman): it isn't converted into Postgres on Kubernetes yet, so LLDAP starts empty."
+  _kube_pg_swap || fail "could not put the restored databases in place (the live ones are untouched; dumps in $pre)"
   kube_ctl -n "$(kube_ns)" delete job -l portcullis.io/component=lldap-schema --ignore-not-found >/dev/null \
     || fail "could not remove LLDAP's schema Jobs"
   # The backup's role passwords (kube_pg_sync_secrets ran before) in effect

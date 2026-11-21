@@ -17,14 +17,20 @@
 # - priorityClassName portcullis-core (ruling I5: every non-app pod).
 # - the memory of the upstream manifest (cnpg-1.30.2.yaml: 100Mi / 200Mi).
 # - no PodMonitor, no Grafana dashboard (no prometheus-operator here).
-# The flows of cnpg-system (default deny, the operator's documented ones)
-# are the core chart's templates/postgres-cnpg.yaml.
+# The flows of cnpg-system: default deny, kube-dns and the operator's
+# documented ones are ./portcullis' (ha_cnpg_policies, applied before the
+# chart: review I4); the instances' are the core chart's
+# templates/postgres-cnpg.yaml.
 image:
   repository: ghcr.io/cloudnative-pg/cloudnative-pg
   tag: "1.30.2@sha256:f96f6be3d81ec93819b443c665c575c609342fca840df90d4d87dae314a5b913"
   pullPolicy: IfNotPresent
 crds:
   create: true
+# The operator's RBAC is kube/ha/cnpg/rbac.yaml (review I2: the chart's
+# webhook-configuration rule names no resource).
+rbac:
+  create: false
 config:
   clusterWide: false
 priorityClassName: portcullis-core

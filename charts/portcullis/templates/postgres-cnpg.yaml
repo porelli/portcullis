@@ -18,12 +18,12 @@ outside cnpg-system). Here, in cnpg-system:
     portcullis-pg-keycloak / portcullis-pg-lldap (kube_pg_sync_secrets,
     never Helm), reconciled by the operator; the database keycloak
     (initdb) and the Database lldap;
-  - the namespace's flows: default deny; kube-dns; the operator's
-    documented ones (the API server, the instances' status port 8000, its
-    webhook :9443 from the API server's addresses only, cnpg.apiServerSources);
-    the instances' (each other on 5432 / 8000, the API server); Postgres
-    5432 from Keycloak, LLDAP and LLDAP's schema Job only (their egress:
-    netpol-networks.yaml to-postgres).
+  - the instances' flows (each other on 5432 / 8000, the API server, the
+    operator's status calls on 8000); Postgres 5432 from Keycloak, LLDAP and
+    LLDAP's schema Job only (their egress: netpol-networks.yaml
+    to-postgres). The namespace's default deny, kube-dns and the operator's
+    flows are the CLI's (ha.sh ha_cnpg_policies, applied before the
+    operator: review I4; they outlive this release).
 Kept on uninstall (helm.sh/resource-policy keep: the data). */ -}}
 {{- $cns := .Values.cnpg.namespace -}}
 {{- $n := include "portcullis.pgInstances" . | int -}}
@@ -121,82 +121,6 @@ spec:
   ensure: present
   cluster:
     name: portcullis-pg
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: default-deny
-  namespace: {{ $cns }}
-  labels:
-    app.kubernetes.io/managed-by: portcullis
-spec:
-  podSelector: {}
-  policyTypes: ["Ingress", "Egress"]
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: kube-dns
-  namespace: {{ $cns }}
-  labels:
-    app.kubernetes.io/managed-by: portcullis
-spec:
-  podSelector: {}
-  policyTypes: ["Egress"]
-  egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
----
-# The operator (its chart's pods): the API server, the instances' status
-# port; its webhook from the API server's addresses only.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: cnpg-operator
-  namespace: {{ $cns }}
-  labels:
-    app.kubernetes.io/managed-by: portcullis
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: cloudnative-pg
-  policyTypes: ["Ingress", "Egress"]
-  ingress:
-    - from:
-        {{- range (required "cnpg.apiServerSources is required (the API server's addresses: kube_apiserver_sources)" .Values.cnpg.apiServerSources) }}
-        - ipBlock:
-            cidr: {{ . }}/32
-        {{- end }}
-      ports:
-        - protocol: TCP
-          port: 9443
-  egress:
-    {{- range (required "apiEndpoints is required" .Values.apiEndpoints) }}
-    {{- $p := splitList ":" . }}
-    - to:
-        - ipBlock:
-            cidr: {{ index $p 0 }}/32
-      ports:
-        - protocol: TCP
-          port: {{ index $p 1 }}
-    {{- end }}
-    - to:
-        - podSelector:
-            matchLabels:
-              cnpg.io/cluster: portcullis-pg
-      ports:
-        - protocol: TCP
-          port: 8000
 ---
 # The instances (and the operator's initdb / join Job pods, labelled with
 # the cluster too): each other, the API server; Postgres from Keycloak,

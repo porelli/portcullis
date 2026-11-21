@@ -658,16 +658,15 @@ HUB_TRAEFIK_PEER, the peer of its routed apps' NetworkPolicies (Hub Task
 
 {{/*
 portcullis.pgInstances — the CNPG Cluster's instances (plan Task 23,
-preflight P40): 1 without HA; in HA min(3, the non-small nodes at the
-primary site) (ha.nonSmallNodesAtPrimary: the instances are pinned there,
-never on small nodes, one per host), at least 1.
+preflight P40): 1 without HA; in HA min(3, cnpg.nodesAtPrimary: the
+labelled non-small nodes at the primary site, Ready or not — review I1: a
+NotReady node never scales Postgres down), at least 1; never below
+cnpg.minInstances (the live Cluster's: only `node remove` lowers it).
 */}}
 {{- define "portcullis.pgInstances" -}}
-{{- if .Values.ha.enabled -}}
-{{- max 1 (min 3 (int .Values.ha.nonSmallNodesAtPrimary)) -}}
-{{- else -}}
-1
-{{- end -}}
+{{- $n := 1 -}}
+{{- if .Values.ha.enabled -}}{{- $n = max 1 (min 3 (int .Values.cnpg.nodesAtPrimary)) -}}{{- end -}}
+{{- max $n (int .Values.cnpg.minInstances) -}}
 {{- end }}
 
 {{/* portcullis.pgHost — the CNPG primary's Service (portcullis-pg-rw). */}}
@@ -685,7 +684,7 @@ images.json's pin, used only when its digest is the resolved one.
 {{- $ref -}}
 {{- else -}}
 {{- $pin := (.Files.Get "images.json" | fromJson).images.postgres | default "" -}}
-{{- if not (hasSuffix (index (splitList "@" $ref) 1) $pin) -}}
+{{- if or (not (contains "@" $ref)) (not (hasSuffix (index (splitList "@" $ref) 1) $pin)) -}}
 {{- fail (printf "images.postgres %q isn't images.json's pin %q (the CNPG Cluster needs its tag)" $ref $pin) -}}
 {{- end -}}
 {{- $pin -}}
