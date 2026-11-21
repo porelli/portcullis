@@ -806,10 +806,13 @@ jobs:
           # Compose services (minus the locally built enroll and the unpinned
           # edge Hub and Keycloak, pulled by their own steps) + the pinned images used inline
           # here and by the CLI (helper, restic, whoami, curl, docker cli).
+          # Left out like the local images: the all-zero digest, a dev-only
+          # placeholder (our SNR image until main's first build, ha.sh
+          # HA_SNR_PLACEHOLDER) that no registry can serve.
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml .github/ci/*.sh scripts/lib/*.sh
-          } | sort -u > "$RUNNER_TEMP/images.txt"
+          } | grep -vE '@sha256:0{64}$' | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         timeout-minutes: 15
         uses: ./.github/actions/cached-images

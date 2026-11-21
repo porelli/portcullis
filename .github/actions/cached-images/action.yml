@@ -42,7 +42,9 @@ runs:
       run: |
         set -euo pipefail
         sorted="$RUNNER_TEMP/ci-images-$NAME.txt"
-        grep -v '^[[:space:]]*$' "$LIST" | LC_ALL=C sort -u > "$sorted"
+        # The all-zero digest is a dev-only placeholder (our SNR image until
+        # main's first build): no registry serves it, so it is never pulled.
+        grep -v '^[[:space:]]*$' "$LIST" | grep -vE '@sha256:0{64}$' | LC_ALL=C sort -u > "$sorted" || true
         [ -s "$sorted" ] || { echo "::error::no images in $LIST"; exit 1; }
         # Verification needs a digest: refuse anything not tag@sha256-pinned.
         if grep -vE '^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$' "$sorted"; then
