@@ -1724,7 +1724,12 @@ spec:
 # attract its pinned pods). The binding's namespaceSelector is the
 # core namespace's only for the CLI's rewrite: a Node is cluster-scoped and
 # never skipped by it. The probe: a node identity's dry-run Node annotated
-# with the generation.
+# with the generation. HA (plan Task 24): the fencing and Longhorn
+# ServiceAccounts (portcullis-fencing, longhorn-system: SNR patches Nodes'
+# taints on every node it runs on) are judged as node identities: their
+# own taints (medik8s.io/, node.kubernetes.io/out-of-service) pass, a
+# placement label or a Portcullis taint never does; SNR's agent (its own
+# ServiceAccount) only annotates its own Node.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -1749,7 +1754,10 @@ spec:
       - nodes/status
   matchConditions:
   - name: node-identities
-    expression: "'system:nodes' in request.userInfo.groups"
+    expression: >-
+      'system:nodes' in request.userInfo.groups
+      || request.userInfo.username.startsWith('system:serviceaccount:portcullis-fencing:')
+      || request.userInfo.username.startsWith('system:serviceaccount:longhorn-system:')
   variables:
   - name: placed
     expression: "['portcullis.io/', 'topology.kubernetes.io/', 'failure-domain.beta.kubernetes.io/', 'node.longhorn.io/', 'svccontroller.k3s.cattle.io/']"
@@ -1787,3 +1795,13 @@ spec:
       && (!('kubernetes.io/hostname' in variables.oldLabels) || ('kubernetes.io/hostname' in variables.newLabels
            && variables.newLabels['kubernetes.io/hostname'] == variables.oldLabels['kubernetes.io/hostname']))
     message: nodes can't set Portcullis placement labels or taints; nodeadm sets them
+  # SNR's agent (plan Task 24, security ruling: the DaemonSet runs on every
+  # node, edge and small ones too): only its own Node (the bound token's
+  # node name), only an UPDATE, and only the annotations change.
+  - expression: >-
+      request.userInfo.username != 'system:serviceaccount:portcullis-fencing:self-node-remediation-agent'
+      || (request.operation == 'UPDATE' && (has(request.subResource) ? request.subResource : '') == ''
+          && 'authentication.kubernetes.io/node-name' in request.userInfo.extra
+          && request.userInfo.extra['authentication.kubernetes.io/node-name'].exists(n, n == object.metadata.name)
+          && object.spec == oldObject.spec && variables.newLabels == variables.oldLabels)
+    message: SNR's agent may only annotate its own Node

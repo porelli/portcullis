@@ -78,6 +78,10 @@ func joinFlags(rec *nodeRecord, id, serverURL, clusterCIDR string) []string {
 			"--etcd-arg=listen-client-urls=https://"+ip+":2379,https://127.0.0.1:2379",
 			"--etcd-arg=heartbeat-interval=200",
 			"--etcd-arg=election-timeout=2000",
+			// Fencing unconfirmed → no stateful failover (plan Task 24): no
+			// volume leaves an unready node by timeout, only through SNR's
+			// out-of-service taint.
+			"--kube-controller-manager-arg=disable-force-detach-on-timeout=true",
 		)
 	}
 	// No placement label and no portcullis.io/ taint (ruling R-NODELABELS:

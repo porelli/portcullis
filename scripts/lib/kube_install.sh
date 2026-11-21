@@ -129,6 +129,9 @@ KUBE_FIRST_NODE_NAME="${PORTCULLIS_NODE_NAME:-node-1}"
 KUBE_UNLABELLED_TAINT="nodeadm.portcullis/unlabelled=true:NoSchedule"
 
 # kube_k3s_server_flags — the first server's flags, one per line (the
+# kube-controller-manager never force-detaches a volume from an unready
+# node by timeout, plan Task 24: fencing unconfirmed → no stateful
+# failover; only SNR's out-of-service taint moves it;
 # shared fixture tests/fixtures/k3s-server-flags.txt; nodeadm's join
 # answer follows it, contract §20.2 / §20.11). No placement label: the
 # kubelet may not set portcullis.io/, topology.kubernetes.io/,
@@ -161,6 +164,7 @@ kube_k3s_server_flags() {
 --etcd-arg=listen-client-urls=https://$ip:2379,https://127.0.0.1:2379
 --etcd-arg=heartbeat-interval=200
 --etcd-arg=election-timeout=2000
+--kube-controller-manager-arg=disable-force-detach-on-timeout=true
 --node-taint=$KUBE_UNLABELLED_TAINT
 EOF
 }
