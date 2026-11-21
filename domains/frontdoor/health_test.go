@@ -95,7 +95,7 @@ func TestBuildStatus(t *testing.T) {
 	st := BuildStatus(true, []string{"example.org", "*.example.org"}, pub, 600*time.Second, c, e.View())
 	b, _ := json.Marshal(st)
 	for _, want := range []string{`"v":1`, `"state":"leading"`, `"addresses":["198.51.100.7","198.51.100.8"]`, `"ttl":600`, `"worst_case_s":630`,
-		`"pending":{"op":"remove","value":"198.51.100.8"`, `"n1":{"ok":true,"verdict":"healthy","internal_only":true,"blind":false}`, `"n2":{"ok":false,"verdict":"unhealthy"`, `"e1":{"ok":false,"verdict":"none"`, `"main":{"healthy":true,"ingress":["n1","n2"]}`, `"edge":{"healthy":false,"ingress":[]}`, `"last_change":null`} {
+		`"pending":{"op":"remove","value":"198.51.100.8"`, `"n1":{"ok":true,"verdict":"healthy","internal_only":true,"blind":false}`, `"n2":{"ok":false,"verdict":"unhealthy"`, `"e1":{"ok":false,"verdict":"none"`, `"main":{"healthy":true,"ingress":["n1","n2"],"addresses":["198.51.100.7","198.51.100.8"],"blind_probers":0}`, `"edge":{"healthy":false,"ingress":[],"addresses":[],"blind_probers":0}`, `"last_change":null`} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("status %s lacks %s", b, want)
 		}

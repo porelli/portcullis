@@ -48,13 +48,6 @@ type ProbeStatus struct {
 	Blind        bool   `json:"blind"`
 }
 
-// SiteStatus: any ingress node of the site healthy, and its ingress
-// nodes.
-type SiteStatus struct {
-	Healthy bool     `json:"healthy"`
-	Ingress []string `json:"ingress"`
-}
-
 // BuildStatus is the status document of a round.
 func BuildStatus(leading bool, names []string, published map[string][]string, ttl time.Duration, c Cluster, v View) Status {
 	st := Status{V: 1, State: "standing by", Names: map[string]NameStatus{}, Probes: map[string]ProbeStatus{}, Sites: map[string]SiteStatus{}}
@@ -74,23 +67,14 @@ func BuildStatus(leading bool, names []string, published map[string][]string, tt
 		st.Names[n] = ns
 	}
 	for _, id := range sortedKeys(c.Nodes) {
-		n := c.Nodes[id]
 		ps := ProbeStatus{Blind: v.BlindProbers[id], Verdict: "none"}
 		if j, ok := v.Judgements[id]; ok {
 			ps.Verdict = map[Verdict]string{Healthy: "healthy", Unhealthy: "unhealthy", Undecided: "undecided"}[j.Verdict]
 			ps.OK, ps.InternalOnly = j.Verdict != Unhealthy, j.InternalOnly
 		}
 		st.Probes[id] = ps
-		s := st.Sites[n.Site]
-		if s.Ingress == nil {
-			s.Ingress = []string{}
-		}
-		if n.Ingress {
-			s.Ingress = append(s.Ingress, id)
-			s.Healthy = s.Healthy || ps.OK
-		}
-		st.Sites[n.Site] = s
 	}
+	st.Sites = BuildSites(c, v)
 	return st
 }
 
@@ -161,18 +145,26 @@ type Metrics struct {
 	Registry  *prometheus.Registry
 	addresses *prometheus.GaugeVec
 	unhealthy *prometheus.GaugeVec
+	siteOK    *prometheus.GaugeVec
+	blind     *prometheus.GaugeVec
 }
 
-// NewMetrics registers portcullis_frontdoor_addresses{name} and
-// portcullis_frontdoor_unhealthy_published_seconds{name,address}.
+// NewMetrics registers portcullis_frontdoor_addresses{name},
+// portcullis_frontdoor_unhealthy_published_seconds{name,address},
+// portcullis_frontdoor_site_healthy{site} and
+// portcullis_frontdoor_blind_probers{site}.
 func NewMetrics() *Metrics {
 	m := &Metrics{Registry: prometheus.NewRegistry(),
 		addresses: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "portcullis_frontdoor_addresses",
 			Help: "Addresses published in the name's address set."}, []string{"name"}),
 		unhealthy: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "portcullis_frontdoor_unhealthy_published_seconds",
 			Help: "How long a published address has been unhealthy (0 while healthy)."}, []string{"name", "address"}),
+		siteOK: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "portcullis_frontdoor_site_healthy",
+			Help: "1 while an ingress node of the site is ok (healthy or undecided), else 0."}, []string{"site"}),
+		blind: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "portcullis_frontdoor_blind_probers",
+			Help: "Probers of the site whose last counted round was blind (their own uplink lost)."}, []string{"site"}),
 	}
-	m.Registry.MustRegister(m.addresses, m.unhealthy)
+	m.Registry.MustRegister(m.addresses, m.unhealthy, m.siteOK, m.blind)
 	return m
 }
 
@@ -185,6 +177,17 @@ func (m *Metrics) Update(now time.Time, published map[string][]string, c Cluster
 		}
 	}
 	m.unhealthy.Reset()
+	// The site series are the snapshot's sites only (a removed site's go).
+	m.siteOK.Reset()
+	m.blind.Reset()
+	for site, s := range BuildSites(c, v) {
+		ok := 0.0
+		if s.Healthy {
+			ok = 1
+		}
+		m.siteOK.WithLabelValues(site).Set(ok)
+		m.blind.WithLabelValues(site).Set(float64(s.BlindProbers))
+	}
 	for name, as := range published {
 		m.addresses.WithLabelValues(name).Set(float64(len(as)))
 		for _, a := range as {
