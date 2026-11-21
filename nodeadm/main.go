@@ -197,6 +197,8 @@ func run(log *slog.Logger) error {
 		}
 		s.loop(ctx)
 	}()
+	// Node remediation (plan Task 24 fix round 1: nodeadm replaces NHC).
+	go s.remediateLoop(ctx)
 	select {
 	case <-ctx.Done():
 		return nil

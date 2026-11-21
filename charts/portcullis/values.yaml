@@ -151,6 +151,9 @@ ha:
   # Longhorn's namespace (Task 24): nodeadm asks it to evict a node's
   # replicas on a cooperative removal.
   longhornNamespace: longhorn-system
+  # Self Node Remediation's namespace (Task 24): nodeadm creates and
+  # removes the SelfNodeRemediations there.
+  fencingNamespace: portcullis-fencing
   # group-gate and mcp-gate in HA (contract §20.10): StatefulSets of this
   # many replicas (1-16; a PDB from 2), each with its own log, served to
   # the Hub on :8091 / :8092 (wg's status on :8093); the Hub reads

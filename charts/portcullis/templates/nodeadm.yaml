@@ -22,7 +22,11 @@ Its rights (the security delta of hardening.md):
     configmaps update on portcullis-cluster-addresses and get on
     portcullis-admission-active; leases get / update on portcullis-nodeadm;
   - HA only, Role in longhorn-system: Longhorn's nodes get / patch (a
-    cooperative removal asks Longhorn to evict the node's replicas).
+    cooperative removal asks Longhorn to evict the node's replicas);
+  - HA only, Role in portcullis-fencing: SelfNodeRemediations create /
+    delete (plan Task 24 fix round 1: nodeadm replaces Node Healthcheck:
+    it asks SNR to fence a dead node and removes the finished request;
+    nodeadm/remediate.go's storm guard decides).
 The objects it updates (nodeadm-k3s-token, nodeadm-state,
 portcullis-cluster-addresses) are created by the CLI, never by Helm. */ -}}
 {{- if .Values.nodeadm.enabled }}
@@ -166,6 +170,34 @@ kind: RoleBinding
 metadata:
   name: portcullis-nodeadm
   namespace: {{ .Values.ha.longhornNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-nodeadm
+subjects:
+  - kind: ServiceAccount
+    name: nodeadm
+    namespace: {{ $nns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-nodeadm
+  namespace: {{ .Values.ha.fencingNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: ["self-node-remediation.medik8s.io"]
+    resources: ["selfnoderemediations"]
+    verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-nodeadm
+  namespace: {{ .Values.ha.fencingNamespace }}
   labels:
     app.kubernetes.io/managed-by: portcullis
 roleRef:
