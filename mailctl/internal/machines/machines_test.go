@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -767,5 +768,32 @@ func TestDMARCNeverBelowFloor(t *testing.T) {
 	if dmarc.AtLeast(dmarc.Domain{Policy: "none"}, "quarantine", t0).Policy != "quarantine" ||
 		dmarc.AtLeast(dmarc.Domain{Policy: "reject"}, "quarantine", t0).Policy != "reject" {
 		t.Fatal("AtLeast")
+	}
+}
+
+// TestDKIMKeysNeverReachViewer (security review N4, data flow): the DKIM
+// private keys mailctl makes are written only into masked secret fields.
+func TestDKIMKeysNeverReachViewer(t *testing.T) {
+	e := newEnv(t, nil)
+	e.step(t)
+	schema, err := os.ReadFile("../stalwart/testdata/schema-v1.1.0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf, err := stalwart.SecretFieldNames(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, w := range e.f.Written {
+		if b, _ := json.Marshal(w.Fields); strings.Contains(string(b), "PRIVATE KEY") {
+			seen = true
+		}
+		if l := stalwart.ViewerSecretLeaks(w.Object, w.Fields, "PRIVATE KEY", sf); len(l) > 0 {
+			t.Errorf("a private key reaches the viewer: %v", l)
+		}
+	}
+	if !seen {
+		t.Fatal("no private key was written: the check proves nothing")
 	}
 }

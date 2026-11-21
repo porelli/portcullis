@@ -107,11 +107,10 @@ var ViewerRolePermissions = []string{
 	"sysEventTracingLevelQuery", "sysExternalPublicKeyGet", "sysExternalPublicKeyQuery", "sysFileStorageGet",
 	"sysHttpFormGet", "sysImapGet", "sysIndexQueueStatusGet", "sysIndexQueueStatusQuery", "sysJmapGet",
 	"sysMailingListGet", "sysMailingListQuery", "sysMemoryLookupKeyGet", "sysMemoryLookupKeyQuery",
-	"sysMemoryLookupKeyValueGet", "sysMemoryLookupKeyValueQuery", "sysMetadataGet", "sysMetricGet",
-	"sysMetricQuery", "sysMtaConnectionStrategyGet", "sysMtaConnectionStrategyQuery",
-	"sysMtaDeliveryScheduleGet", "sysMtaDeliveryScheduleQuery", "sysMtaExtensionsGet",
-	"sysMtaInboundSessionGet", "sysMtaInboundThrottleGet", "sysMtaInboundThrottleQuery", "sysMtaMilterGet",
-	"sysMtaMilterQuery", "sysMtaOutboundStrategyGet", "sysMtaOutboundThrottleGet",
+	"sysMetadataGet", "sysMetricGet", "sysMetricQuery", "sysMtaConnectionStrategyGet",
+	"sysMtaConnectionStrategyQuery", "sysMtaDeliveryScheduleGet", "sysMtaDeliveryScheduleQuery",
+	"sysMtaExtensionsGet", "sysMtaInboundSessionGet", "sysMtaInboundThrottleGet", "sysMtaInboundThrottleQuery",
+	"sysMtaMilterGet", "sysMtaMilterQuery", "sysMtaOutboundStrategyGet", "sysMtaOutboundThrottleGet",
 	"sysMtaOutboundThrottleQuery", "sysMtaQueueQuotaGet", "sysMtaQueueQuotaQuery", "sysMtaRouteGet",
 	"sysMtaRouteQuery", "sysMtaStageAuthGet", "sysMtaStageConnectGet", "sysMtaStageDataGet",
 	"sysMtaStageEhloGet", "sysMtaStageMailGet", "sysMtaStageRcptGet", "sysMtaStsGet", "sysMtaTlsStrategyGet",
@@ -122,9 +121,8 @@ var ViewerRolePermissions = []string{
 	"sysSieveSystemScriptGet", "sysSieveSystemScriptQuery", "sysSieveUserInterpreterGet",
 	"sysSmimeTrustAnchorGet", "sysSmimeTrustAnchorQuery", "sysSpamClassifierGet", "sysSpamFileExtensionGet",
 	"sysSpamFileExtensionQuery", "sysSpamPyzorGet", "sysSpamRuleGet", "sysSpamRuleQuery", "sysSpamSettingsGet",
-	"sysSpamTagGet", "sysSpamTagQuery", "sysSpfReportSettingsGet", "sysSystemSettingsGet", "sysTaskGet",
-	"sysTaskQuery", "sysTaskManagerGet", "sysTenantGet", "sysTenantQuery", "sysTlsReportSettingsGet",
-	"sysWebDavGet",
+	"sysSpamTagGet", "sysSpamTagQuery", "sysSpfReportSettingsGet", "sysSystemSettingsGet", "sysTaskManagerGet",
+	"sysTenantGet", "sysTenantQuery", "sysTlsReportSettingsGet", "sysWebDavGet",
 }
 
 // ViewerDenied are the management objects whose reads the viewer never
@@ -139,7 +137,9 @@ var ViewerRolePermissions = []string{
 //     connection URL or username, HTTP headers, a DNS or HTTP provider's
 //     keys, a lookup zone (the Spamhaus DQS key sits in SpamDnsblServer's
 //     zone): the stores, directories, DNS servers, hooks, tracers,
-//     metrics exporters, AI models, HTTP lookups and the DNSBL settings;
+//     metrics exporters, AI models, HTTP lookups and the DNSBL settings,
+//     free-form lookup values (MemoryLookupKeyValue) and tasks (their
+//     inputs, blobs and failure texts);
 //   - the server's logs and traces: Log, Trace.
 //
 // TestViewerSecretFreeFields walks the schema snapshot so a field that
@@ -149,7 +149,7 @@ var ViewerDenied = []string{"AccountPassword", "ApiKey", "AppPassword", "Passkey
 	"QueuedMessage", "ArfExternalReport", "DmarcExternalReport", "DmarcInternalReport", "TlsExternalReport", "TlsInternalReport",
 	"SpamDnsblServer", "SpamDnsblSettings", "AiModel", "SpamAi", "Asn", "BlobStore", "Cache", "Coordinator", "DataStore", "Directory",
 	"DnsServer", "Http", "HttpLookup", "InMemoryStore", "Metrics", "MetricsStore", "MtaHook", "SearchStore", "StoreLookup",
-	"Tracer", "TracingStore", "WebHook",
+	"Tracer", "TracingStore", "WebHook", "MemoryLookupKeyValue", "Task",
 	"Log", "Trace"}
 
 // viewerMethods are the only JMAP methods the admin view forwards: x:<Obj>/get

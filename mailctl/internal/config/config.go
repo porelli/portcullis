@@ -329,6 +329,12 @@ type AdminView struct {
 	// AdminGroup (PORTCULLIS_MAIL_ADMIN_GROUP): the group forward-auth's
 	// X-Auth-Request-Groups must hold (lldap_admin).
 	AdminGroup string
+	// TicketKeyFile (MAILCTL_ADMINVIEW_TICKET_KEY_FILE): the per-install
+	// ticket secret the Hub writes (a file mount only; never a label or an
+	// environment value); UsedFile (MAILCTL_ADMINVIEW_USED_FILE): the spent
+	// tickets, in the view's own volume.
+	TicketKeyFile string
+	UsedFile      string
 }
 
 // LoadAdminView reads the admin view's configuration; every value is
@@ -377,6 +383,13 @@ func LoadAdminView(env func(string) string) (AdminView, error) {
 	a.AdminGroup = strings.TrimSpace(env("PORTCULLIS_MAIL_ADMIN_GROUP"))
 	if a.AdminGroup == "" || strings.ContainsAny(a.AdminGroup, ", \t") {
 		return a, errors.New("PORTCULLIS_MAIL_ADMIN_GROUP is required: the admin group (the Hub's override sets it)")
+	}
+	a.TicketKeyFile = get(env, "MAILCTL_ADMINVIEW_TICKET_KEY_FILE", "/run/portcullis/mail-admin/ticket-key")
+	a.UsedFile = get(env, "MAILCTL_ADMINVIEW_USED_FILE", "/data/used-tickets.json")
+	for k, v := range map[string]string{"MAILCTL_ADMINVIEW_TICKET_KEY_FILE": a.TicketKeyFile, "MAILCTL_ADMINVIEW_USED_FILE": a.UsedFile} {
+		if !filepath.IsAbs(v) || filepath.Clean(v) != v {
+			return a, fmt.Errorf("%s=%q is not a clean absolute file path", k, v)
+		}
 	}
 	return a, nil
 }

@@ -11,8 +11,9 @@
 //     route key the Hub's router sets after forward-auth and group-gate,
 //     and forward-auth's groups header (X-Auth-Request-Groups, whose client
 //     copy Traefik deletes) holds the admin group;
-//   - a session: only GET /portcullis/open with a single-use ticket the
-//     Hub's audited Open action minted for this admin (≤ 60 s) starts one;
+//   - a session: only POST /portcullis/open with a single-use ticket the
+//     Hub's audited Open action minted for this admin (≤ 60 s, its own
+//     per-install key, spent nonces kept on disk) starts one;
 //     it ends after 30 min idle or 8 h; a visit without one gets a page
 //     saying to open the view from Portcullis.
 //
@@ -103,10 +104,20 @@ type Gate struct {
 	Group     string
 }
 
-// TicketKey is the MAC key of the Hub's tickets: HMAC-SHA256(route key,
-// "portcullis-mail-admin-ticket v1") (contract §19.13).
-func TicketKey(routeKey string) []byte {
-	m := hmac.New(sha256.New, []byte(routeKey))
+// Tickets is how the proxy checks the Hub's tickets (contract §19.13):
+// the per-install ticket secret (its own key, never the route key, never a
+// Traefik label or environment value: a file only the Hub and the proxy
+// read) and the file where spent nonces are kept until they expire, so a
+// restart can't let one be used again.
+type Tickets struct {
+	Secret   []byte
+	UsedFile string
+}
+
+// TicketKey is the MAC key of the Hub's tickets: HMAC-SHA256(the ticket
+// secret, "portcullis-mail-admin-ticket v1") (contract §19.13).
+func TicketKey(secret []byte) []byte {
+	m := hmac.New(sha256.New, secret)
 	m.Write([]byte("portcullis-mail-admin-ticket v1"))
 	return m.Sum(nil)
 }
@@ -118,7 +129,8 @@ type ticketBody struct {
 	Expiry int64  `json:"e"`
 }
 
-// MintTicket is a ticket for user valid until exp (the Hub mints them;
+// MintTicket is a ticket for user valid until exp, key = TicketKey of the
+// ticket secret (the Hub mints them;
 // here for the tests and as the format's reference):
 // "v1.<b64url(json)>.<b64url(hmac)>".
 func MintTicket(key []byte, user, nonce string, exp time.Time) string {
@@ -141,6 +153,7 @@ type session struct {
 type Proxy struct {
 	gate      Gate
 	ticketKey []byte
+	usedFile  string
 	upstream  *url.URL
 	host      string                 // the admin view's hostname (Stalwart's trusted host)
 	secret    func() (string, error) // the viewer's password, read when used
@@ -169,9 +182,16 @@ type Proxy struct {
 // peer certificate fails the connection (verifyPinned); there is no TLS
 // session cache, so no resumption skips the check. TestUpstreamPinned
 // keeps both halves together.
-func New(upstream, host, secretFile string, spkis []string, gate Gate, onSecret func(string), logf func(string, ...any)) (*Proxy, error) {
+func New(upstream, host, secretFile string, spkis []string, gate Gate, tk Tickets, onSecret func(string), logf func(string, ...any)) (*Proxy, error) {
 	if !gate.TraefikIP.Is4() || len(gate.Key) < 32 || gate.Group == "" {
 		return nil, errors.New("admin view: Traefik's address, the per-install route key and the admin group are required: nothing reaches the proxy without them")
+	}
+	if len(tk.Secret) < 32 || tk.UsedFile == "" {
+		return nil, errors.New("admin view: the ticket secret (32+ bytes) and the spent-ticket file are required")
+	}
+	used, err := loadUsed(tk.UsedFile)
+	if err != nil {
+		return nil, err
 	}
 	u, err := url.Parse(upstream)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -194,8 +214,8 @@ func New(upstream, host, secretFile string, spkis []string, gate Gate, onSecret 
 		MaxIdleConns:          16,
 		IdleConnTimeout:       90 * time.Second,
 	}
-	p := &Proxy{gate: gate, ticketKey: TicketKey(gate.Key), upstream: u, host: host, logf: logf, now: time.Now,
-		sessions: map[string]*session{}, used: map[string]time.Time{},
+	p := &Proxy{gate: gate, ticketKey: TicketKey(tk.Secret), usedFile: tk.UsedFile, upstream: u, host: host, logf: logf, now: time.Now,
+		sessions: map[string]*session{}, used: used,
 		secret: func() (string, error) {
 			b, err := os.ReadFile(secretFile)
 			if err != nil {
@@ -356,8 +376,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.URL.Path
 	get := r.Method == http.MethodGet || r.Method == http.MethodHead
-	if path == "/portcullis/open" && get {
-		p.open(w, r)
+	if path == "/portcullis/open" {
+		// The ticket comes in a POST body only (never a URL: no access
+		// log or history holds it); a GET is told to open from Portcullis.
+		if r.Method == http.MethodPost {
+			p.open(w, r)
+		} else {
+			openFromPortcullis(w, "This page opens only from Portcullis.")
+		}
 		return
 	}
 	s, why := p.session(r)
@@ -444,7 +470,14 @@ func (p *Proxy) session(r *http.Request) (*session, string) {
 // the ticket key, unexpired (≤ TicketTTL ahead), for the forwarded admin,
 // never seen before. The mail server's unmask switch must be off.
 func (p *Proxy) open(w http.ResponseWriter, r *http.Request) {
-	t := r.URL.Query().Get("t")
+	t := ""
+	if r.URL.RawQuery == "" && strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		if b, err := io.ReadAll(io.LimitReader(r.Body, 4097)); err == nil && len(b) <= 4096 {
+			if v, err := url.ParseQuery(string(b)); err == nil && len(v["t"]) == 1 {
+				t = v.Get("t")
+			}
+		}
+	}
 	tb, ok := p.checkTicket(t, user(r))
 	if !ok {
 		p.logf("admin-view: %s presented no valid ticket", who(r))
@@ -504,7 +537,64 @@ func (p *Proxy) checkTicket(t, forUser string) (ticketBody, bool) {
 		return tb, false
 	}
 	p.used[tb.Nonce] = exp
+	// Kept on disk before the session opens: a failed write refuses the
+	// ticket (a restart must not forget it).
+	if err := saveUsed(p.usedFile, p.used); err != nil {
+		p.logf("admin-view: the spent-ticket file can't be written: refusing")
+		return tb, false
+	}
 	return tb, true
+}
+
+// loadUsed reads the spent-ticket file (nonce → expiry, unix seconds); a
+// missing file is empty, an unreadable or malformed one is an error.
+func loadUsed(path string) (map[string]time.Time, error) {
+	out := map[string]time.Time{}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("admin view: the spent-ticket file: %w", err)
+	}
+	var m map[string]int64
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, errors.New("admin view: the spent-ticket file is malformed")
+	}
+	now := time.Now()
+	for n, e := range m {
+		if t := time.Unix(e, 0); t.After(now) {
+			out[n] = t
+		}
+	}
+	return out, nil
+}
+
+// saveUsed writes the spent-ticket file in full (temporary file, fsync,
+// rename).
+func saveUsed(path string, used map[string]time.Time) error {
+	m := make(map[string]int64, len(used))
+	for n, e := range used {
+		m[n] = e.Unix()
+	}
+	b, _ := json.Marshal(m)
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // secretsMasked: the mail server's unmask switch (SystemSettings

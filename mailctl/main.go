@@ -513,7 +513,14 @@ func adminViewCmd(args []string, env func(string) string, stderr io.Writer) int 
 	}
 	logger := logx.New(stderr)
 	logx.AddSecret(cfg.RouteKey)
-	p, err := viewer.New(cfg.Upstream, cfg.Host, cfg.SecretFile, cfg.SPKIs, viewer.Gate{TraefikIP: cfg.TraefikIP, Key: cfg.RouteKey, Group: cfg.AdminGroup}, logx.AddSecret, logger.Printf)
+	tsec, err := api.ReadSecret(cfg.TicketKeyFile, 32)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl admin-view: refusing to start: the ticket key: %v\n", err)
+		return 1
+	}
+	logx.AddSecret(tsec)
+	p, err := viewer.New(cfg.Upstream, cfg.Host, cfg.SecretFile, cfg.SPKIs, viewer.Gate{TraefikIP: cfg.TraefikIP, Key: cfg.RouteKey, Group: cfg.AdminGroup},
+		viewer.Tickets{Secret: []byte(tsec), UsedFile: cfg.UsedFile}, logx.AddSecret, logger.Printf)
 	if err != nil {
 		fmt.Fprintf(stderr, "mailctl admin-view: %v\n", err)
 		return 1

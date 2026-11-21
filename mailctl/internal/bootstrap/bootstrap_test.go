@@ -731,3 +731,32 @@ func TestResetViewerWithoutViewer(t *testing.T) {
 		}
 	}
 }
+
+// TestViewerPasswordNeverReachesViewer (security review N4, data flow):
+// the passwords the plan sets (the viewer's, mailctl's) sit only in masked
+// secret fields.
+func TestViewerPasswordNeverReachesViewer(t *testing.T) {
+	f := newFake()
+	p := params()
+	p.ViewerIP = netip.MustParseAddr("172.31.255.5")
+	res := run(t, f, p, false)
+	schema, err := os.ReadFile("../stalwart/testdata/schema-v1.1.0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf, _ := stalwart.SecretFieldNames(schema)
+	seen := false
+	for obj, objs := range f.objs {
+		for _, o := range objs {
+			if b, _ := json.Marshal(o); strings.Contains(string(b), res.ViewerPassword) {
+				seen = true
+			}
+			if l := stalwart.ViewerSecretLeaks(obj, o, res.ViewerPassword, sf); len(l) > 0 {
+				t.Errorf("the viewer password reaches the viewer: %v", l)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("the viewer password was never stored: the check proves nothing")
+	}
+}

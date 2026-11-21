@@ -52,6 +52,14 @@ const testKey = "0123456789abcdefghijklmnopqrstuvwxyzABCDEF"
 
 var testGate = Gate{TraefikIP: netip.MustParseAddr("127.0.0.1"), Key: testKey, Group: "lldap_admin"}
 
+// ticketSecret is the per-install ticket secret (never the route key).
+const ticketSecret = "ticket-secret-0123456789abcdefghijklmnop"
+
+// testTickets: the ticket secret and a fresh spent-ticket file.
+func testTickets(t *testing.T) Tickets {
+	return Tickets{Secret: []byte(ticketSecret), UsedFile: filepath.Join(t.TempDir(), "used-tickets.json")}
+}
+
 const viewerPW = "0123456789abcdef0123456789abcdef"
 
 type env struct {
@@ -78,7 +86,7 @@ func setup(t *testing.T) *env {
 	e.sf = filepath.Join(t.TempDir(), "viewer-password")
 	os.WriteFile(e.sf, []byte(viewerPW+"\n"), 0o640)
 	var mu sync.Mutex
-	p, err := New(us.URL, "mail-admin.example.org", e.sf, []string{spkiOf(us.Certificate())}, testGate,
+	p, err := New(us.URL, "mail-admin.example.org", e.sf, []string{spkiOf(us.Certificate())}, testGate, testTickets(t),
 		func(s string) { mu.Lock(); e.secrets = append(e.secrets, s); mu.Unlock() },
 		func(f string, a ...any) { mu.Lock(); e.logs = append(e.logs, fmt.Sprintf(f, a...)); mu.Unlock() })
 	if err != nil {
@@ -92,13 +100,13 @@ func setup(t *testing.T) *env {
 }
 
 func (e *env) ticket(user string, ttl time.Duration) string {
-	return MintTicket(TicketKey(testKey), user, randomToken(), e.now.Add(ttl))
+	return MintTicket(TicketKey([]byte(ticketSecret)), user, randomToken(), e.now.Add(ttl))
 }
 
 // openSession opens a session for root with a fresh ticket.
 func (e *env) openSession(t *testing.T) {
 	t.Helper()
-	resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(e.ticket("root", 60*time.Second)), "", nil)
+	resp := e.open(t, e.ticket("root", 60*time.Second), nil)
 	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/admin/" {
 		t.Fatalf("open: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
@@ -114,6 +122,16 @@ func (e *env) openSession(t *testing.T) {
 
 func noRedirect() *http.Client {
 	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+// open posts a ticket to /portcullis/open as the Hub's page does.
+func (e *env) open(t *testing.T, ticket string, hdr map[string]string) *http.Response {
+	t.Helper()
+	h := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+	for k, v := range hdr {
+		h[k] = v
+	}
+	return e.do(t, "POST", "/portcullis/open", url.Values{"t": {ticket}}.Encode(), h)
 }
 
 // do sends a request as Traefik would after forward-auth (route key,
@@ -256,7 +274,7 @@ func TestGate(t *testing.T) {
 		"no user":       {"X-Forwarded-User": ""},
 	} {
 		for _, c := range [][3]string{{"GET", "/login?state=s", ""}, {"POST", "/jmap/", read}, {"GET", "/admin/", ""}, {"GET", "/api/account", ""},
-			{"GET", "/portcullis/open?t=" + url.QueryEscape(e.ticket("root", 30*time.Second)), ""}} {
+			{"POST", "/portcullis/open", url.Values{"t": {e.ticket("root", 30*time.Second)}}.Encode()}} {
 			if resp := e.do(t, c[0], c[1], c[2], hdr); resp.StatusCode != http.StatusForbidden {
 				t.Errorf("%s: %s %s = %d", name, c[0], c[1], resp.StatusCode)
 			}
@@ -271,7 +289,7 @@ func TestGate(t *testing.T) {
 		t.Errorf("two keys: %v %v", resp, err)
 	}
 	other, _ := New("https://172.31.255.2:8443", "mail-admin.example.org", e.sf, []string{strings.Repeat("ab", 32)},
-		Gate{TraefikIP: netip.MustParseAddr("172.31.250.2"), Key: testKey, Group: "lldap_admin"}, nil, func(string, ...any) {})
+		Gate{TraefikIP: netip.MustParseAddr("172.31.250.2"), Key: testKey, Group: "lldap_admin"}, testTickets(t), nil, func(string, ...any) {})
 	os := httptest.NewServer(other)
 	defer os.Close()
 	e2 := &env{ps: os}
@@ -283,7 +301,7 @@ func TestGate(t *testing.T) {
 	}
 	for _, g := range []Gate{{}, {TraefikIP: netip.MustParseAddr("172.31.250.2")}, {TraefikIP: netip.MustParseAddr("172.31.250.2"), Key: "short", Group: "g"},
 		{TraefikIP: netip.MustParseAddr("172.31.250.2"), Key: testKey}} {
-		if _, err := New("https://172.31.255.2:8443", "mail-admin.example.org", e.sf, []string{strings.Repeat("ab", 32)}, g, nil, nil); err == nil {
+		if _, err := New("https://172.31.255.2:8443", "mail-admin.example.org", e.sf, []string{strings.Repeat("ab", 32)}, g, testTickets(t), nil, nil); err == nil {
 			t.Errorf("gate %+v accepted", g)
 		}
 	}
@@ -301,10 +319,10 @@ func TestTicketsAndSessions(t *testing.T) {
 			t.Errorf("no session %s: %d %s", p, resp.StatusCode, resp.Header.Get("X-Test-Body"))
 		}
 	}
-	key := TicketKey(testKey)
+	key := TicketKey([]byte(ticketSecret))
 	bad := map[string]string{
 		"garbage":       "nope",
-		"other key":     MintTicket(TicketKey("another-route-key-0123456789abcdefghij"), "root", "n1", e.now.Add(30*time.Second)),
+		"route key":     MintTicket(TicketKey([]byte(testKey)), "root", "n1", e.now.Add(30*time.Second)),
 		"expired":       MintTicket(key, "root", "n2", e.now.Add(-time.Second)),
 		"too long":      MintTicket(key, "root", "n3", e.now.Add(61*time.Second)),
 		"another admin": MintTicket(key, "alice", "n4", e.now.Add(30*time.Second)),
@@ -315,14 +333,14 @@ func TestTicketsAndSessions(t *testing.T) {
 	tampered, _ := json.Marshal(ticketBody{User: "root", Nonce: "n5", Expiry: e.now.Add(3600 * time.Second).Unix()})
 	bad["tampered"] = "v1." + base64.RawURLEncoding.EncodeToString(tampered) + "." + parts[2]
 	for name, tk := range bad {
-		if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(tk), "", nil); resp.StatusCode != http.StatusForbidden || len(resp.Cookies()) != 0 {
+		if resp := e.open(t, tk, nil); resp.StatusCode != http.StatusForbidden || len(resp.Cookies()) != 0 {
 			t.Errorf("%s ticket: %d", name, resp.StatusCode)
 		}
 	}
-	if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(good), "", nil); resp.StatusCode != http.StatusFound {
+	if resp := e.open(t, good, nil); resp.StatusCode != http.StatusFound {
 		t.Fatalf("good ticket: %d", resp.StatusCode)
 	}
-	if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(good), "", nil); resp.StatusCode != http.StatusForbidden {
+	if resp := e.open(t, good, nil); resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("a ticket used twice: %d", resp.StatusCode)
 	}
 	found := false
@@ -335,7 +353,7 @@ func TestTicketsAndSessions(t *testing.T) {
 		t.Fatalf("no open log line: %v", e.logs)
 	}
 	// Impersonation is in the log line.
-	e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(e.ticket("root", time.Minute)), "", map[string]string{"X-Forwarded-Impersonator": "boss"})
+	e.open(t, e.ticket("root", time.Minute), map[string]string{"X-Forwarded-Impersonator": "boss"})
 	if !strings.Contains(strings.Join(e.logs, "\n"), "root (impersonated by boss) opened") {
 		t.Fatal("the impersonator isn't logged")
 	}
@@ -365,13 +383,13 @@ func TestTicketsAndSessions(t *testing.T) {
 	}
 	// The unmask switch on: no session.
 	e.up.unmasked = true
-	if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(e.ticket("root", time.Minute)), "", nil); resp.StatusCode != http.StatusServiceUnavailable {
+	if resp := e.open(t, e.ticket("root", time.Minute), nil); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("includeSecrets on: %d", resp.StatusCode)
 	}
 	// No viewer password: no session either.
 	e.up.unmasked = false
 	os.Remove(e.sf)
-	if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(e.ticket("root", time.Minute)), "", nil); resp.StatusCode != http.StatusServiceUnavailable {
+	if resp := e.open(t, e.ticket("root", time.Minute), nil); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("no secret: %d", resp.StatusCode)
 	}
 }
@@ -524,7 +542,7 @@ func TestUpstreamPinned(t *testing.T) {
 	sf := filepath.Join(t.TempDir(), "pw")
 	os.WriteFile(sf, []byte(viewerPW), 0o640)
 	wrong := strings.Repeat("ab", 32)
-	p, err := New(us.URL, "mail-admin.example.org", sf, []string{wrong}, testGate, nil, func(string, ...any) {})
+	p, err := New(us.URL, "mail-admin.example.org", sf, []string{wrong}, testGate, testTickets(t), nil, func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +551,7 @@ func TestUpstreamPinned(t *testing.T) {
 	ps := httptest.NewServer(p)
 	defer ps.Close()
 	e := &env{ps: ps, up: up, now: now}
-	if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(e.ticket("root", time.Minute)), "", nil); resp.StatusCode != http.StatusServiceUnavailable {
+	if resp := e.open(t, e.ticket("root", time.Minute), nil); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("open with a mismatched certificate: %d, want 503", resp.StatusCode)
 	}
 	if up.readCount != 0 || len(up.seen) != 0 {
@@ -551,16 +569,16 @@ func TestUpstreamPinned(t *testing.T) {
 		t.Fatal("an unpinned certificate passed")
 	}
 	// Two pins (a rollover): the right one among them passes.
-	p2, _ := New(us.URL, "mail-admin.example.org", sf, []string{wrong, spkiOf(us.Certificate())}, testGate, nil, func(string, ...any) {})
+	p2, _ := New(us.URL, "mail-admin.example.org", sf, []string{wrong, spkiOf(us.Certificate())}, testGate, testTickets(t), nil, func(string, ...any) {})
 	p2.now = func() time.Time { return now }
 	ps2 := httptest.NewServer(p2)
 	defer ps2.Close()
 	e2 := &env{ps: ps2, up: up, now: now}
-	if resp := e2.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(e2.ticket("root", time.Minute)), "", nil); resp.StatusCode != http.StatusFound {
+	if resp := e2.open(t, e2.ticket("root", time.Minute), nil); resp.StatusCode != http.StatusFound {
 		t.Fatalf("pinned rollover: %d", resp.StatusCode)
 	}
 	for _, pins := range [][]string{nil, {}, {"xyz"}, {strings.Repeat("AB", 32)}, {wrong, wrong + "00"}, {wrong, strings.Repeat("cd", 32), strings.Repeat("ef", 32)}} {
-		if _, err := New(us.URL, "mail-admin.example.org", sf, pins, testGate, nil, nil); err == nil {
+		if _, err := New(us.URL, "mail-admin.example.org", sf, pins, testGate, testTickets(t), nil, nil); err == nil {
 			t.Errorf("pins %v accepted", pins)
 		}
 	}
@@ -587,5 +605,50 @@ func TestBindAddr(t *testing.T) {
 	}
 	if _, err := bindAddrIn(mk("172.31.250.2/24"), tr); err == nil {
 		t.Fatal("bound to Traefik's own address")
+	}
+}
+
+// Round 2 (N2, N3): a ticket only ever arrives in a POST body (a query
+// ticket opens nothing), and a spent ticket stays spent across a restart
+// (the nonce file); a spent-ticket file that can't be written refuses.
+func TestTicketPostAndReplayAcrossRestart(t *testing.T) {
+	e := setup(t)
+	tk := e.ticket("root", 50*time.Second)
+	if resp := e.do(t, "GET", "/portcullis/open?t="+url.QueryEscape(tk), "", nil); resp.StatusCode != http.StatusForbidden || len(resp.Cookies()) != 0 {
+		t.Fatalf("GET with a query ticket: %d", resp.StatusCode)
+	}
+	if resp := e.do(t, "POST", "/portcullis/open?t="+url.QueryEscape(tk), "", map[string]string{"Content-Type": "application/x-www-form-urlencoded"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST with a query ticket: %d", resp.StatusCode)
+	}
+	if resp := e.open(t, tk, nil); resp.StatusCode != http.StatusFound {
+		t.Fatalf("POST body ticket: %d", resp.StatusCode)
+	}
+	// A restart: a new proxy on the same spent-ticket file.
+	used := e.p.usedFile
+	p2, err := New(e.p.upstream.String(), "mail-admin.example.org", e.sf, []string{strings.Repeat("ab", 32)}, testGate,
+		Tickets{Secret: []byte(ticketSecret), UsedFile: used}, nil, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2.now = func() time.Time { return e.now }
+	if _, ok := p2.checkTicket(tk, "root"); ok {
+		t.Fatal("a spent ticket opened again after a restart")
+	}
+	// An unwritable spent-ticket file refuses (fail closed).
+	dir := t.TempDir()
+	p3, _ := New(e.p.upstream.String(), "mail-admin.example.org", e.sf, []string{strings.Repeat("ab", 32)}, testGate,
+		Tickets{Secret: []byte(ticketSecret), UsedFile: filepath.Join(dir, "no", "such", "dir", "used.json")}, nil, func(string, ...any) {})
+	p3.now = func() time.Time { return e.now }
+	if _, ok := p3.checkTicket(e.ticket("root", 50*time.Second), "root"); ok {
+		t.Fatal("a ticket accepted without its nonce on disk")
+	}
+	// A malformed file refuses to start; a missing secret too.
+	bad := filepath.Join(dir, "bad.json")
+	os.WriteFile(bad, []byte("{"), 0o600)
+	if _, err := New(e.p.upstream.String(), "h", e.sf, []string{strings.Repeat("ab", 32)}, testGate, Tickets{Secret: []byte(ticketSecret), UsedFile: bad}, nil, nil); err == nil {
+		t.Fatal("a malformed spent-ticket file accepted")
+	}
+	if _, err := New(e.p.upstream.String(), "h", e.sf, []string{strings.Repeat("ab", 32)}, testGate, Tickets{Secret: []byte("short"), UsedFile: used}, nil, nil); err == nil {
+		t.Fatal("a short ticket secret accepted")
 	}
 }

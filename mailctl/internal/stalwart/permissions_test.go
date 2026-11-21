@@ -183,55 +183,18 @@ func TestViewerMethods(t *testing.T) {
 	}
 }
 
-// viewerReviewedFields are the plain fields of objects the viewer reads
-// whose names look secret-capable, each judged: not a secret, or masked
-// by the server.
-var viewerReviewedFields = map[string]string{
-	"Account.credentials.otpUrl":             "masked by Stalwart (MASKED_PASSWORD) like the secret",
-	"Account.credentials.publicKey":          "a passkey's public key",
-	"AcmeProvider.accountUri":                "the ACME account's URL (not a credential; Portcullis has no ACME in Stalwart)",
-	"Application.resourceUrl":                "file:// path of the pinned bundle",
-	"Application.urlPrefix":                  "URL prefixes",
-	"CalendarScheduling.httpRsvpUrl":         "the public RSVP URL",
-	"DkimSignature.headers":                  "signed header names",
-	"DkimSignature.publicKey":                "the DKIM public key (published in DNS)",
-	"Domain.dnsZoneFile":                     "the domain's public zone text",
-	"Domain.reportAddressUri":                "a report mailto: URI",
-	"ExternalPublicKey.key":                  "a public key",
-	"ExternalPublicKey.nextKey":              "a public key",
-	"PublicKey.key":                          "a public key",
-	"MemoryLookupKey.key":                    "a lookup entry (allow / block list domains)",
-	"MemoryLookupKeyValue.key":               "a lookup entry",
-	"MtaExtensions.dsn":                      "the DSN extension switch (an expression)",
-	"MtaInboundThrottle.key":                 "rate-limit key names",
-	"MtaOutboundThrottle.key":                "rate-limit key names",
-	"MtaQueueQuota.key":                      "quota key names",
-	"MtaRoute.authUsername":                  "the relay's username (its password is a masked secret)",
-	"MtaStageData.addAuthResultsHeader":      "a header switch (an expression)",
-	"MtaStageData.addDateHeader":             "a header switch",
-	"MtaStageData.addMessageIdHeader":        "a header switch",
-	"MtaStageData.addReceivedHeader":         "a header switch",
-	"MtaStageData.addReceivedSpfHeader":      "a header switch",
-	"MtaStageData.addReturnPathHeader":       "a header switch",
-	"MtaStageData.maxReceivedHeaders":        "a header count",
-	"OAuthClient.postLogoutRedirectUris":     "redirect URIs",
-	"OAuthClient.redirectUris":               "redirect URIs",
-	"SieveUserInterpreter.allowedNotifyUris": "notify URI schemes",
-	"SieveUserInterpreter.protectedHeaders":  "header names",
-	"SpamSettings.spamFilterRulesUrl":        "the adapter's internal rules URL",
-	"Account.quotas":                         "quota sizes",
-	"Tenant.quotas":                          "quota sizes",
-	"Email.defaultFolders":                   "default folder names",
-	"SystemSettings.services":                "advertised service hostnames",
-	"SystemSettings.providerInfo":            "autoconfig provider display info",
-}
-
-// TestViewerSecretFreeFields (security review I1) walks every object the
-// viewer reads, embedded objects included (references are other objects,
-// judged on their own): a plain field (not Stalwart's secret types) that
-// could hold a secret — a string map (headers), or a URL, username, key,
-// token, zone, header or endpoint field — must be judged in
-// viewerReviewedFields, else its object belongs in ViewerDenied.
+// TestViewerSecretFreeFields (security review I1, N4) walks every object
+// the viewer reads, embedded objects included (references are other
+// objects, judged on their own), and lists every plain field (not one of
+// Stalwart's masked secret types) that could carry a secret: a string
+// map (headers), a uri / text / sieve body or a blob, an expression (its
+// literals), or a field named like a URL, username, key, token, zone,
+// header or endpoint. Each must be judged in
+// testdata/viewer-reviewed-fields.tsv (path, kind, why it holds no secret),
+// else its object belongs in ViewerDenied; a stale line fails too. Whether
+// a secret mailctl holds can reach one is the data-flow tests' question
+// (ViewerSecretLeaks: the DQS key, the DKIM keys, the viewer's password).
+// UPDATE_GOLDEN=1 rewrites the file with "UNJUDGED" reasons to fill in.
 func TestViewerSecretFreeFields(t *testing.T) {
 	raw := loadSnapshotRaw(t)
 	var sc struct {
@@ -281,7 +244,7 @@ func TestViewerSecretFreeFields(t *testing.T) {
 	}
 	secretTypes := map[string]bool{"x:SecretKey": true, "x:SecretText": true, "x:SecretKeyOptional": true, "x:SecretTextOptional": true}
 	words := regexp.MustCompile(`(?i)header|url|uri|zone|token|apikey|applicationkey|key$|username|dsn|endpoint|secret|password`)
-	seen := map[string]bool{}
+	found := map[string]string{} // path → kind
 	var walk func(schema, path string, visiting map[string]bool)
 	walk = func(schema, path string, visiting map[string]bool) {
 		if visiting[schema] {
@@ -295,25 +258,37 @@ func TestViewerSecretFreeFields(t *testing.T) {
 			if ty.Format == "secret" || ty.Format == "secretText" || secretTypes[ty.ObjectName] || ty.Type == "objectId" {
 				continue
 			}
-			flag := false
-			if ty.Type == "map" && (ty.Class == nil || ty.Class.Type == "string" || strings.Contains(strings.ToLower(f), "header")) {
-				flag = true
-			} else if (ty.Type == "string" || ty.Type == "set" || ty.Type == "object") && words.MatchString(f) && ty.ObjectName != "x:Rate" {
-				flag = true
+			cf, co := "", ""
+			if ty.Class != nil {
+				cf, co = ty.Class.Format, ty.Class.ObjectName
 			}
-			if flag && !seen[p] {
-				seen[p] = true
-				if viewerReviewedFields[p] == "" {
-					t.Errorf("the viewer reads %s, which could hold a secret: judge it in viewerReviewedFields or deny its object", p)
-				}
+			kind := ""
+			switch {
+			case ty.ObjectName == "x:Expression":
+				kind = "expression"
+			case ty.Format == "uri" || cf == "uri":
+				kind = "uri"
+			case ty.Format == "text" || cf == "text":
+				kind = "text"
+			case ty.Format == "sieve" || cf == "sieve":
+				kind = "sieve"
+			case ty.Type == "blobId":
+				kind = "blob"
+			case ty.Type == "map" && (ty.Class == nil || ty.Class.Type == "string" || strings.Contains(strings.ToLower(f), "header")):
+				kind = "map"
+			case (ty.Type == "string" || ty.Type == "set" || ty.Type == "object") && words.MatchString(f) && ty.ObjectName != "x:Rate":
+				kind = "name"
+			}
+			if kind != "" {
+				found[p] = kind
 			}
 			on := ""
 			if ty.Type == "object" || ty.Type == "objectList" {
 				on = ty.ObjectName
 			} else if ty.Class != nil && ty.Class.Type == "object" {
-				on = ty.Class.ObjectName
+				on = co
 			}
-			if on != "" {
+			if on != "" && on != "x:Expression" {
 				for _, sub := range schemasOf(on) {
 					walk(sub, p, visiting)
 				}
@@ -329,9 +304,48 @@ func TestViewerSecretFreeFields(t *testing.T) {
 			walk(sn, obj, map[string]bool{})
 		}
 	}
-	for p := range viewerReviewedFields {
-		if !seen[p] {
-			t.Errorf("viewerReviewedFields judges %s, which the viewer doesn't read (stale)", p)
+	const golden = "testdata/viewer-reviewed-fields.tsv"
+	judged := map[string][2]string{}
+	if b, err := os.ReadFile(golden); err == nil {
+		for _, ln := range strings.Split(string(b), "\n") {
+			if ln == "" || strings.HasPrefix(ln, "#") {
+				continue
+			}
+			parts := strings.SplitN(ln, "\t", 3)
+			if len(parts) == 3 {
+				judged[parts[0]] = [2]string{parts[1], parts[2]}
+			}
+		}
+	}
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		paths := make([]string, 0, len(found))
+		for p := range found {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		out := "# The admin view's viewer reads these plain fields (TestViewerSecretFreeFields): path, kind, why no secret is there.\n"
+		for _, p := range paths {
+			why := judged[p][1]
+			if why == "" {
+				why = "UNJUDGED"
+			}
+			out += p + "\t" + found[p] + "\t" + why + "\n"
+		}
+		os.WriteFile(golden, []byte(out), 0o644)
+		return
+	}
+	for p, kind := range found {
+		j, ok := judged[p]
+		switch {
+		case !ok:
+			t.Errorf("the viewer reads %s (%s), which could hold a secret: judge it in %s or deny its object", p, kind, golden)
+		case j[0] != kind || strings.TrimSpace(j[1]) == "" || strings.Contains(j[1], "UNJUDGED"):
+			t.Errorf("%s: kind %s / %q isn't a judgement", p, j[0], j[1])
+		}
+	}
+	for p := range judged {
+		if _, ok := found[p]; !ok {
+			t.Errorf("%s judges %s, which the viewer doesn't read (stale)", golden, p)
 		}
 	}
 }
