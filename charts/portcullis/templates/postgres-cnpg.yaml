@@ -217,7 +217,8 @@ spec:
         {{- /* The destination's addresses rotate (review I3): any public
         address on 443, never the private / cluster ranges the CLI lists. */}}
         {{- if ne (int $bk.port) 443 }}{{ fail "backup.cnpg.publicEgress is for port 443 only" }}{{ end }}
-        {{- range (list "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10" "169.254.0.0/16" "127.0.0.0/8") }}
+        {{- /* ha.sh BACKUP_DEST_PRIVATE_CIDRS (review NM2: the special-purpose ranges too). */}}
+        {{- range (list "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10" "169.254.0.0/16" "127.0.0.0/8" "0.0.0.0/8" "192.0.0.0/24" "192.0.2.0/24" "198.18.0.0/15" "198.51.100.0/24" "203.0.113.0/24" "192.88.99.0/24" "224.0.0.0/4" "240.0.0.0/4") }}
         {{- if not (has . $bk.publicExcept) }}{{ fail (printf "backup.cnpg.publicExcept lacks %s" .) }}{{ end }}
         {{- end }}
         - ipBlock:

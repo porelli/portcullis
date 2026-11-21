@@ -149,6 +149,7 @@ backup destination set|expected <url> (the credentials come from stdin)
 backup destination set --allow-rotating-addresses|expected <url> (the credentials come from stdin)
 backup destination set https://s3.example.org/b AKIASECRET|the credentials come from stdin, never argv
 backup destination set --allow-rotating-addresses https://s3.example.org/b AKIASECRET|the credentials come from stdin, never argv
+backup destination set https://s3.example.org/b --allow-rotating-addresses AKIASECRET|the credentials come from stdin, never argv
 backup destination show extra|unknown argument: extra
 restore a b|unexpected argument: b
 restore --frob|unknown option: --frob

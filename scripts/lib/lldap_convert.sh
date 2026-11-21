@@ -202,10 +202,11 @@ select 'hashes ' || encode(sha256(convert_to(coalesce(string_agg(l, E'\n' order 
 select 'attributes ' || encode(sha256(convert_to(coalesce(string_agg(l, E'\n' order by l collate "C"), ''), 'UTF8')), 'hex') from (select user_attribute_user_id || '|' || user_attribute_name || '|' || encode(user_attribute_value, 'hex') as l from user_attributes) s;
 SQL
 
-# _lldap_convert_pg_error <stderr file> — the first ERROR line only, its
-# quoted values cut unless they are plain identifiers (review M6).
+# _lldap_convert_pg_error <stderr file> — the first ERROR line only, every
+# quoted string in it cut (reviews M6 / NN6: a quoted value can look like
+# an identifier — lowercase hex, base32 —, so none is kept).
 _lldap_convert_pg_error() {
-  grep -m1 'ERROR:' "$1" | sed -E 's/^.*ERROR: +/Postgres: /; s/"([^"]*[^a-z0-9_"][^"]*)"/"…"/g' | cut -c1-300
+  grep -m1 'ERROR:' "$1" | sed -E "s/^.*ERROR: +/Postgres: /; s/\"[^\"]*\"?/\"…\"/g; s/'[^']*'?/'…'/g" | cut -c1-300
 }
 
 # What each summary line names in the refusal.
@@ -405,9 +406,19 @@ kube_lldap_convert_preflight() {
   [ ! -s "$1/lldap.dump" ] && [ -s "$1/lldap_data.tar.gz" ] || return 0
   # Review M8: the converted copy (every hash) never outlives this run: any
   # later failure exits through this trap; after the swap it's gone anyway.
-  trap _kube_lldap_restore_drop EXIT
+  # Chained after any EXIT trap the caller has (review NN3). In a subshell
+  # trap -p shows the parent's traps — not live there — until the subshell
+  # runs a trap command: USR2 (never trapped by the CLI) reset first, so only
+  # a live EXIT trap is chained (a parent's cleanup never runs here).
+  local prev=""
+  trap - USR2
+  [ -z "$(trap -p EXIT)" ] || prev="$(eval "_lldap_trap_cmd $(trap -p EXIT | cut -c6-)")"
+  # shellcheck disable=SC2064  # the caller's command, expanded now on purpose
+  case "$prev" in *_kube_lldap_restore_drop*) ;; "") trap _kube_lldap_restore_drop EXIT ;; *) trap "_kube_lldap_restore_drop; $prev" EXIT ;; esac
   kube_lldap_convert_backup "$1"
 }
+# _lldap_trap_cmd -- <command> <signal> — trap -p's command.
+_lldap_trap_cmd() { printf '%s' "$2"; }
 
 # _kube_lldap_restore_drop — the EXIT trap above: drop lldap_restore if it
 # is still there (the swap renames it; a failed restore leaves it).

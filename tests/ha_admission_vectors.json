@@ -18385,6 +18385,205 @@
  },
  {
   "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a Role reading another ObjectStore",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "Role",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup",
+      "other"
+     ],
+     "resources": [
+      "objectstores"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores/status"
+     ],
+     "verbs": [
+      "update"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resourceNames": [
+      "backup-destination"
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a Role updating another ObjectStore's status",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "Role",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "other"
+     ],
+     "resources": [
+      "objectstores/status"
+     ],
+     "verbs": [
+      "update"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resourceNames": [
+      "backup-destination"
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [],
+   "user": "system:serviceaccount:cnpg-system:plugin-barman-cloud"
+  },
+  "name": "barman: a Role reading another Secret",
+  "object": {
+   "apiVersion": "rbac.authorization.k8s.io/v1",
+   "kind": "Role",
+   "metadata": {
+    "name": "portcullis-pg-barman-cloud",
+    "namespace": "cnpg-system"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      "barmancloud.cnpg.io"
+     ],
+     "resourceNames": [
+      "portcullis-backup"
+     ],
+     "resources": [
+      "objectstores/status"
+     ],
+     "verbs": [
+      "update"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resourceNames": [
+      "portcullis-pg-app"
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "watch",
+      "list"
+     ]
+    }
+   ]
+  },
+  "policy": "portcullis-barman-rbac",
+  "update": true
+ },
+ {
+  "allowed": false,
   "also_refused_by": "is attempting to grant RBAC permissions not currently held",
   "as": {
    "groups": [],

@@ -338,6 +338,10 @@ def vectors():
     obj("barman: a Role of another name", role, lambda o: o["metadata"].update(name="other"))
     obj("barman: a RoleBinding of another name", rb, lambda o: o["metadata"].update(name="other"))
     obj("barman: a Role rule without resourceNames", role, lambda o: o["rules"][2].pop("resourceNames"))
+    # Review NN8: the names pinned (BuildRoleRules' ObjectStore / Secret).
+    obj("barman: a Role reading another ObjectStore", role, lambda o: o["rules"][0].update(resourceNames=["portcullis-backup", "other"]))
+    obj("barman: a Role updating another ObjectStore's status", role, lambda o: o["rules"][1].update(resourceNames=["other"]))
+    obj("barman: a Role reading another Secret", role, lambda o: o["rules"][2].update(resourceNames=["portcullis-pg-app"]))
     esc = "is attempting to grant RBAC permissions not currently held"
     obj("barman: a Role reading pods", role, lambda o: o["rules"].append({"apiGroups": [""], "resources": ["pods"], "resourceNames": ["x"], "verbs": ["get"]}), also=esc)
     obj("barman: a Role writing secrets", role, lambda o: o["rules"][2].update(verbs=["get", "update"]), also=esc)

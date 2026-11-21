@@ -1785,13 +1785,14 @@ def check_backup_egress():
     # Review I3: rotating addresses → any public address on 443, the private
     # and cluster ranges excepted; another port refused.
     pub = copy.deepcopy(vals)
-    exc = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8", "0.0.0.0/8", "10.42.0.0/24", "10.43.0.0/16", "10.215.0.0/24", "198.51.100.1/32"]
+    priv = re.search(r'^BACKUP_DEST_PRIVATE_CIDRS="([^"]*)"', (K.ROOT / "scripts/lib/ha.sh").read_text(), re.M).group(1).split()
+    exc = priv + ["10.42.0.0/24", "10.43.0.0/16", "10.215.0.0/24", "198.51.100.1/32"]
     pub["backup"]["cnpg"].update({"publicEgress": True, "endpointCIDRs": [], "publicExcept": exc})
     pp = [d for d in K.by_kind(K.render(pub, "templates/postgres-cnpg.yaml"), "NetworkPolicy") if d["metadata"]["name"] == "portcullis-pg-backup"]
     if not pp or pp[0]["spec"]["egress"] != [{"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": exc}}], "ports": [{"protocol": "TCP", "port": 443}]}] \
             or pp[0]["spec"]["podSelector"] != {"matchLabels": {"cnpg.io/cluster": "portcullis-pg", "cnpg.io/podRole": "instance"}}:
         F.add(f"backup egress (public): {pp and pp[0]['spec']}")
-    for mut in ({"port": 8443}, {"publicExcept": exc[1:]}):
+    for mut in ({"port": 8443}, {"publicExcept": exc[1:]}, {"publicExcept": [c for c in exc if c != "198.18.0.0/15"]}):
         bad = copy.deepcopy(pub); bad["backup"]["cnpg"].update(mut)
         try:
             K.render(bad, "templates/postgres-cnpg.yaml"); F.add(f"backup egress (public): {mut} renders (want refused)")

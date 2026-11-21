@@ -767,7 +767,7 @@ kube_vpn_reserved() {
 # kube_status_extra — status --json's kubernetes fields: netpol (the CLI's
 # probe ConfigMap), admission (the ten bindings), dns_shadows (an app
 # Service named like a core one), kube_api_public (K8).
-# kube_crashing_json — the Deployments of both namespaces whose live pods
+# kube_crashing_json — the Deployments of the core, apps and cnpg-system (CloudNativePG + its barman-cloud plugin: review NM1) namespaces whose live pods
 # crash: a container waiting in CrashLoopBackOff / Error / an image pull
 # backoff, or one that restarted in the last 10 minutes and isn't ready
 # again (a pod that settled after start-up restarts is fine). JSON
@@ -777,7 +777,7 @@ kube_vpn_reserved() {
 kube_crashing_json() {
   local ns pods all='[]' now
   now="$(date +%s)"
-  for ns in "$(kube_ns)" "$(kube_apps_ns)"; do
+  for ns in "$(kube_ns)" "$(kube_apps_ns)" "$KUBE_CNPG_NS"; do
     pods="$(kube_ctl -n "$ns" get pods -o json 2>/dev/null)" \
       && printf '%s' "$pods" | jq -e '.items | type == "array"' >/dev/null 2>&1 || { echo null; return 0; }
     all="$(NS="$ns" CORE="$(kube_ns)" NOW="$now" jq -c --argjson acc "$all" '

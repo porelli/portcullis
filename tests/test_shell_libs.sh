@@ -5682,7 +5682,7 @@ CRASH_APPS='{"items":[
  {"metadata":{"name":"fa--x-6b7c8d9e0-zzzzz","labels":{"pod-template-hash":"6b7c8d9e0"},"ownerReferences":[{"kind":"ReplicaSet","name":"fa--x-6b7c8d9e0"}]},
   "status":{"containerStatuses":[{"restartCount":3,"ready":true,"state":{"running":{}},"lastState":{"terminated":{"finishedAt":"'"$REC"'"}}}]}}]}'
 printf '%s' "$CRASH_CORE" > "$WORK/crash-core.json"; printf '%s' "$CRASH_APPS" > "$WORK/crash-apps.json"
-cj() { kt "kube_ctl() { case \"\$*\" in *'-n portcullis get pods -o json'*) ${1:-cat '$WORK/crash-core.json'} ;; *'-n portcullis-apps get pods -o json'*) cat '$WORK/crash-apps.json' ;; esac; }; kube_crashing_json"; }
+cj() { kt "kube_ctl() { case \"\$*\" in *'-n cnpg-system get pods -o json'*) echo '{\"items\":[]}' ;; *'-n portcullis get pods -o json'*) ${1:-cat '$WORK/crash-core.json'} ;; *'-n portcullis-apps get pods -o json'*) cat '$WORK/crash-apps.json' ;; esac; }; kube_crashing_json"; }
 expect_eq "kube_crashing_json: the crash-looping Hub and an app restarted 2 min ago and not ready; not one ready again, an old restart, a Job's pod or a terminating pod" \
   "$(cj | head -n1 | jq -c '[.[] | [.namespace, .deployment, .reason]]')" \
   '[["portcullis","hub","CrashLoopBackOff"],["portcullis-apps","echo-k--web","restarted"]]'
@@ -5693,7 +5693,7 @@ printf '%s' '{"items":[{"metadata":{"name":"sessions-1","ownerReferences":[{"kin
 printf '%s' '{"items":[{"metadata":{"name":"echo-k--web-0","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
   "status":{"containerStatuses":[{"restartCount":1,"ready":false,"lastState":{"terminated":{"exitCode":1,"message":"portcullis-sessions: spoofed by an app","finishedAt":"'"$REC"'"}},"state":{"running":{}}}]}}]}' > "$WORK/crash-spoof.json"
 expect_eq "kube_crashing_json: an apps-namespace pod writing the session store's prefix → its message is never the reason (security review)" \
-  "$(kt "kube_ctl() { case \"\$*\" in *'-n portcullis get pods -o json'*) echo '{\"items\":[]}' ;; *'-n portcullis-apps get pods -o json'*) cat '$WORK/crash-spoof.json' ;; esac; }; kube_crashing_json" | head -n1 | jq -c '[.[] | .reason]')" '["restarted"]'
+  "$(kt "kube_ctl() { case \"\$*\" in *'-n cnpg-system get pods -o json'*) echo '{\"items\":[]}' ;; *'-n portcullis get pods -o json'*) echo '{\"items\":[]}' ;; *'-n portcullis-apps get pods -o json'*) cat '$WORK/crash-spoof.json' ;; esac; }; kube_crashing_json" | head -n1 | jq -c '[.[] | .reason]')" '["restarted"]'
 printf '%s' '{"items":[{"metadata":{"name":"sessions-1","ownerReferences":[{"kind":"StatefulSet","name":"sessions"}]},
   "status":{"initContainerStatuses":[{"restartCount":2,"lastState":{"terminated":{"exitCode":1,"message":"portcullis-sessions: line one\u001b[31m\u009b2J\nline two '"$(printf 'x%.0s' $(seq 1 300))"'"}},"state":{"waiting":{"reason":"PodInitializing"}}}]}}]}' > "$WORK/crash-long.json"
 expect_eq "kube_crashing_json: the named error stripped of C0, DEL and C1 control characters (CSI U+009B) and capped at 200 characters" \
@@ -6679,7 +6679,7 @@ expect_eq "lldap_convert: the pods get the URL from a temporary Secret (--from-f
 rm -f "$LC/calls"; OUT="$(LC_DUMP_ERR='psql:<stdin>:7: ERROR:  invalid input syntax for type boolean: "HASHSECRET-77fe" in "users"
 DETAIL:  Failing row contains (alice, HASHSECRET-77fe, x).
 LINE 1: INSERT INTO "users" VALUES (HASHSECRET-77fe)' LC_SRC="$SUMS" LC_DST="$SUMS" lconv)"
-case "$OUT" in *"Postgres: invalid input syntax for type boolean: \"…\" in \"users\""*"Postgres refused the dump"*"rc=1") t_pass "lldap_convert: a refused dump prints only its ERROR line, values cut (no DETAIL / LINE)" ;; *) t_fail "lldap_convert pg error: $OUT" ;; esac
+case "$OUT" in *"Postgres: invalid input syntax for type boolean: \"…\" in \"…\""*"Postgres refused the dump"*"rc=1") t_pass "lldap_convert: a refused dump prints only its ERROR line, values cut (no DETAIL / LINE)" ;; *) t_fail "lldap_convert pg error: $OUT" ;; esac
 expect_eq "lldap_convert: no row content of a refused dump in the output" "$(printf '%s' "$OUT" | grep -c 'HASHSECRET\|DETAIL\|LINE 1' || true)" 0
 # Review M3 + M2 on the real Python: a users.db without a private-key hash
 # is refused; the full-row digests normalise per target type (a timestamp
@@ -6712,6 +6712,12 @@ fi
 OUT="$(kt "kube_lldap_convert_backup() { KUBE_LLDAP_CONVERTED=true; }; _kube_pg_exec() { echo \"PG \$*\" >> '$LC/m8'; }
   rm -f '$LC/m8'; mkdir -p '$LC/b'; printf x > '$LC/b/lldap_data.tar.gz'; kube_lldap_convert_preflight '$LC/b'; fail 'a later step failed'")"
 expect_eq "kube restore: a failure after the conversion drops lldap_restore (EXIT trap)" "$(grep -c '^PG dropdb --if-exists --force lldap_restore$' "$LC/m8"):$(printf '%s' "$OUT" | tail -n1)" "1:rc=1"
+# Review NN3: chained after the caller's own EXIT trap; a parent's (not live in a subshell) never runs.
+OUT="$(kt "kube_lldap_convert_backup() { KUBE_LLDAP_CONVERTED=true; }; _kube_pg_exec() { echo \"PG \$*\" >> '$LC/m8'; }
+  rm -f '$LC/m8'; mkdir -p '$LC/b'; printf x > '$LC/b/lldap_data.tar.gz'; trap 'echo CALLER-TRAP' EXIT; kube_lldap_convert_preflight '$LC/b'; fail 'a later step failed'")"
+expect_eq "kube restore: the drop is chained before the caller's own EXIT trap (both run)" "$(grep -c '^PG dropdb --if-exists --force lldap_restore$' "$LC/m8"):$(printf '%s\n' "$OUT" | grep -c '^CALLER-TRAP$'):$(printf '%s' "$OUT" | tail -n1)" "1:1:rc=1"
+OUT="$(trap 'echo PARENT-TRAP-RAN' EXIT; kt "kube_lldap_convert_backup() { :; }; mkdir -p '$LC/b'; printf x > '$LC/b/lldap_data.tar.gz'; _kube_pg_exec() { :; }; kube_lldap_convert_preflight '$LC/b'; trap -p EXIT")"
+expect_eq "kube restore: a parent shell's EXIT trap (not live in the subshell) is never chained" "$(printf '%s\n' "$OUT" | grep -c 'PARENT-TRAP-RAN')" 1
 # The queued early check: the backup's seed against its users.db, before anything changes.
 OUT="$(kt "_kube_pg_wait() { :; }; _kube_pg_fresh_db() { :; }; LLDAP_PG_PASSWORD=x
   lldap_convert_sqlite_to_pg() { :; }; _lldap_convert_pod() { echo \"POD \$2 \$3\" >> '$LC/sc'; [ \"\$2\" != seedcheck ]; }
@@ -6828,7 +6834,7 @@ case "$OUT" in *"node m1: /var/lib/longhorn is on a ZFS dataset"*"rc=1") t_pass 
 OUT="$(h24 ha_install_longhorn)"
 expect_eq "ha_install_longhorn: namespace (PSA longhorn) → deny policies → node checks → render (API + initiator sources) → apply → waits → StorageClass" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*apply --server-side.* -f -$/\1 apply/; s/^(NS) .*/\1/; s/^(PROBE [a-z-]+).*/\1/; s/^FILES .*\/(.*)$/FILES \1/' "$WORK/h24-calls" | grep -v 'get nodes' | uniq | tr '\n' ';')" \
-  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;K get namespace longhorn-system -o name;K -n longhorn-system delete networkpolicy backup-destination backup-destination-manager backup-destination-instance-manager --ignore-not-found;K apply;"
+  "rc=0:NS;K apply;PROBESETUP;PROBE portcullis-ha-probe;K get ValidatingWebhookConfiguration longhorn-webhook-validator -o name;K get MutatingWebhookConfiguration longhorn-webhook-mutator -o name;RENDER longhorn 10.1.0.4 10.42.0.0 10.42.0.1 10.215.0.1 10.42.0.0 10.42.0.1 10.215.0.2 10.42.1.0 10.42.1.1 10.215.0.3 10.42.2.0 10.42.2.1 10.215.0.4 10.42.3.0 10.42.3.1;K apply;WAIT Longhorn's manager (DaemonSet longhorn-manager);WAIT Longhorn's CSI driver;FILES storageclass-replicated.yaml;K get namespace longhorn-system -o name;K -n longhorn-system delete networkpolicy backup-destination --ignore-not-found;K -n longhorn-system delete networkpolicy backup-destination-manager backup-destination-instance-manager --ignore-not-found;K apply;"
 expect_eq "ha_install_longhorn: then its backup target (Task 26; no destination here → an empty target, no egress policy)" \
   "$(grep -v '^---$' "$WORK/h24-applied" 2>/dev/null | jq -c 'select(.kind? == "BackupTarget") | .spec' 2>/dev/null | tail -n1)" '{"backupTargetURL":"","credentialSecret":"","pollInterval":"5m0s"}'
 expect_eq "ha_install_longhorn: the namespace is longhorn-system with namespaces.json's longhorn levels; applied.json records ha.longhorn" \
@@ -7063,9 +7069,33 @@ case "$*" in *"-X PUT"*) printf '%s' "${STUB_CURL_PUT:-200}" ;; *"-X DELETE"*) p
 CSTUB
 chmod +x "$BD/bin/curl"
 BD_KEY="AKIATESTKEY0000SECRET1" BD_SEC="wJalrXUtnFEMI/K7MDENG/bPxRfiCYsecretKEY99"
+# The in-cluster DNS probe's double (review NM4; the pod's Python has its
+# own test below): the lookups from the getent stub, as the probe stops
+# (an empty answer or a changed set), BD_TTL / BD_LONG as its TTL / verdict.
+cat > "$BD/probe-double.sh" <<'PDOUBLE'
+_backup_dest_dns_probe() {
+  local i g first="" out="" n=0
+  for ((i = 1; i <= ${BACKUP_DEST_RESOLVE_TRIES:-5}; i++)); do
+    g="$(getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | LC_ALL=C sort -u | jq -Rsc 'split("\n") | map(select(. != ""))')"
+    out="$out${out:+,}{\"ips\":$g,\"ttl\":${BD_TTL:-1}}"; n=$((n + 1))
+    [ "$g" != "[]" ] || break
+    [ -n "$first" ] || first="$g"
+    [ "$g" = "$first" ] || break
+    [ "${BD_LONG:-false}" = false ] || break
+  done
+  echo "{\"lookups\":[$out],\"long\":${BD_LONG:-false}}"
+}
+# hub vpn host-info: BD_HOSTINFO (exported; "fail" = the Hub not answering).
+_vpn_host_info() {
+  [ "${BD_HOSTINFO:-}" != fail ] || return 1
+  local d='{"local_networks":["10.0.0.0/8"],"provider_ranges":[]}'
+  printf '%s' "${BD_HOSTINFO:-$d}"
+}
+PDOUBLE
 bdk() { rm -f "$BD/curl-argv" "$BD/curl-stdin"; k_fixtures; : > "$KS/kube/ns-cnpg-system.json"
   kt "export PORTCULLIS_ROOT=\"\${BD_ROOT:-$BD/root}\" BD_DIR='$BD' PATH='$BD/bin':\$PATH PORTCULLIS_KUBE_NODE_ADDRESSES=\${BD_NODES-198.51.100.1} BACKUP_DEST_RESOLVE_WAIT=0
-    getent() { echo '203.0.113.50 STREAM s3.example.org'; }; env_load 2>/dev/null || true; $1"; }
+    getent() { echo '203.0.113.50 STREAM s3.example.org'; }
+    . '$BD/probe-double.sh'; env_load 2>/dev/null || true; $1"; }
 OUT="$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_DEFAULT_REGION=eu-west-1\n' "$BD_KEY" "$BD_SEC" \
   | bdk "backup_dest_set https://s3.example.org/pc-bucket/site-a")"
 case "$OUT" in *"wrote and deleted a test object"*"Backup destination set: https://s3.example.org/pc-bucket/site-a"*"rc=0") t_pass "backup destination set: tested, then stored, synced" ;; *) t_fail "backup destination set: $OUT" ;; esac
@@ -7124,17 +7154,20 @@ OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCU
 case "$OUT" in *"isn't a uuid"*"rc=1") t_pass "kube_backup_values: no install id → refused (never a shared archive path)" ;; *) t_fail "serverName no id: $OUT" ;; esac
 # Review I3: rotating addresses → any public address on 443; stable → pinned.
 ROT="getent() { n=\$(cat '$BD/rot' 2>/dev/null || echo 0); echo \$((n + 1)) > '$BD/rot'; echo \"52.0.0.\$((n % 3 + 1)) STREAM\"; }"
-rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=; $ROT; backup_dest_egress_resolve")"
+# The opt-in is .env's (review NM3): BD_ALLOW writes it there.
+BD_ALLOW="env_set PORTCULLIS_BACKUP_ALLOW_ROTATING true; export PORTCULLIS_BACKUP_ALLOW_ROTATING=true"
+bd_allow_off() { grep -v '^PORTCULLIS_BACKUP_ALLOW_ROTATING=' "$BD/root/.env" > "$BD/env.tmp" || true; cat "$BD/env.tmp" > "$BD/root/.env"; }
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket; $ROT; backup_dest_egress_resolve")"
 case "$OUT" in *"addresses rotate"*"Refused; to allow TCP 443 to any public address from the backup pods, set it again with --allow-rotating-addresses"*"rc=1") t_pass "backup egress: a rotating name without the opt-in → refused naming --allow-rotating-addresses (never automatic)" ;; *) t_fail "rotating no opt-in: $OUT" ;; esac
-rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; $ROT; backup_dest_egress_resolve; echo \"MODE=\$_BD_EGRESS_MODE\"; printf '%s\n' \"\$_BD_EGRESS_EXCEPT\"")"
-expect_eq "backup egress: a rotating name → public, 5 lookups" "$(printf '%s\n' "$OUT" | grep -c '^MODE=public$'):$(cat "$BD/rot")" "1:5"
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket; $BD_ALLOW; $ROT; backup_dest_egress_resolve; echo \"MODE=\$_BD_EGRESS_MODE\"; printf '%s\n' \"\$_BD_EGRESS_EXCEPT\"")"; bd_allow_off
+expect_eq "backup egress: a rotating name → public (the probe stops at the first change)" "$(printf '%s\n' "$OUT" | grep -c '^MODE=public$'):$(cat "$BD/rot")" "1:2"
 expect_eq "backup egress (public): RFC 1918, CGNAT, link-local, loopback, the pod / service / mesh CIDRs, the nodes and API endpoints excepted" \
   "$(for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8 10.42.0.0/24 10.43.0.0/16 10.215.0.0/24 198.51.100.1/32 10.1.0.4/32; do printf '%s\n' "$OUT" | grep -qx "$c" || echo "missing $c"; done)" ""
-rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org:9000/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; $ROT; backup_dest_egress_resolve")"
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org:9000/pc-bucket; $BD_ALLOW; $ROT; backup_dest_egress_resolve")"; bd_allow_off
 case "$OUT" in *"addresses rotate"*"its port is 9000 (refused)"*"rc=1") t_pass "backup egress: rotating addresses on a port other than 443 → refused" ;; *) t_fail "rotating 9000: $OUT" ;; esac
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; backup_dest_egress_resolve; echo \"MODE=\$_BD_EGRESS_MODE \$_BD_EGRESS_CIDRS\"")"
 expect_eq "backup egress: a stable name → pinned /32s" "$(printf '%s\n' "$OUT" | grep '^MODE=')" "MODE=pinned 203.0.113.50/32"
-OUT="$(rm -f "$BD/rot"; bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; $ROT; _ha_backup_egress longhorn-system backup-destination-manager '{\"matchLabels\":{\"app\":\"longhorn-manager\"}}'")"
+OUT="$(rm -f "$BD/rot"; bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket; $BD_ALLOW; $ROT; _ha_backup_egress longhorn-system backup-destination-manager '{\"matchLabels\":{\"app\":\"longhorn-manager\"}}'")"; bd_allow_off
 expect_eq "_ha_backup_egress (public): the exact pods, 0.0.0.0/0 minus the private ranges, 443" \
   "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(.kind? == "NetworkPolicy") | [.spec.podSelector, .spec.egress[0].to[0].ipBlock.cidr, (.spec.egress[0].to[0].ipBlock.except | index("10.0.0.0/8") != null), .spec.egress[0].ports]')" \
   '[{"matchLabels":{"app":"longhorn-manager"}},"0.0.0.0/0",true,[{"protocol":"TCP","port":443}]]'
@@ -7157,26 +7190,142 @@ rm -rf "$MV/src"; mkdir -p "$MV/src2/backups/evil"; printf x > "$MV/src2/backups
 tar -czf "$MV/b/hub_data2.tar.gz" -C "$MV/src2" ./backups && cat "$MV/b/hub_data2.tar.gz" >> "$MV/b/hub_data.tar.gz"
 OUT="$(kt "_kube_restore_volume() { :; }; _kube_volume_exists() { :; }; _kube_empty_volume() { :; }; _kube_helper_done() { :; }
   _kube_helper_pod() { case \"\$1\" in hub-state*) echo src-pod ;; *) echo dst-pod ;; esac; }
-  kube_ctl() { echo \"K \$*\" >> '$MV/calls'; case \"\$*\" in *'tar -cf -'*) printf TARSTREAM ;; *'tar -xf -'*) cat > '$MV/streamed' ;; esac; return 0; }
+  kube_ctl() { echo \"K \$*\" >> '$MV/calls'; case \"\$*\" in *'tar -cf -'*) printf TARSTREAM ;; *'tar -xf -'*) cat > '$MV/streamed' ;;
+    *'du -sk'*) echo \"\${MV_DU:-100} /vol/backups\" ;; *'get pvc'*) printf 1Gi ;; esac; return 0; }
   cd '$MV' && _kube_restore_volume_t26 '$MV/b' hub_data 10001 10001")"
 expect_eq "instance-backup move: pod to pod (hub-state's tar → hub-backups' tar), nothing unpacked on the host, a symlink member can't reach a host path" \
-  "$(printf '%s' "$OUT" | tail -n1):$(grep -c 'exec src-pod -- tar -cf - -C /vol/backups .' "$MV/calls"):$(grep -c 'exec -i dst-pod -- tar -xf - -C /vol' "$MV/calls"):$(cat "$MV/streamed"):$(test -e "$MV/outside/pwn" && echo PWNED || echo clean):$(declare -f _kube_restore_volume_t26 | grep -c 'tar -x[a-z]*f "\$dir' || true)" \
+  "$(printf '%s' "$OUT" | tail -n1):$(grep -c 'exec src-pod -- tar -cf - -C /vol/backups .' "$MV/calls"):$(grep -c 'exec -i dst-pod -- sh -c m="$(stat -c %a /vol)" && tar -xf - -C /vol && chmod "$m" /vol' "$MV/calls"):$(cat "$MV/streamed"):$(test -e "$MV/outside/pwn" && echo PWNED || echo clean):$(declare -f _kube_restore_volume_t26 | grep -c 'tar -x[a-z]*f "\$dir' || true)" \
   "rc=0:1:1:TARSTREAM:clean:0"
 # The first base backup after the release (found in e2e-k3s: not immediate).
 kbar() { kt "KBAR_VF=\$(mktemp); echo '{\"backup\":{\"cnpg\":{\"enabled\":$1}}}' > \$KBAR_VF; kube_values_file() { echo \$KBAR_VF; }; KUBE_PG_ARCHIVE_WAIT=5
   kube_ctl() { echo \"K \$*\" >> '$BD/kbar'; case \"\$*\" in *'get cluster.postgresql.cnpg.io'*) echo '{\"spec\":{\"instances\":1},\"status\":{\"readyInstances\":1,\"conditions\":[{\"type\":\"ContinuousArchiving\",\"status\":\"$2\"}]}}' ;;
     *'get backups'*) echo '{\"items\":$3}' ;; 'create -f '*) jq -c . \"\${@: -1}\" >> '$BD/kbar' ;; esac; }; kube_backup_after_release"; }
-rm -f "$BD/kbar"; OUT="$(kbar true True '[{"spec":{"method":"plugin"},"status":{"phase":"failed"}}]')"
+rm -f "$BD/kbar"; OUT="$(kbar true True '[{"spec":{"method":"plugin","cluster":{"name":"portcullis-pg"}},"status":{"phase":"failed"}}]')"
 expect_eq "kube_backup_after_release: archiving and no completed / running plugin Backup → one Backup (method plugin) made" \
   "$(grep -c '^{"apiVersion":"postgresql.cnpg.io/v1","kind":"Backup".*"spec":{"method":"plugin","pluginConfiguration":{"name":"barman-cloud.cloudnative-pg.io"},"cluster":{"name":"portcullis-pg"}}}$' "$BD/kbar"):$(printf '%s' "$OUT" | tail -n1)" "1:rc=0"
-rm -f "$BD/kbar"; OUT="$(kbar true True '[{"spec":{"method":"plugin"},"status":{"phase":"completed"}}]')"
+rm -f "$BD/kbar"; OUT="$(kbar true True '[{"spec":{"method":"plugin","cluster":{"name":"portcullis-pg"}},"status":{"phase":"completed"}}]')"
 expect_eq "kube_backup_after_release: a completed plugin Backup → none made" "$(grep -c '"kind":"Backup"' "$BD/kbar" || true)" 0
 rm -f "$BD/kbar"; OUT="$(kbar true False '[]')"
-case "$OUT" in *"isn't archiving to the backup destination yet"*"rc=0") t_pass "kube_backup_after_release: not archiving → a warning, no Backup, up goes on" ;; *) t_fail "after release not archiving: $OUT" ;; esac
+case "$OUT" in *"ContinuousArchiving is False"*"rc=0") t_pass "kube_backup_after_release: not archiving → a warning, no Backup, up goes on" ;; *) t_fail "after release not archiving: $OUT" ;; esac
 rm -f "$BD/kbar"; OUT="$(kbar false True '[]')"
 expect_eq "kube_backup_after_release: no archive → nothing asked" "$(test -e "$BD/kbar" && echo asked || echo none)" none
 expect_eq "rt_up: the first base backup after the release (and Vault's voters)" \
   "$(declare -f _rtk_up | awk '/kube_helm upgrade/ {h=NR} /kube_backup_after_release/ {b=NR} END {print (h && b > h) ? "after" : "no"}')" after
+# Review NM5: only this Cluster's Backups count; finalizing / walArchivingFailing are in progress.
+kbar2() { kt "KBAR_VF=\$(mktemp); echo '{\"backup\":{\"cnpg\":{\"enabled\":true,\"serverName\":\"portcullis-pg-0b0e2b3c\"}}}' > \$KBAR_VF; kube_values_file() { echo \$KBAR_VF; }
+  KUBE_PG_ARCHIVE_WAIT=\${KBAR_WAIT:-5} KUBE_PG_ARCHIVE_FALSE_WAIT=10; sleep() { :; }
+  kube_ctl() { echo \"K \$*\" >> '$BD/kbar'; case \"\$*\" in *'get cluster.postgresql.cnpg.io'*) printf '%s' '$1' ;;
+    *'get backups'*) echo '{\"items\":$2}' ;; 'create -f '*) jq -c . \"\${@: -1}\" >> '$BD/kbar' ;; esac; }; kube_backup_after_release"; }
+KB_CL='{"metadata":{"uid":"u-1","creationTimestamp":"2026-11-20T10:00:00Z"},"spec":{"instances":1},"status":{"readyInstances":1,"conditions":[{"type":"ContinuousArchiving","status":"True"}]}}'
+kb_made() { grep -c '"kind":"Backup"' "$BD/kbar" || true; }
+KB_B() { local o=""; [ -z "${4:-}" ] || o=',"ownerReferences":[{"kind":"Cluster","uid":"'"$4"'"}]'
+  printf '{"metadata":{"creationTimestamp":"%s"%s},"spec":{"method":"plugin","cluster":{"name":"portcullis-pg"}},"status":{"phase":"%s","serverName":"%s"}}' "$1" "$o" "$2" "$3"; }
+for ph in finalizing walArchivingFailing running; do
+  rm -f "$BD/kbar"; kbar2 "$KB_CL" "[$(KB_B 2026-11-20T11:00:00Z "$ph" portcullis-pg-0b0e2b3c)]" >/dev/null
+  expect_eq "kube_backup_after_release: a $ph Backup of this archive → none made (in progress)" "$(kb_made)" 0
+done
+rm -f "$BD/kbar"; kbar2 "$KB_CL" "[$(KB_B 2026-11-20T11:00:00Z completed portcullis-pg-deadbeef)]" >/dev/null
+expect_eq "kube_backup_after_release: a completed Backup of another serverName → the first base backup still made" "$(kb_made)" 1
+rm -f "$BD/kbar"; kbar2 "$KB_CL" "[$(KB_B 2026-11-19T11:00:00Z completed portcullis-pg-0b0e2b3c)]" >/dev/null
+expect_eq "kube_backup_after_release: a completed Backup older than the Cluster (an earlier incarnation) → made" "$(kb_made)" 1
+rm -f "$BD/kbar"; kbar2 "$KB_CL" "[$(KB_B 2026-11-20T11:00:00Z completed portcullis-pg-0b0e2b3c u-0)]" >/dev/null
+expect_eq "kube_backup_after_release: a completed Backup owned by another Cluster uid → made" "$(kb_made)" 1
+rm -f "$BD/kbar"; kbar2 "$KB_CL" "[$(KB_B 2026-11-20T11:00:00Z completed portcullis-pg-0b0e2b3c u-1)]" >/dev/null
+expect_eq "kube_backup_after_release: a completed Backup of this Cluster and archive → none made" "$(kb_made)" 0
+rm -f "$BD/kbar"; OUT="$(KBAR_WAIT=300 kbar2 '{"spec":{"instances":1},"status":{"readyInstances":1,"conditions":[{"type":"ContinuousArchiving","status":"False","message":"unexpected failure invoking barman-cloud-wal-archive"}]}}' '[]')"
+expect_eq "kube_backup_after_release: ContinuousArchiving already False → the wait ends early (not 300 s) with its message, no Backup" \
+  "$(grep -c 'get cluster.postgresql.cnpg.io' "$BD/kbar"):$(printf '%s\n' "$OUT" | grep -c "ContinuousArchiving is False (unexpected failure invoking barman-cloud-wal-archive)"):$(kb_made):$(printf '%s' "$OUT" | tail -n1)" "2:1:0:rc=0"
+# Review NM5 / NM1: status — no base backup yet is a warning naming the next one; the plugin down while the Cluster names it is a problem.
+OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"pinned","cnpg":{"plugin":true,"plugin_ready":true,"archiving":true,"last_backup":"Unknown","next_base":"2026-11-22T03:15:00Z","message":""},"longhorn":null}'; echo "rc=$?" ) )"
+expect_eq "status: WAL archived, no base backup yet → a warning naming when it's taken (not ok, not a problem)" \
+  "$(printf '%s\n' "$OUT" | grep -c '^warn backup destination: Postgres archives WAL but has no base backup yet .*runs at 2026-11-22T03:15:00Z'):$(printf '%s\n' "$OUT" | grep -c '^ok '):$(printf '%s' "$OUT" | tail -n1)" "1:0:rc=0"
+OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"pinned","cnpg":{"plugin":true,"plugin_ready":false,"archiving":true,"last_backup":"True","message":""},"longhorn":null}'; echo "rc=$?" ) )"
+expect_eq "status: the Cluster archives through a plugin that isn't available → a problem of its own" \
+  "$(printf '%s\n' "$OUT" | grep -c "^fail backup destination: the Postgres Cluster archives through the barman-cloud plugin, which isn't available"):$(printf '%s' "$OUT" | tail -n1)" "1:rc=1"
+KBS="$BD/kbs.json"; echo '{"backup":{"cnpg":{"enabled":true}}}' > "$KBS"
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; kube_values_file() { echo '$KBS'; }; _kube_barman_ready() { return 1; }
+  kube_ctl() { case \"\$*\" in *'get cluster.postgresql.cnpg.io'*) echo '{\"spec\":{\"plugins\":[{\"name\":\"barman-cloud.cloudnative-pg.io\"}]},\"status\":{\"conditions\":[{\"type\":\"ContinuousArchiving\",\"status\":\"True\"},{\"type\":\"LastBackupSucceeded\",\"status\":\"True\"}]}}' ;; *) return 1 ;; esac; }
+  kube_backup_status_json")"
+expect_eq "status json: the plugin down → the Cluster is still read (plugin named, not ready)" \
+  "$(printf '%s\n' "$OUT" | head -n1 | jq -c '[.cnpg.plugin, .cnpg.plugin_ready, .cnpg.archiving, .cnpg.last_backup]')" '[true,false,true,"True"]'
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; kube_values_file() { echo '$KBS'; }; _kube_barman_ready() { return 1; }; kube_ctl() { return 1; }; kube_backup_status_json")"
+expect_eq "status json: the plugin down and the Cluster unreadable while the release archives → unreadable (a problem)" "$(printf '%s\n' "$OUT" | head -n1 | jq -c .cnpg)" '{"unreadable":true}'
+# Review NM3: the opt-in is .env's only.
+rm -f "$BD/rot"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.us-east-1.amazonaws.com/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; $ROT; backup_dest_egress_resolve")"
+case "$OUT" in *"PORTCULLIS_BACKUP_ALLOW_ROTATING in the environment (true) differs from .env (empty)"*"rc=1") t_pass "backup egress: the opt-in from the process environment alone → refused (.env only)" ;; *) t_fail "env opt-in: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCULLIS_BACKUP_ALLOW_ROTATING=true; _kube_barman_ready() { return 1; }; kube_ctl() { return 1; }; kube_backup_status_json")"
+expect_eq "status json: allow_rotating is .env's, not the environment's" "$(printf '%s\n' "$OUT" | head -n1 | jq -c .allow_rotating)" false
+expect_eq "restore keeps this host's PORTCULLIS_BACKUP_ALLOW_ROTATING (a kubernetes key)" "$(case " $(kt 'echo $RESTORE_KUBE_KEY_NAMES' | tr '\n' ' ') " in *" PORTCULLIS_BACKUP_ALLOW_ROTATING "*) echo kept ;; *) echo no ;; esac)" kept
+RK="$WORK/rkeys"; rm -rf "$RK"; mkdir -p "$RK"; printf 'CONTAINER_RUNTIME=kubernetes\nPORTCULLIS_BACKUP_ALLOW_ROTATING=true\n' > "$RK/.env"
+OUT="$(kt "export PORTCULLIS_ROOT='$RK'; RESTORE_RUNTIME=kubernetes RESTORE_KUBE_KEYS=\$'PORTCULLIS_KUBE_CONTEXT=ci\n'; _restore_runtime_keys")"
+expect_eq "restore: the backup's opt-in dropped (this host's is off), with a line naming it" \
+  "$(grep -c '^PORTCULLIS_BACKUP_ALLOW_ROTATING=true' "$RK/.env" || true):$(printf '%s\n' "$OUT" | grep -c "The backup's PORTCULLIS_BACKUP_ALLOW_ROTATING=true isn't kept")" "0:1"
+printf 'CONTAINER_RUNTIME=kubernetes\n' > "$RK/.env"
+OUT="$(kt "export PORTCULLIS_ROOT='$RK'; RESTORE_RUNTIME=kubernetes RESTORE_KUBE_KEYS=\$'PORTCULLIS_BACKUP_ALLOW_ROTATING=true\n'; _restore_runtime_keys")"
+expect_eq "restore: this host's opt-in kept, with a line naming it" \
+  "$(grep -c '^PORTCULLIS_BACKUP_ALLOW_ROTATING=true$' "$RK/.env"):$(printf '%s\n' "$OUT" | grep -c "Kept this host's PORTCULLIS_BACKUP_ALLOW_ROTATING=true")" "1:1"
+# Review NM4: the TTL too long for the probe window → can't tell (the opt-in, an IP or a short TTL needed).
+OUT="$(BD_LONG=true BD_TTL=300 bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; backup_dest_egress_resolve")"
+case "$OUT" in *"TTL of 300s, too long to tell"*"can't tell; addresses may rotate"*"--allow-rotating-addresses"*"rc=1") t_pass "backup egress: a TTL longer than the probe window → can't tell, refused without the opt-in" ;; *) t_fail "long ttl: $OUT" ;; esac
+OUT="$(BD_LONG=true BD_TTL=300 bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; $BD_ALLOW; backup_dest_egress_resolve; echo MODE=\$_BD_EGRESS_MODE")"; bd_allow_off
+expect_eq "backup egress: a TTL longer than the window with the opt-in → public" "$(printf '%s\n' "$OUT" | grep '^MODE=')" "MODE=public"
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; _backup_dest_dns_probe() { echo PROBED; }; backup_dest_egress_resolve; echo MODE=\$_BD_EGRESS_MODE")"
+expect_eq "backup egress: an IPv4 literal → pinned, no DNS probe" "$(printf '%s\n' "$OUT" | grep -c PROBED):$(printf '%s\n' "$OUT" | grep '^MODE=')" "0:MODE=pinned"
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; _backup_dest_dns_probe() { return 1; }; backup_dest_egress_resolve")"
+case "$OUT" in *"couldn't be looked up from inside the cluster (CoreDNS)"*"rc=1") t_pass "backup egress: the in-cluster probe failing → refused" ;; *) t_fail "probe fails: $OUT" ;; esac
+OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; _kube_image_of() { echo gg@sha256:x; }; _kube_helper_pod() { echo \"POD \$*\" >> '$BD/probe'; echo dns-pod; }; _kube_helper_done() { echo \"DONE \$1\" >> '$BD/probe'; }
+  kube_ctl() { echo \"K \${*:1:10} | \${*: -4}\" >> '$BD/probe'; [ \"\${11}\" != \"\$_BD_DNS_PROBE_PY\" ] || echo SRC-OK >> '$BD/probe'; echo '{\"lookups\":[{\"ips\":[\"203.0.113.50\"],\"ttl\":5}],\"long\":false}'; }; unset -f _backup_dest_dns_probe; . '$HERE/../scripts/lib/ha.sh'; _backup_dest_dns_probe s3.example.org")"; PRB="$(cat "$BD/probe" 2>/dev/null)"; rm -f "$BD/probe"
+expect_eq "the DNS probe: a restricted helper pod (nobody, no volume) of group-gate's image, the Python on exec, the pod removed" \
+  "$(printf '%s\n' "$PRB" | grep -c '^POD  65534:65534 ro gg@sha256:x backup-dns-probe$'):$(printf '%s\n' "$PRB" | grep -c '^K -n portcullis exec dns-pod -- env PYTHONDONTWRITEBYTECODE=1 python3 -I -c | s3.example.org 150 5 0$'):$(printf '%s\n' "$PRB" | grep -c '^SRC-OK$'):$(printf '%s\n' "$PRB" | grep -c '^DONE dns-pod$')" "1:1:1:1"
+# The probe's Python against a fake DNS server (UDP): stable, rotating, a long TTL.
+PRD="$WORK/dnsprobe"; rm -rf "$PRD"; mkdir -p "$PRD"; echo 'nameserver 127.0.0.1' > "$PRD/resolv"
+cat > "$PRD/fakedns.py" <<'FDNS'
+import itertools, socket, struct, sys
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.bind(("127.0.0.1", 0))
+open(sys.argv[1], "w").write(str(sock.getsockname()[1]))
+ttl = int(sys.argv[2]); sets = itertools.cycle([s.split(",") for s in sys.argv[3].split(";")])
+while True:
+    data, addr = sock.recvfrom(512)
+    i = 12
+    while data[i]:
+        i += data[i] + 1
+    ips = next(sets)
+    ans = b"".join(b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, ttl, 4) + socket.inet_aton(ip) for ip in ips)
+    sock.sendto(data[:2] + struct.pack(">HHHHH", 0x8180, 1, len(ips), 0, 0) + data[12:i + 5] + ans, addr)
+FDNS
+prb() { rm -f "$PRD/port"; python3 "$PRD/fakedns.py" "$PRD/port" "$1" "$2" & local p=$! i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$PRD/port" ] && break; sleep 0.2; done
+  (cd "$PRD" && python3 -I -c "$(kt 'printf "%s" "$_BD_DNS_PROBE_PY"' | sed '$d')" s3.example.org "$3" 3 0 "$PRD/resolv" "$(cat "$PRD/port")"); kill "$p" 2>/dev/null; wait "$p" 2>/dev/null || true; }
+expect_eq "DNS probe (Python): a stable set → every lookup the same, each past the TTL" "$(prb 0 '198.51.100.7,198.51.100.8' 30 | jq -c '[(.lookups | length), (.lookups | map(.ips) | unique), .long]')" '[3,[["198.51.100.7","198.51.100.8"]],false]'
+expect_eq "DNS probe (Python): a rotating set → stops at the first change" "$(prb 0 '198.51.100.7;198.51.100.9' 30 | jq -c '[(.lookups | length), .lookups[1].ips, .long]')" '[2,["198.51.100.9"],false]'
+expect_eq "DNS probe (Python): a TTL longer than the window → long after one lookup" "$(prb 300 '198.51.100.7' 30 | jq -c '[(.lookups | length), .lookups[0].ttl, .long]')" '[1,300,true]'
+# Review NM2: public mode excepts the VPN subnet (custom), the Hub's Local
+# networks / provider ranges, the server's public addresses and the special-purpose ranges.
+mkdir -p "$BD/root/secrets/domains"; printf 'DOMAINS_PUBLIC_IPV4=203.0.113.77\n' > "$BD/root/secrets/domains/public-ips.env"; rm -f "$BD/root/secrets/kube/backup-egress-hub-ranges"
+rm -f "$BD/rot"; OUT="$(BD_HOSTINFO='{"local_networks":["10.0.0.0/8","81.2.3.0/24","2001:db8::/32"],"provider_ranges":["45.1.0.0/16"]}' bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket PORTCULLIS_VPN_SUBNET=44.10.0.0/22 PORTCULLIS_MAIL_PUBLIC_IPV4=192.0.2.99; $BD_ALLOW; $ROT; backup_dest_egress_resolve; printf '%s\n' \"\$_BD_EGRESS_EXCEPT\"")"; bd_allow_off
+expect_eq "backup egress (public): a custom VPN subnet, the Hub's Local networks / provider ranges, the public IPv4s and every special-purpose range excepted; IPv6 skipped" \
+  "$(for c in 44.10.0.0/22 81.2.3.0/24 45.1.0.0/16 203.0.113.77/32 192.0.2.99/32 198.51.100.1/32 192.0.0.0/24 192.0.2.0/24 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 192.88.99.0/24 224.0.0.0/4 240.0.0.0/4 0.0.0.0/8; do printf '%s\n' "$OUT" | grep -qx "$c" || echo "missing $c"; done)$(printf '%s\n' "$OUT" | grep -c ':' || true):$(printf '%s' "$OUT" | tail -n1)" "0:rc=0"
+expect_eq "backup egress (public): the Hub's ranges kept for an up with the Hub at 0" "$(tr '\n' ' ' < "$BD/root/secrets/kube/backup-egress-hub-ranges")" "10.0.0.0/8 81.2.3.0/24 2001:db8::/32 45.1.0.0/16 "
+rm -f "$BD/rot"; OUT="$(BD_HOSTINFO=fail bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket; $BD_ALLOW; $ROT; backup_dest_egress_resolve; printf '%s\n' \"\$_BD_EGRESS_EXCEPT\"")"; bd_allow_off
+expect_eq "backup egress (public): the Hub not answering → its ranges as last read, said so" \
+  "$(printf '%s\n' "$OUT" | grep -cx '81.2.3.0/24'):$(printf '%s\n' "$OUT" | grep -c "the Hub didn't answer hub vpn host-info"):$(printf '%s' "$OUT" | tail -n1)" "1:1:rc=0"
+rm -f "$BD/rot" "$BD/root/secrets/kube/backup-egress-hub-ranges"; OUT="$(BD_HOSTINFO=fail bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket; $BD_ALLOW; $ROT; backup_dest_egress_resolve")"; bd_allow_off
+case "$OUT" in *"Local networks and wired-VPN provider ranges can't be read"*"(refused)"*"rc=1") t_pass "backup egress (public): the Hub's ranges never read and the Hub not answering → refused" ;; *) t_fail "no hub ranges: $OUT" ;; esac
+rm -f "$BD/rot"; OUT="$(BD_HOSTINFO='{"local_networks":["81.2.3.0/33"],"provider_ranges":[]}' bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket; $BD_ALLOW; $ROT; backup_dest_egress_resolve")"; bd_allow_off
+case "$OUT" in *"81.2.3.0/33 (the VPN subnet or a Hub Local network / provider range) isn't an IPv4 CIDR"*"rc=1") t_pass "backup egress (public): an invalid Hub range → refused" ;; *) t_fail "bad hub range: $OUT" ;; esac
+rm -f "$BD/root/secrets/domains/public-ips.env" "$BD/root/secrets/kube/backup-egress-hub-ranges"
+# Review NN7: one resolution per run (Longhorn's and CloudNativePG's policies the same).
+CNT="getent() { n=\$(cat '$BD/cnt' 2>/dev/null || echo 0); echo \$((n + 1)) > '$BD/cnt'; echo '203.0.113.50 STREAM'; }"
+rm -f "$BD/cnt"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.example.org/pc-bucket; $CNT; backup_dest_egress_resolve; f=\$(mktemp); echo '{}' > \$f; _kube_barman_ready() { return 0; }; kube_backup_values \$f; jq -c .backup.cnpg.endpointCIDRs \$f")"
+expect_eq "kube_backup_values: the run's resolution reused (one probe of 5 lookups), the same /32s" "$(cat "$BD/cnt"):$(printf '%s\n' "$OUT" | head -n1)" '5:["203.0.113.50/32"]'
+# Review NN2: the old namespace-wide policy goes before anything can refuse.
+rm -f "$BD/rot" "$BD/lh"; OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://s3.amazonaws.com/pc-bucket; $ROT
+  kube_backup_destination_sync() { echo SYNC >> '$BD/lh'; }; kube_ctl() { echo \"K \$*\" >> '$BD/lh'; return 0; }; ha_longhorn_backup_target")"
+expect_eq "ha_longhorn_backup_target: a rotating destination without the opt-in fails, the old policy already deleted first" \
+  "$(head -n2 "$BD/lh" | sed -n 2p):$(printf '%s' "$OUT" | tail -n1)" "K -n longhorn-system delete networkpolicy backup-destination --ignore-not-found:rc=1"
+# Review NM1: the CNPG namespace (operator + plugin) is judged for crashes too.
+OUT="$(kt "kube_ctl() { echo \"\$2\" >> '$BD/crash'; echo '{\"items\":[]}'; }; kube_crashing_json")"; CR="$(sort -u "$BD/crash" | tr '\n' ' ')"; rm -f "$BD/crash"
+expect_eq "kube_crashing_json: the core, apps and cnpg-system namespaces" "$CR:$(printf '%s\n' "$OUT" | head -n1)" "cnpg-system portcullis portcullis-apps :[]"
 # Security review: empty / invalid API endpoints or node addresses refuse.
 OUT="$(bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket PORTCULLIS_KUBE_API_ENDPOINTS=; backup_dest_cidrs")"
 case "$OUT" in *"PORTCULLIS_KUBE_API_ENDPOINTS unknown: the backup destination can't be checked (refused)"*"rc=1") t_pass "backup_dest_cidrs: no API endpoints → refused" ;; *) t_fail "no api: $OUT" ;; esac
@@ -7185,10 +7334,10 @@ case "$OUT" in *"the cluster address 10.1.0.999"*"isn't an IPv4 address"*"rc=1")
 OUT="$(BD_NODES='198.51.100.1 node-x' bdk "export PORTCULLIS_BACKUP_S3_URL=https://203.0.113.9/pc-bucket; backup_dest_cidrs")"
 case "$OUT" in *"the cluster address node-x"*"rc=1") t_pass "backup_dest_cidrs: a node address that isn't an IPv4 → refused" ;; *) t_fail "bad node: $OUT" ;; esac
 # Review I1 / I3: status — not archiving, Longhorn unavailable, the public-egress notice.
-OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"public","cnpg":{"archiving":false,"last_backup":true,"message":"WAL upload failed"},"longhorn":{"available":false}}'; echo "rc=$?" ) )"
+OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"public","cnpg":{"plugin":true,"plugin_ready":true,"archiving":false,"last_backup":"True","message":"WAL upload failed"},"longhorn":{"available":false}}'; echo "rc=$?" ) )"
 expect_eq "status: Postgres not archiving and Longhorn's target unavailable are problems; public egress a notice" \
   "$(printf '%s\n' "$OUT" | grep -c '^fail backup destination: Postgres isn.t archiving (WAL upload failed)'):$(printf '%s\n' "$OUT" | grep -c '^fail backup destination: Longhorn'):$(printf '%s\n' "$OUT" | grep -c '^warn backup egress: any public address on 443 (the destination.s addresses rotate)'):$(printf '%s\n' "$OUT" | tail -n1)" "1:1:1:rc=1"
-OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"pinned","cnpg":{"archiving":true,"last_backup":true,"message":""},"longhorn":{"available":true}}'; echo "rc=$?" ) )"
+OUT="$( ( _st_line() { echo "$1 $2"; }; kube_backup_status_lines '{"egress":"pinned","cnpg":{"plugin":true,"plugin_ready":true,"archiving":true,"last_backup":"True","message":""},"longhorn":{"available":true}}'; echo "rc=$?" ) )"
 expect_eq "status: archiving + an available target → ok" "$(printf '%s\n' "$OUT" | grep -c '^ok '):$(printf '%s\n' "$OUT" | tail -n1)" "2:rc=0"
 expect_eq "status runs the backup destination's check on Kubernetes" "$(grep -c 'kube_backup_status_lines' "$HERE/../scripts/lib/status.sh")" 2
 # Security ruling: the backup egress reaches exactly the endpoint, from the exact pods.

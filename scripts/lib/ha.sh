@@ -956,7 +956,7 @@ KUBE_BACKUP_EXTRA_VOLUMES="hub_backups:$CT_UID_HUB:$CT_UID_HUB"
 # copy is emptied (the directory stays: the Hub's mount point). A
 # Kubernetes backup has its own hub_backups.tar.gz.
 _kube_restore_volume_t26() {
-  local dir="$1" key="$2" src dst rc=0 ns
+  local dir="$1" key="$2" src dst rc=0 ns used cap
   _kube_restore_volume "$@" || return 1
   [ "$key" = hub_data ] && [ ! -f "$dir/hub_backups.tar.gz" ] && _kube_volume_exists hub_backups || return 0
   ns="$(kube_ns)"
@@ -964,15 +964,39 @@ _kube_restore_volume_t26() {
   if ! kube_ctl -n "$ns" exec "$src" -- sh -c '[ -d /vol/backups ] && [ ! -L /vol/backups ] && [ -n "$(ls -A /vol/backups)" ]' >/dev/null 2>&1; then
     _kube_helper_done "$src"; return 0
   fi
+  # Review NN4: they must fit hub-backups (1Gi by default) before it is
+  # emptied; refused, they stay in hub_data (nothing lost).
+  used="$(kube_ctl -n "$ns" exec "$src" -- du -sk /vol/backups 2>/dev/null | awk 'NR == 1 {print $1}')"
+  cap="$(_kube_quantity_kib "$(kube_ctl -n "$ns" get pvc "$(kube_pvc_name hub_backups)" -o jsonpath='{.status.capacity.storage}' 2>/dev/null)")"
+  if ! [[ "$used" =~ ^[0-9]+$ ]] || ! [[ "$cap" =~ ^[0-9]+$ ]] || [ $((used + used / 20 + 1024)) -gt "$cap" ]; then
+    _kube_helper_done "$src"
+    fail "the backup's instance backups (${used:-?} KiB) don't fit the hub-backups volume (${cap:-?} KiB): they stay in hub_data. Grow the PVC $(kube_pvc_name hub_backups) (kubectl -n $ns edit pvc, where its storage class allows it) and restore again"
+  fi
   info "Moving the instance backups from hub_data into hub-backups..."
   _kube_empty_volume hub_backups "$CT_UID_HUB" "$CT_UID_HUB" || { _kube_helper_done "$src"; return 1; }
   dst="$(_kube_helper_pod "$(kube_pvc_name hub_backups)" "$CT_UID_HUB:$CT_UID_HUB" rw "$PORTCULLIS_HELPER_IMAGE")" || { _kube_helper_done "$src"; return 1; }
-  kube_ctl -n "$ns" exec "$src" -- tar -cf - -C /vol/backups . | kube_ctl -n "$ns" exec -i "$dst" -- tar -xf - -C /vol || rc=1
+  # The PVC root keeps its mode (tar's "." member would set the source's).
+  kube_ctl -n "$ns" exec "$src" -- tar -cf - -C /vol/backups . \
+    | kube_ctl -n "$ns" exec -i "$dst" -- sh -c 'm="$(stat -c %a /vol)" && tar -xf - -C /vol && chmod "$m" /vol' || rc=1
   _kube_helper_done "$dst"
   # The directory stays (the Hub's hub-backups mount point), its content goes.
   [ "$rc" != 0 ] || kube_ctl -n "$ns" exec "$src" -- find /vol/backups -mindepth 1 -delete || rc=1
   _kube_helper_done "$src"
   return "$rc"
+}
+
+# _kube_quantity_kib <quantity> — a Kubernetes storage quantity (Ki Mi Gi Ti
+# Pi, k M G T P, or bytes) in KiB, rounded down; nothing for anything else.
+_kube_quantity_kib() {
+  local q="$1" n u
+  [[ "$q" =~ ^([0-9]+)(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?$ ]] || return 0
+  n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+  case "$u" in
+    "") echo $((n / 1024)) ;; Ki) echo "$n" ;; Mi) echo $((n * 1024)) ;; Gi) echo $((n * 1048576)) ;;
+    Ti) echo $((n * 1073741824)) ;; Pi) echo $((n * 1099511627776)) ;;
+    k) echo $((n * 1000 / 1024)) ;; M) echo $((n * 1000000 / 1024)) ;; G) echo $((n * 1000000000 / 1024)) ;;
+    T) echo $((n * 1000000000000 / 1024)) ;; P) echo $((n * 1000000000000000 / 1024)) ;;
+  esac
 }
 
 # kube_sync_prepare_t26 — kube_sync_secrets' first steps from Task 26: LLDAP's
@@ -1022,8 +1046,7 @@ _kube_barman_ready() { _ha_deploy_ready "$KUBE_BARMAN_NS" barman-cloud >/dev/nul
 # kube_backup_values <values file> — backup.* (see the header): destination
 # = the URL is set; cnpg.* only when the plugin is ready too.
 kube_backup_values() {
-  local f="$1" dest=false cnpg=false path="" ep="" port=443 srv=""
-  _BD_EGRESS_MODE="" _BD_EGRESS_CIDRS="" _BD_EGRESS_EXCEPT=""
+  local f="$1" dest=false cnpg=false path="" ep="" port=443 srv="" mode="" cidrs="" exc=""
   if [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
     dest=true
     backup_dest_parts
@@ -1033,10 +1056,12 @@ kube_backup_values() {
       cnpg=true
       backup_dest_egress_resolve || fail "the backup destination's endpoint: see above (nothing rendered)"
       srv="$(kube_pg_server_name)" || fail "PORTCULLIS_KUBE_INSTALL_ID isn't a uuid: CloudNativePG's archive needs this install's own serverName (nothing rendered)"
+      # The run's one resolution (review NN7: Longhorn's policies have the same).
+      mode="$_BD_EGRESS_MODE" cidrs="$_BD_EGRESS_CIDRS" exc="$_BD_EGRESS_EXCEPT"
     fi
   fi
   (umask 077 && jq --argjson d "$dest" --argjson c "$cnpg" --arg p "$path" --arg e "$ep" --argjson port "$port" --arg srv "$srv" \
-       --arg mode "$_BD_EGRESS_MODE" --arg cidrs "$_BD_EGRESS_CIDRS" --arg exc "$_BD_EGRESS_EXCEPT" \
+       --arg mode "$mode" --arg cidrs "$cidrs" --arg exc "$exc" \
     'def lines: split("\n") | map(select(. != ""));
      .backup = {destination: $d, cnpg: {enabled: $c, destinationPath: $p, endpointURL: $e, port: $port, serverName: $srv,
        publicEgress: ($mode == "public"), endpointCIDRs: (if $mode == "public" then [] else ($cidrs | lines) end),
@@ -1046,23 +1071,45 @@ kube_backup_values() {
 
 # kube_backup_after_release — after the release, with the archive on
 # (backup.cnpg.enabled): the first base backup, once the Cluster archives
-# (≤ KUBE_PG_ARCHIVE_WAIT, 300 s) and no plugin Backup is completed or
-# running — the ScheduledBackup isn't immediate (found in e2e-k3s: an
-# immediate one raced the instances' restart with the plugin's sidecar and
-# failed "requested plugin is not available"). A Backup object; status
-# shows its result (LastBackupSucceeded). Never fails the up.
+# (≤ KUBE_PG_ARCHIVE_WAIT, 300 s; ContinuousArchiving False for
+# KUBE_PG_ARCHIVE_FALSE_WAIT, 60 s, ends the wait early: review NM5) and no
+# Backup of this archive is completed or in progress — the ScheduledBackup
+# isn't immediate (found in e2e-k3s: an immediate one raced the instances'
+# restart with the plugin's sidecar and failed "requested plugin is not
+# available"). Only this Cluster's Backups count (review NM5): spec.cluster
+# portcullis-pg, created since the Cluster was (and owned by its uid when
+# they name a Cluster owner), status.serverName this install's (or not yet
+# set); phases completed / pending / started / running / finalizing /
+# walArchivingFailing (or none yet). A Backup object; status shows its
+# result (LastBackupSucceeded). Never fails the up.
 kube_backup_after_release() {
-  local i a n f
+  local i a="" n f cl srv uid ct falsefor=0 msg
   [ "$(jq -r '.backup.cnpg.enabled // false' "$(kube_values_file)" 2>/dev/null)" = true ] || return 0
+  srv="$(jq -r '.backup.cnpg.serverName // ""' "$(kube_values_file)" 2>/dev/null || true)"
   for ((i = 0; i < "${KUBE_PG_ARCHIVE_WAIT:-300}"; i += 5)); do
-    a="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null \
-      | jq -r '([.status.conditions[]? | select(.type == "ContinuousArchiving")][0].status // "") + " " + ((.status.readyInstances // 0) == (.spec.instances // -1) | tostring)' 2>/dev/null || true)"
+    cl="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null || true)"
+    a="$(printf '%s' "$cl" | jq -r '([.status.conditions[]? | select(.type == "ContinuousArchiving")][0].status // "") + " " + ((.status.readyInstances // 0) == (.spec.instances // -1) | tostring)' 2>/dev/null || true)"
     [ "$a" = "True true" ] && break
+    case "$a" in False*) falsefor=$((falsefor + 5)) ;; *) falsefor=0 ;; esac
+    [ "$falsefor" -lt "${KUBE_PG_ARCHIVE_FALSE_WAIT:-60}" ] || break
     sleep 5
   done
-  [ "$a" = "True true" ] || { warn "CloudNativePG isn't archiving to the backup destination yet: no first base backup (see ./portcullis status)"; return 0; }
+  if [ "$a" != "True true" ]; then
+    case "$a" in
+      False*) msg="$(printf '%s' "$cl" | jq -r '[.status.conditions[]? | select(.type == "ContinuousArchiving")][0].message // "" | .[0:300]' 2>/dev/null || true)"
+              warn "CloudNativePG's ContinuousArchiving is False${msg:+ ($msg)}: no first base backup (see ./portcullis status)" ;;
+      *) warn "CloudNativePG isn't archiving to the backup destination yet: no first base backup (see ./portcullis status)" ;;
+    esac
+    return 0
+  fi
+  uid="$(printf '%s' "$cl" | jq -r '.metadata.uid // ""')" ct="$(printf '%s' "$cl" | jq -r '.metadata.creationTimestamp // ""')"
   n="$(kube_ctl -n "$KUBE_CNPG_NS" get backups.postgresql.cnpg.io -o json 2>/dev/null \
-    | jq -r '[.items[] | select(.spec.method == "plugin" and ((.status.phase // "pending") | IN("completed", "running", "started", "pending", "")))] | length' 2>/dev/null || echo x)"
+    | jq -r --arg srv "$srv" --arg uid "$uid" --arg ct "$ct" --arg cl "$KUBE_PG_CLUSTER" '[.items[]
+        | select(.spec.method == "plugin" and .spec.cluster.name == $cl)
+        | select((.metadata.creationTimestamp // "") >= $ct)
+        | select((.metadata.ownerReferences // []) | all(.kind != "Cluster" or .uid == $uid))
+        | select((.status.serverName // "") | . == "" or . == $srv)
+        | select((.status.phase // "") | IN("completed", "pending", "started", "running", "finalizing", "walArchivingFailing", ""))] | length' 2>/dev/null || echo x)"
   [ "$n" = 0 ] || return 0
   f="$(mktemp)"
   NS="$KUBE_CNPG_NS" N="portcullis-pg-base-$(date -u +%Y%m%d%H%M%S)" jq -n '{apiVersion: "postgresql.cnpg.io/v1", kind: "Backup",
@@ -1103,27 +1150,49 @@ backup_dest_port() {
   case "$_BD_HOST" in *:*) echo "${_BD_HOST##*:}" ;; *) if [ "$_BD_SCHEME" = https ]; then echo 443; else echo 80; fi ;; esac
 }
 
-# backup_dest_egress_resolve — how the backup pods reach the destination
-# (security rulings, Task 26 + review I3), into _BD_EGRESS_MODE / _CIDRS /
-# _EXCEPT (one per line). The endpoint name is resolved
-# BACKUP_DEST_RESOLVE_TRIES (5) times BACKUP_DEST_RESOLVE_WAIT (2) s apart:
+# backup_dest_egress_resolve [<opt-in>] — how the backup pods reach the
+# destination (security rulings, Task 26 + reviews I3 / NM2–NM4), into
+# _BD_EGRESS_MODE / _CIDRS / _EXCEPT (one per line). The endpoint name is
+# resolved as the pods resolve it — from inside the cluster through CoreDNS
+# (_backup_dest_dns_probe: a short-lived restricted pod, up to
+# BACKUP_DEST_RESOLVE_TRIES (5) lookups, each past the answer's TTL and at
+# least BACKUP_DEST_RESOLVE_WAIT (2) s apart, within
+# BACKUP_DEST_PROBE_WINDOW (150) s):
 #   pinned  the same address set every time (or an IPv4 literal): exactly
 #           those /32s on the destination's port;
 #   public  the set rotates (AWS S3, R2, B2…: the pods' own lookups would
-#           mostly miss a pinned set): TCP 443 to any PUBLIC address —
-#           0.0.0.0/0 except RFC 1918, CGNAT, link-local, loopback, the pod /
-#           service / mesh CIDRs, the nodes and the API endpoints (a port
-#           other than 443 is refused in this mode). Status says so.
-# Either way only the exact backup pods get it. Refused (fail closed):
-# nothing resolves, an address inside the cluster, unknown pod / service
-# CIDRs or node addresses, an invalid range or address. Cached for the run
-# (_BD_EGRESS_URL); the mode is recorded in secrets/kube/backup-egress for
-# status. Re-resolved at every up, set and test.
-BACKUP_DEST_PRIVATE_CIDRS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8 0.0.0.0/8"
+#           mostly miss a pinned set), or the TTL is too long for the window
+#           to tell ("can't tell; addresses may rotate"): only with the
+#           opt-in, TCP 443 to any PUBLIC address — 0.0.0.0/0 except
+#           BACKUP_DEST_PRIVATE_CIDRS (RFC 1918, CGNAT, link-local,
+#           loopback, 0/8 and the special-purpose ranges), the pod / service
+#           / mesh CIDRs, the nodes, the API endpoints, the VPN subnet, the
+#           Hub's Local networks and wired-VPN provider ranges and the
+#           server's own public addresses (a port other than 443 is refused
+#           in this mode). Status says so.
+# The opt-in is .env's PORTCULLIS_BACKUP_ALLOW_ROTATING=true only (env_get,
+# never the process environment: one that disagrees with .env is refused),
+# or <opt-in> = set's flag (true / empty). Either way only the exact backup
+# pods get it. Refused (fail closed): nothing resolves, an address inside
+# the cluster, unknown pod / service CIDRs or node addresses, an invalid
+# range or address, and in public mode the Hub's ranges unreadable (and
+# never read before). Resolved once per run (_BD_EGRESS_KEY: URL + opt-in);
+# the mode is recorded in secrets/kube/backup-egress for status.
+# Re-resolved at every up, set and test.
+BACKUP_DEST_PRIVATE_CIDRS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8 0.0.0.0/8 192.0.0.0/24 192.0.2.0/24 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 192.88.99.0/24 224.0.0.0/4 240.0.0.0/4"
+# shellcheck disable=SC2120  # set's opt-in argument comes from backup.sh
 backup_dest_egress_resolve() {
-  local h ips="" seen="" got a n nodes nets api bad="" i tries="${BACKUP_DEST_RESOLVE_TRIES:-5}" stable=true port
+  local h ips="" seen="" a n nodes nets api bad="" stable=true port allow envv j long=false ttl=unknown extra
   backup_dest_parts
-  [ "${_BD_EGRESS_URL:-}" != "$PORTCULLIS_BACKUP_S3_URL" ] || [ -z "${_BD_EGRESS_MODE:-}" ] || return 0
+  if [ $# -gt 0 ]; then allow="$1"
+  else
+    envv="$(env_get PORTCULLIS_BACKUP_ALLOW_ROTATING 2>/dev/null || true)"
+    [ "${PORTCULLIS_BACKUP_ALLOW_ROTATING:-}" = "$envv" ] \
+      || { echo "PORTCULLIS_BACKUP_ALLOW_ROTATING in the environment (${PORTCULLIS_BACKUP_ALLOW_ROTATING:-empty}) differs from .env (${envv:-empty}): the opt-in is read from .env only (backup destination set --allow-rotating-addresses); unset it in the environment (refused)" >&2; return 1; }
+    allow="$envv"
+  fi
+  [ "$allow" = true ] || allow=""
+  [ "${_BD_EGRESS_KEY:-}" != "$PORTCULLIS_BACKUP_S3_URL|$allow" ] || [ -z "${_BD_EGRESS_MODE:-}" ] || return 0
   h="${_BD_HOST%:*}"
   [ -n "${PORTCULLIS_POD_CIDR:-}" ] && [ -n "${PORTCULLIS_SERVICE_CIDR:-}" ] \
     || { echo "PORTCULLIS_POD_CIDR / PORTCULLIS_SERVICE_CIDR unknown: the backup destination can't be checked against the cluster (refused)" >&2; return 1; }
@@ -1138,13 +1207,15 @@ backup_dest_egress_resolve() {
   done
   if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ips="$h"
   else
-    for ((i = 1; i <= tries; i++)); do
-      got="$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | LC_ALL=C sort -u | tr '\n' ' ')"
-      [ -n "$got" ] || { echo "the backup destination's host $h doesn't resolve to an IPv4 address: no egress policy for it" >&2; return 1; }
-      if [ -z "$ips" ]; then ips="$got"; elif [ "$got" != "$ips" ]; then stable=false; fi
-      seen="$seen $got"
-      [ "$i" -ge "$tries" ] || sleep "${BACKUP_DEST_RESOLVE_WAIT:-2}"
-    done
+    j="$(_backup_dest_dns_probe "$h")" && printf '%s' "$j" | jq -e '(.lookups | type == "array" and length > 0) and (.long | type == "boolean")' >/dev/null 2>&1 \
+      || { echo "the backup destination's host $h couldn't be looked up from inside the cluster (CoreDNS): no egress policy for it (refused)" >&2; return 1; }
+    [ "$(printf '%s' "$j" | jq -r 'all(.lookups[]; (.ips | length) > 0)')" = true ] \
+      || { echo "the backup destination's host $h doesn't resolve to an IPv4 address in the cluster (CoreDNS): no egress policy for it" >&2; return 1; }
+    ips="$(printf '%s' "$j" | jq -r '.lookups[0].ips | join(" ")')"
+    seen="$(printf '%s' "$j" | jq -r '[.lookups[].ips[]] | unique | join(" ")')"
+    [ "$(printf '%s' "$j" | jq -r '[.lookups[].ips] | unique | length')" = 1 ] || stable=false
+    long="$(printf '%s' "$j" | jq -r '.long')"
+    ttl="$(printf '%s' "$j" | jq -r '.lookups[0].ttl // "unknown"')"
   fi
   for a in $ips $seen; do
     ip_to_int "$a" >/dev/null 2>&1 || { echo "the backup destination's address $a isn't an IPv4 address (refused)" >&2; return 1; }
@@ -1152,23 +1223,153 @@ backup_dest_egress_resolve() {
     case " $nodes $api " in *" $a "*) bad="$bad $a" ;; esac
   done
   [ -z "$bad" ] || { echo "the backup destination resolves inside the cluster ($(printf '%s\n' $bad | sort -u | tr '\n' ' ' | sed 's/ $//')): refused" >&2; return 1; }
-  if [ "$stable" = true ]; then
+  if [ "$stable" = true ] && [ "$long" = false ]; then
     _BD_EGRESS_MODE=pinned _BD_EGRESS_CIDRS="$(printf '%s/32\n' $ips)" _BD_EGRESS_EXCEPT=""
   else
     # Security review: never automatic — the operator opts in with
     # backup destination set --allow-rotating-addresses (.env
     # PORTCULLIS_BACKUP_ALLOW_ROTATING=true).
-    [ "${PORTCULLIS_BACKUP_ALLOW_ROTATING:-}" = true ] \
-      || { echo "the backup destination's addresses rotate ($(printf '%s\n' $seen | LC_ALL=C sort -u | wc -l | tr -d ' ') seen): its pods' own lookups would miss a pinned policy. Refused; to allow TCP 443 to any public address from the backup pods, set it again with --allow-rotating-addresses" >&2; return 1; }
+    if [ "$allow" != true ]; then
+      if [ "$stable" = true ]; then
+        echo "the backup destination's host $h answers with a TTL of ${ttl}s, too long to tell within ${BACKUP_DEST_PROBE_WINDOW:-150}s whether its addresses rotate: can't tell; addresses may rotate. Refused; use an IP address or a name with a short TTL, or, to allow TCP 443 to any public address from the backup pods, set it again with --allow-rotating-addresses" >&2
+      else
+        echo "the backup destination's addresses rotate ($(printf '%s\n' $seen | wc -l | tr -d ' ') seen from inside the cluster): its pods' own lookups would miss a pinned policy. Refused; to allow TCP 443 to any public address from the backup pods, set it again with --allow-rotating-addresses" >&2
+      fi
+      return 1
+    fi
     port="$(backup_dest_port)"
-    [ "$port" = 443 ] || { echo "the backup destination's addresses rotate: egress then goes to any public address on 443 only, and its port is $port (refused)" >&2; return 1; }
+    [ "$port" = 443 ] || { echo "the backup destination's addresses rotate (or may): egress then goes to any public address on 443 only, and its port is $port (refused)" >&2; return 1; }
+    extra="$(_backup_dest_public_except)" || return 1
     _BD_EGRESS_MODE=public _BD_EGRESS_CIDRS="0.0.0.0/0"
-    _BD_EGRESS_EXCEPT="$(printf '%s\n' $BACKUP_DEST_PRIVATE_CIDRS "$PORTCULLIS_POD_CIDR" "$PORTCULLIS_SERVICE_CIDR" "$KUBE_MESH_CIDR"; printf '%s/32\n' $nodes $api | LC_ALL=C sort -u)"
+    _BD_EGRESS_EXCEPT="$(printf '%s\n' $BACKUP_DEST_PRIVATE_CIDRS "$PORTCULLIS_POD_CIDR" "$PORTCULLIS_SERVICE_CIDR" "$KUBE_MESH_CIDR"; printf '%s/32\n' $nodes $api | LC_ALL=C sort -u; printf '%s\n' "$extra")"
     _BD_EGRESS_EXCEPT="$(printf '%s\n' "$_BD_EGRESS_EXCEPT" | awk 'NF && !s[$0]++')"
   fi
-  _BD_EGRESS_URL="$PORTCULLIS_BACKUP_S3_URL"
+  _BD_EGRESS_KEY="$PORTCULLIS_BACKUP_S3_URL|$allow"
   { (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/kube" && printf '%s\n' "$_BD_EGRESS_MODE" > "$PORTCULLIS_ROOT/secrets/kube/backup-egress"); } 2>/dev/null || true
 }
+
+# _backup_dest_public_except — public mode's ranges beyond the fixed ones
+# (review NM2), one per line: the VPN subnet (PORTCULLIS_VPN_SUBNET), the
+# Hub's Local networks and wired-VPN provider ranges (hub vpn host-info;
+# kept in secrets/kube/backup-egress-hub-ranges for an up with the Hub at 0:
+# never read and the Hub not answering = refused), and the server's own
+# public IPv4 (PORTCULLIS_PUBLIC_IPV4, secrets/domains/public-ips.env's
+# DOMAINS_PUBLIC_IPV4, PORTCULLIS_MAIL_PUBLIC_IPV4: hairpin NAT reaches this
+# install's Traefik from a trusted source). IPv6 entries are skipped (the
+# policies are IPv4; IPv6 egress is denied). An invalid IPv4 range refuses.
+_backup_dest_public_except() {
+  local info c cache="$PORTCULLIS_ROOT/secrets/kube/backup-egress-hub-ranges" pips="$PORTCULLIS_ROOT/secrets/domains/public-ips.env" hub out=""
+  if info="$(_vpn_host_info 2>/dev/null)" && printf '%s' "$info" | jq -e 'type == "object" and (.local_networks | type == "array")' >/dev/null 2>&1; then
+    hub="$(printf '%s' "$info" | jq -r '[(.local_networks // [])[], (.provider_ranges // [])[]] | map(strings) | .[]')"
+    { (umask 077 && mkdir -p "${cache%/*}" && printf '%s\n' "$hub" > "$cache"); } 2>/dev/null || true
+  elif [ -f "$cache" ]; then
+    hub="$(cat "$cache")"
+    echo "the Hub didn't answer hub vpn host-info: its Local networks and provider ranges as last read are excepted" >&2
+  else
+    echo "the Hub's Local networks and wired-VPN provider ranges can't be read (hub vpn host-info: is the Hub running?): public backup egress needs them excepted (refused)" >&2
+    return 1
+  fi
+  for c in ${PORTCULLIS_VPN_SUBNET:-} $hub; do
+    case "$c" in *:*) continue ;; esac
+    cidr_bounds "$c" >/dev/null 2>&1 || { echo "$c (the VPN subnet or a Hub Local network / provider range) isn't an IPv4 CIDR: public backup egress can't except it (refused)" >&2; return 1; }
+    out="$out$c"$'\n'
+  done
+  for c in "${PORTCULLIS_PUBLIC_IPV4:-}" "$(env_get DOMAINS_PUBLIC_IPV4 "$pips" 2>/dev/null || true)" "${PORTCULLIS_MAIL_PUBLIC_IPV4:-}"; do
+    [ -n "$c" ] || continue
+    ip_to_int "$c" >/dev/null 2>&1 || { echo "the server's public address $c isn't an IPv4 address (refused)" >&2; return 1; }
+    out="$out$c/32"$'\n'
+  done
+  printf '%s' "$out"
+}
+
+# _backup_dest_dns_probe <host> — JSON {lookups: [{ips, ttl}], long} of the
+# name as the pods see it (review NM4): a restricted helper pod in the core
+# namespace (nobody, no volume, only kube-dns reachable: the namespace's
+# policies) of group-gate's image runs _BD_DNS_PROBE_PY against its
+# resolv.conf's nameserver (CoreDNS), asking A records directly (no search
+# list). Each lookup waits past the previous answer's TTL (the caches of
+# CoreDNS and the node's resolver); a TTL that doesn't fit the window ends
+# it "long". The name isn't a secret (argv).
+_backup_dest_dns_probe() {
+  local pod rc=0
+  pod="$(_kube_helper_pod "" 65534:65534 ro "$(_kube_image_of group-gate)" backup-dns-probe)" || { echo "could not start the DNS probe pod" >&2; return 1; }
+  kube_ctl -n "$(kube_ns)" exec "$pod" -- env PYTHONDONTWRITEBYTECODE=1 python3 -I -c "$_BD_DNS_PROBE_PY" "$1" "${BACKUP_DEST_PROBE_WINDOW:-150}" "${BACKUP_DEST_RESOLVE_TRIES:-5}" "${BACKUP_DEST_RESOLVE_WAIT:-2}" || rc=1
+  _kube_helper_done "$pod"
+  return "$rc"
+}
+# argv: host window tries gap [resolv.conf [port]] (the last two for tests).
+_BD_DNS_PROBE_PY='import json, random, socket, struct, sys, time
+host, window, tries, gap = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+conf = sys.argv[5] if len(sys.argv) > 5 else "/etc/resolv.conf"
+port = int(sys.argv[6]) if len(sys.argv) > 6 else 53
+ns = [l.split()[1] for l in open(conf) if l.split()[:1] == ["nameserver"]][0]
+labels = host.rstrip(".").split(".")
+if not all(0 < len(p) < 64 and p.isascii() for p in labels):
+    sys.exit("not a DNS name")
+def ask():
+    qid = random.randrange(65536)
+    msg = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + b"".join(bytes([len(p)]) + p.encode() for p in labels) + b"\0" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
+    try:
+        s.sendto(msg, (ns, port))
+        while True:
+            data = s.recv(4096)
+            if data[:2] == msg[:2]:
+                break
+    finally:
+        s.close()
+    if struct.unpack(">H", data[2:4])[0] & 0x0200:  # truncated: TCP
+        t = socket.create_connection((ns, port), timeout=5)
+        try:
+            t.sendall(struct.pack(">H", len(msg)) + msg)
+            buf = b""
+            while len(buf) < 2 or len(buf) < 2 + struct.unpack(">H", buf[:2])[0]:
+                c = t.recv(65535)
+                if not c:
+                    break
+                buf += c
+        finally:
+            t.close()
+        data = buf[2:]
+    flags, qd, an = struct.unpack(">HHH", data[2:8])
+    if data[:2] != msg[:2] or flags & 0x000F:
+        return [], None
+    def skip(i):
+        while True:
+            b = data[i]
+            if b == 0:
+                return i + 1
+            if b & 0xC0 == 0xC0:
+                return i + 2
+            i += b + 1
+    i = 12
+    for _ in range(qd):
+        i = skip(i) + 4
+    ips, ttl = set(), None
+    for _ in range(an):
+        i = skip(i)
+        typ, cls, rttl, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+        i += 10
+        if cls == 1 and typ in (1, 5):
+            ttl = rttl if ttl is None else min(ttl, rttl)
+        if cls == 1 and typ == 1 and rdlen == 4:
+            ips.add(socket.inet_ntoa(data[i:i + 4]))
+        i += rdlen
+    return sorted(ips), ttl
+out, start, long_ = [], time.monotonic(), False
+for n in range(tries):
+    ips, ttl = ask()
+    out.append({"ips": ips, "ttl": ttl})
+    if not ips or n == tries - 1 or (n and ips != out[0]["ips"]):
+        break
+    # Past the TTL of the answer (the caches of the resolvers), within the window.
+    wait = max(gap, (ttl or 0) + 1)
+    if time.monotonic() - start + wait * (tries - 1 - n) > window:
+        long_ = True
+        break
+    time.sleep(wait)
+print(json.dumps({"lookups": out, "long": long_}))
+'
 
 # backup_dest_cidrs — the resolved egress as lines: the pinned /32s, or
 # "public" (see above).
@@ -1207,53 +1408,69 @@ backup-destination-instance-manager {"matchLabels":{"longhorn.io/component":"ins
 # selected every pod of longhorn-system.
 HA_LONGHORN_BACKUP_OLD="backup-destination"
 
-# kube_backup_status_json — the destination's health for status (review I1 /
-# I3): {egress, cnpg: {archiving, last_backup, message}, longhorn:
-# {available}}; null without a destination. An unreadable Cluster /
-# BackupTarget is null (a problem: fail closed) when its component runs.
+# kube_backup_status_json — the destination's health for status (reviews I1
+# / I3 / NM1 / NM5): {egress, allow_rotating, cnpg: {plugin, plugin_ready,
+# archiving, last_backup (True / False / Unknown), next_base, message},
+# longhorn: {available}}; null without a destination. The Cluster is read
+# whenever the last render archived (backup.cnpg.enabled) or the plugin
+# runs — whatever the plugin's state: a Cluster naming a plugin that isn't
+# available is a problem of its own. An unreadable Cluster / BackupTarget
+# is a problem (fail closed). The opt-in is .env's (env_get).
 kube_backup_status_json() {
-  local c="null" l="null" e=""
+  local c="null" l="null" e="" up want=false ready=false next
   [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ] || { echo null; return 0; }
-  local up
   up="$(backup_dest_url_problem "${PORTCULLIS_BACKUP_S3_URL%/}")"
   [ -z "$up" ] || { jq -nc --arg p "$up" '{url_problem: $p}'; return 0; }
   e="$(cat "$PORTCULLIS_ROOT/secrets/kube/backup-egress" 2>/dev/null || true)"
-  if _kube_barman_ready; then
-    c="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null | jq -c '
+  [ "$(jq -r '.backup.cnpg.enabled // false' "$(kube_values_file)" 2>/dev/null)" != true ] || want=true
+  ! _kube_barman_ready || ready=true
+  if [ "$want" = true ] || [ "$ready" = true ]; then
+    # The ScheduledBackup's next run (chart: 03:15 UTC daily).
+    next=$(( $(date -u +%s) / 86400 * 86400 + 11700 )); [ "$next" -gt "$(date -u +%s)" ] || next=$((next + 86400))
+    c="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null | jq -c --argjson want "$want" --argjson ready "$ready" --argjson next "$next" '
       [.status.conditions[]?] as $c
-      | {archiving: (($c | map(select(.type == "ContinuousArchiving"))[0].status // "Unknown") == "True"),
-         last_backup: (($c | map(select(.type == "LastBackupSucceeded"))[0].status // "Unknown") != "False"),
-         message: ([$c[] | select((.type == "ContinuousArchiving" or .type == "LastBackupSucceeded") and .status != "True") | .message // .reason] | join("; "))}' 2>/dev/null || echo '{"unreadable":true}')"
+      | ((.spec.plugins // []) | any(.name == "barman-cloud.cloudnative-pg.io")) as $p
+      | if ($p | not) and ($want | not) then null else
+        {plugin: $p, plugin_ready: $ready,
+         archiving: (($c | map(select(.type == "ContinuousArchiving"))[0].status // "Unknown") == "True"),
+         last_backup: ($c | map(select(.type == "LastBackupSucceeded"))[0].status // "Unknown"),
+         next_base: ($next | todate),
+         message: ([$c[] | select((.type == "ContinuousArchiving" or .type == "LastBackupSucceeded") and .status == "False") | .message // .reason] | join("; "))} end' 2>/dev/null || echo '{"unreadable":true}')"
   fi
   if kube_ctl get namespace "$KUBE_LONGHORN_NS" -o name >/dev/null 2>&1; then
     l="$(kube_ctl -n "$KUBE_LONGHORN_NS" get backuptargets.longhorn.io default -o json 2>/dev/null | jq -c '{available: (.status.available == true)}' 2>/dev/null || echo '{"available":false}')"
   fi
-  jq -nc --arg e "$e" --argjson c "${c:-null}" --argjson l "${l:-null}" --arg ar "${PORTCULLIS_BACKUP_ALLOW_ROTATING:-}" \
+  jq -nc --arg e "$e" --argjson c "${c:-null}" --argjson l "${l:-null}" --arg ar "$(env_get PORTCULLIS_BACKUP_ALLOW_ROTATING 2>/dev/null || true)" \
     '{egress: (if $e == "" then null else $e end), allow_rotating: ($ar == "true"), cnpg: $c, longhorn: $l}'
 }
 
 # kube_backup_status_lines <json> — status' lines; exit 1 on a problem.
+_bsl_q() { printf '%s' "$2" | jq -r "$1"; }
 kube_backup_status_lines() {
   local j="$1" rc=0
   [ -n "$j" ] && [ "$j" != null ] || return 0
-  if [ "$(printf '%s' "$j" | jq -r '.url_problem // ""')" != "" ]; then
-    _st_line fail "backup destination: PORTCULLIS_BACKUP_S3_URL is refused ($(printf '%s' "$j" | jq -r .url_problem)): nothing backs up to it"; return 1
+  if [ "$(_bsl_q '.url_problem // ""' "$j")" != "" ]; then
+    _st_line fail "backup destination: PORTCULLIS_BACKUP_S3_URL is refused ($(_bsl_q .url_problem "$j")): nothing backs up to it"; return 1
   fi
-  if [ "$(printf '%s' "$j" | jq -r '.cnpg.unreadable // false')" = true ]; then
+  if [ "$(_bsl_q '.cnpg.unreadable // false' "$j")" = true ]; then
     _st_line fail "backup destination: the Postgres Cluster's archive state can't be read"; rc=1
-  elif [ "$(printf '%s' "$j" | jq -r '.cnpg != null')" = true ]; then
-    if [ "$(printf '%s' "$j" | jq -r '.cnpg.archiving and .cnpg.last_backup')" = true ]; then
-      _st_line ok "backup destination: Postgres archiving (WAL + base backups)"
+  elif [ "$(_bsl_q '.cnpg != null' "$j")" = true ]; then
+    if [ "$(_bsl_q '.cnpg.plugin and (.cnpg.plugin_ready | not)' "$j")" = true ]; then
+      _st_line fail "backup destination: the Postgres Cluster archives through the barman-cloud plugin, which isn't available (kubectl -n $KUBE_BARMAN_NS get deploy barman-cloud): WAL piles up until the disk fills"; rc=1
+    elif [ "$(_bsl_q '.cnpg.archiving and .cnpg.last_backup != "False"' "$j")" != true ]; then
+      _st_line fail "backup destination: Postgres isn't archiving ($(_bsl_q '.cnpg.message | if . == "" then "ContinuousArchiving / LastBackupSucceeded not true" else .[0:300] end' "$j")): WAL piles up until the disk fills"; rc=1
+    elif [ "$(_bsl_q '.cnpg.last_backup' "$j")" != True ]; then
+      _st_line warn "backup destination: Postgres archives WAL but has no base backup yet (not restorable from the destination until one): the daily one runs at $(_bsl_q '.cnpg.next_base' "$j"), or ./portcullis up starts one now"
     else
-      _st_line fail "backup destination: Postgres isn't archiving ($(printf '%s' "$j" | jq -r '.cnpg.message | if . == "" then "ContinuousArchiving / LastBackupSucceeded not true" else .[0:300] end')): WAL piles up until the disk fills"; rc=1
+      _st_line ok "backup destination: Postgres archiving (WAL + base backups)"
     fi
   fi
-  if [ "$(printf '%s' "$j" | jq -r '.longhorn != null')" = true ]; then
-    if [ "$(printf '%s' "$j" | jq -r '.longhorn.available')" = true ]; then _st_line ok "backup destination: Longhorn's backup target available"
+  if [ "$(_bsl_q '.longhorn != null' "$j")" = true ]; then
+    if [ "$(_bsl_q '.longhorn.available' "$j")" = true ]; then _st_line ok "backup destination: Longhorn's backup target available"
     else _st_line fail "backup destination: Longhorn's backup target isn't available (kubectl -n longhorn-system get backuptargets default)"; rc=1; fi
   fi
-  [ "$(printf '%s' "$j" | jq -r '.egress')" != public ] || _st_line warn "backup egress: any public address on 443 (the destination's addresses rotate)"
-  [ "$(printf '%s' "$j" | jq -r '.allow_rotating')" != true ] || _st_line warn "backup destination: rotating addresses allowed (PORTCULLIS_BACKUP_ALLOW_ROTATING=true, set with --allow-rotating-addresses)"
+  [ "$(_bsl_q '.egress' "$j")" != public ] || _st_line warn "backup egress: any public address on 443 (the destination's addresses rotate)"
+  [ "$(_bsl_q '.allow_rotating' "$j")" != true ] || _st_line warn "backup destination: rotating addresses allowed (PORTCULLIS_BACKUP_ALLOW_ROTATING=true, set with --allow-rotating-addresses)"
   return "$rc"
 }
 
@@ -1344,19 +1561,20 @@ _ha_barman_certs_ready() {
 ha_longhorn_backup_target() {
   local f url="" n sel
   kube_ctl get namespace "$KUBE_LONGHORN_NS" -o name >/dev/null 2>&1 || return 0
+  # The first version's namespace-wide policy (security review): gone
+  # first, before anything here can refuse (review NN2).
+  kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy $HA_LONGHORN_BACKUP_OLD --ignore-not-found >/dev/null \
+    || fail "could not delete the old backup egress policy ($HA_LONGHORN_BACKUP_OLD) in $KUBE_LONGHORN_NS"
   if [ -n "${PORTCULLIS_BACKUP_S3_URL:-}" ]; then
     backup_dest_read; backup_dest_parts
     kube_backup_destination_sync || fail "could not sync the destination's Secret into $KUBE_LONGHORN_NS"
     backup_dest_egress_resolve || fail "the backup destination's endpoint: see above (Longhorn's egress not applied)"
-    # The first version's namespace-wide policy (security review): gone first.
-    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy $HA_LONGHORN_BACKUP_OLD --ignore-not-found >/dev/null \
-      || fail "could not delete the old backup egress policy ($HA_LONGHORN_BACKUP_OLD) in $KUBE_LONGHORN_NS"
     while read -r n sel; do
       _ha_backup_egress "$KUBE_LONGHORN_NS" "$n" "$sel" || fail "could not apply Longhorn's egress to the backup destination ($n)"
     done <<< "$HA_LONGHORN_BACKUP_PODS"
     url="s3://$_BD_BUCKET@$_BD_AWS_DEFAULT_REGION/${_BD_PREFIX:+$_BD_PREFIX/}longhorn"
   else
-    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy $HA_LONGHORN_BACKUP_OLD backup-destination-manager backup-destination-instance-manager --ignore-not-found >/dev/null \
+    kube_ctl -n "$KUBE_LONGHORN_NS" delete networkpolicy backup-destination-manager backup-destination-instance-manager --ignore-not-found >/dev/null \
       || fail "could not delete Longhorn's backup egress policies"
   fi
   f="$(mktemp)"

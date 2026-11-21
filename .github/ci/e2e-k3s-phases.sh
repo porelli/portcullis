@@ -337,6 +337,10 @@ restore)
   K -n portcullis wait --for=condition=Ready "pod/$pod" --timeout=180s >/dev/null
   [ "$(K -n portcullis exec "$pod" -- cat /b/rt-inst/20261121T000000Z.tar)" = rt-instance-backup ] && K -n portcullis exec "$pod" -- sh -c '[ ! -e /s/backups/rt-inst ]' \
     || fail "the Docker backup's instance backup isn't on hub-backups (or is still in hub-state)"
+  # Review NN4: the move keeps the PVC root's mode (its portcullis.io/mode).
+  m="$(K -n portcullis get pvc hub-backups -o jsonpath='{.metadata.labels.portcullis\.io/mode}')"
+  [ -n "$m" ] && [ "$(K -n portcullis exec "$pod" -- stat -c %a /b)" = "${m#0}" ] \
+    || fail "hub-backups' root mode $(K -n portcullis exec "$pod" -- stat -c %a /b) isn't its label's ${m:-none} after the move"
   K -n portcullis delete pod "$pod" --wait=false >/dev/null
   echo "PASS: test_lldap_convert_keeps_uuids: the Docker backup's LLDAP converted into CNPG (uuids, password hashes and memberships equal the source, rt-alice and rt-bob bind with their passwords, Keycloak links rt-alice by the same entryUUID); host keys kept, status clean, the CA chain the Docker phase's, Keycloak signs in"
   ;;
@@ -365,6 +369,25 @@ dest)
   # shellcheck disable=SC2016,SC2024  # expanded by the netns shell; the log is the runner's own file
   sudo ip netns exec ext bash -c 'set -a; . "$1"; set +a; exec "$2" serve s3 --addr 198.51.100.2:9000 "$3"' _ "$t/rc.env" "$t/rclone-v1.76.0-linux-amd64/rclone" "$t/data" > "$t/rclone.log" 2>&1 &
   for _ in $(seq 1 30); do curl -s -o /dev/null --max-time 2 http://198.51.100.2:9000/ && break; sleep 1; done
+  # Review NM4: the rotation check runs inside the cluster (CoreDNS). Two
+  # test names served by a CoreDNS server block of their own (k3s imports
+  # coredns-custom's *.server): a long TTL can't be told (refused, nothing
+  # written), a short one is pinned. The runner resolves them from /etc/hosts
+  # for set's own test write.
+  echo "198.51.100.2 s3short.e2e.test s3long.e2elong.test" | sudo tee -a /etc/hosts >/dev/null
+  printf '%s\n' "apiVersion: v1" "kind: ConfigMap" "metadata: {name: coredns-custom, namespace: kube-system}" "data:" "  e2e.server: |" \
+    "    e2e.test:53 {" "        hosts {" "            198.51.100.2 s3short.e2e.test" "            ttl 3" "        }" "    }" \
+    "    e2elong.test:53 {" "        hosts {" "            198.51.100.2 s3long.e2elong.test" "            ttl 3600" "        }" "    }" | K apply -f - >/dev/null
+  for _ in $(seq 1 30); do
+    out="$(HUB_DEV=1 ./portcullis backup destination set http://s3long.e2elong.test:9000/e2e-bucket/k3s < "$t/creds" 2>&1 | redact || true)"
+    case "$out" in *"can't tell; addresses may rotate"*) break ;; esac; sleep 10
+  done
+  case "$out" in *"TTL of"*"can't tell; addresses may rotate"*"--allow-rotating-addresses"*) ;; *) printf '%s\n' "$out" | tail -n 3; fail "a long-TTL destination name wasn't refused as can't tell" ;; esac
+  ! grep -q '^PORTCULLIS_BACKUP_S3_URL=.' .env || fail "the refused destination was written to .env"
+  s0=$SECONDS
+  HUB_DEV=1 ./portcullis backup destination set http://s3short.e2e.test:9000/e2e-bucket/k3s < "$t/creds" 2>&1 | redact
+  [ "$(cat secrets/kube/backup-egress)" = pinned ] && grep -q '^PORTCULLIS_BACKUP_S3_URL=http://s3short.e2e.test:9000/e2e-bucket/k3s$' .env || fail "a short-TTL destination name isn't pinned"
+  echo "PASS: the destination's rotation is checked through CoreDNS: a 3600 s TTL refused (can't tell), a 3 s TTL pinned after the in-cluster probe ($((SECONDS - s0)) s for set)"
   HUB_DEV=1 ./portcullis backup destination set http://198.51.100.2:9000/e2e-bucket/k3s < "$t/creds" 2>&1 | redact
   HUB_DEV=1 ./portcullis backup destination show | grep -q 'credentials: set' || fail "backup destination show: no credentials"
   ! HUB_DEV=1 ./portcullis backup destination show | grep -qF "$(sed -n 's/^AWS_SECRET_ACCESS_KEY=//p' "$t/creds" | cut -c1-12)" || fail "backup destination show printed the secret"
@@ -388,6 +411,16 @@ dest)
   [ -n "$(find "$t/data/e2e-bucket/k3s/cnpg/$sn/base" -name data.tar.gz 2>/dev/null)" ] && [ "$(find "$t/data/e2e-bucket/k3s/cnpg/$sn/wals" -name '*.gz' | wc -l)" -ge 2 ] \
     || fail "no base backup / WAL objects under <url>/cnpg/$sn"
   echo "PASS: CloudNativePG archives to the destination: ContinuousArchiving, a completed plugin backup, base + WAL objects under <url>/cnpg/$sn, the egress exact"
+  # Review NM1: the plugin down while the Cluster archives through it is a status problem.
+  K -n cnpg-system scale deploy barman-cloud --replicas=0 >/dev/null
+  for _ in $(seq 1 30); do [ "$(K -n cnpg-system get deploy barman-cloud -o jsonpath='{.status.availableReplicas}')" = "" ] && break; sleep 2; done
+  ./portcullis status --json > /tmp/status-nm1.json 2>/dev/null || true
+  ./portcullis status > /tmp/status-nm1.txt 2>&1 || true
+  jq -e '.backup_destination.cnpg.plugin == true and .backup_destination.cnpg.plugin_ready == false' /tmp/status-nm1.json >/dev/null \
+    && grep -q "archives through the barman-cloud plugin, which isn't available" /tmp/status-nm1.txt || { tail -n 20 /tmp/status-nm1.txt; fail "status doesn't report the barman-cloud plugin down"; }
+  K -n cnpg-system scale deploy barman-cloud --replicas=1 >/dev/null
+  K -n cnpg-system rollout status deploy/barman-cloud --timeout=180s >/dev/null || fail "the barman-cloud plugin didn't come back"
+  echo "PASS: status reports the barman-cloud plugin down while the Cluster archives through it (a problem), and it came back"
   ./portcullis backup --offsite 2>&1 | redact | tail -n 3
   [ -s "$t/data/e2e-bucket/k3s/core/config" ] || fail "no restic repository at <url>/core"
   K -n portcullis get configmap portcullis-backup-status -o jsonpath='{.data.last_success}' | grep -qE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T' || fail "no portcullis-backup-status record for the Hub"

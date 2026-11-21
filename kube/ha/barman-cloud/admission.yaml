@@ -8,7 +8,9 @@
 #     portcullis-pg), in cnpg-system;
 #   - the Role: rules only on barmancloud.cnpg.io objectstores (get, list,
 #     watch), objectstores/status (update) and core secrets (get, list,
-#     watch), every rule with resourceNames (BuildRoleRules);
+#     watch), every rule with resourceNames, pinned to the ObjectStore
+#     portcullis-backup / the Secret backup-destination (BuildRoleRules;
+#     review NN8);
 #   - the RoleBinding: roleRef exactly that Role, subjects exactly the
 #     Cluster's ServiceAccount portcullis-pg in cnpg-system
 #     (BuildRoleBinding).
@@ -44,9 +46,12 @@ spec:
         has(object.rules) && size(object.rules) > 0 && object.rules.all(r,
           has(r.resourceNames) && size(r.resourceNames) > 0 && !has(r.nonResourceURLs)
           && has(r.apiGroups) && size(r.apiGroups) == 1 && has(r.resources) && size(r.resources) == 1
-          && ((r.apiGroups[0] == 'barmancloud.cnpg.io' && r.resources[0] == 'objectstores' && r.verbs.all(v, v in ['get', 'list', 'watch']))
-           || (r.apiGroups[0] == 'barmancloud.cnpg.io' && r.resources[0] == 'objectstores/status' && r.verbs.all(v, v == 'update'))
-           || (r.apiGroups[0] == '' && r.resources[0] == 'secrets' && r.verbs.all(v, v in ['get', 'list', 'watch']))))
+          && ((r.apiGroups[0] == 'barmancloud.cnpg.io' && r.resources[0] == 'objectstores' && r.verbs.all(v, v in ['get', 'list', 'watch'])
+               && r.resourceNames.all(n, n == 'portcullis-backup'))
+           || (r.apiGroups[0] == 'barmancloud.cnpg.io' && r.resources[0] == 'objectstores/status' && r.verbs.all(v, v == 'update')
+               && r.resourceNames.all(n, n == 'portcullis-backup'))
+           || (r.apiGroups[0] == '' && r.resources[0] == 'secrets' && r.verbs.all(v, v in ['get', 'list', 'watch'])
+               && r.resourceNames.all(n, n == 'backup-destination'))))
     - name: bindingOk
       expression: >-
         has(object.roleRef) && object.roleRef.kind == 'Role' && object.roleRef.name == 'portcullis-pg-barman-cloud'

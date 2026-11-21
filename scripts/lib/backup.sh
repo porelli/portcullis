@@ -731,7 +731,7 @@ backup_dest_set() {
   # The opt-in for a destination whose addresses rotate (security review:
   # never automatic), in effect for this check and then stored.
   local ar=""; [ "$allow" != true ] || ar=true
-  PORTCULLIS_BACKUP_ALLOW_ROTATING="$ar" PORTCULLIS_BACKUP_S3_URL="$url" backup_dest_egress_resolve || fail "the backup destination: see above (nothing was written)"
+  PORTCULLIS_BACKUP_S3_URL="$url" backup_dest_egress_resolve "$ar" || fail "the backup destination: see above (nothing was written)"
   f="$(backup_dest_file)"
   (umask 077 && mkdir -p "${f%/*}")
   tmp="$(umask 077 && mktemp "${f%/*}/.backup-destination.XXXXXX")"
@@ -762,7 +762,7 @@ backup_dest_show() {
   echo "  core archive (restic): s3:$(backup_dest_sub core)"
   echo "  CloudNativePG (barman-cloud, HA): s3://$_BD_BUCKET/${_BD_PREFIX:+$_BD_PREFIX/}cnpg"
   echo "  Longhorn (HA): s3://$_BD_BUCKET@<region>/${_BD_PREFIX:+$_BD_PREFIX/}longhorn"
-  if [ "${PORTCULLIS_BACKUP_ALLOW_ROTATING:-}" = true ]; then
+  if [ "$(env_get PORTCULLIS_BACKUP_ALLOW_ROTATING 2>/dev/null || true)" = true ]; then
     echo "  rotating addresses: allowed (--allow-rotating-addresses: if they rotate, the backup pods reach any public address on 443)"
   else
     echo "  rotating addresses: not allowed (the endpoint's addresses must be stable: the backup pods reach exactly them)"
@@ -798,7 +798,8 @@ cmd_backup_destination() {
          local allow=false
          case "${1:-}" in -h|--help) help_backup_destination; return 0 ;; --allow-rotating-addresses) allow=true; shift ;; esac
          case "${1:-}" in "") usage_error "backup destination set" "expected <url> (the credentials come from stdin)" ;; esac
-         [ "${2:-}" != --allow-rotating-addresses ] || { allow=true; set -- "$1"; }
+         # Review NN1: the flag after <url> is taken out, anything else stays an extra argument.
+         [ "${2:-}" != --allow-rotating-addresses ] || { allow=true; set -- "$1" "${@:3}"; }
          [ $# -eq 1 ] || usage_error "backup destination set" "only <url> (and --allow-rotating-addresses) is an argument: the credentials come from stdin, never argv" ;;
     show|test|unset) shift
          case "${1:-}" in -h|--help) help_backup_destination; return 0 ;; "") ;; *) usage_error "backup destination $sub" "unknown argument: $1" ;; esac ;;
@@ -1219,8 +1220,12 @@ restore_runtime_from_host() {
   RESTORE_KUBE_KEYS=""
   if [ "$RESTORE_RUNTIME" = kubernetes ]; then
     local k
+    local v
     for k in $RESTORE_KUBE_KEY_NAMES; do
-      [ -z "${!k:-}" ] || RESTORE_KUBE_KEYS+="$k=${!k}"$'\n'
+      v="${!k:-}"
+      # The backup egress opt-in is .env's only (review NM3), never the environment's.
+      [ "$k" != PORTCULLIS_BACKUP_ALLOW_ROTATING ] || v="$(env_get "$k" 2>/dev/null || true)"
+      [ -z "$v" ] || RESTORE_KUBE_KEYS+="$k=$v"$'\n'
     done
   fi
   runtime_check
@@ -1230,8 +1235,9 @@ restore_runtime_from_host() {
 # _restore_runtime_keys — the restored .env keeps this host's runtime, never
 # the backup's: CONTAINER_RUNTIME always, the engine socket under podman; a
 # PORTCULLIS_ENGINE_SOCKET the backup carried is dropped under docker.
-# The .env keys that belong to a kubernetes host (restore keeps the host's).
-RESTORE_KUBE_KEY_NAMES="PORTCULLIS_KUBE_CONTEXT PORTCULLIS_NAMESPACE PORTCULLIS_APPS_NAMESPACE PORTCULLIS_POD_CIDR PORTCULLIS_SERVICE_CIDR PORTCULLIS_KUBE_API_ENDPOINTS PORTCULLIS_KUBE_INSTALL_ID PORTCULLIS_KUBE_IMAGES PORTCULLIS_TRAEFIK_SERVICE_IP PORTCULLIS_TRAEFIK_VPN_SERVICE_IP PORTCULLIS_WG_EDGE_SERVICE_IP PORTCULLIS_K3S_VERSION"
+# The .env keys that belong to a kubernetes host (restore keeps the host's;
+# the backup egress opt-in too, review NM3: a restore never widens it).
+RESTORE_KUBE_KEY_NAMES="PORTCULLIS_KUBE_CONTEXT PORTCULLIS_NAMESPACE PORTCULLIS_APPS_NAMESPACE PORTCULLIS_POD_CIDR PORTCULLIS_SERVICE_CIDR PORTCULLIS_KUBE_API_ENDPOINTS PORTCULLIS_KUBE_INSTALL_ID PORTCULLIS_KUBE_IMAGES PORTCULLIS_TRAEFIK_SERVICE_IP PORTCULLIS_TRAEFIK_VPN_SERVICE_IP PORTCULLIS_WG_EDGE_SERVICE_IP PORTCULLIS_K3S_VERSION PORTCULLIS_BACKUP_ALLOW_ROTATING"
 
 _restore_runtime_keys() {
   local k line
@@ -1242,12 +1248,19 @@ _restore_runtime_keys() {
     env_unset PORTCULLIS_ENGINE_SOCKET
   fi
   # The backup's kubernetes keys (if any) never survive; this host's do.
+  local bar
+  bar="$(env_get PORTCULLIS_BACKUP_ALLOW_ROTATING 2>/dev/null || true)"
   for k in $RESTORE_KUBE_KEY_NAMES; do env_unset "$k"; done
   if [ "$RESTORE_RUNTIME" = kubernetes ]; then
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       env_set "${line%%=*}" "${line#*=}"
     done <<< "${RESTORE_KUBE_KEYS:-}"
+    if [ "$(env_get PORTCULLIS_BACKUP_ALLOW_ROTATING 2>/dev/null || true)" = true ]; then
+      info "Kept this host's PORTCULLIS_BACKUP_ALLOW_ROTATING=true (backup destination: rotating addresses allowed), whatever the backup had."
+    elif [ "$bar" = true ]; then
+      info "The backup's PORTCULLIS_BACKUP_ALLOW_ROTATING=true isn't kept (this host never allowed rotating addresses): if wanted, set the destination again with --allow-rotating-addresses."
+    fi
   fi
 }
 
