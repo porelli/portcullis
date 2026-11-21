@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -713,6 +714,9 @@ func TestOriginChecks(t *testing.T) {
 	}
 }
 
+// inlineHandlerRe is an inline event handler attribute (onclick=, …).
+var inlineHandlerRe = regexp.MustCompile(`(?i)\son[a-z]+\s*=`)
+
 // The start page (fix-mail-admin-421): a GET, its CSP runs only the
 // same-origin script, it names exactly the Hub's origin as the ticket's
 // sender and posts the form to this origin; no session is needed and none
@@ -722,15 +726,23 @@ func TestStartPage(t *testing.T) {
 	resp := e.do(t, "GET", "/portcullis/open", "", nil)
 	body := resp.Header.Get("X-Test-Body")
 	csp := resp.Header.Get("Content-Security-Policy")
+	// Review M1: the whole policy and headers, exactly as the contract
+	// states them, and one script, external.
+	if csp != "default-src 'none'; script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" ||
+		resp.Header.Get("X-Content-Type-Options") != "nosniff" || resp.Header.Get("Content-Type") != "text/html; charset=utf-8" ||
+		strings.Count(body, "<script") != 1 || strings.Count(body, `<script src="/portcullis/open.js"></script>`) != 1 ||
+		inlineHandlerRe.MatchString(body) || strings.Contains(strings.ToLower(body), "javascript:") {
+		t.Fatalf("start page headers / script %q %v %s", csp, resp.Header, body)
+	}
 	if resp.StatusCode != http.StatusOK || len(resp.Cookies()) != 0 || resp.Header.Get("Cache-Control") != "no-store" ||
-		!strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "form-action 'self'") || strings.Contains(csp, "unsafe") ||
 		!strings.Contains(body, `data-hub-origin="https://hub.example.org"`) || !strings.Contains(body, `action="/portcullis/open"`) ||
 		!strings.Contains(body, `<script src="/portcullis/open.js">`) || resp.Header.Get("Referrer-Policy") != "same-origin" {
 		t.Fatalf("start page %d %q %s", resp.StatusCode, csp, body)
 	}
 	js := e.do(t, "GET", "/portcullis/open.js", "", nil)
 	src := js.Header.Get("X-Test-Body")
-	if js.StatusCode != http.StatusOK || !strings.HasPrefix(js.Header.Get("Content-Type"), "text/javascript") || js.Header.Get("X-Content-Type-Options") != "nosniff" {
+	if js.StatusCode != http.StatusOK || js.Header.Get("Content-Type") != "text/javascript; charset=utf-8" || js.Header.Get("X-Content-Type-Options") != "nosniff" ||
+		js.Header.Get("Cache-Control") != "no-store" || src != startJS {
 		t.Fatalf("script %d %v", js.StatusCode, js.Header)
 	}
 	for _, want := range []string{"e.origin !== hub", "'portcullis-mail-admin-hello'", "e.ports.length !== 1", "'portcullis-mail-admin-ready'", "ticketRe.test(t)", "f.submit()"} {
