@@ -441,7 +441,7 @@ jobs:
           jq -e '.uid == "portcullis" and (.panels | length) > 0' monitoring/grafana/dashboards/portcullis.json >/dev/null
           jq -e '.uid == "portcullis-usage" and .title == "Portcullis usage" and (.panels | length) >= 5' monitoring/grafana/dashboards/usage.json >/dev/null
           echo "PASS: prometheus config + rules (+ rule tests), alertmanager receivers, blackbox modules, dashboard"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           # Module + build cache handled below (saved on main only).
@@ -1604,7 +1604,7 @@ jobs:
       - name: Test the MCP gate (non-root, pinned address, secrets, access log, MCP routes without forward-auth)
         run: bash .github/ci/build-and-test-mcp-gate.sh
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -2787,7 +2787,7 @@ jobs:
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # imp_ai_refused: an AI token minted for alice before a start.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -4449,7 +4449,7 @@ jobs:
           # shellcheck disable=SC2016
           xargs -P 4 -I{} bash -c 'pull "$1"' _ {} < "$RUNNER_TEMP/app-images.txt"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -5242,7 +5242,7 @@ jobs:
       # handshake and a GET through the tunnel (userspace WireGuard, no TUN:
       # the people port goes through rootlessport / pasta). The reboot step
       # below then also brings wg back (restart: always).
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -5812,7 +5812,7 @@ jobs:
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -6011,7 +6011,7 @@ jobs:
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -6080,7 +6080,7 @@ jobs:
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
