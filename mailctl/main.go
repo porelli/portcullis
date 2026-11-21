@@ -513,7 +513,7 @@ func adminViewCmd(args []string, env func(string) string, stderr io.Writer) int 
 	}
 	logger := logx.New(stderr)
 	logx.AddSecret(cfg.RouteKey)
-	p, err := viewer.New(cfg.Upstream, cfg.Host, cfg.SecretFile, cfg.SPKIs, viewer.Gate{TraefikIP: cfg.TraefikIP, Key: cfg.RouteKey}, logger.Printf)
+	p, err := viewer.New(cfg.Upstream, cfg.Host, cfg.SecretFile, cfg.SPKIs, viewer.Gate{TraefikIP: cfg.TraefikIP, Key: cfg.RouteKey, Group: cfg.AdminGroup}, logx.AddSecret, logger.Printf)
 	if err != nil {
 		fmt.Fprintf(stderr, "mailctl admin-view: %v\n", err)
 		return 1

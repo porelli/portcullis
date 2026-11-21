@@ -326,6 +326,9 @@ type AdminView struct {
 	// client and the per-install key its router sets.
 	TraefikIP netip.Addr
 	RouteKey  string
+	// AdminGroup (PORTCULLIS_MAIL_ADMIN_GROUP): the group forward-auth's
+	// X-Auth-Request-Groups must hold (lldap_admin).
+	AdminGroup string
 }
 
 // LoadAdminView reads the admin view's configuration; every value is
@@ -370,6 +373,10 @@ func LoadAdminView(env func(string) string) (AdminView, error) {
 	a.RouteKey = strings.TrimSpace(env("PORTCULLIS_MAIL_ADMIN_ROUTE_KEY"))
 	if len(a.RouteKey) < 32 || strings.Trim(a.RouteKey, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") != "" {
 		return a, errors.New("PORTCULLIS_MAIL_ADMIN_ROUTE_KEY is required: 32+ letters and digits (the Hub's override sets it)")
+	}
+	a.AdminGroup = strings.TrimSpace(env("PORTCULLIS_MAIL_ADMIN_GROUP"))
+	if a.AdminGroup == "" || strings.ContainsAny(a.AdminGroup, ", \t") {
+		return a, errors.New("PORTCULLIS_MAIL_ADMIN_GROUP is required: the admin group (the Hub's override sets it)")
 	}
 	return a, nil
 }

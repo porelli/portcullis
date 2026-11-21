@@ -4,45 +4,52 @@
 // reaches Stalwart's admin-view listener (TLS, answered only to this
 // service's address) on the template's internal network.
 //
-// Three layers keep it read-only and keep every mail guard of the Hub:
+// What keeps it admin-only (every check fails closed with 403 and no
+// credential used anywhere):
 //
-//  1. the session is always the viewer's: GET /login (Stalwart's OAuth
-//     sign-in page) is answered here by signing in as the viewer, whose
-//     password only this service holds, and redirecting to the code
-//     callback; the sign-in API (/api/auth) is never forwarded, so no
-//     other Stalwart login (a mail password included, P11) opens the view;
-//  2. every JMAP call is a read: a request with any method whose name
-//     isn't /get, /query, /changes or /queryChanges, or that isn't strict
-//     JSON (a duplicate or case-variant key, another top-level key), is
-//     refused here (403) and never reaches Stalwart, and what is forwarded
-//     is the checked request re-encoded, never the browser's bytes;
-//     uploads, downloads, push and live endpoints aren't forwarded;
+//   - Gate: the request comes from Traefik's address with the per-install
+//     route key the Hub's router sets after forward-auth and group-gate,
+//     and forward-auth's groups header (X-Auth-Request-Groups, whose client
+//     copy Traefik deletes) holds the admin group;
+//   - a session: only GET /portcullis/open with a single-use ticket the
+//     Hub's audited Open action minted for this admin (≤ 60 s) starts one;
+//     it ends after 30 min idle or 8 h; a visit without one gets a page
+//     saying to open the view from Portcullis.
+//
+// What keeps it read-only (and every mail guard of the Hub):
+//
+//  1. the browser never signs in to Stalwart: the proxy answers the web
+//     admin's OAuth itself (/login, /auth/token, /auth/revoke,
+//     /auth/logout) with opaque per-session values, and authenticates every
+//     forwarded read as the viewer (Basic, over the pinned hop): no Stalwart
+//     token or password reaches a person, and Stalwart's sign-in API is
+//     never forwarded (no other login, a mail password included, P11);
+//  2. every JMAP call is on the allowlist: x:<Obj>/get and /query of the
+//     objects the viewer's role reads (stalwart.ViewerMethodAllowed), in a
+//     strict body forwarded re-encoded; anything else is 403 here and never
+//     reaches Stalwart; uploads, downloads, push and live aren't forwarded;
 //  3. the viewer's role holds reads only (stalwart.ViewerRolePermissions):
 //     Stalwart refuses every write itself.
 //
-// Nothing is served (and no credential is injected) unless the request
-// comes from Traefik's address with the per-install route key the Hub's
-// admin view router sets after forward-auth admitted a full
-// administrator (Gate); the proxy listens only on Traefik's network.
-//
-// Only an allowlist of paths is forwarded (anything else is 404 here, so
-// Stalwart's scan bans never see a stray path), never the browser's
-// Authorization (the reads are authenticated as the viewer by the proxy:
-// behind Portcullis's forward-auth the browser's header is replaced by
-// Traefik anyway), and neither cookies nor forwarding headers. The
-// viewer's password reaches only Stalwart, over the pinned hop.
+// Only canonical allowlisted paths are forwarded (anything else is 404
+// here, so Stalwart's scan bans never see a stray path), never the
+// browser's Authorization, cookies or forwarding headers.
 package viewer
 
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -51,8 +58,10 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/portcullis/mailctl/internal/stalwart"
@@ -65,34 +74,104 @@ const Viewer = "portcullis-viewer@portcullis-former.internal"
 const (
 	maxJMAPBody  = 1 << 20  // a JMAP request (Stalwart's own maxSizeRequest is 10 MB)
 	maxTokenBody = 16 << 10 // an OAuth token request
+	// TicketTTL is the longest a ticket from the Hub's Open action lives.
+	TicketTTL = 60 * time.Second
+	// SessionIdle / SessionMax end a session (contract §19.13).
+	SessionIdle = 30 * time.Minute
+	SessionMax  = 8 * time.Hour
+	// SessionCookie is the proxy's own session cookie (never forwarded).
+	SessionCookie = "__Host-portcullis-mail-admin"
 )
 
-// readMethod is a JMAP method name the view forwards: a read only.
-var readMethod = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9:]*/(get|query|changes|queryChanges)$`)
+// RouteKeyHeader carries the per-install route key the Hub's admin view
+// router sets after forward-auth admitted the request (Traefik overwrites
+// any client copy; contract §19.13).
+const RouteKeyHeader = "X-Portcullis-Mail-Admin-Key"
+
+// GroupsHeader is forward-auth's groups header (oauth2-proxy, echoed by
+// group-gate; both list it in authResponseHeaders, so Traefik deletes a
+// client's copy).
+const GroupsHeader = "X-Auth-Request-Groups"
+
+// Gate is who may reach the proxy: Traefik's address on portcullis-proxy,
+// the route key its router sets and the admin group in forward-auth's
+// groups header. A request without all three is 403 and nothing (no
+// credential) is sent upstream.
+type Gate struct {
+	TraefikIP netip.Addr
+	Key       string
+	Group     string
+}
+
+// TicketKey is the MAC key of the Hub's tickets: HMAC-SHA256(route key,
+// "portcullis-mail-admin-ticket v1") (contract §19.13).
+func TicketKey(routeKey string) []byte {
+	m := hmac.New(sha256.New, []byte(routeKey))
+	m.Write([]byte("portcullis-mail-admin-ticket v1"))
+	return m.Sum(nil)
+}
+
+// ticketBody is a ticket's payload.
+type ticketBody struct {
+	User   string `json:"u"`
+	Nonce  string `json:"n"`
+	Expiry int64  `json:"e"`
+}
+
+// MintTicket is a ticket for user valid until exp (the Hub mints them;
+// here for the tests and as the format's reference):
+// "v1.<b64url(json)>.<b64url(hmac)>".
+func MintTicket(key []byte, user, nonce string, exp time.Time) string {
+	b, _ := json.Marshal(ticketBody{User: user, Nonce: nonce, Expiry: exp.Unix()})
+	p := "v1." + base64.RawURLEncoding.EncodeToString(b)
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(p))
+	return p + "." + base64.RawURLEncoding.EncodeToString(m.Sum(nil))
+}
+
+// session is one admin's view session.
+type session struct {
+	user                    string
+	created, last           time.Time
+	code, access, refresh   string // the opaque OAuth values handed to the web admin
+	codeChallenge, redirect string
+}
 
 // Proxy is the admin view's handler.
 type Proxy struct {
-	gate     Gate
-	upstream *url.URL
-	host     string                 // the admin view's hostname (Stalwart's trusted host)
-	secret   func() (string, error) // the viewer's password, read on every sign-in
-	rp       *httputil.ReverseProxy
-	client   *http.Client
-	logf     func(string, ...any)
+	gate      Gate
+	ticketKey []byte
+	upstream  *url.URL
+	host      string                 // the admin view's hostname (Stalwart's trusted host)
+	secret    func() (string, error) // the viewer's password, read when used
+	rp        *httputil.ReverseProxy
+	client    *http.Client
+	logf      func(string, ...any)
+	now       func() time.Time
+
+	mu       sync.Mutex
+	sessions map[string]*session
+	used     map[string]time.Time // ticket nonces seen, until their expiry
 }
 
 // New builds the proxy. upstream is Stalwart's admin-view listener
 // (https://<ip>:<port>); host the admin view's hostname; secretFile holds
-// the viewer's password; spkis are the mail certificate's SPKI SHA-256
-// values (hex, the Hub's PORTCULLIS_MAIL_TLS_SPKI: one, two during a key
-// rollover). Stalwart serves the mail certificate there, issued for
-// MAIL_HOSTNAME (not the internal address, and a staging chain on test
-// servers), so the hop is pinned instead of chain-checked: the peer's leaf
-// must have one of spkis, or the connection fails (verifyPinned). The
-// password and the browser's token never reach anything else.
-func New(upstream, host, secretFile string, spkis []string, gate Gate, logf func(string, ...any)) (*Proxy, error) {
-	if !gate.TraefikIP.Is4() || len(gate.Key) < 32 {
-		return nil, errors.New("admin view: Traefik's address and the per-install route key are required: nothing reaches the proxy without them")
+// the viewer's password (each read is registered with onSecret, the log
+// redaction); spkis are the mail certificate's SPKI SHA-256 values (hex,
+// the Hub's PORTCULLIS_MAIL_TLS_SPKI: one, two during a key rollover).
+//
+// The upstream hop: Stalwart serves the mail certificate there, issued
+// for MAIL_HOSTNAME (not the internal address, and a staging chain on test
+// servers), so the hop is pinned instead of chain-checked. The ruling owner
+// accepted this exact form (ux2 fix round 1, ruling 3): InsecureSkipVerify
+// together with VerifyConnection requiring the leaf's SPKI SHA-256 to be
+// one of spkis. Without a valid pin New fails; a mismatched or missing
+// peer certificate fails the connection (verifyPinned); there is no TLS
+// session cache, so no resumption skips the check. TestUpstreamPinned
+// keeps both halves together.
+func New(upstream, host, secretFile string, spkis []string, gate Gate, onSecret func(string), logf func(string, ...any)) (*Proxy, error) {
+	if !gate.TraefikIP.Is4() || len(gate.Key) < 32 || gate.Group == "" {
+		return nil, errors.New("admin view: Traefik's address, the per-install route key and the admin group are required: nothing reaches the proxy without them")
 	}
 	u, err := url.Parse(upstream)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -105,17 +184,18 @@ func New(upstream, host, secretFile string, spkis []string, gate Gate, logf func
 	if logf == nil {
 		logf = log.Printf
 	}
+	if onSecret == nil {
+		onSecret = func(string) {}
+	}
 	tr := &http.Transport{
-		// InsecureSkipVerify only skips the chain and name check that can't
-		// apply here; VerifyConnection pins the leaf's key (fail closed).
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host, MinVersion: tls.VersionTLS12, // #nosec G402: pinned by VerifyConnection
-			VerifyConnection: func(cs tls.ConnectionState) error { return verifyPinned(cs, pins) }},
+		TLSClientConfig:       pinnedTLS(host, pins),
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		ResponseHeaderTimeout: 60 * time.Second,
 		MaxIdleConns:          16,
 		IdleConnTimeout:       90 * time.Second,
 	}
-	p := &Proxy{gate: gate, upstream: u, host: host, logf: logf,
+	p := &Proxy{gate: gate, ticketKey: TicketKey(gate.Key), upstream: u, host: host, logf: logf, now: time.Now,
+		sessions: map[string]*session{}, used: map[string]time.Time{},
 		secret: func() (string, error) {
 			b, err := os.ReadFile(secretFile)
 			if err != nil {
@@ -125,6 +205,7 @@ func New(upstream, host, secretFile string, spkis []string, gate Gate, logf func
 			if len(s) < 16 {
 				return "", errors.New("the viewer's password is missing")
 			}
+			onSecret(s)
 			return s, nil
 		},
 		client: &http.Client{Transport: tr, Timeout: 30 * time.Second,
@@ -139,13 +220,12 @@ func New(upstream, host, secretFile string, spkis []string, gate Gate, logf func
 				r.Out.Header.Del(h)
 			}
 			for k := range r.Out.Header {
-				if strings.HasPrefix(strings.ToLower(k), "x-auth-request-") || strings.HasPrefix(strings.ToLower(k), "x-forwarded-") {
+				if lk := strings.ToLower(k); strings.HasPrefix(lk, "x-auth-request-") || strings.HasPrefix(lk, "x-forwarded-") {
 					r.Out.Header.Del(k)
 				}
 			}
-			// The browser's own Authorization never reaches Stalwart (behind
-			// Portcullis's forward-auth it doesn't arrive at all: Traefik
-			// replaces it). The reads are the viewer's, always.
+			// The browser's own Authorization never reaches Stalwart. The
+			// reads are the viewer's, always.
 			r.Out.Header.Del("Authorization")
 			if viewerAuthPath(r.In.URL.Path) {
 				if pw, err := p.secret(); err == nil {
@@ -156,6 +236,9 @@ func New(upstream, host, secretFile string, spkis []string, gate Gate, logf func
 		Transport: tr,
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Header.Del("Set-Cookie")
+			// Never a browser password prompt (a mail password is never
+			// typed into a web page, P11).
+			resp.Header.Del("WWW-Authenticate")
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -166,12 +249,21 @@ func New(upstream, host, secretFile string, spkis []string, gate Gate, logf func
 	return p, nil
 }
 
-// viewerAuthPath: the paths the proxy authenticates as the viewer (the
-// JMAP session and calls, the account and schema reads); the sign-in,
-// token, logout and static paths go without credentials.
-func viewerAuthPath(path string) bool {
-	return path == "/jmap" || path == "/jmap/" || path == "/jmap/session" || path == "/api/account" ||
-		path == "/api/schema" || strings.HasPrefix(path, "/api/schema/")
+// pinnedTLS is the upstream hop's TLS: the chain and name checks are
+// skipped only because VerifyConnection pins the leaf's key (ruling 3).
+func pinnedTLS(host string, pins map[[32]byte]bool) *tls.Config {
+	return &tls.Config{InsecureSkipVerify: true, ServerName: host, MinVersion: tls.VersionTLS12, // #nosec G402: pinned by VerifyConnection (ruling 3)
+		VerifyConnection: func(cs tls.ConnectionState) error { return verifyPinned(cs, pins) }}
+}
+
+// schemaHashRe is /api/schema/<hash>.
+var schemaHashRe = regexp.MustCompile(`^/api/schema/[A-Za-z0-9_-]{8,128}$`)
+
+// viewerAuthPath: the exact paths the proxy authenticates as the viewer
+// (the JMAP session and calls, the account and schema reads); the static
+// paths go without credentials.
+func viewerAuthPath(p string) bool {
+	return p == "/jmap" || p == "/jmap/" || p == "/jmap/session" || p == "/api/account" || p == "/api/schema" || schemaHashRe.MatchString(p)
 }
 
 // parsePins checks the pinned SPKI SHA-256 values: 1–2, 64 lowercase hex.
@@ -201,42 +293,76 @@ func verifyPinned(cs tls.ConnectionState, pins map[[32]byte]bool) error {
 	return nil
 }
 
-// RouteKeyHeader carries the per-install route key the Hub's admin view
-// router sets after forward-auth admitted a full administrator (Traefik
-// overwrites any client copy; contract §19.13).
-const RouteKeyHeader = "X-Portcullis-Mail-Admin-Key"
-
-// Gate is who may reach the proxy: Traefik's address on portcullis-proxy
-// and the route key its router sets. A request without both is 403 and
-// nothing (no credential) is sent upstream.
-type Gate struct {
-	TraefikIP netip.Addr
-	Key       string
-}
-
-// admitted: the request came from Traefik's address with the route key.
+// admitted: the request came from Traefik's address with the route key
+// and the admin group.
 func (p *Proxy) admitted(r *http.Request) bool {
 	ap, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil || ap.Addr().Unmap() != p.gate.TraefikIP {
 		return false
 	}
-	got := r.Header.Get(RouteKeyHeader)
-	return len(r.Header.Values(RouteKeyHeader)) == 1 && subtle.ConstantTimeCompare([]byte(got), []byte(p.gate.Key)) == 1
-}
-
-// ServeHTTP is the gate, then the allowlist (contract §19.13).
-func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-	get := r.Method == http.MethodGet || r.Method == http.MethodHead
-	if path == "/healthz" && get {
-		// The container's own healthcheck, on loopback only.
-		if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil && ap.Addr().IsLoopback() {
-			w.WriteHeader(http.StatusOK)
-			return
+	if len(r.Header.Values(RouteKeyHeader)) != 1 || subtle.ConstantTimeCompare([]byte(r.Header.Get(RouteKeyHeader)), []byte(p.gate.Key)) != 1 {
+		return false
+	}
+	if len(r.Header.Values(GroupsHeader)) != 1 {
+		return false
+	}
+	for _, g := range strings.Split(r.Header.Get(GroupsHeader), ",") {
+		if strings.TrimSpace(g) == p.gate.Group {
+			return true
 		}
 	}
-	if !p.admitted(r) {
+	return false
+}
+
+// canonicalPath: a path the proxy will look at (no dot segments, no
+// doubled or encoded slashes or dots, no backslash).
+func canonicalPath(r *http.Request) bool {
+	p, raw := r.URL.Path, r.URL.RawPath
+	if p == "" || !strings.HasPrefix(p, "/") || strings.Contains(p, "//") || strings.Contains(p, "\\") {
+		return false
+	}
+	lr := strings.ToLower(raw + r.URL.EscapedPath())
+	if strings.Contains(lr, "%2e") || strings.Contains(lr, "%2f") || strings.Contains(lr, "%5c") {
+		return false
+	}
+	c := path.Clean(p)
+	if strings.HasSuffix(p, "/") && c != "/" {
+		c += "/"
+	}
+	return c == p
+}
+
+// user is the full administrator forward-auth let through (and the
+// admin impersonating, if any: both for the logs).
+func user(r *http.Request) string { return strings.TrimSpace(r.Header.Get("X-Forwarded-User")) }
+
+func who(r *http.Request) string {
+	u := user(r)
+	if imp := strings.TrimSpace(r.Header.Get("X-Forwarded-Impersonator")); imp != "" {
+		return u + " (impersonated by " + imp + ")"
+	}
+	return u
+}
+
+// ServeHTTP is the gate, the session, then the allowlist (contract §19.13).
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !p.admitted(r) || user(r) == "" {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if !canonicalPath(r) {
+		http.NotFound(w, r)
+		return
+	}
+	path := r.URL.Path
+	get := r.Method == http.MethodGet || r.Method == http.MethodHead
+	if path == "/portcullis/open" && get {
+		p.open(w, r)
+		return
+	}
+	s, why := p.session(r)
+	if s == nil {
+		openFromPortcullis(w, why)
 		return
 	}
 	switch {
@@ -245,23 +371,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case (path == "/admin" || strings.HasPrefix(path, "/admin/")) && get,
 		(path == "/logo" || strings.HasPrefix(path, "/logo/")) && get,
 		path == "/api/account" && get,
-		(path == "/api/schema" || strings.HasPrefix(path, "/api/schema/")) && get,
+		(path == "/api/schema" || schemaHashRe.MatchString(path)) && get,
 		path == "/jmap/session" && get,
-		strings.HasPrefix(path, "/.well-known/oauth-") && get,
-		path == "/.well-known/openid-configuration" && get,
-		(path == "/auth/logout") && (get || r.Method == http.MethodPost),
-		path == "/auth/revoke" && r.Method == http.MethodPost:
+		(path == "/.well-known/oauth-authorization-server" || path == "/.well-known/openid-configuration" ||
+			strings.HasPrefix(path, "/.well-known/oauth-protected-resource")) && get:
 		p.rp.ServeHTTP(w, r)
 	case strings.HasPrefix(path, "/api/discover/") && get:
-		// Whatever name the sign-in form was given, the view signs in as
-		// the viewer: discover the viewer's domain.
+		// Whatever name the sign-in form was given, the view is the
+		// viewer's: discover the viewer's domain.
 		r2 := r.Clone(r.Context())
 		r2.URL.Path, r2.URL.RawPath = "/api/discover/"+url.PathEscape(Viewer), ""
 		p.rp.ServeHTTP(w, r2)
 	case path == "/login" && get:
-		p.signIn(w, r)
+		p.login(w, r, s)
 	case path == "/auth/token" && r.Method == http.MethodPost:
-		p.token(w, r)
+		p.token(w, r, s)
+	case path == "/auth/revoke" && r.Method == http.MethodPost:
+		w.WriteHeader(http.StatusOK)
+	case path == "/auth/logout" && (get || r.Method == http.MethodPost):
+		p.end(w, r)
 	case (path == "/jmap" || path == "/jmap/") && r.Method == http.MethodPost:
 		p.jmap(w, r)
 	default:
@@ -269,90 +397,236 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// user is the full administrator Traefik's forward-auth let through (for
-// the log line only; Traefik strips a client's own copy).
-func user(r *http.Request) string {
-	if u := r.Header.Get("X-Forwarded-User"); u != "" {
-		return u
-	}
-	return "an unnamed admin"
+// openFromPortcullis is the answer without a session.
+func openFromPortcullis(w http.ResponseWriter, why string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'")
+	w.WriteHeader(http.StatusForbidden)
+	fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>Open it from Portcullis</title>`+
+		`<h1>Open it from Portcullis</h1><p>%s</p><p>Open the mail server's read-only admin screen from Portcullis: Settings → Mail, <strong>Open … admin (read-only)</strong>.</p>`,
+		html.EscapeString(why))
 }
 
-// signIn answers Stalwart's OAuth sign-in page: it signs in as the viewer
-// with the browser's own authorization request (its client, redirect and
-// PKCE challenge, checked by Stalwart) and redirects the browser to the
-// answer's location, the web admin's code callback on this host.
-func (p *Proxy) signIn(w http.ResponseWriter, r *http.Request) {
-	pw, err := p.secret()
-	if err != nil {
-		p.logf("admin-view: sign-in refused: %v", err)
-		http.Error(w, "the read-only mail admin view isn't set up on this mail server", http.StatusServiceUnavailable)
+func randomToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// session is the request's live session (its cookie, the same admin,
+// within the idle and total limits), or nil and why.
+func (p *Proxy) session(r *http.Request) (*session, string) {
+	c, err := r.Cookie(SessionCookie)
+	if err != nil || c.Value == "" {
+		return nil, "This page opens only from Portcullis."
+	}
+	now := p.now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := p.sessions[c.Value]
+	switch {
+	case s == nil:
+		return nil, "This session isn't known (it ended, or the view restarted)."
+	case now.Sub(s.last) > SessionIdle || now.Sub(s.created) > SessionMax:
+		delete(p.sessions, c.Value)
+		return nil, "This session ended (30 minutes idle or 8 hours open)."
+	case s.user != user(r):
+		return nil, "This session belongs to another administrator."
+	}
+	s.last = now
+	return s, ""
+}
+
+// open starts a session from the Hub's ticket: well formed, MAC'd with
+// the ticket key, unexpired (≤ TicketTTL ahead), for the forwarded admin,
+// never seen before. The mail server's unmask switch must be off.
+func (p *Proxy) open(w http.ResponseWriter, r *http.Request) {
+	t := r.URL.Query().Get("t")
+	tb, ok := p.checkTicket(t, user(r))
+	if !ok {
+		p.logf("admin-view: %s presented no valid ticket", who(r))
+		openFromPortcullis(w, "The link was used, expired or isn't yours.")
 		return
 	}
-	body, _ := json.Marshal(map[string]any{"type": "authCode", "accountName": Viewer, "accountSecret": pw, "query": r.URL.RawQuery})
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, p.upstream.String()+"/api/auth", bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "sign-in failed", http.StatusBadGateway)
+	if err := p.secretsMasked(r.Context()); err != nil {
+		p.logf("admin-view: refusing to open: %v", err)
+		http.Error(w, "the read-only mail admin view can't open: "+err.Error(), http.StatusServiceUnavailable)
 		return
+	}
+	id := randomToken()
+	now := p.now()
+	p.mu.Lock()
+	for k, s := range p.sessions {
+		if now.Sub(s.last) > SessionIdle || now.Sub(s.created) > SessionMax {
+			delete(p.sessions, k)
+		}
+	}
+	p.sessions[id] = &session{user: tb.User, created: now, last: now}
+	p.mu.Unlock()
+	p.logf("admin-view: %s opened the read-only mail admin view (ticket %s)", who(r), tb.Nonce)
+	http.SetCookie(w, &http.Cookie{Name: SessionCookie, Value: id, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, "/admin/", http.StatusFound)
+}
+
+func (p *Proxy) checkTicket(t, forUser string) (ticketBody, bool) {
+	var tb ticketBody
+	parts := strings.Split(t, ".")
+	if len(parts) != 3 || parts[0] != "v1" || len(t) > 1024 {
+		return tb, false
+	}
+	m := hmac.New(sha256.New, p.ticketKey)
+	m.Write([]byte(parts[0] + "." + parts[1]))
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || !hmac.Equal(sig, m.Sum(nil)) {
+		return tb, false
+	}
+	b, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil || json.Unmarshal(b, &tb) != nil || tb.Nonce == "" || tb.User == "" {
+		return tb, false
+	}
+	now := p.now()
+	exp := time.Unix(tb.Expiry, 0)
+	if !now.Before(exp) || exp.Sub(now) > TicketTTL || tb.User != forUser {
+		return tb, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for n, e := range p.used {
+		if now.After(e) {
+			delete(p.used, n)
+		}
+	}
+	if _, seen := p.used[tb.Nonce]; seen {
+		return tb, false
+	}
+	p.used[tb.Nonce] = exp
+	return tb, true
+}
+
+// secretsMasked: the mail server's unmask switch (SystemSettings
+// includeSecrets) is off, read as the viewer (contract §19.13).
+func (p *Proxy) secretsMasked(ctx context.Context) error {
+	pw, err := p.secret()
+	if err != nil {
+		return err
+	}
+	body := `{"using":["urn:ietf:params:jmap:core","urn:stalwart:jmap"],"methodCalls":[["x:SystemSettings/get",{"ids":["singleton"],"properties":["includeSecrets"]},"0"]]}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.upstream.String()+"/jmap", strings.NewReader(body))
+	if err != nil {
+		return err
 	}
 	req.Host = p.host
 	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(Viewer, pw)
 	resp, err := p.client.Do(req)
 	if err != nil {
-		p.logf("admin-view: sign-in: the mail server isn't answering")
-		http.Error(w, "the mail server isn't answering", http.StatusBadGateway)
-		return
+		return errors.New("the mail server isn't answering")
 	}
 	defer resp.Body.Close()
 	var ans struct {
-		Type     string `json:"type"`
-		Location string `json:"location"`
+		MethodResponses [][]json.RawMessage `json:"methodResponses"`
 	}
-	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&ans) != nil {
-		p.logf("admin-view: sign-in: the mail server answered HTTP %d", resp.StatusCode)
-		http.Error(w, "sign-in failed", http.StatusBadGateway)
-		return
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&ans) != nil || len(ans.MethodResponses) != 1 || len(ans.MethodResponses[0]) != 3 {
+		return fmt.Errorf("the mail server answered HTTP %d", resp.StatusCode)
 	}
-	if ans.Type != "authenticated" && ans.Type != "redirect" {
-		p.logf("admin-view: sign-in: the mail server answered %q", ans.Type)
-		http.Error(w, "sign-in failed: the mail server answered "+ans.Type, http.StatusForbidden)
-		return
+	var got struct {
+		List []struct {
+			IncludeSecrets *bool `json:"includeSecrets"`
+		} `json:"list"`
 	}
-	// Only back to this host's web admin.
-	loc, err := url.Parse(ans.Location)
-	if err != nil || loc.Scheme != "https" || !strings.EqualFold(loc.Host, p.host) || !strings.HasPrefix(loc.Path, "/admin/") {
-		p.logf("admin-view: sign-in: refused a redirect off the admin view")
-		http.Error(w, "sign-in failed", http.StatusBadGateway)
-		return
+	if json.Unmarshal(ans.MethodResponses[0][1], &got) != nil || len(got.List) != 1 || got.List[0].IncludeSecrets == nil {
+		return errors.New("the mail server's secret masking can't be read")
 	}
-	if ans.Type == "authenticated" {
-		p.logf("admin-view: %s opened the read-only mail admin view (signed in as the viewer)", user(r))
+	if *got.List[0].IncludeSecrets {
+		return errors.New("the mail server shows secrets (includeSecrets is on)")
 	}
-	w.Header().Set("Cache-Control", "no-store")
-	http.Redirect(w, r, loc.String(), http.StatusFound)
+	return nil
 }
 
-// token forwards an OAuth token request with a code or a refresh token
-// only (never a password or device grant).
-func (p *Proxy) token(w http.ResponseWriter, r *http.Request) {
+// login answers the web admin's OAuth sign-in for the session: a code for
+// the web admin's own callback on this host only.
+func (p *Proxy) login(w http.ResponseWriter, r *http.Request, s *session) {
+	q := r.URL.Query()
+	redir := q.Get("redirect_uri")
+	ru, err := url.Parse(redir)
+	if q.Get("response_type") != "code" || q.Get("state") == "" || err != nil || ru.Scheme != "https" || !strings.EqualFold(ru.Host, p.host) ||
+		ru.Path != "/admin/oauth/callback" || ru.RawQuery != "" || ru.Fragment != "" || q.Get("code_challenge_method") != "S256" || q.Get("code_challenge") == "" {
+		http.Error(w, "sign-in refused", http.StatusBadRequest)
+		return
+	}
+	p.mu.Lock()
+	s.code, s.codeChallenge, s.redirect = randomToken(), q.Get("code_challenge"), redir
+	code := s.code
+	p.mu.Unlock()
+	back := url.Values{"code": {code}, "state": {q.Get("state")}, "iss": {"https://" + p.host}}
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, redir+"?"+back.Encode(), http.StatusFound)
+}
+
+// token answers the web admin's token requests itself: its code (with
+// the PKCE verifier) or its refresh token for opaque per-session values,
+// never a Stalwart token.
+func (p *Proxy) token(w http.ResponseWriter, r *http.Request, s *session) {
 	b, err := io.ReadAll(io.LimitReader(r.Body, maxTokenBody+1))
 	if err != nil || len(b) > maxTokenBody {
 		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	v, err := url.ParseQuery(string(b))
-	if g := v.Get("grant_type"); err != nil || (g != "authorization_code" && g != "refresh_token") || len(v["grant_type"]) != 1 {
-		http.Error(w, "the read-only admin view takes only code and refresh grants", http.StatusBadRequest)
+	refuse := func() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}
+	if err != nil || len(v["grant_type"]) != 1 {
+		refuse()
 		return
 	}
-	// The checked form, re-encoded (never the browser's bytes).
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	p.forward(w, r, []byte(v.Encode()))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch v.Get("grant_type") {
+	case "authorization_code":
+		sum := sha256.Sum256([]byte(v.Get("code_verifier")))
+		if s.code == "" || subtle.ConstantTimeCompare([]byte(v.Get("code")), []byte(s.code)) != 1 || v.Get("redirect_uri") != s.redirect ||
+			base64.RawURLEncoding.EncodeToString(sum[:]) != s.codeChallenge {
+			refuse()
+			return
+		}
+		s.code = ""
+	case "refresh_token":
+		if s.refresh == "" || subtle.ConstantTimeCompare([]byte(v.Get("refresh_token")), []byte(s.refresh)) != 1 {
+			refuse()
+			return
+		}
+	default:
+		refuse()
+		return
+	}
+	s.access, s.refresh = randomToken(), randomToken()
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(map[string]any{"access_token": s.access, "refresh_token": s.refresh, "token_type": "Bearer", "expires_in": 3600})
 }
 
-// jmap forwards a JMAP request only when every method call is a read,
-// and forwards the body it checked, re-encoded (canonicalJMAP): never the
-// browser's bytes, so Stalwart can't parse anything the check didn't see.
+// end ends the session (the web admin's sign-out).
+func (p *Proxy) end(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(SessionCookie); err == nil {
+		p.mu.Lock()
+		delete(p.sessions, c.Value)
+		p.mu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: SessionCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	openFromPortcullis(w, "You signed out of the mail server's admin screen.")
+}
+
+// jmap forwards a JMAP request only when every method call is on the
+// allowlist, and forwards the body it checked, re-encoded (canonicalJMAP):
+// never the browser's bytes, so Stalwart can't parse anything the check
+// didn't see.
 func (p *Proxy) jmap(w http.ResponseWriter, r *http.Request) {
 	b, err := io.ReadAll(io.LimitReader(r.Body, maxJMAPBody+1))
 	if err != nil || len(b) > maxJMAPBody {
@@ -364,7 +638,7 @@ func (p *Proxy) jmap(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]any{"type": "urn:ietf:params:jmap:error:forbidden", "status": 403,
-			"title": "Read-only", "detail": "Stalwart's admin screen is read-only here: make changes in Portcullis (Settings → Mail). " + why})
+			"title": "Read-only", "detail": "The mail server's admin screen is read-only here: make changes in Portcullis (Settings → Mail). " + why})
 		return
 	}
 	r.Header.Set("Content-Type", "application/json")
@@ -380,7 +654,7 @@ const errNotJMAP = "Not a strict JMAP request."
 // call id]), in that exact case, each once: a duplicate key, another
 // case, another key or trailing data is refused, so no second reading
 // of the bytes can hold a call the check didn't see (strictObject scans
-// the tokens). Every name must be a read (readMethod). The answer is
+// the tokens). Every name must be on the allowlist (stalwart.ViewerMethodAllowed). The answer is
 // built from the checked values only; each arguments object is decoded
 // (numbers kept exact) and encoded again, so its keys reach Stalwart once.
 func canonicalJMAP(b []byte) ([]byte, string) {
@@ -415,13 +689,10 @@ func canonicalJMAP(b []byte) ([]byte, string) {
 		if json.Unmarshal(call[0], &name) != nil || json.Unmarshal(call[2], &id) != nil {
 			return nil, errNotJMAP
 		}
-		if !readMethod.MatchString(name) {
+		// The allowlist: x:<Obj>/get and /query of the role's objects
+		// only (stalwart.ViewerMethodAllowed, one list for both layers).
+		if !stalwart.ViewerMethodAllowed(name) {
 			return nil, "Refused: " + name + "."
-		}
-		// Messages, envelopes, reports and credentials: never, even as a
-		// read (the role holds none of them either).
-		if stalwart.ViewerDeniedObject(name) {
-			return nil, "Refused: " + name + " (messages, envelopes, reports and credentials stay out of the admin view)."
 		}
 		args, ok := strictValue(call[1])
 		if _, isObj := args.(map[string]any); !ok || !isObj {

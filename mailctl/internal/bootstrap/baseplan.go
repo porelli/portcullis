@@ -150,7 +150,7 @@ type Named struct {
 	Immutable []string
 }
 
-// listeners are the six (Global Constraints); every other one is destroyed.
+// listeners are the seven (Global Constraints, plus the admin view's); every other one is destroyed.
 func (p Params) listeners() Named {
 	l := func(name, proto string, tls, implicit bool, binds ...string) map[string]any {
 		return map[string]any{"name": name, "protocol": proto, "bind": set(binds...), "useTls": tls, "implicitTls": implicit}
@@ -337,7 +337,9 @@ func (p Params) systemSettings() map[string]any {
 	if h == "" {
 		h = PlaceholderHostname
 	}
-	return map[string]any{"maxBufferedMemory": 134217728, "defaultHostname": h}
+	// includeSecrets stays false: Stalwart masks every secret on a read
+	// only then (the admin view's viewer reads settings, contract §19.13).
+	return map[string]any{"maxBufferedMemory": 134217728, "defaultHostname": h, "includeSecrets": false}
 }
 
 func (p Params) domains() []map[string]any {

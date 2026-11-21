@@ -683,6 +683,9 @@ func TestBasePlanViewer(t *testing.T) {
 	if !found {
 		t.Fatal("no viewer account")
 	}
+	if ss := f.objs["SystemSettings"]["singleton"]; ss == nil || ss["includeSecrets"] != false {
+		t.Fatalf("includeSecrets isn't pinned false: %v", ss)
+	}
 	rules := fmt.Sprint(p.AllowedEndpoints())
 	if !strings.Contains(rules, "listener == 'admin-view' && remote_ip == '172.31.255.5'") {
 		t.Fatalf("no admin-view rule: %s", rules)

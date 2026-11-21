@@ -97,86 +97,80 @@ var MailctlRolePermissions = func() []string {
 var ViewerRolePermissions = []string{
 	"authenticate",
 	"sysAccountGet", "sysAccountQuery", "sysAccountSettingsGet", "sysAcmeProviderGet", "sysAcmeProviderQuery",
-	"sysAddressBookGet", "sysAiModelGet", "sysAiModelQuery", "sysAlertGet", "sysAlertQuery", "sysAllowedIpGet",
-	"sysAllowedIpQuery", "sysApplicationGet", "sysApplicationQuery", "sysAsnGet", "sysAuthenticationGet",
-	"sysBlobStoreGet", "sysBlockedIpGet", "sysBlockedIpQuery", "sysCacheGet", "sysCalendarGet",
-	"sysCalendarAlarmGet", "sysCalendarSchedulingGet", "sysCertificateGet", "sysCertificateQuery",
-	"sysClusterNodeGet", "sysClusterNodeQuery", "sysClusterRoleGet", "sysClusterRoleQuery",
-	"sysCoordinatorGet", "sysDataRetentionGet", "sysDataStoreGet", "sysDirectoryGet", "sysDirectoryQuery",
-	"sysDkimReportSettingsGet", "sysDkimSignatureGet", "sysDkimSignatureQuery", "sysDmarcReportSettingsGet",
-	"sysDnsResolverGet", "sysDnsServerGet", "sysDnsServerQuery", "sysDomainGet", "sysDomainQuery",
-	"sysDsnReportSettingsGet", "sysEmailGet", "sysEncryptionGet", "sysEventTracingLevelGet",
+	"sysAddressBookGet", "sysAlertGet", "sysAlertQuery", "sysAllowedIpGet", "sysAllowedIpQuery",
+	"sysApplicationGet", "sysApplicationQuery", "sysAuthenticationGet", "sysBlockedIpGet", "sysBlockedIpQuery",
+	"sysCalendarGet", "sysCalendarAlarmGet", "sysCalendarSchedulingGet", "sysCertificateGet",
+	"sysCertificateQuery", "sysClusterNodeGet", "sysClusterNodeQuery", "sysClusterRoleGet",
+	"sysClusterRoleQuery", "sysDataRetentionGet", "sysDkimReportSettingsGet", "sysDkimSignatureGet",
+	"sysDkimSignatureQuery", "sysDmarcReportSettingsGet", "sysDnsResolverGet", "sysDomainGet",
+	"sysDomainQuery", "sysDsnReportSettingsGet", "sysEmailGet", "sysEncryptionGet", "sysEventTracingLevelGet",
 	"sysEventTracingLevelQuery", "sysExternalPublicKeyGet", "sysExternalPublicKeyQuery", "sysFileStorageGet",
-	"sysHttpGet", "sysHttpFormGet", "sysHttpLookupGet", "sysHttpLookupQuery", "sysImapGet",
-	"sysInMemoryStoreGet", "sysIndexQueueStatusGet", "sysIndexQueueStatusQuery", "sysJmapGet",
+	"sysHttpFormGet", "sysImapGet", "sysIndexQueueStatusGet", "sysIndexQueueStatusQuery", "sysJmapGet",
 	"sysMailingListGet", "sysMailingListQuery", "sysMemoryLookupKeyGet", "sysMemoryLookupKeyQuery",
 	"sysMemoryLookupKeyValueGet", "sysMemoryLookupKeyValueQuery", "sysMetadataGet", "sysMetricGet",
-	"sysMetricQuery", "sysMetricsGet", "sysMetricsStoreGet", "sysMtaConnectionStrategyGet",
-	"sysMtaConnectionStrategyQuery", "sysMtaDeliveryScheduleGet", "sysMtaDeliveryScheduleQuery",
-	"sysMtaExtensionsGet", "sysMtaHookGet", "sysMtaHookQuery", "sysMtaInboundSessionGet",
-	"sysMtaInboundThrottleGet", "sysMtaInboundThrottleQuery", "sysMtaMilterGet", "sysMtaMilterQuery",
-	"sysMtaOutboundStrategyGet", "sysMtaOutboundThrottleGet", "sysMtaOutboundThrottleQuery",
-	"sysMtaQueueQuotaGet", "sysMtaQueueQuotaQuery", "sysMtaRouteGet", "sysMtaRouteQuery", "sysMtaStageAuthGet",
-	"sysMtaStageConnectGet", "sysMtaStageDataGet", "sysMtaStageEhloGet", "sysMtaStageMailGet",
-	"sysMtaStageRcptGet", "sysMtaStsGet", "sysMtaTlsStrategyGet", "sysMtaTlsStrategyQuery",
-	"sysMtaVirtualQueueGet", "sysMtaVirtualQueueQuery", "sysNetworkListenerGet", "sysNetworkListenerQuery",
-	"sysOAuthClientGet", "sysOAuthClientQuery", "sysOidcProviderGet", "sysPublicKeyGet", "sysPublicKeyQuery",
-	"sysReportSettingsGet", "sysRoleGet", "sysRoleQuery", "sysSearchGet", "sysSearchStoreGet",
-	"sysSecurityGet", "sysSenderAuthGet", "sysSharingGet", "sysSieveSystemInterpreterGet",
+	"sysMetricQuery", "sysMtaConnectionStrategyGet", "sysMtaConnectionStrategyQuery",
+	"sysMtaDeliveryScheduleGet", "sysMtaDeliveryScheduleQuery", "sysMtaExtensionsGet",
+	"sysMtaInboundSessionGet", "sysMtaInboundThrottleGet", "sysMtaInboundThrottleQuery", "sysMtaMilterGet",
+	"sysMtaMilterQuery", "sysMtaOutboundStrategyGet", "sysMtaOutboundThrottleGet",
+	"sysMtaOutboundThrottleQuery", "sysMtaQueueQuotaGet", "sysMtaQueueQuotaQuery", "sysMtaRouteGet",
+	"sysMtaRouteQuery", "sysMtaStageAuthGet", "sysMtaStageConnectGet", "sysMtaStageDataGet",
+	"sysMtaStageEhloGet", "sysMtaStageMailGet", "sysMtaStageRcptGet", "sysMtaStsGet", "sysMtaTlsStrategyGet",
+	"sysMtaTlsStrategyQuery", "sysMtaVirtualQueueGet", "sysMtaVirtualQueueQuery", "sysNetworkListenerGet",
+	"sysNetworkListenerQuery", "sysOAuthClientGet", "sysOAuthClientQuery", "sysOidcProviderGet",
+	"sysPublicKeyGet", "sysPublicKeyQuery", "sysReportSettingsGet", "sysRoleGet", "sysRoleQuery",
+	"sysSearchGet", "sysSecurityGet", "sysSenderAuthGet", "sysSharingGet", "sysSieveSystemInterpreterGet",
 	"sysSieveSystemScriptGet", "sysSieveSystemScriptQuery", "sysSieveUserInterpreterGet",
-	"sysSmimeTrustAnchorGet", "sysSmimeTrustAnchorQuery", "sysSpamAiGet", "sysSpamClassifierGet",
-	"sysSpamDnsblServerGet", "sysSpamDnsblServerQuery", "sysSpamDnsblSettingsGet", "sysSpamFileExtensionGet",
+	"sysSmimeTrustAnchorGet", "sysSmimeTrustAnchorQuery", "sysSpamClassifierGet", "sysSpamFileExtensionGet",
 	"sysSpamFileExtensionQuery", "sysSpamPyzorGet", "sysSpamRuleGet", "sysSpamRuleQuery", "sysSpamSettingsGet",
-	"sysSpamTagGet", "sysSpamTagQuery", "sysSpfReportSettingsGet", "sysStoreLookupGet", "sysStoreLookupQuery",
-	"sysSystemSettingsGet", "sysTaskGet", "sysTaskQuery", "sysTaskManagerGet", "sysTenantGet",
-	"sysTenantQuery", "sysTlsReportSettingsGet", "sysTracerGet", "sysTracerQuery", "sysTracingStoreGet",
-	"sysWebDavGet", "sysWebHookGet", "sysWebHookQuery",
+	"sysSpamTagGet", "sysSpamTagQuery", "sysSpfReportSettingsGet", "sysSystemSettingsGet", "sysTaskGet",
+	"sysTaskQuery", "sysTaskManagerGet", "sysTenantGet", "sysTenantQuery", "sysTlsReportSettingsGet",
+	"sysWebDavGet",
 }
 
 // ViewerDenied are the management objects whose reads the viewer never
-// gets: credentials and their metadata (AccountPassword, ApiKey,
-// AppPassword, Passkey, OAuthGrant, Bootstrap, SymmetricKey, Enterprise),
-// people's data (SpamTrainingSample, ArchivedItem, MaskedEmail,
-// SieveUserScript), messages and their envelopes (QueuedMessage, the
-// queue; the received and sent DMARC, TLS and ARF reports, which carry
-// senders, recipients, headers or whole messages) and the server's logs
-// and traces (Log, Trace). The admin view's proxy refuses their methods
-// too (ViewerDeniedObject).
+// gets (contract §19.13):
+//   - credentials and their metadata: AccountPassword, ApiKey,
+//     AppPassword, Passkey, OAuthGrant, Bootstrap, SymmetricKey, Enterprise;
+//   - people's data: SpamTrainingSample, ArchivedItem, MaskedEmail,
+//     SieveUserScript;
+//   - messages and their envelopes: QueuedMessage (the queue) and the
+//     received and sent DMARC, TLS and ARF reports;
+//   - every object whose plain (unmasked) fields can hold a secret: a
+//     connection URL or username, HTTP headers, a DNS or HTTP provider's
+//     keys, a lookup zone (the Spamhaus DQS key sits in SpamDnsblServer's
+//     zone): the stores, directories, DNS servers, hooks, tracers,
+//     metrics exporters, AI models, HTTP lookups and the DNSBL settings;
+//   - the server's logs and traces: Log, Trace.
+//
+// TestViewerSecretFreeFields walks the schema snapshot so a field that
+// could hold a secret can't come back unjudged.
 var ViewerDenied = []string{"AccountPassword", "ApiKey", "AppPassword", "Passkey", "OAuthGrant", "Bootstrap", "SymmetricKey",
 	"Enterprise", "SpamTrainingSample", "ArchivedItem", "MaskedEmail", "SieveUserScript",
 	"QueuedMessage", "ArfExternalReport", "DmarcExternalReport", "DmarcInternalReport", "TlsExternalReport", "TlsInternalReport",
+	"SpamDnsblServer", "SpamDnsblSettings", "AiModel", "SpamAi", "Asn", "BlobStore", "Cache", "Coordinator", "DataStore", "Directory",
+	"DnsServer", "Http", "HttpLookup", "InMemoryStore", "Metrics", "MetricsStore", "MtaHook", "SearchStore", "StoreLookup",
+	"Tracer", "TracingStore", "WebHook",
 	"Log", "Trace"}
 
-// ViewerDeniedObject reports a JMAP method's object (x:<Object>/…) that
-// the viewer may never read: ViewerDenied's, and anything whose name says
-// it holds messages, reports, envelopes or credentials (a later schema's
-// new kin is refused before it is judged).
-func ViewerDeniedObject(method string) bool {
-	mgmt := strings.HasPrefix(method, "x:")
-	obj, _, _ := strings.Cut(strings.TrimPrefix(method, "x:"), "/")
-	for _, d := range ViewerDenied {
-		if strings.EqualFold(obj, d) {
-			return true
+// viewerMethods are the only JMAP methods the admin view forwards: x:<Obj>/get
+// and x:<Obj>/query for exactly the objects ViewerRolePermissions reads
+// (one list for both layers, contract §19.13).
+var viewerMethods = func() map[string]bool {
+	m := map[string]bool{}
+	for _, p := range ViewerRolePermissions {
+		if obj, ok := strings.CutSuffix(strings.TrimPrefix(p, "sys"), "Get"); ok && p != obj {
+			m["x:"+obj+"/get"] = true
+		} else if obj, ok := strings.CutSuffix(strings.TrimPrefix(p, "sys"), "Query"); ok {
+			m["x:"+obj+"/query"] = true
 		}
 	}
-	lo := strings.ToLower(obj)
-	for _, w := range []string{"message", "report", "envelope", "queue", "email", "mailbox", "blob", "password", "apikey", "secret", "key", "token", "credential", "log", "trace", "sample", "archived"} {
-		if strings.Contains(lo, w) && !(mgmt && viewerAllowedKin[obj]) {
-			return true
-		}
-	}
-	return false
-}
+	return m
+}()
 
-// viewerAllowedKin are management objects (x:) whose names match
-// ViewerDeniedObject's words but hold settings only (no message, report
-// or secret value).
-var viewerAllowedKin = map[string]bool{
-	"DkimReportSettings": true, "DmarcReportSettings": true, "DsnReportSettings": true, "SpfReportSettings": true,
-	"TlsReportSettings": true, "ReportSettings": true, "MtaQueueQuota": true, "MtaVirtualQueue": true, "Email": true,
-	"MemoryLookupKey": true, "MemoryLookupKeyValue": true, "ExternalPublicKey": true, "PublicKey": true, "IndexQueueStatus": true,
-	"BlobStore": true, "MtaStageMail": true, "Tracer": true,
-}
+// ViewerMethodAllowed reports a JMAP method the admin view may forward:
+// exactly x:<Obj>/get or x:<Obj>/query (lowercase x:, exact case) of an
+// object the viewer's role reads. Everything else is refused.
+func ViewerMethodAllowed(method string) bool { return viewerMethods[method] }
 
 func init() {
 	for _, l := range [][]string{MailPasswordPermissions, ExportPermissions, MailctlRolePermissions, ViewerRolePermissions} {
