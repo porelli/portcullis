@@ -89,7 +89,7 @@ ha_cnpg_policies() {
 ha_install_cnpg() {
   local psa src
   ha_cnpg_pins_ok || fail "the CloudNativePG pins don't hold: $_K_ERR (nothing installed)"
-  src="$(kube_apiserver_sources)"
+  src="$(kube_apiserver_sources)" || src=""
   [ -n "$src" ] || fail "can't read the API server's addresses (the API endpoints, the control-plane nodes' pod ranges): the CNPG webhook would admit nobody (nothing installed)"
   psa="$(kube_psa cnpg)" || exit 1
   # shellcheck disable=SC2086  # three single-word levels
@@ -109,12 +109,15 @@ ha_install_cnpg() {
 # come from (the CNPG webhook admits only these, contract §20.1): every API
 # endpoint, and per control-plane node the first two addresses of its pod
 # range (flannel's and cni0's: kube-proxy masquerades the host's traffic to
-# a pod onto them). Space-separated IPv4s; empty when unreadable.
+# a pod onto them). Space-separated IPv4s; nothing and exit 1 when the
+# nodes can't be read (re-review M-c: never a partial list that would drop
+# a server's sources from the webhook's policy).
 kube_apiserver_sources() {
-  local nodes ep
+  local nodes ep json
   # shellcheck disable=SC2086  # ip:port words
   ep="$(printf '%s\n' ${PORTCULLIS_KUBE_API_ENDPOINTS:-} | sed 's/:[0-9]*$//')"
-  nodes="$(kube_ctl get nodes -l node-role.kubernetes.io/control-plane -o json 2>/dev/null \
+  json="$(kube_ctl get nodes -l node-role.kubernetes.io/control-plane -o json 2>/dev/null)" && printf '%s' "$json" | jq -e '.items | type == "array"' >/dev/null 2>&1 || return 1
+  nodes="$(printf '%s' "$json" \
     | jq -r '.items[].spec.podCIDR // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$"))
         | split("/")[0] | split(".") | map(tonumber) as $o
         | ($o | map(tostring) | join(".")), ($o[0:3] + [$o[3] + 1] | map(tostring) | join("."))' 2>/dev/null || true)"
@@ -145,12 +148,15 @@ kube_pg_nodes_at_primary() {
   printf '%s\n' "$n"
 }
 
-# kube_pg_min_instances — the live Cluster's spec.instances (0 before it
-# exists), the render's floor (review I1): only the node-remove path
-# (KUBE_PG_SHRINK=1, plan Tasks 30/31) renders fewer. Unreadable refuses.
+# kube_pg_min_instances [--shrink] — the live Cluster's spec.instances (0
+# before it exists), the render's floor (review I1): only the node-remove
+# path (plan Tasks 30/31) passes --shrink, through kube_render_values'
+# argument (re-review N2: never from .env or the environment — a
+# KUBE_PG_SHRINK there is refused). Unreadable refuses.
 kube_pg_min_instances() {
   local out rc=0
-  [ "${KUBE_PG_SHRINK:-}" != 1 ] || { echo 0; return 0; }
+  [ -z "${KUBE_PG_SHRINK+x}" ] || { warn "KUBE_PG_SHRINK is set in .env or the environment: refused (only node remove may lower Postgres' instances)"; return 1; }
+  [ "${1:-}" != --shrink ] || { echo 0; return 0; }
   out="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>&1)" || rc=$?
   if [ "$rc" != 0 ]; then
     case "$out" in *NotFound*|*"not found"*) echo 0; return 0 ;; esac
@@ -295,15 +301,17 @@ _kube_pg_fresh_db() {
 }
 
 # _kube_pg_swap — the restored databases take the live names in ONE
-# transaction (review I3): keycloak / lldap → <db>_pre_restore,
-# <db>_restore → <db>; their sessions ended first (Keycloak, LLDAP and the
-# Hub are at 0; a straggler is terminated). A rename refused (a session
-# came back) is retried, the live pair untouched until it commits.
+# transaction (review I3, re-review N1: psql -1 applies only to -c / -f, so
+# the SQL goes through -f - with -1 and ON_ERROR_STOP): keycloak / lldap →
+# <db>_pre_restore, <db>_restore → <db>; their sessions ended first
+# (Keycloak, LLDAP and the Hub are at 0; a straggler is terminated). Any
+# statement refused (a session came back) rolls the whole swap back and it
+# is retried, the live pair untouched until it commits.
 _kube_pg_swap() {
   local i
   _kube_pg_exec dropdb --if-exists --force keycloak_pre_restore >/dev/null && _kube_pg_exec dropdb --if-exists --force lldap_pre_restore >/dev/null || return 1
   for i in 1 2 3 4 5; do
-    _kube_pg_exec psql -X -q -v ON_ERROR_STOP=1 -1 -d postgres >/dev/null <<'SQL' && return 0
+    _kube_pg_exec psql -X -q -v ON_ERROR_STOP=1 -1 -d postgres -f - >/dev/null <<'SQL' && return 0
 select pg_terminate_backend(pid) from pg_stat_activity where datname in ('keycloak', 'lldap', 'keycloak_restore', 'lldap_restore') and pid <> pg_backend_pid();
 alter database keycloak rename to keycloak_pre_restore;
 alter database lldap rename to lldap_pre_restore;

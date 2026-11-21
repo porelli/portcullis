@@ -1615,6 +1615,9 @@ kube_nonsmall_at_primary() {
 # kube_render_values — secrets/kube/values.yaml from .env, the resolved
 # images, the synced objects' hashes and nested items (JSON, which Helm
 # reads as YAML). A required key missing in .env refuses, naming it.
+# --shrink: only from the node-remove path (Tasks 30/31): CNPG's instances
+# may then go below the live Cluster's (ha.sh kube_pg_min_instances).
+# shellcheck disable=SC2120  # --shrink: the node-remove path only (Tasks 30/31)
 kube_render_values() {
   local f v cls
   for v in PORTCULLIS_DOMAIN PORTCULLIS_POD_CIDR PORTCULLIS_SERVICE_CIDR PORTCULLIS_KUBE_API_ENDPOINTS PORTCULLIS_TRAEFIK_SERVICE_IP PORTCULLIS_TRAEFIK_VPN_SERVICE_IP PORTCULLIS_WG_EDGE_SERVICE_IP; do
@@ -1640,7 +1643,7 @@ kube_render_values() {
   # CNPG's instance count (ha.sh, review I1): labelled nodes, a floor at the
   # live Cluster's; unreadable → refused.
   if kube_ha_on; then pgn="$(kube_pg_nodes_at_primary)" || exit 1; fi
-  pgmin="$(kube_pg_min_instances)" || exit 1
+  pgmin="$(kube_pg_min_instances ${1:+"$1"})" || exit 1
   jq -n --argjson images "$_K_IMAGES" --argjson hashes "${_K_HASHES:-{\}}" --argjson items "${_K_ITEMS:-{\}}" \
     --argjson mon "$mon" --argjson wg "$wg" --argjson ha "$ha" --argjson nsp "$nsp" --arg psite "$KUBE_PRIMARY_SITE" --arg dnsname "${DNS_PROVIDER:-}" \
     --arg domain "$PORTCULLIS_DOMAIN" --arg pod "$PORTCULLIS_POD_CIDR" --arg svc "$PORTCULLIS_SERVICE_CIDR" \
@@ -2163,7 +2166,9 @@ _backup_restore_kube() {
   config_build_ca_bundle
   vault_init false
   rt_up || warn "some services did not start — check ./portcullis status"
-  wait_healthy 300 vault postgres lldap keycloak
+  # Re-review M-b: a stack that doesn't come up names the replaced databases.
+  ( wait_healthy 300 vault postgres lldap keycloak ) \
+    || fail "the restored stack isn't healthy: the databases this restore replaced are kept as keycloak_pre_restore / lldap_pre_restore (rename them back by hand; dumps in $pre)"
   _kube_pg_drop_pre_restore
   ok "Restore complete. Previous .env/secrets/certs and databases: $pre. Verify with ./portcullis status"
   [ -z "${RESTORE_STOPPED_APPS:-}" ] || warn "Scaled to 0 for the restore and NOT started again: $RESTORE_STOPPED_APPS (their file-share passwords were voided). Start each one from the Hub."

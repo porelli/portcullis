@@ -571,12 +571,22 @@ def check_cnpg():
     chart_role = [d for d in chart if d.get("kind") == "Role"]
     if len(roles) != 1 or roles[0]["metadata"].get("namespace") != K.CNPG_NS or len(chart_role) != 1 or roles[0]["rules"] != chart_role[0]["rules"]:
         F.add("cnpg: rbac.yaml's one Role (in cnpg-system) must be the chart's namespaced rules verbatim")
-    want_cr = [{"apiGroups": [""], "resources": ["nodes"], "verbs": ["get", "list", "watch"]},
-               {"apiGroups": ["admissionregistration.k8s.io"], "resources": ["mutatingwebhookconfigurations"],
-                "resourceNames": [hooks.get("MutatingWebhookConfiguration")], "verbs": ["get", "patch"]},
-               {"apiGroups": ["admissionregistration.k8s.io"], "resources": ["validatingwebhookconfigurations"],
-                "resourceNames": [hooks.get("ValidatingWebhookConfiguration")], "verbs": ["get", "patch"]},
-               {"apiGroups": ["postgresql.cnpg.io"], "resources": ["clusterimagecatalogs"], "verbs": ["get", "list", "watch"]}]
+    # Re-review M-a: derived from the chart's bound ClusterRole (a chart bump
+    # that adds a rule must show here): each webhook-configuration resource
+    # becomes its own rule naming the operator's configuration of that kind.
+    hook_of = {"mutatingwebhookconfigurations": hooks.get("MutatingWebhookConfiguration"),
+               "validatingwebhookconfigurations": hooks.get("ValidatingWebhookConfiguration")}
+    chart_bound = {b["roleRef"]["name"] for b in chart if b.get("kind") == "ClusterRoleBinding"}
+    want_cr = []
+    for r in (r for cr in chart if cr.get("kind") == "ClusterRole" and cr["metadata"]["name"] in chart_bound for r in cr.get("rules", [])):
+        hooked = [x for x in r.get("resources", []) if x in hook_of]
+        rest = [x for x in r.get("resources", []) if x not in hook_of]
+        if rest:
+            want_cr.append(dict(r, resources=rest))
+        for x in hooked:
+            want_cr.append({"apiGroups": r["apiGroups"], "resources": [x], "resourceNames": [hook_of[x]], "verbs": r["verbs"]})
+    if len(want_cr) != 4 or None in hook_of.values():
+        F.add(f"cnpg: the chart's cluster-wide rules changed ({want_cr}): review rbac.yaml against them")
     crs = [d for d in mine if d["kind"] == "ClusterRole"]
     if len(crs) != 1 or crs[0]["rules"] != want_cr:
         F.add(f"cnpg: rbac.yaml's ClusterRole must be exactly {want_cr} (webhook configurations by resourceNames, review I2)")
