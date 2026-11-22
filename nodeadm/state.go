@@ -118,8 +118,10 @@ type nodeadmState struct {
 	// removedNodes: portcullis-removed-nodes refuses that name's kubelet
 	// identity a Node CREATE / UPDATE (its client certificate still
 	// authenticates). A cooperatively removed name leaves the list when a
-	// new code is issued for it; a revoked one never does (a new code for
-	// it is refused: the old kubelet certificate would pass as the new node).
+	// new node enrols under it (never at code issue: an unused or expired
+	// code keeps the old kubelet refused); a revoked one never does (a new
+	// code for it is refused: the old kubelet certificate would pass as the
+	// new node).
 	RemovedNames map[string]*removedName `json:"removed_names,omitempty"`
 }
 

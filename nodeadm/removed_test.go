@@ -109,8 +109,10 @@ func TestFirstNodeRecordUnreadableStops(t *testing.T) {
 }
 
 // TestRemovedNameCooperative: a cooperatively removed name is listed
-// removed (its kubelet can't register again) until a new code is issued
-// for it, which takes it off the list; an unknown code leaves no name.
+// removed (its kubelet can't register again) until a new node actually
+// enrols under it (security review: never at code issue — the old kubelet
+// stays refused while a code is unused, and after it expires); an unknown
+// id leaves no name.
 func TestRemovedNameCooperative(t *testing.T) {
 	h := newHarness(t)
 	j := h.issue(t, "n4", "agent", "home", "main", "10.215.0.4")
@@ -130,9 +132,28 @@ func TestRemovedNameCooperative(t *testing.T) {
 		t.Fatalf("a code while removed: %d %s", code, body)
 	}
 	h.putState(t, func(st *nodeadmState) { delete(st.Nodes, "n4") })
-	h.issue(t, "n4", "agent", "home", "main", "10.215.0.4")
+	j2 := h.issue(t, "n4", "agent", "home", "main", "10.215.0.4")
+	if d := docOf(t, h); !slices.Equal(d.RemovedNames, []string{"n4"}) {
+		t.Fatalf("a code issued unlisted n4 (its old kubelet could register): %v", d.RemovedNames)
+	}
+	// The code expires unused: still listed.
+	h.setNow(vecNow.Add(codeTTL + time.Minute))
+	if err := h.s.sweepCodes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if d := docOf(t, h); !slices.Equal(d.RemovedNames, []string{"n4"}) {
+		t.Fatalf("an expired code unlisted n4: %v", d.RemovedNames)
+	}
+	// A new code, and the new node enrols with it: unlisted.
+	h.setNow(vecNow)
+	_ = j2
+	j3 := h.issue(t, "n4", "agent", "home", "main", "10.215.0.4")
+	if d := docOf(t, h); !slices.Equal(d.RemovedNames, []string{"n4"}) {
+		t.Fatalf("before the enrolment: %v", d.RemovedNames)
+	}
+	h.enrol(t, j3, "")
 	if _, ok := h.state(t).RemovedNames["n4"]; ok {
-		t.Fatal("a new code left n4 listed removed")
+		t.Fatal("the new node enrolled and n4 is still listed removed")
 	}
 	if d := docOf(t, h); len(d.RemovedNames) != 0 {
 		t.Fatalf("removed_names %v", d.RemovedNames)

@@ -180,14 +180,12 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) error {
 		}
 		// Task 30 fix round 1: a revoked name is never enrolled again (its
 		// old kubelet client certificate names it and would pass as the
-		// new node); a cooperatively removed one leaves the removed list
-		// with this code (the next document, then params-sync, lets its
-		// kubelet register: the join's release waits for that generation).
-		if rn := st.RemovedNames[req.ServerID]; rn != nil {
-			if rn.Revoked {
-				return errPlain(409, "node %s was revoked: its old kubelet certificate still names it, so that name is never enrolled again: pick another id", req.ServerID)
-			}
-			delete(st.RemovedNames, req.ServerID)
+		// new node). A cooperatively removed one stays listed removed
+		// until a new node actually enrols with this code (handleEnrol;
+		// security review: never at code issue, so an unused or expired
+		// code leaves the old kubelet refused).
+		if rn := st.RemovedNames[req.ServerID]; rn != nil && rn.Revoked {
+			return errPlain(409, "node %s was revoked: its old kubelet certificate still names it, so that name is never enrolled again: pick another id", req.ServerID)
 		}
 		for id, n := range st.Nodes {
 			if n.MeshIP == req.MeshIP {
@@ -436,6 +434,15 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 		}
 		cur.Used, cur.KeySHA256 = true, ""
 		code = *cur
+		// The new node enrolled (Task 30 fix round 1, security review): a
+		// cooperatively removed name leaves the removed list only now. The
+		// next document drops it, and the join's release waits for an
+		// admission generation built after it (one holding this node's
+		// addresses), so its kubelet registers. A revoked name never gets
+		// here (no code is issued for it).
+		if rn := st.RemovedNames[req.ServerID]; rn != nil && !rn.Revoked {
+			delete(st.RemovedNames, req.ServerID)
+		}
 		st.Nodes[req.ServerID] = &nodeRecord{Role: cur.Role, Class: cur.Class, Site: cur.Site, MeshIP: cur.MeshIP,
 			Ingress: cur.Ingress, Storage: cur.Storage, Mesh: req.Mesh, Forward: cur.Forward, EnrolledAt: now, JoinState: joinEnrolled}
 		return nil

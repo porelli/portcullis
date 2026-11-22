@@ -1978,8 +1978,10 @@ spec:
 # nodes/status) whose name, or whose identity's own name, nodeadm lists
 # removed: params removedNodes, from portcullis-cluster-addresses'
 # removed_names (nodeadm keeps every removed name; a cooperatively removed
-# one leaves the list when a new join code is made for it, a revoked one
-# never does). Controllers and the CLI aren't matched (a parked revoke's
+# one leaves the list only once a new node enrols under it — never at code
+# issue —, a revoked one never does). The API server exposes no client
+# certificate serial to a policy, so a re-used name can't be bound to the
+# new node's certificate: the name stays refused until that enrolment. Controllers and the CLI aren't matched (a parked revoke's
 # Node is still marked NotReady by the node lifecycle controller). The
 # probe: its own annotation portcullis.io/removed-nodes-generation (the
 # probe Node of portcullis-node-labels carries portcullis.io/params-generation,
@@ -2022,4 +2024,4 @@ spec:
   - expression: "!(object.metadata.name in variables.removed) && !(variables.self in variables.removed)"
     messageExpression: >-
       'node ' + (variables.self in variables.removed ? variables.self : object.metadata.name)
-      + ' was removed from the cluster: its kubelet identity can neither register nor update a Node (a new join code frees a removed name, never a revoked one)'
+      + ' was removed from the cluster: its kubelet identity can neither register nor update a Node (a removed name is freed when a new node enrols under it, a revoked one never)'
