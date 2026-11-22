@@ -43,6 +43,60 @@ redact() { sed -E 's#(https?://[^ ]*/invite/)[A-Za-z0-9_-]+#\1<redacted>#g'; }
 fail() { echo "FAIL: $*"; exit 1; }
 ALPINE="docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
 
+# lh_prereqs — Longhorn's node prerequisites for the dest step (sets
+# lh_skip; see there). lh_diag — what they look like on this node, printed
+# when they are still missing on a GitHub-hosted runner (nothing secret).
+lh_diag() {
+  echo "::group::Longhorn prerequisites: diagnostics"
+  ls -ld /etc/multipath.conf /etc/multipath /etc/multipath/conf.d 2>&1 || true
+  ls -l /etc/multipath/conf.d 2>&1 || sudo ls -l /etc/multipath/conf.d 2>&1 || true
+  echo "--- /etc/multipath.conf (od -c of the last bytes, then the file)"; tail -c 64 /etc/multipath.conf 2>&1 | od -c | tail -n 5 || true
+  cat /etc/multipath.conf 2>&1 || true
+  echo "--- multipathd: $(systemctl is-active multipathd multipathd.socket 2>&1 | tr '\n' ' ')/ binaries: $(ls /usr/sbin/multipathd /sbin/multipathd 2>&1 | tr '\n' ' ')/ pid: $(pgrep -x multipathd | tr '\n' ' ')"
+  echo "--- awk: $(readlink -f "$(command -v awk)") $(awk -W version 2>&1 | head -n1)"
+  echo "--- the CLI's probe (HA_PROBE_SH, CHECKS=multipath_blacklist) as nobody, the host's / read-only at /host, the helper image, host PID:"
+  # shellcheck disable=SC2016  # expanded by the inner bash
+  bash -c 'source scripts/lib/common.sh >/dev/null 2>&1; printf "%s" "$HA_PROBE_SH"' > "$RUNNER_TEMP/ha-probe.sh"
+  sed -n '/multipath_blacklist)/,/;;/p' "$RUNNER_TEMP/ha-probe.sh"
+  # shellcheck disable=SC2016
+  img="$(bash -c 'source scripts/lib/common.sh >/dev/null 2>&1; printf "%s" "$PORTCULLIS_HELPER_IMAGE"')"
+  echo "image: $img"
+  docker run --rm --pid host --user 65534:65534 --read-only -v /:/host:ro -e CHECKS=multipath_blacklist -v "$RUNNER_TEMP/ha-probe.sh:/probe.sh:ro" "$img" sh /probe.sh 2>&1 || true
+  echo "::endgroup::"
+}
+lh_prereqs() {
+  lh_skip=""
+  if [ "${E2E_K3S_SKIP_LONGHORN:-}" = 1 ]; then lh_skip="E2E_K3S_SKIP_LONGHORN=1"
+  else
+    if [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
+      sudo apt-get install -y -qq open-iscsi nfs-common >/dev/null && sudo systemctl start iscsid && sudo modprobe iscsi_tcp \
+        || fail "could not provide Longhorn's node prerequisites on this GitHub-hosted runner (open-iscsi, nfs-common, iscsi_tcp)"
+      # Longhorn's documented blacklist, in /etc/multipath.conf itself: the
+      # CLI's probe reads the node's files as nobody, and Ubuntu's
+      # /etc/multipath (conf.d's parent) is 0700 root (found in CI).
+      if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
+        grep -q '^[[:space:]]*devnode[[:space:]]*"\^sd\[a-z0-9\]+"' /etc/multipath.conf 2>/dev/null \
+          || printf '%s\n' 'blacklist {' '    devnode "^sd[a-z0-9]+"' '}' | sudo tee -a /etc/multipath.conf >/dev/null \
+          || fail "could not set multipathd's blacklist for Longhorn on this GitHub-hosted runner"
+        sudo chmod 0644 /etc/multipath.conf && sudo systemctl restart multipathd \
+          || fail "could not restart multipathd with Longhorn's blacklist on this GitHub-hosted runner"
+      fi
+    fi
+    miss=""
+    { [ -e /usr/sbin/iscsiadm ] || [ -e /sbin/iscsiadm ]; } && pgrep -x iscsid >/dev/null || miss="$miss open-iscsi (iscsid running)"
+    [ -d /sys/module/iscsi_tcp ] || miss="$miss iscsi_tcp"
+    [ -e /usr/sbin/mount.nfs ] || [ -e /sbin/mount.nfs ] || miss="$miss nfs-common"
+    if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
+      cat /etc/multipath.conf /etc/multipath/conf.d/*.conf 2>/dev/null | sed 's/#.*//' | awk '/^[[:space:]]*blacklist[[:space:]]*\{/ { b = 1; next } b && /\}/ { b = 0 }
+        b { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); if ($0 == "devnode \"^sd[a-z0-9]+\"") f = 1 } END { exit !f }' || miss="$miss multipathd-blacklist"
+    fi
+    if [ -n "$miss" ]; then
+      [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ] || { lh_diag; fail "Longhorn's node prerequisites are still missing on this GitHub-hosted runner after providing them:$miss"; }
+      lh_skip="this runner lacks Longhorn's node prerequisites:$miss"
+    fi
+  fi
+}
+
 status_wait() { # status_wait <seconds> — status --json clean (DNS problems allowed: portcullis.local has no records)
   local i
   for ((i = 0; i < $1; i += 10)); do
@@ -434,36 +488,7 @@ dest)
   # (re-review R2-N3: never an unnoticed skip); elsewhere one missing → the
   # Longhorn part skips loudly (a notice and the job summary). The CNPG
   # archive and the core offsite above have run either way.
-  lh_skip=""
-  if [ "${E2E_K3S_SKIP_LONGHORN:-}" = 1 ]; then lh_skip="E2E_K3S_SKIP_LONGHORN=1"
-  else
-    if [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
-      sudo apt-get install -y -qq open-iscsi nfs-common >/dev/null && sudo systemctl start iscsid && sudo modprobe iscsi_tcp \
-        || fail "could not provide Longhorn's node prerequisites on this GitHub-hosted runner (open-iscsi, nfs-common, iscsi_tcp)"
-      # Longhorn's documented blacklist, in /etc/multipath.conf itself: the
-      # CLI's probe reads the node's files as nobody, and Ubuntu's
-      # /etc/multipath (conf.d's parent) is 0700 root (found in CI).
-      if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
-        grep -q '^[[:space:]]*devnode[[:space:]]*"\^sd\[a-z0-9\]+"' /etc/multipath.conf 2>/dev/null \
-          || printf '%s\n' 'blacklist {' '    devnode "^sd[a-z0-9]+"' '}' | sudo tee -a /etc/multipath.conf >/dev/null \
-          || fail "could not set multipathd's blacklist for Longhorn on this GitHub-hosted runner"
-        sudo chmod 0644 /etc/multipath.conf && sudo systemctl restart multipathd \
-          || fail "could not restart multipathd with Longhorn's blacklist on this GitHub-hosted runner"
-      fi
-    fi
-    miss=""
-    { [ -e /usr/sbin/iscsiadm ] || [ -e /sbin/iscsiadm ]; } && pgrep -x iscsid >/dev/null || miss="$miss open-iscsi (iscsid running)"
-    [ -d /sys/module/iscsi_tcp ] || miss="$miss iscsi_tcp"
-    [ -e /usr/sbin/mount.nfs ] || [ -e /sbin/mount.nfs ] || miss="$miss nfs-common"
-    if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
-      cat /etc/multipath.conf /etc/multipath/conf.d/*.conf 2>/dev/null | sed 's/#.*//' | awk '/^[[:space:]]*blacklist[[:space:]]*\{/ { b = 1; next } b && /\}/ { b = 0 }
-        b { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); if ($0 == "devnode \"^sd[a-z0-9]+\"") f = 1 } END { exit !f }' || miss="$miss multipathd-blacklist"
-    fi
-    if [ -n "$miss" ]; then
-      [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ] || fail "Longhorn's node prerequisites are still missing on this GitHub-hosted runner after providing them:$miss"
-      lh_skip="this runner lacks Longhorn's node prerequisites:$miss"
-    fi
-  fi
+  lh_prereqs
   if [ -n "$lh_skip" ]; then
     echo "::notice title=Longhorn backup skipped::Longhorn's part of the backup destination step was skipped ($lh_skip); the HA VMs proved it (task 26 report). The CNPG archive and the core offsite ran."
     [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "- **Longhorn backup to the destination: SKIPPED** ($lh_skip). Proven on the HA VMs (task 26); the CNPG archive and the core offsite ran and passed." >> "$GITHUB_STEP_SUMMARY"
@@ -494,5 +519,10 @@ dest)
   jq -e '.backup_destination.cnpg.archiving == true' /tmp/status.json >/dev/null || fail "status doesn't show Postgres archiving"
   echo "PASS: backup destination end to end (status clean, archiving)"
   ;;
-*) echo "usage: $0 docker|init|seed|hub|vpn|restore|dest" >&2; exit 2 ;;
+lhprep)
+  # Longhorn's node prerequisites alone (provided on a GitHub-hosted runner, then checked).
+  lh_prereqs; echo "lh_skip=${lh_skip:-none}"
+  ;;
+lhdiag) lh_diag ;;
+*) echo "usage: $0 docker|init|seed|hub|vpn|restore|dest|lhprep|lhdiag" >&2; exit 2 ;;
 esac
