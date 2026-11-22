@@ -19054,5 +19054,68 @@
   },
   "policy": "portcullis-frontdoor-status",
   "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "extra": {
+    "authentication.kubernetes.io/pod-name": "frontdoor-0"
+   },
+   "groups": [
+    "system:serviceaccounts",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis:vector-intruder"
+  },
+  "name": "frontdoor-status: this params generation's probe is refused",
+  "object": {
+   "apiVersion": "v1",
+   "data": {
+    "leader": "frontdoor-0",
+    "status.json": "{\"v\":1,\"state\":\"leading\",\"leader\":\"frontdoor-0\"}"
+   },
+   "kind": "ConfigMap",
+   "metadata": {
+    "annotations": {
+     "portcullis.io/params-generation": "e2e0ha0000000000"
+    },
+    "name": "frontdoor-status",
+    "namespace": "portcullis"
+   }
+  },
+  "policy": "portcullis-frontdoor-status",
+  "reason_contains": "admission probe: params generation e2e0ha0000000000 in effect",
+  "update": true
+ },
+ {
+  "allowed": true,
+  "as": {
+   "extra": {
+    "authentication.kubernetes.io/pod-name": "frontdoor-0"
+   },
+   "groups": [
+    "system:serviceaccounts",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis:vector-intruder"
+  },
+  "name": "frontdoor-status: another params generation's probe (a dry run) is let by",
+  "object": {
+   "apiVersion": "v1",
+   "data": {
+    "leader": "frontdoor-0",
+    "status.json": "{\"v\":1,\"state\":\"leading\",\"leader\":\"frontdoor-0\"}"
+   },
+   "kind": "ConfigMap",
+   "metadata": {
+    "annotations": {
+     "portcullis.io/params-generation": "fedcba9876543210"
+    },
+    "name": "frontdoor-status",
+    "namespace": "portcullis"
+   }
+  },
+  "policy": "portcullis-frontdoor-status",
+  "update": true
  }
 ]

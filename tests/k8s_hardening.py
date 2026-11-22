@@ -1701,13 +1701,16 @@ def check_ha_infra():
             F.add("ha_admission_vectors: portcullis-node-labels needs a node's and the manager's refused / admitted vectors")
         # Task 28 fix round 1 (review M2): who may write frontdoor-status.
         fs = [v for v in vecs if v["policy"] == "portcullis-frontdoor-status"]
-        if sum(v["allowed"] for v in fs) != 1 or sum(not v["allowed"] for v in fs) < 5:
+        if sum(v["allowed"] for v in fs) != 2 or sum(not v["allowed"] for v in fs) < 6 \
+                or not any("probe is refused" in v["name"] for v in fs) or not any("let by" in v["name"] and v["allowed"] for v in fs):
             F.add("ha_admission_vectors: portcullis-frontdoor-status needs the front door's own write admitted and the forged ones refused")
     fsp = next((d for d in yaml.safe_load_all((K.ROOT / "kube/admission/policies.yaml").read_text())
                 if d and d.get("kind") == "ValidatingAdmissionPolicy" and d["metadata"]["name"] == "portcullis-frontdoor-status"), None)
     fsb = next((d for d in yaml.safe_load_all((K.ROOT / "kube/admission/bindings.yaml").read_text())
                 if d and d["metadata"]["name"] == "portcullis-core-guard-frontdoor-status"), None)
     if not fsp or not fsb or fsp["spec"].get("failurePolicy") != "Fail" or fsp["spec"]["matchConditions"] != [{"name": "frontdoor-status", "expression": "request.name == 'frontdoor-status'"}] \
+            or [r.get("resourceNames") for r in fsp["spec"]["matchConstraints"]["resourceRules"]] != [["frontdoor-status"]] \
+            or "variables.otherProbe" not in fsp["spec"]["validations"][1]["expression"] \
             or fsb["spec"]["policyName"] != "portcullis-frontdoor-status" or fsb["spec"]["validationActions"] != ["Deny"]:
         F.add("admission: portcullis-frontdoor-status (Fail, frontdoor-status only) and its Deny binding on the core namespace")
     # Round 3 I1: portcullis-node-labels guards the storm guard's inputs.

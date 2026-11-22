@@ -374,6 +374,16 @@ def vectors():
     intruder = {"user": "system:serviceaccount:portcullis:vector-intruder", "groups": ["system:serviceaccounts", "system:authenticated"],
                 "extra": {"authentication.kubernetes.io/pod-name": "frontdoor-0"}}
     fsv("another ServiceAccount allowed to update ConfigMaps", status(), intruder, False)
+    # The params generations' probes (fix round 2, found in CI): this
+    # generation's (e2e-ha-admission.sh's params) refused with the probe
+    # text; another generation's dry run let by, even for the intruder.
+    def probe(gen):
+        o = status()
+        o["metadata"]["annotations"] = {"portcullis.io/params-generation": gen}
+        return o
+    out.append({"policy": FS, "name": "frontdoor-status: this params generation's probe is refused", "allowed": False, "as": intruder, "object": probe("e2e0ha0000000000"),
+                "update": True, "reason_contains": "admission probe: params generation e2e0ha0000000000 in effect"})
+    fsv("another params generation's probe (a dry run) is let by", probe("fedcba9876543210"), intruder, True)
     return out
 
 

@@ -101,7 +101,7 @@ while IFS= read -r v; do
     out="$(jq -c .pod <<<"$v" | sed "s|$pinned|$img|g" | kubectl --context "$ctx" create --dry-run=server -f - 2>&1)" && got=true || got=false
   fi
   if [ "$allowed" = true ] && [ "$got" = true ]; then echo "ok   - $name: admitted"
-  elif [ "$allowed" = false ] && [ "$got" = false ] && grep -q "$policy" <<<"$out"; then echo "ok   - $name: refused by $policy"
+  elif [ "$allowed" = false ] && [ "$got" = false ] && grep -q "$policy" <<<"$out" && grep -qF -- "$(jq -r '.reason_contains // ""' <<<"$v")" <<<"$out"; then echo "ok   - $name: refused by $policy"
   elif [ "$allowed" = false ] && [ "$got" = false ] && also="$(jq -r '.also_refused_by // empty' <<<"$v")" && [ -n "$also" ] && grep -qF "$also" <<<"$out"; then
     echo "ok   - $name: refused before $policy ($also)"
   else echo "FAIL - $name: allowed=$allowed got=$got: $(head -c 300 <<<"$out")"; fail=1; fi

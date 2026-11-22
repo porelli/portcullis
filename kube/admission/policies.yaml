@@ -1905,7 +1905,8 @@ spec:
 # own pod: the key leader and status.json's "leader" must both be the pod
 # name its bound token carries (authentication.kubernetes.io/pod-name), so
 # a follower knows who wrote it. The probe: a dry-run CREATE of
-# frontdoor-status annotated with the generation.
+# frontdoor-status annotated with the generation; another generation's
+# probe (a dry run with its 16 hex) is let by.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -1927,6 +1928,12 @@ spec:
       - DELETE
       resources:
       - configmaps
+      # Only this ConfigMap reaches the binding: a binding whose params are
+      # missing denies every request it matches, so it must never match the
+      # core namespace's other ConfigMaps (the params themselves among them:
+      # the CLI could no longer repair them).
+      resourceNames:
+      - frontdoor-status
   matchConditions:
   - name: frontdoor-status
     expression: "request.name == 'frontdoor-status'"
@@ -1940,16 +1947,24 @@ spec:
       has(request.userInfo.extra) && 'authentication.kubernetes.io/pod-name' in request.userInfo.extra
       && size(request.userInfo.extra['authentication.kubernetes.io/pod-name']) == 1
       ? request.userInfo.extra['authentication.kubernetes.io/pod-name'][0] : ''
+  # Another params generation's probe (a dry run annotated with its 16
+  # hex): let by, so that generation's own binding is the one that refuses
+  # it (every policy refuses exactly its own generation first; found in CI).
+  - name: otherProbe
+    expression: >-
+      request.dryRun && request.operation != 'DELETE' && has(object.metadata.annotations) && 'portcullis.io/params-generation' in object.metadata.annotations
+      && object.metadata.annotations['portcullis.io/params-generation'].matches('^[0-9a-f]{16}$')
+      && object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
   validations:
   - expression: >-
       request.operation == 'DELETE' || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
       || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
     messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
-  - expression: "variables.cli || variables.frontdoor"
+  - expression: "variables.cli || variables.otherProbe || variables.frontdoor"
     message: only the front door (and the CLI) may write frontdoor-status
-  - expression: "variables.cli || request.operation == 'UPDATE'"
+  - expression: "variables.cli || variables.otherProbe || request.operation == 'UPDATE'"
     message: the front door only updates frontdoor-status (the chart creates it)
   - expression: >-
-      variables.cli || (variables.pod != '' && has(object.data) && 'leader' in object.data && object.data['leader'] == variables.pod
+      variables.cli || variables.otherProbe || (variables.pod != '' && has(object.data) && 'leader' in object.data && object.data['leader'] == variables.pod
         && 'status.json' in object.data && object.data['status.json'].contains('"leader":"' + variables.pod + '"'))
     message: the front door writes frontdoor-status only as its own pod (leader = its pod name)
