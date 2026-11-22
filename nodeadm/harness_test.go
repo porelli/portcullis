@@ -528,14 +528,34 @@ type fakeProbe struct {
 	stale   bool
 	inForce []string // the names the servers judge by
 	calls   int
+	// listed: the EndpointSlice's servers (default: n1's); unreachable:
+	// servers that don't answer; probed: the last Confirm's list.
+	listed      []string
+	unreachable map[string]bool
+	probed      []string
 }
 
-func (p *fakeProbe) Confirm(ctx context.Context, gen string) error {
+func (p *fakeProbe) Listed(ctx context.Context) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.listed == nil {
+		return []string{"10.215.0.1:6443"}, nil
+	}
+	return append([]string{}, p.listed...), nil
+}
+
+func (p *fakeProbe) Confirm(ctx context.Context, gen string, servers []string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
+	p.probed = append([]string{}, servers...)
 	if p.down {
 		return errors.New("the API server 10.215.0.1:6443 doesn't answer")
+	}
+	for _, srv := range servers {
+		if p.unreachable[srv] {
+			return errors.New("the API server " + srv + " doesn't answer")
+		}
 	}
 	cm, err := p.kube.CoreV1().ConfigMaps(coreNS).Get(ctx, removedCM, metav1.GetOptions{})
 	if err != nil {

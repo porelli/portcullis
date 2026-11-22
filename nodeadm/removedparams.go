@@ -25,8 +25,13 @@ package main
 //     that isn't a dry run;
 //   - get on the EndpointSlice default/kubernetes (the API servers).
 //
-// A write is confirmed by the probe on EVERY API server of that
-// EndpointSlice, dialled one by one (each has its own params cache): a
+// A write is confirmed by the probe on EVERY API server nodeadm knows,
+// dialled one by one (each has its own params cache): the EndpointSlice
+// default/kubernetes's, every server Node's mesh address and every server
+// in its state (a server missing from the slice — restarting, partitioned
+// — would judge by its own cache when it answers again; security review:
+// one that doesn't answer is unconfirmed, fail closed); only a server whose
+// own name is listed removed is left out (its removal is what waits). A
 // server dry-run CREATE of the probe Node annotated
 // portcullis.io/removed-nodes-generation=<generation> must be refused by
 // the binding naming that generation (the policy's first rules: the params
@@ -37,6 +42,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -68,8 +74,63 @@ const (
 
 // AdmissionProbe confirms a removed-node params generation in force.
 type AdmissionProbe interface {
-	// Confirm: nil once every API server refuses the probe naming gen.
-	Confirm(ctx context.Context, gen string) error
+	// Confirm: nil once every API server of servers (host:port) refuses
+	// the probe naming gen; servers is never empty.
+	Confirm(ctx context.Context, gen string, servers []string) error
+	// Listed: the API servers of the EndpointSlice default/kubernetes.
+	Listed(ctx context.Context) ([]string, error)
+}
+
+// apiServers: every API server nodeadm knows (host:port, sorted): the
+// slice's, every server Node's mesh address, every server record of its
+// state that isn't removed; less any whose node name is listed removed.
+func (s *Server) apiServers(ctx context.Context, st *nodeadmState) ([]string, error) {
+	set := map[string]bool{}
+	listed, err := s.probe.Listed(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range listed {
+		set[a] = true
+	}
+	cl, err := s.clusterNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	gone := map[string]bool{}
+	for _, c := range cl {
+		if c.Role != "server" || c.Mesh == "" {
+			continue
+		}
+		hp := net.JoinHostPort(c.Mesh, "6443")
+		if _, removed := st.RemovedNames[c.Name]; removed {
+			gone[hp] = true
+			continue
+		}
+		set[hp] = true
+	}
+	for id, r := range st.Nodes {
+		if r.Role != "server" || r.MeshIP == "" || r.Removed || r.JoinedAt == nil {
+			continue
+		}
+		hp := net.JoinHostPort(r.MeshIP, "6443")
+		if _, removed := st.RemovedNames[id]; removed {
+			gone[hp] = true
+			continue
+		}
+		set[hp] = true
+	}
+	out := make([]string, 0, len(set))
+	for a := range set {
+		if !gone[a] {
+			out = append(out, a)
+		}
+	}
+	sort.Strings(out)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no API server is known")
+	}
+	return out, nil
 }
 
 // removedData is the ConfigMap's data for names (sorted, unique).
@@ -131,13 +192,19 @@ func (s *Server) pushRemoved(ctx context.Context, wait time.Duration) ([]string,
 		s.log.Info("removed-node params written", "generation", gen, "names", len(names))
 		break
 	}
-	key := gen + "/" + rv
+	// Every known server, each time (a server that joined, or came back,
+	// since the last confirmation is probed too).
+	servers, err := s.apiServers(ctx, st)
+	if err != nil {
+		return nil, fmt.Errorf("removed-node params generation %s isn't confirmed in force: %w", gen, err)
+	}
+	key := gen + "/" + rv + "/" + strings.Join(servers, ",")
 	if s.removedProven == key {
 		return names, nil
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		err := s.probe.Confirm(ctx, gen)
+		err := s.probe.Confirm(ctx, gen, servers)
 		if err == nil {
 			break
 		}
@@ -218,7 +285,7 @@ func probeAnswer(server, gen string, err error) error {
 	return nil
 }
 
-func (p *apiProbe) servers(ctx context.Context) ([]string, error) {
+func (p *apiProbe) Listed(ctx context.Context) ([]string, error) {
 	sl, err := p.kube.DiscoveryV1().EndpointSlices("default").Get(ctx, "kubernetes", metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("reading the API servers (EndpointSlice default/kubernetes): %w", err)
@@ -244,11 +311,8 @@ func (p *apiProbe) servers(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-func (p *apiProbe) Confirm(ctx context.Context, gen string) error {
-	servers, err := p.servers(ctx)
-	if err != nil {
-		return err
-	}
+func (p *apiProbe) Confirm(ctx context.Context, gen string, servers []string) error {
+	var down []string
 	for _, srv := range servers {
 		cfg := rest.CopyConfig(p.base)
 		cfg.Host = "https://" + srv
@@ -260,8 +324,13 @@ func (p *apiProbe) Confirm(ctx context.Context, gen string) error {
 		}
 		_, err = cs.CoreV1().Nodes().Create(ctx, probeNode(gen), metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
 		if err := probeAnswer(srv, gen, err); err != nil {
-			return err
+			down = append(down, err.Error())
 		}
+	}
+	if len(down) > 0 {
+		// Every server that didn't confirm, named (a known one that
+		// doesn't answer is unconfirmed: fail closed).
+		return errors.New(strings.Join(down, "; "))
 	}
 	return nil
 }

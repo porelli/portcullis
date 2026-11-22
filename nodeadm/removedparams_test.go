@@ -288,3 +288,61 @@ func TestProbeAnswer(t *testing.T) {
 		}
 	}
 }
+
+// TestProbesEveryKnownServer (security review): the confirmation probes
+// every API server nodeadm knows — the EndpointSlice's, every server Node's
+// mesh address and every joined server of its state — not only the slice.
+// A known server missing from the slice that doesn't answer is unconfirmed:
+// the removal stops before the Node delete, naming it; once it answers,
+// the retry goes on. A server whose own name is listed removed (a revoked
+// server, possibly dead) isn't waited for.
+func TestProbesEveryKnownServer(t *testing.T) {
+	a4 := nodeSpec{"n4", "agent", "home", "main", "10.215.0.4", []string{"192.0.2.14"}, nil, true, false}
+	h := newHarness(t, append(append([]nodeSpec{}, baseNodes...), a4)...)
+	h.agents.onRotate = h.bootFollows
+	joined := vecNow
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["n4"] = &nodeRecord{Role: "agent", Serial: "aa:04", MeshIP: "10.215.0.4"}
+		// A joined server whose Node isn't (or no longer) listed.
+		st.Nodes["n9"] = &nodeRecord{Role: "server", Serial: "aa:09", MeshIP: "10.215.0.9", JoinedAt: &joined}
+	})
+	h.probe.mu.Lock()
+	h.probe.listed = []string{"10.215.0.1:6443"} // the slice lists n1 only
+	h.probe.unreachable = map[string]bool{"10.215.0.3:6443": true}
+	h.probe.mu.Unlock()
+	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=revoke", nil); w.Code/100 == 2 {
+		t.Fatalf("revoke with a known server not answering: %d %s", w.Code, w.Body)
+	}
+	op := h.state(t).Ops["n4"]
+	if op == nil || !strings.Contains(op.LastError, "10.215.0.3:6443 doesn't answer") || !strings.Contains(op.LastError, "n4's Node isn't deleted") {
+		t.Fatalf("op %+v: want it stopped naming 10.215.0.3:6443", op)
+	}
+	if !nodeExists(t, h, "n4") {
+		t.Fatal("n4's Node was deleted with a known server unconfirmed")
+	}
+	h.probe.mu.Lock()
+	want := "10.215.0.1:6443 10.215.0.2:6443 10.215.0.3:6443 10.215.0.9:6443"
+	got := strings.Join(h.probe.probed, " ")
+	h.probe.unreachable = nil
+	h.probe.mu.Unlock()
+	if got != want {
+		t.Fatalf("probed %q, want every known server %q", got, want)
+	}
+	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=revoke", nil); w.Code != 204 {
+		t.Fatalf("revoke once every server answers: %d %s", w.Code, w.Body)
+	}
+	if nodeExists(t, h, "n4") {
+		t.Fatal("n4's Node kept")
+	}
+	// The revoked server's own address isn't waited for.
+	h.probe.mu.Lock()
+	h.probe.unreachable = map[string]bool{"10.215.0.9:6443": true}
+	h.probe.mu.Unlock()
+	h.putState(t, func(st *nodeadmState) { st.RemovedNames["n9"] = &removedName{At: vecNow, Revoked: true} })
+	if _, err := h.s.pushRemoved(context.Background(), 0); err != nil {
+		t.Fatalf("a removed server's address blocked the push: %v", err)
+	}
+	if strings.Contains(strings.Join(h.probe.probed, " "), "10.215.0.9") {
+		t.Fatalf("probed the removed server: %v", h.probe.probed)
+	}
+}
