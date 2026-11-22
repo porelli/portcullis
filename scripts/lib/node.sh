@@ -567,9 +567,10 @@ kube_other_nodes_apparmor() {
 # and reads its pcmesh key; nodeadm has it rotate tokens and remove etcd
 # members; joining nodes measure their RTT against its echo). `up` adopts
 # it once nodeadm runs, and renews its certificate (kube check too):
-#   - the binary from nodeadm's image (the copy it serves joining nodes,
-#     its sha256 checked against nodeadm's own), installed as
-#     /usr/local/lib/portcullis/nodeagent;
+#   - the binary from nodeadm's image by its pinned digest (this host's
+#     containerd; the copy nodeadm serves joining nodes), installed as
+#     /usr/local/lib/portcullis/nodeagent, on the Node named by k3s's own
+#     --node-name here (never one found by its address);
 #   - `nodeagent adopt-csr <id>`: the key made on this host by the agent
 #     (root's 0600 file; the CLI never reads it), the CSR printed;
 #   - Vault pki_node/sign/node-cluster (the root token, as link.control):
@@ -583,11 +584,47 @@ KUBE_NODEAGENT_BIN=/usr/local/lib/portcullis/nodeagent
 KUBE_NODEAGENT_STATE=/var/lib/portcullis/nodeagent
 KUBE_CLUSTER_DOMAIN=cluster.portcullis.internal
 
-# kube_first_node_name — the Kubernetes Node holding the first mesh
-# address (init's), or "".
+# kube_first_node_name — this host's Kubernetes Node: the --node-name init
+# gave k3s here (its unit's ExecStart, which install.sh writes), never a
+# Node found by its address (a node identity may register a Node naming
+# any InternalIP; security review). Printed only when that Node's
+# InternalIP is the first mesh address and no other Node claims it: in
+# _KN_NAME (else empty, and why in _KN_WHY; set, not printed, so the
+# reason survives).
 kube_first_node_name() {
-  kube_ctl get nodes -o json 2>/dev/null | jq -r --arg ip "$KUBE_MESH_IP" \
-    '[.items[] | select([.status.addresses[]? | select(.type == "InternalIP") | .address] | index($ip)) | .metadata.name][0] // empty' 2>/dev/null || true
+  local name nodes
+  _KN_WHY="" _KN_NAME=""
+  name="$(_ki_sudo cat "$(_ki_p /etc/systemd/system/k3s.service)" 2>/dev/null \
+    | sed -n "s/^[[:space:]]*'--node-name=\([a-z][a-z0-9-]*\)'.*/\1/p" | head -n1)"
+  [[ "$name" =~ $NODE_ID_RE ]] || { _KN_WHY="k3s's unit here names no --node-name"; return 0; }
+  nodes="$(kube_ctl get nodes -o json 2>/dev/null)" || { _KN_WHY="the Nodes can't be read"; return 0; }
+  printf '%s' "$nodes" | jq -e --arg ip "$KUBE_MESH_IP" --arg n "$name" '
+    [.items[] | select([.status.addresses[]? | select(.type == "InternalIP") | .address] | index($ip)) | .metadata.name] == [$n]' >/dev/null 2>&1 \
+    || { _KN_WHY="this host's Node $name must be the only Node with InternalIP $KUBE_MESH_IP"; return 0; }
+  _KN_NAME="$name"
+}
+
+# _kn_agent_from_image <arch> <out> — nodeagent-<arch> out of nodeadm's
+# image by its pinned digest (PORTCULLIS_NODEADM_IMAGE, name@sha256:…; the
+# trust anchor is the CLI's own pin, never a pod; security review): this
+# host's containerd (k3s ctr, namespace k8s.io) holds it by that digest
+# (pulled by digest when absent), its rootfs mounted read-only, the file
+# copied, unmounted. Content is verified by containerd against the digest.
+_kn_agent_from_image() {
+  local ref="$PORTCULLIS_NODEADM_IMAGE" arch="$1" out="$2" dig have mnt rc=0
+  dig="${ref##*@}"
+  have="$(_ki_sudo k3s ctr -n k8s.io images ls "name==$ref" 2>/dev/null | awk 'NR > 1 { print $3; exit }')"
+  if [ -z "$have" ]; then
+    _ki_sudo k3s ctr -n k8s.io images pull --platform "linux/$arch" "$ref" >/dev/null 2>&1 || { _KN_WHY="nodeadm's image $ref couldn't be pulled by its digest"; return 1; }
+    have="$(_ki_sudo k3s ctr -n k8s.io images ls "name==$ref" 2>/dev/null | awk 'NR > 1 { print $3; exit }')"
+  fi
+  [ "$have" = "$dig" ] || { _KN_WHY="containerd holds $ref as ${have:-nothing}, not its pinned digest"; return 1; }
+  mnt="$(_ki_sudo mktemp -d)" || return 1
+  _ki_sudo k3s ctr -n k8s.io images mount --platform "linux/$arch" "$ref" "$mnt" >/dev/null 2>&1 || rc=1
+  [ "$rc" != 0 ] || _ki_sudo cat "$mnt$KUBE_NODEAGENT_BIN-$arch" > "$out" 2>/dev/null || rc=1
+  _ki_sudo k3s ctr -n k8s.io images unmount "$mnt" >/dev/null 2>&1 || true
+  _ki_sudo rmdir "$mnt" 2>/dev/null || true
+  [ "$rc" = 0 ] && [ -s "$out" ] || { _KN_WHY="nodeagent-$arch couldn't be read from nodeadm's image $ref"; return 1; }
 }
 
 # _kn_here_first — this host is the first node: init installed k3s here
@@ -658,26 +695,21 @@ kube_first_nodeagent() {
     return 0
   fi
   _kn_here_first || return 0
-  local id arch want tmp labels site class pod rc=0
-  id="$(kube_first_node_name)"
-  [[ "$id" =~ $NODE_ID_RE ]] || { warn "first node: no Node holds the mesh address $KUBE_MESH_IP: its nodeagent isn't installed"; return 1; }
+  local id arch want tmp labels site class
+  kube_first_node_name
+  id="$_KN_NAME"
+  [[ "$id" =~ $NODE_ID_RE ]] || { warn "first node: ${_KN_WHY:-no Node for this host}: its nodeagent isn't installed"; return 1; }
   case "$(_ki_arch)" in amd64|arm64) arch="$(_ki_arch)" ;; *) warn "first node: no nodeagent for $(_ki_arch)"; return 1 ;; esac
-  pod="$(kube_ctl -n "$KUBE_NODEADM_NS" get pods -l portcullis.io/component=nodeadm --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || pod=""
-  [ -n "$pod" ] || { warn "first node: nodeadm isn't running: its nodeagent waits for the next ./portcullis up"; return 1; }
-  want="$(kube_ctl -n "$KUBE_NODEADM_NS" exec "$pod" -c nodeadm -- sha256sum "$KUBE_NODEAGENT_BIN-$arch" 2>/dev/null | awk '{print $1}')"
-  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { warn "first node: nodeadm's nodeagent-$arch has no sha256"; return 1; }
-  _kn_agent_due "$want" || return 0
+  tmp="$(mktemp -d)" || return 1
+  chmod 700 "$tmp"
+  _kn_agent_from_image "$arch" "$tmp/nodeagent" || { rm -rf "$tmp"; warn "first node: $_KN_WHY: nothing installed"; return 1; }
+  want="$(_kube_sha "$tmp/nodeagent")"
+  _kn_agent_due "$want" || { rm -rf "$tmp"; return 0; }
   labels="$(kube_ctl get node "$id" -o json 2>/dev/null | jq -r '[.metadata.labels["portcullis.io/site"] // "", .metadata.labels["portcullis.io/class"] // ""] | @tsv')" || labels=""
   IFS=$'\t' read -r site class <<< "$labels"
   [[ "$site" =~ $NODE_ID_RE ]] && case "$class" in small|home|cloud) true ;; *) false ;; esac \
-    || { warn "first node: node $id has no portcullis.io/site and class labels (init sets them): its nodeagent isn't installed"; return 1; }
+    || { rm -rf "$tmp"; warn "first node: node $id has no portcullis.io/site and class labels (init sets them): its nodeagent isn't installed"; return 1; }
   info "First node $id: installing / renewing its nodeagent..." >&2
-  tmp="$(mktemp -d)" || return 1
-  chmod 700 "$tmp"
-  kube_ctl -n "$KUBE_NODEADM_NS" exec "$pod" -c nodeadm -- cat "$KUBE_NODEAGENT_BIN-$arch" > "$tmp/nodeagent" 2>/dev/null || rc=1
-  if [ "$rc" != 0 ] || [ "$(_kube_sha "$tmp/nodeagent")" != "$want" ]; then
-    rm -rf "$tmp"; warn "first node: the nodeagent copied from nodeadm doesn't match its sha256: nothing installed"; return 1
-  fi
   _ki_sudo mkdir -p "$(_ki_p "$(dirname "$KUBE_NODEAGENT_BIN")")" \
     && _ki_sudo install -m 0755 "$tmp/nodeagent" "$(_ki_p "$KUBE_NODEAGENT_BIN").new" \
     && _ki_sudo mv -f "$(_ki_p "$KUBE_NODEAGENT_BIN").new" "$(_ki_p "$KUBE_NODEAGENT_BIN")" \

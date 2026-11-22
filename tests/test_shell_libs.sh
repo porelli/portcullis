@@ -7744,12 +7744,14 @@ case "$RC:$(cat "$ND/err")" in "1:"*"node add: Kubernetes only"*) t_pass "node a
 expect_eq "node add on Docker: no kubectl call" "$(cat "$ND/calls" 2>/dev/null)" ""
 
 # ── the first node's nodeagent (plan Task 30 carry): kube_first_nodeagent ──
-# A prefix as the host (init's k3s server dir), a kubectl stub as the
-# cluster (node-1 at 10.215.0.1, nodeadm's pod serving the agent), a
-# stand-in nodeagent (adopt-csr makes a key + CSR, adopt records its
-# stdin), a curl stub as Vault signing the CSR under a test node CA.
+# A prefix as the host (init's k3s server dir, k3s's unit naming node-1),
+# a kubectl stub as the cluster, a k3s stub as this host's containerd
+# holding nodeadm's image by its pinned digest (its rootfs: the stand-in
+# nodeagent), a stand-in nodeagent (adopt-csr makes a key + CSR, adopt
+# records its stdin), a curl stub as Vault signing under a test node CA.
 FN="$WORK/fn"; FP="$FN/p"
-mkdir -p "$FN/bin" "$FN/root/certs" "$FN/root/secrets" "$FP/var/lib/rancher/k3s/server"
+mkdir -p "$FN/bin" "$FN/root/certs" "$FN/root/secrets" "$FP/var/lib/rancher/k3s/server" "$FP/etc/systemd/system" "$FN/rootfs/usr/local/lib/portcullis"
+printf "[Service]\nExecStart=/usr/local/bin/k3s \\\\\n    server \\\\\n\t'--cluster-init' \\\\\n\t'--node-name=node-1' \\\\\n\t'--secrets-encryption' \\\\\n" > "$FP/etc/systemd/system/k3s.service"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$FN/ca.key" -out "$FN/root/certs/node-ca.crt" \
   -subj "/CN=test Node CA" -days 3650 -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign >/dev/null 2>&1
 printf '{"root_token":"VAULTROOTTOKEN"}' > "$FN/root/secrets/vault-init.json"
@@ -7762,22 +7764,37 @@ case "$1" in
   adopt) cat > "$FN_DIR/adopt.json"; jq -r .certificate "$FN_DIR/adopt.json" > "$d/crt"; cat "$d/adopt.key" "$d/crt" > "$d/node.pem"; echo '{"v":1,"adopted":true}' > "$d/state.json" ;;
 esac
 AGENT
+cp "$FN/agent.sh" "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"
+FN_IMG="ghcr.io/x/nodeadm@sha256:$(printf '%064d' 1)"
 cat > "$FN/bin/kubectl" <<'KSTUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FN_CALLS"
 case "$*" in
-  "--context ci get nodes -o json") echo '{"items":[{"metadata":{"name":"node-2"},"status":{"addresses":[{"type":"InternalIP","address":"10.215.0.2"}]}},{"metadata":{"name":"node-1"},"status":{"addresses":[{"type":"InternalIP","address":"10.215.0.1"}]}}]}' ;;
+  "--context ci get nodes -o json") cat "$FN_DIR/nodes.json" ;;
   "--context ci get node node-1 -o json") echo '{"metadata":{"labels":{"portcullis.io/site":"main","portcullis.io/class":"home"}}}' ;;
-  "--context ci -n portcullis-nodeadm get pods -l portcullis.io/component=nodeadm --field-selector=status.phase=Running -o jsonpath={.items[0].metadata.name}") printf nodeadm-x ;;
-  "--context ci -n portcullis-nodeadm exec nodeadm-x -c nodeadm -- sha256sum /usr/local/lib/portcullis/nodeagent-amd64") echo "$(sha256sum < "$FN_DIR/agent.sh" | cut -d' ' -f1)  /usr/local/lib/portcullis/nodeagent-amd64" ;;
-  "--context ci -n portcullis-nodeadm exec nodeadm-x -c nodeadm -- cat /usr/local/lib/portcullis/nodeagent-amd64") cat "$FN_DIR/agent.sh"; [ ! -f "$FN_DIR/tamper" ] || echo "# tampered" ;;
   *) echo "unexpected kubectl $*" >&2; exit 98 ;;
 esac
 KSTUB
+# k3s ctr: images ls / pull / mount / unmount (namespace k8s.io), digest
+# from $FN_DIR/digest; mount copies $FN_DIR/rootfs.
+cat > "$FN/bin/k3s" <<'K3S'
+#!/usr/bin/env bash
+printf 'k3s %s\n' "$*" >> "$FN_CALLS"
+[ "$1 $2 $3 $4" = "ctr -n k8s.io images" ] || exit 97
+shift 4
+case "$1" in
+  ls) [ -f "$FN_DIR/present" ] || { echo "REF TYPE DIGEST"; exit 0; }
+      printf 'REF TYPE DIGEST\n%s application/vnd.oci.image.index.v1+json %s\n' "${2#name==}" "$(cat "$FN_DIR/digest")" ;;
+  pull) [ -f "$FN_DIR/pullable" ] && touch "$FN_DIR/present" ;;
+  mount) cp -R "$FN_DIR/rootfs/." "${@: -1}/" ;;
+  unmount) rm -rf "${2:?}"/* ;;
+  *) exit 96 ;;
+esac
+K3S
 cat > "$FN/bin/curl" <<'CSTUB'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$FN_CALLS"
-out=""; hdr=""
+out=""
 while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; -H) case "$2" in @*) cat "${2#@}" >> "$FN_DIR/curl-headers" ;; esac; shift ;; esac; shift; done
 jq -r .csr > "$FN_DIR/req.csr"
 printf 'extendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:node-1.cluster.portcullis.internal\n' > "$FN_DIR/ext"
@@ -7785,9 +7802,14 @@ if openssl x509 -req -in "$FN_DIR/req.csr" -CA "$FN_DIR/root/certs/node-ca.crt" 
   jq -n --rawfile c "$FN_DIR/leaf.crt" '{data: {certificate: $c}}' > "$out"; printf 200
 else printf 400; fi
 CSTUB
-chmod +x "$FN/bin/kubectl" "$FN/bin/curl" "$FN/agent.sh"
-# fnode [env…] — kube_first_nodeagent; prints its output, then rc=N.
-FN_IMG="ghcr.io/x/nodeadm@sha256:$(printf '%064d' 1)"
+chmod +x "$FN/bin/kubectl" "$FN/bin/curl" "$FN/bin/k3s" "$FN/agent.sh"
+fn_nodes() { # fn_nodes <name>=<ip>… → the cluster's Nodes
+  local a; printf '{"items":[' > "$FN/nodes.json"
+  for a in "$@"; do printf '{"metadata":{"name":"%s"},"status":{"addresses":[{"type":"InternalIP","address":"%s"}]}},' "${a%%=*}" "${a#*=}"; done | sed 's/,$//' >> "$FN/nodes.json"
+  printf ']}' >> "$FN/nodes.json"; }
+fn_nodes node-2=10.215.0.2 node-1=10.215.0.1
+printf '%s' "${FN_IMG##*@}" > "$FN/digest"; touch "$FN/present"
+# fnode [KEY=value…] — kube_first_nodeagent; prints its output, then rc=N.
 fnode() {
   # shellcheck disable=SC2163  # "$@": the caller's KEY=value overrides
   ( export PATH="$FN/bin:$PATH" PORTCULLIS_ROOT="$FN/root" KUBE_INSTALL_PREFIX="$FP" KUBE_INSTALL_ARCH=amd64 FN_P="$FP" FN_DIR="$FN" FN_CALLS="$FN/calls" \
@@ -7798,37 +7820,63 @@ fnode() {
 }
 rm -f "$FN/calls"
 OUT="$(fnode)"
-case "$OUT" in *"First node node-1: its nodeagent runs"*"rc=0") t_pass "first node: adopted (the nodeagent from nodeadm, Vault's certificate, adopt)" ;; *) t_fail "first node adopt: $OUT" ;; esac
+case "$OUT" in *"First node node-1: its nodeagent runs"*"rc=0") t_pass "first node: adopted (the nodeagent from nodeadm's pinned image, Vault's certificate, adopt)" ;; *) t_fail "first node adopt: $OUT" ;; esac
 expect_eq "first node: the adoption request (id, mesh ip, site, class from the Node; the node CA)" \
   "$(jq -c '[.id, .mesh_ip, .site, .class, (.ca == $ca)]' --rawfile ca "$FN/root/certs/node-ca.crt" "$FN/adopt.json" 2>/dev/null)" '["node-1","10.215.0.1","main","home",true]'
 expect_eq "first node: the certificate is node-1.cluster.portcullis.internal from the node CA" \
   "$(jq -r .certificate "$FN/adopt.json" | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null)" "subject=CN=node-1.cluster.portcullis.internal"
-expect_eq "first node: the binary installed 0755 as nodeadm's copy" \
+expect_eq "first node: the binary installed 0755, the pinned image's copy" \
   "$(file_mode "$FP/usr/local/lib/portcullis/nodeagent"):$(cmp -s "$FP/usr/local/lib/portcullis/nodeagent" "$FN/agent.sh" && echo same)" "755:same"
+expect_eq "first node: the binary comes from this host's containerd by the pinned reference (mounted, then unmounted), never a pod" \
+  "$(grep -c "^k3s ctr -n k8s.io images mount --platform linux/amd64 $FN_IMG " "$FN/calls"):$(grep -c '^k3s ctr -n k8s.io images unmount ' "$FN/calls"):$(grep -c ' exec \| cp ' "$FN/calls")" "1:1:0"
 expect_eq "first node: the CSR from adopt-csr <id>, then adopt (no argument)" "$(grep '^agent ' "$FN/calls" | tr '\n' '|')" "agent adopt-csr node-1|agent adopt|"
 expect_eq "first node: Vault's root token in a header from a pipe, never on argv" \
   "$(grep -c VAULTROOTTOKEN "$FN/calls"):$(grep -c 'X-Vault-Token: VAULTROOTTOKEN' "$FN/curl-headers")" "0:1"
 expect_eq "first node: pki_node/sign/node-cluster" "$(grep -c '^curl .*/v1/pki_node/sign/node-cluster$' "$FN/calls")" 1
 rm -f "$FN/calls"
 OUT="$(fnode)"
-expect_eq "first node: adopted, the certificate fresh, the binary nodeadm's → nothing done" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^agent \|-- cat ' "$FN/calls")" "rc=0:0"
+expect_eq "first node: adopted, the certificate fresh, the binary the image's → nothing done" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^agent ' "$FN/calls")" "rc=0:0"
 rm -f "$FN/calls"
 OUT="$(fnode KUBE_NODEAGENT_NOW=$(( $(date +%s) + 25 * 86400 )))"
 expect_eq "first node: ⅓ of the certificate's life left → renewed (a new CSR, adopt again)" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^agent adopt' "$FN/calls")" "rc=0:2"
+# Security review: the image's digest is the anchor. containerd holding the
+# name under another digest (another binary) → refused, nothing installed.
 rm -f "$FN/calls" "$FP/var/lib/portcullis/nodeagent/state.json"
-touch "$FN/tamper"
+cp "$FP/usr/local/lib/portcullis/nodeagent" "$FN/installed.before"
+printf 'sha256:%064d' 2 > "$FN/digest"; echo '# another binary' >> "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"
 OUT="$(fnode)"
-case "$OUT" in *"doesn't match its sha256: nothing installed"*"rc=1") t_pass "first node: a copy that isn't nodeadm's sha256 → refused" ;; *) t_fail "first node tamper: $OUT" ;; esac
-expect_eq "first node: a refused copy installs nothing and adopts nothing" "$(grep -c '^agent ' "$FN/calls")" 0
-rm -f "$FN/tamper" "$FN/calls"
-rm -rf "$FP/var/lib/rancher/k3s/server"
+case "$OUT" in *"not its pinned digest: nothing installed"*"rc=1") t_pass "first node: an image that isn't the pinned digest (another binary) → refused" ;; *) t_fail "first node digest: $OUT" ;; esac
+expect_eq "first node: a refused image installs nothing, mounts nothing and adopts nothing" \
+  "$(grep -c '^agent \| images mount ' "$FN/calls"):$(cmp -s "$FP/usr/local/lib/portcullis/nodeagent" "$FN/installed.before" && echo unchanged)" "0:unchanged"
+printf '%s' "${FN_IMG##*@}" > "$FN/digest"; cp "$FN/agent.sh" "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"
+# Absent: pulled by its digest, else refused.
+rm -f "$FN/present" "$FN/calls"
+OUT="$(fnode)"
+case "$OUT" in *"couldn't be pulled by its digest: nothing installed"*"rc=1") t_pass "first node: the image absent and not pullable → refused" ;; *) t_fail "first node pull: $OUT" ;; esac
+expect_eq "first node: the pull is by the pinned reference" "$(grep -c "^k3s ctr -n k8s.io images pull --platform linux/amd64 $FN_IMG$" "$FN/calls")" 1
+touch "$FN/present"
+# Security review: the Node is k3s's --node-name here, the only one with
+# the first mesh address.
+fn_nodes node-1=10.215.0.1 rogue=10.215.0.1
+rm -f "$FN/calls"
+OUT="$(fnode)"
+case "$OUT" in *"this host's Node node-1 must be the only Node with InternalIP 10.215.0.1"*"rc=1") t_pass "first node: another Node claiming the first mesh address → refused" ;; *) t_fail "first node rogue: $OUT" ;; esac
+fn_nodes node-1=10.215.0.9 rogue=10.215.0.1
+OUT="$(fnode)"
+case "$OUT" in *"must be the only Node with InternalIP 10.215.0.1"*"rc=1") t_pass "first node: a rogue Node holding the address, this host's elsewhere → refused (never adopted as the rogue)" ;; *) t_fail "first node rogue2: $OUT" ;; esac
+expect_eq "first node: no adoption for a mismatched Node" "$(grep -c '^agent ' "$FN/calls")" 0
+fn_nodes node-1=10.215.0.1
+sed -i.bak "/--node-name=/d" "$FP/etc/systemd/system/k3s.service"
+OUT="$(fnode)"
+case "$OUT" in *"k3s's unit here names no --node-name"*"rc=1") t_pass "first node: no --node-name in k3s's unit → refused" ;; *) t_fail "first node no name: $OUT" ;; esac
+mv "$FP/etc/systemd/system/k3s.service.bak" "$FP/etc/systemd/system/k3s.service"
+rm -rf "$FP/var/lib/rancher/k3s/server"; rm -f "$FN/calls"
 OUT="$(fnode)"
 expect_eq "first node: not init's k3s server host → nothing (no cluster call)" "$OUT:$(cat "$FN/calls" 2>/dev/null)" "rc=0:"
 OUT="$(fnode PORTCULLIS_NODEADM_IMAGE=)"
 expect_eq "first node: no nodeadm → nothing" "$OUT" "rc=0"
 expect_eq "up adopts the first node after a waited release; kube check too" \
   "$(grep -c '^  kube_cluster_check; \[ "\${#wait\[@\]}" -eq 0 \] || kube_first_nodeagent || true  #\|; ( kube_first_nodeagent ) || true$' "$HERE/../scripts/lib/kube.sh")" 2
-
 # Found live (Task 30): a background port-forward inherited the CLI lock
 # (fd 9) and, left behind, held it: params-sync waited for ever and no
 # join passed waiting_admission. Every background forward closes fd 9.
