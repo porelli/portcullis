@@ -144,8 +144,12 @@ func (s *Server) revoke(ctx context.Context, id string) error {
 			// restarted mid-call, the CLI asks once more) is done — also
 			// while its burnt code's record is still kept (fix round 2,
 			// found live: each resend ran a whole new revoke, restarting
-			// the servers again). A revoked name gets no new code.
-			if rn := st.RemovedNames[id]; rn != nil && rn.Revoked && st.Nodes[id] == nil {
+			// the servers again), and while its removed record is still kept
+			// (dropped only once the active admission generation leaves its
+			// addresses; found live too). No op is recorded (a parked or
+			// running one is above), so the revocation finished. A revoked
+			// name gets no new code.
+			if rn := st.RemovedNames[id]; rn != nil && rn.Revoked && (st.Nodes[id] == nil || st.Nodes[id].Removed) {
 				return nil
 			}
 			if st.Nodes[id] == nil && st.Codes[id] == nil {

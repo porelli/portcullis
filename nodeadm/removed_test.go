@@ -316,6 +316,16 @@ func TestRevokeAgainIsDone(t *testing.T) {
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=revoke", nil); w.Code != 204 {
 		t.Fatalf("revoke: %d %s", w.Code, w.Body)
 	}
+	// Asked again while its removed record is still kept (found live).
+	if r := h.state(t).Nodes["n4"]; r == nil || !r.Removed {
+		t.Fatalf("record after the revoke: %+v", r)
+	}
+	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=revoke", nil); w.Code != 204 {
+		t.Fatalf("the revoke asked again with its record kept: %d %s", w.Code, w.Body)
+	}
+	if n := strings.Count(h.logs.String(), "revocation recorded"); n != 1 {
+		t.Fatalf("the revoke asked again with its record kept started a new revocation (%d recorded)", n)
+	}
 	h.putState(t, func(st *nodeadmState) {
 		delete(st.Nodes, "n4") // dropped once the params left it
 		// Its burnt code's record (fix round 2, found live: the revoke ran
