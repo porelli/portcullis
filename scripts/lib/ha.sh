@@ -2394,7 +2394,9 @@ kube_frontdoor_restore_step() {
 # atomically) only after it succeeded, so a re-run (after a refusal, a
 # failure, Stop / SIGINT, a CLI crash or a node lost) starts at the first
 # step not recorded and never repeats a recorded one:
-#    1 checklist  the Hub's checklist all green, and the CLI's own: an
+#    1 checklist  the Hub's checklist all green (N−1 only shown: the
+#                 single-node shape is never N−1 green; step 10 gates it),
+#                 and the CLI's own: an
 #                 automated DNS provider for the main domain with its
 #                 credentials (the front door writes its addresses and
 #                 orders its certificate), no unfinished Vault HA off; any
@@ -2528,6 +2530,15 @@ ha_enable_step_checklist() {
   local items red
   _ha_hub_view || fail "can't read the Hub's HA checklist (${_HA_ERR}): nothing changed. Is the Hub running? (./portcullis status)"
   items="$(jq -c --argjson cli "$(_ha_cli_items)" '.checklist + $cli' <<<"$_HA_VIEW")"
+  # N−1 (found live): the single-node shape is never N−1 green — Vault has
+  # one voter (nodeadm counts its minimum as 2), the node-local pods have
+  # nowhere to go — and the HA shape doesn't exist yet to be judged. So
+  # before the switch it is shown, not gated; step 10 refuses to finish
+  # until it is green in HA.
+  if ! kube_ha_on && jq -e 'any(.[]; .id == "n_minus_1" and .ok != true)' <<<"$items" >/dev/null; then
+    warn "N−1 isn't green yet ($(jq -r '.[] | select(.id == "n_minus_1") | .text' <<<"$items")): the single-node shape can't be; ha enable's last step (10) requires it green once HA runs."
+    items="$(jq -c 'map(select(.id != "n_minus_1"))' <<<"$items")"
+  fi
   red="$(jq -r '[.[] | select(.ok != true)] | length' <<<"$items")"
   if [ "$red" != 0 ]; then
     warn "High availability can't be turned on yet:"

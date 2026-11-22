@@ -8224,6 +8224,13 @@ printf '%s' "$he_green" | jq -c '.checklist[1] = {id: "watchdog", ok: false, tex
 hacli "" "" enable --yes
 case "$RC:$ERR" in "1:"*"Watchdogs (fencing): node n3 has no watchdog"*"1 checklist item(s) not green: nothing changed"*) t_pass "ha enable: a red checklist item refuses, naming it" ;; *) t_fail "ha enable red: $RC $ERR" ;; esac
 expect_eq "ha enable: a red checklist changes nothing (no kubectl write recorded, no record)" "$(he_writes):$(ls "$HE/root/secrets/kube")" "0:"
+# N−1 before the switch: shown, not gated (the single-node shape is never
+# N−1 green); with HA on it gates like every item.
+printf '%s' "$he_green" | jq -c '.checklist += [{id: "n_minus_1", ok: false, text: "the N−1 check isn'"'"'t green"}]' > "$HE/view.json"
+hacli "" "need_env; ha_enable_step_checklist; echo PASSED" status
+case "$RC:$OUT:$ERR" in "0:"*PASSED*":"*"N−1 isn't green yet"*"step (10) requires it green"*) t_pass "ha enable step 1: a red N−1 before the switch is shown, not gated" ;; *) t_fail "n1 off: $RC $OUT $ERR" ;; esac
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_enable_step_checklist; echo PASSED" status
+case "$RC:$OUT:$ERR" in "1:"*"N−1 check: the N−1 check isn't green"*) t_pass "ha enable step 1: a red N−1 with HA on refuses" ;; *) t_fail "n1 on: $RC $OUT $ERR" ;; esac
 printf '%s' "$he_green" > "$HE/view.json"
 sed -i.bak '/^CLOUDFLARE_API_TOKEN=/d' "$HE/root/.env"
 hacli "" "" enable --yes
@@ -8354,6 +8361,11 @@ rm -f "$HE/k/frontdoor-cert.json"
 jq '.letsencrypt.Certificates |= map(select(.domain.main != "ha.example.org"))' "$HE/acme.json" > "$HE/acme.json.t" && mv "$HE/acme.json.t" "$HE/acme.json"
 hacli "" "need_env; _ha_frontdoor_cert_seed; exit 0" status
 case "$RC:$ERR:$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" in "0:"*"Traefik holds no current certificate of ha.example.org"*":0") t_pass "frontdoor-cert seed: none in acme.json → warned, nothing written" ;; *) t_fail "seed none: $RC $ERR" ;; esac
+
+# Found live (Task 31): on Kubernetes the dns tool's one-shot runs the
+# release's image: domains_image_ensure builds nothing and never refuses.
+OUT="$(CONTAINER_RUNTIME=kubernetes bash -c 'for l in common domains; do source "'"$HERE"'/../scripts/lib/$l.sh" >/dev/null 2>&1; done; runtime_build_service() { echo BUILT; }; domains_image_ensure "for the dns tool"; echo "rc=$?"' 2>&1)"
+expect_eq "domains_image_ensure on kubernetes: nothing built, no refusal" "$OUT" "rc=0"
 
 echo ""
 echo "$PASS passed, $FAIL failed"
