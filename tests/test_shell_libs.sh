@@ -7238,11 +7238,12 @@ expect_eq "ha_install_certmanager: cert-manager (restricted) → deny + its webh
   'rc=0:NS cert-manager restricted:[["10.1.0.4/32","10.42.0.0/32","10.42.0.1/32"],10250]'
 # Fix round 1 (security review): the host probes run in their own
 # namespace, after its default-deny, the policy's params (the helper image
-# and the exact script) and the policy itself.
+# and the exact script) and the policy itself. An apply from stdin logs once
+# it has read it all, so a pipe's order is the stub's (both sides start at once).
 rm -f "$WORK/ps-calls" "$WORK/ps-in" "$WORK/ps-pol"
 OUT="$(kt "PORTCULLIS_HOME='$H24'; mkdir -p '$H24/kube/ha/probe'; cp '$HERE/../kube/ha/probe/admission.yaml' '$H24/kube/ha/probe/'
   kube_namespace_apply() { echo \"NS \$*\" >> '$WORK/ps-calls'; }; _ha_policy_in_force() { :; }
-  kube_ctl() { echo \"K \$*\" >> '$WORK/ps-calls'; case \"\$*\" in *'create configmap'*) all=\"\$*\"; d=\"\${all##*--from-file=}\"; d=\"\${d%% *}\"; jq -n --rawfile i \"\$d/image\" --rawfile s \"\$d/script\" '{data: {image: \$i, script: \$s}}' ;; *'-f -'*) cat >> '$WORK/ps-in' ;; *admission.yaml) cp \"\${@: -1}\" '$WORK/ps-pol' ;; esac; }
+  kube_ctl() { case \"\$*\" in *'-f -'*) cat >> '$WORK/ps-in' ;; esac; echo \"K \$*\" >> '$WORK/ps-calls'; case \"\$*\" in *'create configmap'*) all=\"\$*\"; d=\"\${all##*--from-file=}\"; d=\"\${d%% *}\"; jq -n --rawfile i \"\$d/image\" --rawfile s \"\$d/script\" '{data: {image: \$i, script: \$s}}' ;; *admission.yaml) cp \"\${@: -1}\" '$WORK/ps-pol' ;; esac; }
   _ha_probe_setup; jq -sj '.[1].data.script' '$WORK/ps-in' | cmp -s - <(printf '%s' \"\$HA_PROBE_SH\") && echo SCRIPT-SAME")"
 expect_eq "_ha_probe_setup: portcullis-ha-probe (PSA haprobe) → its default-deny → the params (helper image, the exact probe script) → the probe policy" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(sed -E 's/^(K) .*(create configmap ha-probe-params).*/\1 \2/; s/^K .*apply.*-f -$/K apply/; s/^K .*apply.*admission.yaml$/K policy/' "$WORK/ps-calls" | tr '\n' ';')" \
