@@ -2823,9 +2823,45 @@ _ha_frontdoor_cert_seed() {
   ok "Traefik's certificate of $d (until $(printf '%s\n' "$pem" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)) is the front door's served one until the account switch."
 }
 
+# _ha_writers_on_replicated — a writer's Deployment already mounts a
+# <pvc>-r (an earlier switch applied it): its data is the replicated
+# copy's now, which must never be copied over again.
+_ha_writers_on_replicated() {
+  local d
+  for d in $HA_ENABLE_WRITERS; do
+    kube_ctl -n "$(kube_ns)" get deployment "$d" -o json 2>/dev/null       | jq -e 'any(.spec.template.spec.volumes[]?; (.persistentVolumeClaim.claimName // "") | endswith("-r"))' >/dev/null && return 0
+  done
+  return 1
+}
+
+# HA_MOVED_SERVICES — Traefik's Services that move to the ingress
+# namespace in HA (charts/portcullis/templates/services.yaml): traefik and
+# traefik-vpn keep their fixed ClusterIPs there, keycloak-internal and
+# traefik-metrics stay in the core namespace as ExternalName names.
+HA_MOVED_SERVICES="traefik traefik-vpn keycloak-internal traefik-metrics"
+
+# _ha_services_move — before the switch's release: the core namespace's
+# old Services of HA_MOVED_SERVICES deleted (found live: the release
+# creates traefik in portcullis-ingress at the same fixed ClusterIP, which
+# the old one still held — "provided IP is already allocated" — and a
+# ClusterIP Service can't become an ExternalName in place). Sign-in stops
+# here until the release's Traefik DaemonSet serves (the confirmed
+# downtime). An ExternalName one (the release made it) is kept.
+_ha_services_move() {
+  local ns s t
+  ns="$(kube_ns)"
+  for s in $HA_MOVED_SERVICES; do
+    t="$(kube_ctl -n "$ns" get service "$s" -o jsonpath='{.spec.type}' 2>/dev/null)" || continue
+    [ "$t" != ExternalName ] || continue
+    kube_ctl -n "$ns" delete service "$s" --wait=true --timeout=60s >/dev/null || fail "could not delete the Service $s in $ns (Traefik's moves to $KUBE_INGRESS_NS): run ./portcullis ha enable again"
+  done
+}
+
 # ha_enable_step_switch — step 5.
 ha_enable_step_switch() {
-  if ! _ha_writers_stopped || ! _ha_volumes_same; then
+  if _ha_writers_on_replicated; then
+    info "The core writers already run on the replicated volumes (an earlier switch): no copy again."
+  elif ! _ha_writers_stopped || ! _ha_volumes_same; then
     info "Something wrote to the core volumes since the copy (or a writer runs again): copying them again..."
     ha_enable_step_volumes
   fi
@@ -2833,6 +2869,7 @@ ha_enable_step_switch() {
   _ha_frontdoor_cert_seed
   env_set PORTCULLIS_HA on
   export PORTCULLIS_HA=on
+  _ha_services_move
   info "HA on (PORTCULLIS_HA=on in .env): deploying the HA shape (./portcullis up)..."
   stack_up
 }

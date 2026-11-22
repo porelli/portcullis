@@ -8192,6 +8192,9 @@ case "$a" in
     c="$(cat "$HE/k/pod-$2")"
     if [ -e "$HE/fault-manifest" ] && [ "${c%-r}" != "$c" ]; then printf '%064d\n' 2; else printf '%064d\n' 1; fi ;;
   "apply --server-side "*) cat > "$HE/k/applied.$(date +%s%N)"; echo "apply" >> "$HE/order" ;;
+  "get service "*" -o jsonpath={.spec.type}") [ -e "$HE/k/svc-$3" ] && cat "$HE/k/svc-$3" || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
+  "delete service "*) rm -f "$HE/k/svc-$3"; echo "delete service $3" >> "$HE/order" ;;
+  "get deployment "*" -o json") [ -e "$HE/k/deploy-$3" ] || exit 1; c=hub-state; [ ! -e "$HE/k/onrep-$3" ] || c=hub-state-r; echo '{"spec":{"template":{"spec":{"volumes":[{"persistentVolumeClaim":{"claimName":"'"$c"'"}}]}}}}' ;;
   "get secret frontdoor-cert -o json") cat "$HE/k/frontdoor-cert.json" 2>/dev/null || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
   "exec "*" -- cat /vol/acme.json") cat "$HE/acme.json" ;;
   *) echo "unexpected kubectl $*" >&2; exit 98 ;;
@@ -8404,6 +8407,24 @@ if stat -c %a / >/dev/null 2>&1; then
   chmod 644 "$MF/b/d/f"; echo y > "$MF/b/d/f"
   expect_eq "the copy's manifest: a file's content counts" "$( [ "$(mf a)" != "$(mf b)" ] && echo differ)" differ
 fi
+
+# The switch (found live): the core namespace's old Traefik Services go
+# before the release (its traefik in portcullis-ingress takes the same
+# fixed ClusterIP); an ExternalName one stays; an absent one is fine.
+he_vols; printf LoadBalancer > "$HE/k/svc-traefik"; printf ClusterIP > "$HE/k/svc-traefik-vpn"; printf ExternalName > "$HE/k/svc-keycloak-internal"
+hacli "" "need_env; _ha_services_move; exit 0" status
+expect_eq "switch: the old traefik / traefik-vpn Services deleted, an ExternalName kept, a missing one skipped" \
+  "$RC:$(grep -c '^delete service' "$HE/order"):$(ls "$HE/k" | grep -c '^svc-keycloak-internal$')" "0:2:1"
+# A writer already on its <pvc>-r (an earlier switch applied it): never
+# copied over again.
+he_vols; touch "$HE/k/onrep-hub"
+hacli "" "need_env; _ha_writers_on_replicated && echo ONREP; exit 0" status
+expect_eq "switch: a writer on a <pvc>-r is seen (no copy over it)" "$RC:$OUT" "0:ONREP"
+rm -f "$HE/k/onrep-hub"
+hacli "" "need_env; _ha_writers_on_replicated || echo LOCAL; exit 0" status
+expect_eq "switch: writers on their old volumes" "$RC:$OUT" "0:LOCAL"
+expect_eq "switch: the services move before the release, the copy check skipped on replicated writers" \
+  "$(declare -f ha_enable_step_switch >/dev/null 2>&1; bash -c 'source "'"$HERE"'/../scripts/lib/common.sh" >/dev/null 2>&1; declare -f ha_enable_step_switch' | grep -c '_ha_writers_on_replicated\|_ha_services_move')" 2
 
 echo ""
 echo "$PASS passed, $FAIL failed"
