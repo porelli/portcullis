@@ -927,7 +927,7 @@ NODEADM_CLUSTER_RULES = [
 NODEADM_CORE_RULES = [
     {"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["nodeadm-k3s-token", "frontdoor-control-tls", "nodeadm-state"], "verbs": ["get", "update"]},
     {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-cluster-addresses"], "verbs": ["update"]},
-    {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-admission-active"], "verbs": ["get"]},
+    {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-admission-active", "portcullis-first-node"], "verbs": ["get"]},
     {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["portcullis-nodeadm"], "verbs": ["get", "update"]},
 ]
 NODEADM_KUBE_SYSTEM_RULES = [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "delete"]}]

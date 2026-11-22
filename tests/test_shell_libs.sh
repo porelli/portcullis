@@ -4634,6 +4634,9 @@ case "$*" in
       case "$(printf '%s' "$in" | jq -r .kind):$ns" in
         Secret:kube-system) b=portcullis-nodeadm-guard-tokens ;; Node:) b=portcullis-nodes-guard-labels ;; *) echo "stub: nodeadm probe $ns" >&2; exit 97 ;;
       esac
+      # portcullis-removed-nodes' probe: its own annotation (Task 30 fix round 1).
+      rg="$(printf '%s' "$in" | jq -r '.metadata.annotations["portcullis.io/removed-nodes-generation"] // ""')"
+      [ -z "$rg" ] || { b=portcullis-nodes-guard-removed g="$rg"; }
     fi
     printf 'probe %s\n' "$b" >> "$STUB_DIR/order"
     if [ -z "${STUB_PROBE_STALE:-}" ] && [ "${STUB_PROBE_STALE_BINDING:-}" != "$b" ] && [ -e "$STUB_DIR/live/Binding.$b-$g.json" ] && [ -e "$STUB_DIR/live/ConfigMap.portcullis-admission-params-$g.json" ]; then
@@ -5153,7 +5156,7 @@ expect_eq "kube_admission_params_apply's generation is kube_params_generation, a
   "$(sed -n '/^kube_admission_params_apply() {/,/^}/p' "$HERE/../scripts/lib/kube.sh" | grep -c 'kube_params_generation\|kube_admission_active_put "$gen" "$params"')" 2
 # The cluster addresses → the params' addresses: pending and active nodes,
 # never a removed one; anything that doesn't validate changes nothing.
-CA_ST='{"v":1,"mesh_cidr":"10.215.0.0/24","cluster_cidr":"10.42.0.0/24","service_cidr":"10.43.0.0/16","api":["10.215.0.10","10.215.0.1"],"nodes":{"n1":{"mesh":"10.215.0.1","lan":["192.0.2.10"],"public":["198.51.100.7"],"state":"active"},"n2":{"mesh":"10.215.0.10","lan":[],"public":[],"state":"pending"},"n3":{"mesh":"10.215.0.30","lan":["192.0.2.30"],"public":[],"state":"removed"}}}'
+CA_ST='{"v":1,"mesh_cidr":"10.215.0.0/24","cluster_cidr":"10.42.0.0/24","service_cidr":"10.43.0.0/16","api":["10.215.0.10","10.215.0.1"],"nodes":{"n1":{"mesh":"10.215.0.1","lan":["192.0.2.10"],"public":["198.51.100.7"],"state":"active"},"n2":{"mesh":"10.215.0.10","lan":[],"public":[],"state":"pending"},"n3":{"mesh":"10.215.0.30","lan":["192.0.2.30"],"public":[],"state":"removed"}},"removed_names":["n3","a0"]}'
 # The live nodes (the API server's view): n1 (with an ExternalIP the
 # document doesn't list) and n2, both control-plane servers.
 cp_node() { jq -nc --arg n "$1" --arg ip "$2" --arg ext "${3:-}" '{metadata: {name: $n, labels: {"node-role.kubernetes.io/control-plane": "true"},
@@ -5165,6 +5168,14 @@ kda() { kt "kube_doc_addresses && echo \"\$_K_DOC_NODES|\$_K_DOC_API\" || { r=\$
 ca "$CA_ST"
 expect_eq "kube_doc_addresses: the pending and active nodes' addresses ∪ every live Node's (not a removed node without a Node), api, each /32" "$(kda)" "10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32|10.215.0.1/32 10.215.0.10/32
 rc=0"
+# Task 30 fix round 1: the removed names (params removedNodes), strict.
+expect_eq "kube_doc_addresses: removed_names → _K_DOC_REMOVED, sorted" \
+  "$(kt "kube_doc_addresses && echo \"\$_K_DOC_REMOVED\"" | head -n1)" "a0 n3"
+for bad in 'del(.removed_names)' '.removed_names = "n3"' '.removed_names = ["N3"]' '.removed_names = ["n3 a0"]' '.removed_names = [3]'; do
+  ca "$(printf '%s' "$CA_ST" | jq -c "$bad")"
+  case "$(kda)" in *"rc1 "*"don't parse"*) t_pass "kube_doc_addresses: $bad → refused" ;; *) t_fail "kda removed $bad: $(kda)" ;; esac
+done
+ca "$CA_ST"
 # A removed node whose Node object still exists stays excluded.
 live_nodes "$(cp_node n1 10.215.0.1 198.51.100.9)" "$(cp_node n2 10.215.0.10)" "$(cp_node n3 10.215.0.30 | jq -c '.metadata.labels = {} | .metadata.annotations = {"k3s.io/node-args": "[\"agent\"]"}')"
 case "$(kda)" in *"10.215.0.30/32"*"192.0.2.30/32"*"rc=0") t_pass "kube_doc_addresses: a removed node keeps its addresses excluded while its Node exists" ;; *) t_fail "kda removed live: $(kda)" ;; esac
@@ -5198,7 +5209,7 @@ rm -f "$KS/kube/cluster-addresses.json"
 case "$(kda)" in *"rc2"*) t_pass "kube_doc_addresses: no document yet → 2 (the .env addresses)" ;; *) t_fail "kda none: $(kda)" ;; esac
 # params-sync: the active generation's params with the document's four
 # keys; unchanged → nothing; changed → the swap; refused → nothing.
-PS_BASE="$(printf 'hubImage\tghcr.io/porelli/portcullis-hub@sha256:%064d\nappsNamespace\tportcullis-apps\nnodeAddresses\t10.215.0.1/32\napiAddresses\t10.215.0.1/32 10.215.0.10/32\npodCIDR\t10.42.0.0/24\nserviceCIDR\t10.43.0.0/16' 1)"
+PS_BASE="$(printf 'hubImage\tghcr.io/porelli/portcullis-hub@sha256:%064d\nappsNamespace\tportcullis-apps\nnodeAddresses\t10.215.0.1/32\napiAddresses\t10.215.0.1/32 10.215.0.10/32\npodCIDR\t10.42.0.0/24\nserviceCIDR\t10.43.0.0/16\nremovedNodes\ta0 n3' 1)"
 PS_BINDINGS="$(kt 'echo $KUBE_BINDINGS' | head -n1)"
 psync() { # psync <base params lines> [drop binding] [record jq] → kube_params_sync with the stub's active record / params / bindings
   local g; g="$(printf '%s\n' "$1" | kt kube_params_generation | head -n1)"
@@ -5207,7 +5218,7 @@ psync() { # psync <base params lines> [drop binding] [record jq] → kube_params
       api_addresses: ($p[0].data.apiAddresses | split(" ")), proven_at: "x"} | '"${3:-.}"' | tojson)}}' > "$KS/kube/active.json"
   printf '%s\n' $PS_BINDINGS | grep -vx "${2:-none}" | jq -R --arg g "$g" '{metadata: {name: (. + "-" + $g)}, spec: {paramRef: {name: ("portcullis-admission-params-" + $g)}}}' \
     | jq -s '{items: .}' > "$KS/kube/bindings-$g.json"
-  kt "kube_admission_params_apply() { echo \"APPLY \$1\"; printf '%s\n' \"\$2\" | awk -F'\t' '\$1 ~ /Addresses\$/'; }; kube_params_sync"
+  kt "kube_admission_params_apply() { echo \"APPLY \$1\"; printf '%s\n' \"\$2\" | awk -F'\t' '\$1 ~ /Addresses\$/ || \$1 == \"removedNodes\"'; }; kube_params_sync"
 }
 ca "$CA_ST"
 OUT="$(psync "$(printf '%s\n' "$PS_BASE" | sed 's#^nodeAddresses\t.*#nodeAddresses\t10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32#')")"
@@ -5224,6 +5235,13 @@ expect_eq "kube params-sync and kube check run under cli_lock (review I3)" \
 OUT="$(psync "$PS_BASE")"
 case "$OUT" in *"APPLY ghcr.io/porelli/portcullis-hub@sha256:"*"nodeAddresses	10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32"*"apiAddresses	10.215.0.1/32 10.215.0.10/32"*"rc=0")
   t_pass "kube params-sync: a pending node's addresses → the swap with the document's addresses and the active hub image" ;; *) t_fail "psync change: $OUT" ;; esac
+# Task 30 fix round 1: a newly removed name → a new generation with it
+# (portcullis-removed-nodes judges by it); params without the key get it.
+ca "$(printf '%s' "$CA_ST" | jq -c '.removed_names += ["z9"]')"
+OUT="$(psync "$PS_SAME")"
+case "$OUT" in *"APPLY "*"removedNodes	a0 n3 z9"*"rc=0") t_pass "kube params-sync: a newly removed node name → the swap with removedNodes" ;; *) t_fail "psync removed: $OUT" ;; esac
+OUT="$(psync "$(printf '%s\n' "$PS_SAME" | grep -v '^removedNodes')")"
+case "$OUT" in *"APPLY "*"removedNodes	a0 n3 z9"*"rc=0") t_pass "kube params-sync: active params without removedNodes → the key added" ;; *) t_fail "psync removed key: $OUT" ;; esac
 ca "$(printf '%s' "$CA_ST" | jq -c '.nodes.n2.mesh = "10.9.0.1"')"
 OUT="$(psync "$PS_BASE")"
 case "$OUT" in *APPLY*) t_fail "psync bad doc applied: $OUT" ;; *"rc=1") t_pass "kube params-sync: a node outside the mesh → nothing changed, exit 1" ;; *) t_fail "psync bad: $OUT" ;; esac
@@ -5543,14 +5561,14 @@ expect_eq "cluster setup: params ConfigMap carries the resolved Hub digest, the 
 expect_eq "cluster setup: the params ConfigMap has exactly params.tmpl.yaml's keys" \
   "$(jq -r '.data | keys | join(" ")' "$PJ") " \
   "$(sed -n '/^data:/,$p' "$HERE/../kube/admission/params.tmpl.yaml" | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')"
-expect_eq "cluster setup: the eleven bindings as <name>-<generation> on portcullis-admission-params-<generation>, labelled with their base name" \
-  "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | [.metadata.name == .metadata.labels["portcullis.io/binding"] + "-" + $g, .spec.paramRef.name == "portcullis-admission-params-" + $g] | all) | [length, all] | map(tostring) | join(":")' "$KS"/live/Binding.*.json)" "11:true"
+expect_eq "cluster setup: the twelve bindings as <name>-<generation> on portcullis-admission-params-<generation>, labelled with their base name" \
+  "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | [.metadata.name == .metadata.labels["portcullis.io/binding"] + "-" + $g, .spec.paramRef.name == "portcullis-admission-params-" + $g] | all) | [length, all] | map(tostring) | join(":")' "$KS"/live/Binding.*.json)" "12:true"
 expect_eq "cluster setup: the five apps bindings select portcullis-apps, the edge one portcullis-edge, (HA) the exec one the core namespace, nodeadm's tokens kube-system, the ingress one portcullis-ingress" \
   "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | .spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"]) | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$KS"/live/Binding.*.json)" \
-  "kube-system=1 portcullis=3 portcullis-apps=5 portcullis-edge=1 portcullis-ingress=1"
+  "kube-system=1 portcullis=4 portcullis-apps=5 portcullis-edge=1 portcullis-ingress=1"
 expect_eq "cluster setup: first run → params, bindings, probe (3 requests), nothing older to delete" \
-  "$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp)' "$KS/order" | sed "s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" " 1 apply bindings G1; 13 probe;"
-expect_eq "cluster setup: every one of the eleven bindings probed with its own object" \
+  "$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp)' "$KS/order" | sed "s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" " 1 apply bindings G1; 14 probe;"
+expect_eq "cluster setup: every one of the twelve bindings probed with its own object" \
   "$(grep '^probe portcullis-' "$KS/order" | sort | tr '\n' ' ')" "$(printf 'probe %s\n' $KUBE_BINDINGS | sort | tr '\n' ' ')"
 expect_eq "cluster setup: the five namespaces with PSA labels and K11's label + install annotation (server-side)" \
   "$(jq -cs '[.[] | select(.kind == "Namespace") | [.metadata.name, .metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["portcullis.io/install"]]]' < <(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object")' 2>/dev/null))" \
@@ -5564,13 +5582,13 @@ expect_eq "cluster setup: applied.json records every step (0600)" \
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
 expect_eq "cluster setup: unchanged params → the same generation re-applied and probed, nothing deleted, no Hub scaling" \
-  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'delete binding\|scale deploy/hub' "$KS/order" || true):$(grep -c '^probe' "$KS/order")" "rc=0:0:13"
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'delete binding\|scale deploy/hub' "$KS/order" || true):$(grep -c '^probe' "$KS/order")" "rc=0:0:14"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.7'; kube_cluster_setup")"
 G2="$(grep '^apply bindings ' "$KS/order" | tail -n1 | cut -d' ' -f3)"
 expect_eq "cluster setup: changed params → create-before-delete: the new generation's bindings, the probe, only then the older bindings deleted; the older params stamped, not deleted; the Hub never scaled" \
   "$(printf '%s\n' "$OUT" | tail -n1):$([ "$G2" != "$G1" ] && echo new-gen):$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp|kubectl .*scale)' "$KS/order" | sed "s/$G2/G2/; s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" \
-  "rc=0:new-gen: 1 apply bindings G2; 13 probe; 1 delete binding portcullis-apps-guard-netpol-G1; 1 delete binding portcullis-apps-guard-pods-G1; 1 delete binding portcullis-apps-guard-services-G1; 1 delete binding portcullis-apps-guard-traefik-G1; 1 delete binding portcullis-apps-guard-workloads-G1; 1 delete binding portcullis-core-guard-exec-G1; 1 delete binding portcullis-core-guard-frontdoor-status-G1; 1 delete binding portcullis-edge-guard-routes-G1; 1 delete binding portcullis-ingress-guard-pods-G1; 1 delete binding portcullis-nodeadm-guard-tokens-G1; 1 delete binding portcullis-nodes-guard-labels-G1; 1 stamp portcullis-admission-params-G1;"
+  "rc=0:new-gen: 1 apply bindings G2; 14 probe; 1 delete binding portcullis-apps-guard-netpol-G1; 1 delete binding portcullis-apps-guard-pods-G1; 1 delete binding portcullis-apps-guard-services-G1; 1 delete binding portcullis-apps-guard-traefik-G1; 1 delete binding portcullis-apps-guard-workloads-G1; 1 delete binding portcullis-core-guard-exec-G1; 1 delete binding portcullis-core-guard-frontdoor-status-G1; 1 delete binding portcullis-edge-guard-routes-G1; 1 delete binding portcullis-ingress-guard-pods-G1; 1 delete binding portcullis-nodeadm-guard-tokens-G1; 1 delete binding portcullis-nodes-guard-labels-G1; 1 delete binding portcullis-nodes-guard-removed-G1; 1 stamp portcullis-admission-params-G1;"
 echo '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"portcullis-admission-params-ffffffffffffffff","labels":{"app.kubernetes.io/managed-by":"portcullis","portcullis.io/params-generation":"ffffffffffffffff"},"annotations":{"portcullis.io/orphaned-at":"a[$(touch '"$WORK"'/pwned)]"}},"data":{}}' > "$KS/live/ConfigMap.portcullis-admission-params-ffffffffffffffff.json"
 echo '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"portcullis-admission-params-evil","labels":{"app.kubernetes.io/managed-by":"portcullis","portcullis.io/params-generation":"x"},"annotations":{"portcullis.io/orphaned-at":"1"}},"data":{}}' > "$KS/live/ConfigMap.portcullis-admission-params-evil.json"
 rm -f "$KS/order"
@@ -5588,11 +5606,11 @@ rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.8' KUBE_ADMISSION_PROBE_WAIT=0; export STUB_PROBE_STALE_BINDING=portcullis-apps-guard-netpol; kube_cluster_setup")"
 case "$OUT" in *"not live with generation"*"portcullis-apps-guard-netpol"*"aren't live with their params"*"rc=1") t_pass "cluster setup: one binding of the six (netpol) not live → refused, the older bindings kept" ;; *) t_fail "cluster setup one stale binding: $OUT" ;; esac
 expect_eq "cluster setup: one stale binding deletes nothing" "$(grep -c '^delete binding' "$KS/order" || true)" 0
-expect_eq "cluster setup: a failed probe deletes no binding" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:11"
+expect_eq "cluster setup: a failed probe deletes no binding" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:12"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.9'; export STUB_BINDINGS_FAIL=1; kube_cluster_setup")"
 case "$OUT" in *"could not create the admission bindings of params generation"*"the older ones still judge"*"rc=1") t_pass "cluster setup: the new bindings can't be created → refused, nothing deleted" ;; *) t_fail "cluster setup bindings failure: $OUT" ;; esac
-expect_eq "cluster setup: failed bindings → the older bindings kept" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:11"
+expect_eq "cluster setup: failed bindings → the older bindings kept" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:12"
 echo '{"items":[{"kind":"IngressRoute","metadata":{"name":"app-ok","labels":{"portcullis.io/instance":"a"}}},{"kind":"IngressRoute","metadata":{"name":"app-bad","labels":{"portcullis.io/instance":"b"}},"spec":{"x":"REFUSE-ME"}}]}' > "$KS/kube/edge-hub-ir.json"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
@@ -5603,7 +5621,7 @@ k_fixtures
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_APPS_NAMESPACE=team-apps; export STUB_APPS_NS=team-apps; kube_cluster_setup")"
 expect_eq "cluster setup, PORTCULLIS_APPS_NAMESPACE=team-apps: the five apps bindings select team-apps, the edge one portcullis-edge (the HA ones unchanged)" \
   "$(printf '%s\n' "$OUT" | tail -n1) $(jq -s -r 'map(.spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"]) | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$KS"/live/Binding.*.json)" \
-  "rc=0 kube-system=1 portcullis=3 portcullis-edge=1 portcullis-ingress=1 team-apps=5"
+  "rc=0 kube-system=1 portcullis=4 portcullis-edge=1 portcullis-ingress=1 team-apps=5"
 expect_eq "no Hub scaling around the admission bindings (create-before-delete needs none)" "$(declare -f kube_admission_params_apply kube_cluster_setup | grep -c '_kube_scale\|deployment hub' || true)" 0
 k_fixtures
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_WHOAMI_FAIL=1; kube_cluster_setup")"
@@ -5683,7 +5701,7 @@ expect_eq "StorageClasses: portcullis-core Retain, portcullis-apps Delete, both 
   "[('portcullis-core', 'Retain', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False), ('portcullis-apps', 'Delete', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False)]"
 expect_eq "kube/admission: ten policies (policies.yaml + nodeadm-tokens.yaml), ten bindings (portcullis-apps-guard-<policy>, portcullis-edge-guard-routes, HA: portcullis-core-guard-exec, portcullis-nodeadm-guard-tokens, portcullis-ingress-guard-pods; Deny, params missing = Deny, Fail)" \
   "$(python3 -c 'import sys, yaml; P = [d for f in sys.argv[2:] for d in yaml.safe_load_all(open(f)) if d]; B = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]; print(sorted(p["metadata"]["name"] for p in P), all(p["spec"]["failurePolicy"] == "Fail" for p in P), sorted((b["metadata"]["name"], b["spec"]["policyName"], b["spec"]["validationActions"] == ["Deny"], b["spec"]["paramRef"]["parameterNotFoundAction"]) for b in B))' "$HERE/../kube/admission/bindings.yaml" "$HERE/../kube/admission/policies.yaml" "$HERE/../kube/admission/nodeadm-tokens.yaml")" \
-  "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads', 'portcullis-core-exec', 'portcullis-edge-routes', 'portcullis-frontdoor-status', 'portcullis-ingress-pods', 'portcullis-node-labels', 'portcullis-nodeadm-tokens'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny'), ('portcullis-core-guard-exec', 'portcullis-core-exec', True, 'Deny'), ('portcullis-core-guard-frontdoor-status', 'portcullis-frontdoor-status', True, 'Deny'), ('portcullis-edge-guard-routes', 'portcullis-edge-routes', True, 'Deny'), ('portcullis-ingress-guard-pods', 'portcullis-ingress-pods', True, 'Deny'), ('portcullis-nodeadm-guard-tokens', 'portcullis-nodeadm-tokens', True, 'Deny'), ('portcullis-nodes-guard-labels', 'portcullis-node-labels', True, 'Deny')]"
+  "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads', 'portcullis-core-exec', 'portcullis-edge-routes', 'portcullis-frontdoor-status', 'portcullis-ingress-pods', 'portcullis-node-labels', 'portcullis-nodeadm-tokens', 'portcullis-removed-nodes'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny'), ('portcullis-core-guard-exec', 'portcullis-core-exec', True, 'Deny'), ('portcullis-core-guard-frontdoor-status', 'portcullis-frontdoor-status', True, 'Deny'), ('portcullis-edge-guard-routes', 'portcullis-edge-routes', True, 'Deny'), ('portcullis-ingress-guard-pods', 'portcullis-ingress-pods', True, 'Deny'), ('portcullis-nodeadm-guard-tokens', 'portcullis-nodeadm-tokens', True, 'Deny'), ('portcullis-nodes-guard-labels', 'portcullis-node-labels', True, 'Deny'), ('portcullis-nodes-guard-removed', 'portcullis-removed-nodes', True, 'Deny')]"
 expect_eq "KUBE_BINDINGS lists portcullis-nodeadm-guard-tokens (and the other HA bindings), never a guard on admission objects (R-ADM)" \
   "$(for b in portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods portcullis-nodes-guard-labels; do case " $KUBE_BINDINGS " in *" $b "*) printf y ;; *) printf n ;; esac; done):$(printf '%s\n' $KUBE_BINDINGS | grep -c 'nodeadm-guard-admission')" yyyy:0
 expect_eq "cluster setup applies the two policy files (KUBE_POLICY_FILES), never a binding of them" \
@@ -7688,12 +7706,24 @@ case "$*" in
   "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers add-cluster-node")
     [ -f "$ND/refuse" ] && { echo "server n4 already exists" >&2; echo "command terminated with exit code 1" >&2; exit 1; }
     echo '{"op_id":"op1","role":"agent","class":"cloud","site":"edge","expires_at":"2026-11-22T10:15:00Z","warnings":["w1"],"command":"curl -fsSL https://ex.org/node/join.sh | sudo sh"}' >&2
-    echo pcj2.SECRETCODE ;;
+    echo pcj2.SECRETCODE
+    # An interrupt once the code is in the CLI's temporary file.
+    [ ! -f "$ND/term" ] || kill -TERM "$NODE_CLI_PID" ;;
   "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers list")
-    echo '{"servers":[{"id":"primary","state":"ready"},{"id":"nas","kind":"worker","state":"ready"},{"id":"n4","kind":"cluster-node","role":"agent","class":"cloud","site":"edge","mesh_ip":"10.215.0.4","state":"enrolling"}]}' ;;
+    # $ND/lists: one answer per call (the last one repeats).
+    if [ -s "$ND/lists" ]; then head -n1 "$ND/lists"; [ "$(wc -l < "$ND/lists")" -le 1 ] || sed -i.bak 1d "$ND/lists"; exit 0; fi
+    echo '{"servers":[{"id":"primary","state":"ready"},{"id":"nas","kind":"worker","state":"ready"},{"id":"n4","kind":"cluster-node","role":"agent","class":"cloud","site":"edge","mesh_ip":"10.215.0.4","state":"enrolling"},{"id":"n6","kind":"cluster-node","role":"agent","state":"revoked"},{"id":"n7","kind":"cluster-node","role":"server","state":"revoked","revoke_confirmed":true},{"id":"n8","kind":"cluster-node","role":"server","state":"revoked","revoke_confirmed":true,"error":"revoked; waiting for quorum to remove its etcd member"}]}' ;;
   "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers remove n4") echo '{"status":"removing","server":"n4","op_id":"op9","op":"server.remove"}' ;;
   "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers op n4 op9") echo '{"op":"server.remove","op_id":"op9","ok":true,"steps":[{"key":"drain","label":"Draining","state":"done"}]}' ;;
-  "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers revoke n4") echo '{"status":"revoked","server":"n4"}' ;;
+  "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers revoke n4")
+    # broken: the exec breaks under the restarts (no "command terminated");
+    # refuse-revoke: the Hub's own refusal.
+    [ ! -f "$ND/broken" ] || { echo "error: error reading from error stream: read tcp 10.215.0.1:4: connection reset by peer" >&2; exit 1; }
+    [ ! -f "$ND/broken-once" ] || { rm -f "$ND/broken-once"; echo "error: unable to upgrade connection: container not found" >&2; exit 1; }
+    [ ! -f "$ND/standby-once" ] || { rm -f "$ND/standby-once"; echo '{"error":"this Hub is standing by: another Hub is the active writer"}' >&2; echo "command terminated with exit code 3" >&2; exit 1; }
+    [ ! -f "$ND/lists-after-revoke" ] || mv "$ND/lists-after-revoke" "$ND/lists"
+    [ ! -f "$ND/refuse-revoke" ] || { echo "server n4 is enrolling: stop its operation first" >&2; echo "command terminated with exit code 1" >&2; exit 1; }
+    echo '{"status":"revoked","server":"n4"}' ;;
   *) echo "unexpected kubectl $*" >&2; exit 98 ;;
 esac
 KSTUB
@@ -7703,10 +7733,11 @@ chmod +x "$ND/bin/kubectl"
 nodecli() {
   local in="$1"; shift
   rm -f "$ND/calls" "$ND/n" "$ND"/stdin.*
+  rm -rf "$ND/tmp"; mkdir -p "$ND/tmp"
   RC=0
-  printf '%s' "$in" | (unset CONTAINER_RUNTIME _RT_CHECKED; export PATH="$ND/bin:$PATH" PORTCULLIS_ROOT="$ND/root" ND
+  printf '%s' "$in" | (unset CONTAINER_RUNTIME _RT_CHECKED; export PATH="$ND/bin:$PATH" PORTCULLIS_ROOT="$ND/root" ND TMPDIR="$ND/tmp" NODE_POLL=0
     bash -c 'cd "$PORTCULLIS_ROOT"; for l in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" "$1/portcullis"); do . "$1/scripts/lib/$l.sh"; done
-      kube_runtime_check() { :; }; shift; cmd_node "$@"' _ "$HERE/.." "$@") >"$ND/out" 2>"$ND/err" || RC=$?
+      kube_runtime_check() { :; }; kube_api_endpoints_refresh() { echo "API ENDPOINTS REFRESHED" >&2; }; export NODE_CLI_PID=$$; shift; cmd_node "$@"' _ "$HERE/.." "$@") >"$ND/out" 2>"$ND/err" || RC=$?
   OUT="$(cat "$ND/out")"; ERR="$(cat "$ND/err")"
 }
 nodecli "" add n4 --role agent --class cloud --site edge
@@ -7738,6 +7769,67 @@ expect_eq "node remove: the typed id → the confirm body on stdin, the op waite
   "$RC|$(cat "$ND"/stdin.* | jq -c . | head -n1)|$(grep -c 'hub servers op n4 op9$' "$ND/calls")|$(printf '%s' "$ERR" | grep -c 'n4 removed')" '0|{"confirm":"n4"}|1|1'
 nodecli "n4"$'\n' revoke n4
 expect_eq "node revoke: the typed id → revoked" "$RC|$(cat "$ND"/stdin.* | jq -c .)|$(printf '%s' "$ERR" | grep -c 'n4 revoked')" '0|{"confirm":"n4"}|1'
+expect_eq "node remove|revoke: the API servers re-detected afterwards (Task 30 fix round 1)" "$(printf '%s' "$ERR" | grep -c 'API ENDPOINTS REFRESHED')" 1
+# Task 30 fix round 1 (review M3): the code's temporary directory never
+# outlives the command — done, refused, or interrupted once the code is in it.
+nodecli "" add n4
+expect_eq "node add: no temporary file left after the code" "$(find "$ND/tmp" -mindepth 1 | wc -l | tr -d ' ')" 0
+touch "$ND/refuse"; nodecli "" add n4; rm -f "$ND/refuse"
+expect_eq "node add: no temporary file left after a refusal" "$(find "$ND/tmp" -mindepth 1 | wc -l | tr -d ' ')" 0
+touch "$ND/term"; nodecli "" add n4; rm -f "$ND/term"
+expect_eq "node add: interrupted with the code in its file → no code on stdout, nothing left (exit 130)" \
+  "$RC:$OUT:$(find "$ND/tmp" -mindepth 1 | wc -l | tr -d ' ')" "130::0"
+expect_eq "node add: the code is never read into a variable (streamed from its file)" \
+  "$(sed -n '/^_node_add() {/,/^}/p' "$HERE/../scripts/lib/node.sh" | grep -c 'code="\$(\|\$code\b')" 0
+# The forwarded endpoint of a NATed node (the NAT model, contract §20.11).
+nodecli "" add n4 --site edge --public-endpoint 203.0.113.7:40000
+expect_eq "node add --public-endpoint: in the request on stdin" "$RC|$(cat "$ND"/stdin.* | jq -c .)" '0|{"id":"n4","site":"edge","public_endpoint":"203.0.113.7:40000"}'
+for bad in 203.0.113.7 '203.0.113.7:40000:1' host.example:51830 '[2001:db8::1]:51830'; do
+  nodecli "" add n4 --public-endpoint "$bad"
+  expect_eq "node add --public-endpoint $bad → usage error, the Hub not asked" "$RC:$( (cat "$ND/calls" 2>/dev/null || true) | grep -c 'hub servers')" "2:0"
+done
+# node list: revoked nodes as revoked (Task 30 fix round 1).
+nodecli "" list
+expect_eq "node list: a revoked node going on, a confirmed one, a parked one" \
+  "$(printf '%s\n' "$OUT" | awk '$1 ~ /^n[678]$/ { $1 = $1; print }' | tr '\n' '|')" \
+  "n6 agent - - - revoked (goes on)|n7 server - - - revoked|n8 server - - - revoked (revoked; waiting for quorum to remove its etcd member)|"
+# node revoke whose exec breaks under the server restarts: the outcome is
+# polled from the Hub (listed before, then revoked and confirmed / gone).
+L_READY='{"servers":[{"id":"n4","kind":"cluster-node","state":"ready"}]}'
+L_GOING='{"servers":[{"id":"n4","kind":"cluster-node","state":"revoked"}]}'
+L_DONE='{"servers":[{"id":"n4","kind":"cluster-node","state":"revoked","revoke_confirmed":true}]}'
+touch "$ND/broken"
+printf '%s\n' "$L_READY" "$L_READY" "not json" "$L_GOING" "$L_DONE" > "$ND/lists"
+nodecli "n4"$'\n' revoke n4
+case "$RC:$ERR" in "0:"*"connection to the Hub broke during the revoke"*"n4 revoked"*) t_pass "node revoke: a broken exec → the Hub's list polled until revoked and confirmed" ;; *) t_fail "revoke broken: $RC $ERR" ;; esac
+printf '%s\n' "$L_READY" '{"servers":[]}' > "$ND/lists"
+nodecli "n4"$'\n' revoke n4
+case "$RC:$ERR" in "0:"*"n4 revoked (the Hub no longer lists it)"*) t_pass "node revoke: a broken exec, then the node gone from the list → revoked" ;; *) t_fail "revoke gone: $RC $ERR" ;; esac
+printf '%s\n' '{"servers":[]}' > "$ND/lists"
+nodecli "n4"$'\n' revoke n4
+case "$RC:$ERR" in "1:"*"the Hub doesn't list n4"*"isn't known to be revoked"*) t_pass "node revoke: a broken exec for a node never listed → not claimed revoked" ;; *) t_fail "revoke unlisted: $RC $ERR" ;; esac
+rm -f "$ND/broken" "$ND/lists"
+# Found live: the Hub restarted mid-call (its Lease lost while the servers
+# restarted) and recorded nothing: it lists the node ready again, so the
+# revoke is asked once more (nodeadm answers a finished one done).
+touch "$ND/broken-once"
+printf '%s\n' "$L_READY" "$L_READY" > "$ND/lists"; printf '%s\n' "$L_DONE" > "$ND/lists-after-revoke"
+nodecli "n4"$'\n' revoke n4
+case "$RC:$ERR" in "0:"*"broke during the revoke"*"asking it to revoke n4 again"*"n4 revoked"*) t_pass "node revoke: the Hub lost the broken revoke → asked again → revoked" ;; *) t_fail "revoke resend: $RC $ERR" ;; esac
+expect_eq "node revoke: the revoke sent twice (the broken one, the one asked again)" "$(grep -c 'hub servers revoke n4$' "$ND/calls")" 2
+# Found live: the Hub asked again was a new pod still standing by (a 503:
+# `hub servers` exits 3, not answered): not a refusal, the outcome is polled.
+touch "$ND/broken-once" "$ND/standby-once"
+printf '%s\n' "$L_READY" "$L_READY" "$L_READY" > "$ND/lists"; printf '%s\n' "$L_DONE" > "$ND/lists-after-revoke"
+nodecli "n4"$'\n' revoke n4
+case "$RC:$ERR" in "0:"*"n4 revoked"*) t_pass "node revoke: a Hub standing by when asked again → polled, asked again later → revoked" ;; *) t_fail "revoke standby: $RC $ERR" ;; esac
+rm -f "$ND/lists" "$ND/lists-after-revoke" "$ND/broken-once" "$ND/standby-once"
+rm -f "$ND/lists" "$ND/lists-after-revoke" "$ND/broken-once"
+touch "$ND/refuse-revoke"
+nodecli "n4"$'\n' revoke n4
+case "$RC:$ERR" in "1:"*"is enrolling: stop its operation first"*"the Hub refused to revoke n4"*) t_pass "node revoke: the Hub's own refusal (command terminated) → refused, no polling" ;; *) t_fail "revoke refused: $RC $ERR" ;; esac
+expect_eq "node revoke: a refusal polls nothing (one list before, no more)" "$(grep -c 'hub servers list$' "$ND/calls")" 1
+rm -f "$ND/refuse-revoke"
 # Docker: refused before any cluster call.
 printf 'CONTAINER_RUNTIME=docker\n' > "$ND/root/.env"
 RC=0; ( export PATH="$ND/bin:$WORK/bin:$PATH" PORTCULLIS_ROOT="$ND/root" ND; unset CONTAINER_RUNTIME; rm -f "$ND/calls"
@@ -7774,6 +7866,12 @@ printf '%s\n' "$*" >> "$FN_CALLS"
 case "$*" in
   "--context ci get nodes -o json") cat "$FN_DIR/nodes.json" ;;
   "--context ci get node node-1 -o json") echo '{"metadata":{"labels":{"portcullis.io/site":"main","portcullis.io/class":"home"}}}' ;;
+  # The first node's serials (review I2): read, then put by server-side apply.
+  "--context ci -n portcullis get configmap portcullis-first-node -o json")
+    [ -f "$FN_DIR/firstnode.json" ] && cat "$FN_DIR/firstnode.json" || { echo 'Error from server (NotFound): configmaps "portcullis-first-node" not found' >&2; exit 1; } ;;
+  "--context ci apply --server-side --force-conflicts --field-manager=portcullis-cli -f -")
+    [ ! -f "$FN_DIR/apply-fails" ] || exit 1
+    cat > "$FN_DIR/firstnode.json" ;;
   *) echo "unexpected kubectl $*" >&2; exit 98 ;;
 esac
 KSTUB
@@ -7789,7 +7887,7 @@ case "$1" in
       printf 'REF TYPE DIGEST\n%s application/vnd.oci.image.index.v1+json %s\n' "${2#name==}" "$(cat "$FN_DIR/digest")" ;;
   pull) [ -f "$FN_DIR/pullable" ] && touch "$FN_DIR/present" ;;
   mount) cp -R "$FN_DIR/rootfs/." "${@: -1}/" ;;
-  unmount) rm -rf "${2:?}"/* ;;
+  unmount) printf '%s\n' "$*" >> "$FN_DIR/unmounts"; rm -rf "${@: -1}"/* ;;
   *) exit 96 ;;
 esac
 K3S
@@ -7835,12 +7933,36 @@ expect_eq "first node: the CSR from adopt-csr <id>, then adopt (no argument)" "$
 expect_eq "first node: Vault's root token in a header from a pipe, never on argv" \
   "$(grep -c VAULTROOTTOKEN "$FN/calls"):$(grep -c 'X-Vault-Token: VAULTROOTTOKEN' "$FN/curl-headers")" "0:1"
 expect_eq "first node: pki_node/sign/node-cluster" "$(grep -c '^curl .*/v1/pki_node/sign/node-cluster$' "$FN/calls")" 1
+# Review I2: the signed serial recorded where nodeadm's removal finds it.
+expect_eq "first node: its certificate's serial in portcullis-first-node (id node-1, Vault's form, notAfter)" \
+  "$(jq -r '.data["first-node.json"] | fromjson | [.v, .id, (.serials | length), (.serials[0].serial == $s), (.serials[0].not_after | test("^[0-9-]+T[0-9:]+Z$"))] | map(tostring) | join(":")' \
+     --arg s "$(openssl x509 -in "$FN/leaf.crt" -noout -serial | sed 's/^serial=//' | tr A-F a-f | sed 's/../&:/g; s/:$//')" "$FN/firstnode.json")" "1:node-1:1:true:true"
+expect_eq "first node: the image's mount unmounted with its snapshot removed (--rm, review M4)" "$(grep -c -- '^unmount --rm ' "$FN/unmounts")" 1
 rm -f "$FN/calls"
 OUT="$(fnode)"
 expect_eq "first node: adopted, the certificate fresh, the binary the image's → nothing done" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^agent ' "$FN/calls")" "rc=0:0"
 rm -f "$FN/calls"
 OUT="$(fnode KUBE_NODEAGENT_NOW=$(( $(date +%s) + 25 * 86400 )))"
 expect_eq "first node: ⅓ of the certificate's life left → renewed (a new CSR, adopt again)" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^agent adopt' "$FN/calls")" "rc=0:2"
+expect_eq "first node: a renewal adds its serial, the earlier one kept until it expires" "$(jq -r '.data["first-node.json"] | fromjson | .serials | length' "$FN/firstnode.json")" 2
+# Review M4: nothing is installed before Vault signed and the serial is
+# recorded; a refused adopt puts the old binary back.
+cp "$FP/usr/local/lib/portcullis/nodeagent" "$FN/installed.before"
+echo '# a newer binary' >> "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"
+touch "$FN/apply-fails"; rm -f "$FN/calls"
+OUT="$(fnode)"
+expect_eq "first node: the serial can't be recorded → refused, the old binary in place, no adopt, nothing staged" \
+  "$(printf '%s' "$OUT" | tail -n1):$(cmp -s "$FP/usr/local/lib/portcullis/nodeagent" "$FN/installed.before" && echo unchanged):$(grep -c '^agent adopt$' "$FN/calls"):$(find "$FP/usr/local/lib/portcullis" -name "*.new" -o -name "*.old" | grep -c .)" \
+  "rc=1:unchanged:0:0"
+rm -f "$FN/apply-fails"
+sed -i.bak 's/^  adopt) /  adopt) [ ! -f "$FN_DIR\/adopt-fails" ] || { echo "adopt refused" >\&2; exit 1; }; /' "$FN/agent.sh"
+cp "$FN/agent.sh" "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"; echo '# newer again' >> "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"
+touch "$FN/adopt-fails"; rm -f "$FN/calls"
+OUT="$(fnode)"
+case "$OUT" in *"nodeagent adopt: adopt refused"*"rc=1") t_pass "first node: adopt refused → refused" ;; *) t_fail "first node adopt refused: $OUT" ;; esac
+expect_eq "first node: a refused adopt puts the old binary back (no .new / .old left)" \
+  "$(cmp -s "$FP/usr/local/lib/portcullis/nodeagent" "$FN/installed.before" && echo restored):$(find "$FP/usr/local/lib/portcullis" -name "*.new" -o -name "*.old" | grep -c .)" "restored:0"
+rm -f "$FN/adopt-fails"; mv "$FN/agent.sh.bak" "$FN/agent.sh"; cp "$FN/agent.sh" "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"
 # Security review: the image's digest is the anchor. containerd holding the
 # name under another digest (another binary) → refused, nothing installed.
 rm -f "$FN/calls" "$FP/var/lib/portcullis/nodeagent/state.json"
@@ -7883,8 +8005,45 @@ expect_eq "up adopts the first node after a waited release; kube check too" \
 # (fd 9) and, left behind, held it: params-sync waited for ever and no
 # join passed waiting_admission. Every background forward closes fd 9.
 expect_eq "every background kubectl port-forward closes the CLI lock's fd 9" \
-  "$(grep -h 'port-forward .*&$' "$HERE"/../scripts/lib/*.sh | grep -vc '9>&- &$')" 0
-expect_eq "the background port-forwards (kube_forward_core, _kube_with_forward, the probe's)" "$(grep -h 'port-forward .*9>&- &$' "$HERE"/../scripts/lib/*.sh | wc -l | tr -d ' ')" 3
+  "$(grep -hE 'port-forward .*&( pid=\$!)?$' "$HERE"/../scripts/lib/*.sh | grep -vEc '9>&- &( pid=\$!)?$')" 0
+expect_eq "the background port-forwards (kube_forward_core, _kube_with_forward, the probe's)" "$(grep -hE 'port-forward .*9>&- &( pid=\$!)?$' "$HERE"/../scripts/lib/*.sh | wc -l | tr -d ' ')" 3
+# Review I1: a backgrounded kube_ctl is a forked subshell; bash <= 5.2
+# doesn't exec its last command, so `kill $!` ended the subshell and left
+# kubectl running. kubectl itself is the background child.
+expect_eq "no background port-forward runs through the kube_ctl function" \
+  "$(grep -hE 'kube_ctl .*port-forward.*&[[:space:]]*($|[a-z_]+=\$!)' "$HERE"/../scripts/lib/*.sh | grep -c .)" 0
+expect_eq "every background port-forward is kubectl itself, on the install's context" \
+  "$(grep -hE 'port-forward .*&[[:space:]]*($|pid=\$!$)' "$HERE"/../scripts/lib/*.sh | grep -vc '^[[:space:]]*kubectl --context "\$PORTCULLIS_KUBE_CONTEXT" ')" 0
+# Review M2: every backgrounded command in the CLI (forwards, their
+# watchers, _kube_bounded's job and watchdog) closes the lock's fd 9.
+BG_ALL="$(grep -nE '(^|[^&>|])&[[:space:]]*($|[a-z_]+=\$!)' "$HERE"/../scripts/lib/*.sh "$HERE"/../portcullis | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#')"
+expect_eq "every backgrounded command in scripts/lib closes the CLI lock's fd 9" \
+  "$(printf '%s\n' "$BG_ALL" | grep . | grep -vc '9>&- &')" 0
+expect_eq "the backgrounded commands found (3 forwards, 2 watchers, _kube_bounded's 2)" "$(printf '%s\n' "$BG_ALL" | grep -c .)" 7
+expect_eq "the three background port-forwards are found by the kubectl-itself check" "$(grep -hE 'port-forward .*&[[:space:]]*($|pid=\$!$)' "$HERE"/../scripts/lib/*.sh | grep -c .)" 3
+# Live behaviour: kube_port_forward_stop / the watcher end kubectl itself
+# (a stub that sleeps under a unique name), whatever bash execs.
+PFB="$(mktemp -d)"
+cat > "$PFB/kubectl" <<'STUB'
+#!/usr/bin/env bash
+echo "Forwarding from 127.0.0.1:41234 -> 8200"
+exec -a pf-stub-sleep-4711 sleep 300
+STUB
+chmod +x "$PFB/kubectl"
+OUT="$(PATH="$PFB:$PATH" PORTCULLIS_KUBE_CONTEXT=ci bash -c '
+  source "'"$HERE"'/../scripts/lib/common.sh" >/dev/null 2>&1
+  kube_ns() { echo portcullis; }
+  kube_port_forward vault 8200 >/dev/null; kube_port_forward_stop
+  sleep 0.5; pgrep -f "pf-stub-sleep-471[1]" | grep -c . || true' 2>/dev/null)"
+expect_eq "kube_port_forward_stop ends kubectl itself (no orphan)" "$OUT" 0
+pkill -f "pf-stub-sleep-471[1]" 2>/dev/null || true
+OUT="$(PATH="$PFB:$PATH" PORTCULLIS_KUBE_CONTEXT=ci bash -c '
+  source "'"$HERE"'/../scripts/lib/common.sh" >/dev/null 2>&1
+  kube_ns() { echo portcullis; }
+  _kube_forward pod/vault-0 8200 >/dev/null' >/dev/null 2>&1; sleep 2.5; pgrep -f "pf-stub-sleep-471[1]" | grep -c . || true)"
+expect_eq "_kube_forward's kubectl ends with the CLI (no orphan)" "$OUT" 0
+pkill -f "pf-stub-sleep-471[1]" 2>/dev/null || true
+rm -rf "$PFB"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

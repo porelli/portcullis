@@ -1841,11 +1841,11 @@ kube_vault_voters() {
 _kube_bounded() {
   local s="$1" p w rc=0
   shift
-  "$@" & p=$!
+  "$@" 9>&- & p=$!
   # The function's own children (kubectl) first: they hold the pipe open.
   # shellcheck disable=SC2046  # pid words
   # The watchdog holds no pipe of the caller's (else a reader waits for it).
-  ( sleep "$s"; kill $(pgrep -P "$p" 2>/dev/null) "$p" 2>/dev/null ) </dev/null >/dev/null 2>&1 & w=$!
+  ( sleep "$s"; kill $(pgrep -P "$p" 2>/dev/null) "$p" 2>/dev/null ) </dev/null >/dev/null 2>&1 9>&- & w=$!
   wait "$p" 2>/dev/null || rc=$?
   # shellcheck disable=SC2046  # pid words
   kill $(pgrep -P "$w" 2>/dev/null) "$w" 2>/dev/null; wait "$w" 2>/dev/null
@@ -1954,7 +1954,7 @@ _kube_with_forward() {
   pid=$!
   # The CLI killed meanwhile (by pid): the forward ends with it (review N2).
   local parent=$$
-  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 9>&- &
   for ((i = 0; i < 100; i++)); do
     lp="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> .*/\1/p' "$log" | head -n1)"
     [ -z "$lp" ] || break

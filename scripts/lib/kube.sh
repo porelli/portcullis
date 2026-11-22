@@ -27,9 +27,9 @@ KUBE_PRIMARY_SITE="main"
 # Traefik's only watched namespace (the chart's edgeNamespace): the core
 # IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
 KUBE_EDGE_NS="portcullis-edge"
-# The eleven admission bindings (kube/admission/bindings.yaml; the last
-# five HA), live as <name>-<params generation> (kube_admission_params_apply).
-KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods portcullis-nodes-guard-labels portcullis-core-guard-frontdoor-status"
+# The twelve admission bindings (kube/admission/bindings.yaml; the last
+# six HA), live as <name>-<params generation> (kube_admission_params_apply).
+KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods portcullis-nodes-guard-labels portcullis-core-guard-frontdoor-status portcullis-nodes-guard-removed"
 KUBE_PROBE_NS="portcullis-netpol-probe"
 KUBE_MANAGED_LABEL="app.kubernetes.io/managed-by"
 KUBE_INSTALL_ANNOTATION="portcullis.io/install"
@@ -52,10 +52,8 @@ kube_ha_on() { [ "${PORTCULLIS_HA:-}" = on ]; }
 
 # kube_ctl <kubectl args> — kubectl on PORTCULLIS_KUBE_CONTEXT, always
 # with --context (a wrong current context can't hit another cluster).
-kube_ctl() {
-  [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || fail "PORTCULLIS_KUBE_CONTEXT is not set in .env: CONTAINER_RUNTIME=kubernetes never uses the current context"
-  kubectl --context "$PORTCULLIS_KUBE_CONTEXT" "$@"
-}
+kube_ctx() { [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || fail "PORTCULLIS_KUBE_CONTEXT is not set in .env: CONTAINER_RUNTIME=kubernetes never uses the current context"; }
+kube_ctl() { kube_ctx; kubectl --context "$PORTCULLIS_KUBE_CONTEXT" "$@"; }
 
 # kube_helm <helm args> — helm on PORTCULLIS_KUBE_CONTEXT (--kube-context).
 kube_helm() {
@@ -270,7 +268,7 @@ kube_host_checks() {
   else
     _rt_chk fail "kubelet podPidsLimit is ${pids:-unset}, not 1024: reinstall k3s with --kubelet-arg=pod-max-pids=1024 (the only per-pod pids cap)"
   fi
-  if kube_detect_cidrs && kube_cluster_addresses; then
+  if kube_detect_settled; then
     if _kube_ipv6_in "$_K_POD_CIDR $_K_SVC_CIDR"; then
       _rt_chk fail "dual-stack or IPv6 cluster (pods $_K_POD_CIDR, services $_K_SVC_CIDR): Portcullis supports IPv4 single-stack only"
     elif [ "${_K_POD_CIDR// /}" != "$_K_POD_CIDR" ] || [ "${_K_SVC_CIDR// /}" != "$_K_SVC_CIDR" ]; then
@@ -371,8 +369,9 @@ kube_runtime_check() {
   [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || fail "PORTCULLIS_KUBE_CONTEXT is not set in .env (CONTAINER_RUNTIME=kubernetes): ./portcullis init --runtime kubernetes [--kube-context <ctx>] writes it; the current context is never used"
   command -v kubectl >/dev/null 2>&1 || fail "kubectl is missing (CONTAINER_RUNTIME=kubernetes)"
   kube_context_exists "$PORTCULLIS_KUBE_CONTEXT" || fail "the kube context $PORTCULLIS_KUBE_CONTEXT (PORTCULLIS_KUBE_CONTEXT) doesn't exist in the kubeconfig"
-  { kube_detect_cidrs && kube_cluster_addresses; } || fail "can't read the cluster behind $PORTCULLIS_KUBE_CONTEXT: $_K_ERR"
+  kube_detect_settled || fail "can't read the cluster behind $PORTCULLIS_KUBE_CONTEXT: $_K_ERR"
   ! _kube_ipv6_in "$_K_POD_CIDR $_K_SVC_CIDR" || fail "dual-stack or IPv6 cluster (pods $_K_POD_CIDR, services $_K_SVC_CIDR): Portcullis supports IPv4 single-stack only"
+  kube_api_endpoints_follow  # after a server join / removal (node.sh)
   for a in "PORTCULLIS_POD_CIDR:$_K_POD_CIDR" "PORTCULLIS_SERVICE_CIDR:$_K_SVC_CIDR" "PORTCULLIS_KUBE_API_ENDPOINTS:$_K_API_EP"; do
     v="${a%%:*}"
     [ -n "${!v:-}" ] || fail "$v is not set in .env (./portcullis init --runtime kubernetes detects it)"
@@ -453,9 +452,9 @@ EOF
 # this shell, and kube_port_forward_stop (the caller's trap) kills it.
 kube_port_forward() {
   local svc="$1" port="$2" log i lp="" pid
-  log="$(mktemp)"
-  kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "svc/$svc" ":$port" >"$log" 2>&1 9>&- &
-  pid=$!
+  kube_ctx; log="$(mktemp)"
+  # kubectl itself, never kube_ctl (review I1: bash <= 5.2 leaves a backgrounded function's child orphaned); no fd 9.
+  kubectl --context "$PORTCULLIS_KUBE_CONTEXT" -n "$(kube_ns)" port-forward --address 127.0.0.1 "svc/$svc" ":$port" >"$log" 2>&1 9>&- & pid=$!
   _K_PF_PIDS="${_K_PF_PIDS:-} $pid"
   for ((i = 0; i < 100; i++)); do
     lp="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> .*/\1/p' "$log" | head -n1)"
@@ -765,7 +764,7 @@ kube_vpn_reserved() {
 }
 
 # kube_status_extra — status --json's kubernetes fields: netpol (the CLI's
-# probe ConfigMap), admission (the eleven bindings), dns_shadows (an app
+# probe ConfigMap), admission (the twelve bindings), dns_shadows (an app
 # Service named like a core one), kube_api_public (K8).
 # kube_crashing_json — the Deployments of the core, apps and cnpg-system (CloudNativePG + its barman-cloud plugin: review NM1) namespaces whose live pods
 # crash: a container waiting in CrashLoopBackOff / Error / an image pull
@@ -961,7 +960,7 @@ kube_admission_params() {
     edgeCoreMiddlewares "$KUBE_EDGE_CORE_MIDDLEWARES" \
     reservedHosts "$reserved" \
     maxAppPriority "$maxprio" \
-    nodeadmServiceAccount "$KUBE_NODEADM_SA" \
+    nodeadmServiceAccount "$KUBE_NODEADM_SA" removedNodes "$_K_PARAM_REMOVED" \
     traefikImage "$traefik"
 }
 
@@ -1148,7 +1147,7 @@ _kube_probe_object() {
   local b="$1" ns kind
   case "$b" in
     portcullis-edge-guard-routes) _kube_probe_route "portcullis-admission-probe.${PORTCULLIS_DOMAIN,,}" "$2"; return ;;
-    portcullis-core-guard-exec|portcullis-nodeadm-guard-tokens|portcullis-ingress-guard-pods|portcullis-nodes-guard-labels|portcullis-core-guard-frontdoor-status) _kube_probe_ha "$b" "$2"; return ;;
+    portcullis-core-guard-exec|portcullis-nodeadm-guard-tokens|portcullis-ingress-guard-pods|portcullis-nodes-guard-labels|portcullis-core-guard-frontdoor-status|portcullis-nodes-guard-removed) _kube_probe_ha "$b" "$2"; return ;;
     portcullis-apps-guard-pods) kind=Pod ;;
     portcullis-apps-guard-workloads) kind=Deployment ;;
     portcullis-apps-guard-services) kind=Service ;;
@@ -1213,7 +1212,7 @@ _kube_configmap_from() {
 #   storage     the provisioner portcullis.io/local-path (kube/storage),
 #               its ConfigMap, the StorageClasses, its deny policy + API egress;
 #   crds        the Traefik CRDs (K14: kubectl --server-side, never Helm);
-#   admission   the eleven VAPs and their eleven bindings (kube/admission);
+#   admission   the twelve VAPs and their twelve bindings (kube/admission);
 #   params      portcullis-admission-params: the Hub's resolved digest
 #               (KUBE_HUB_IMAGE, name@sha256:…), roots, ports, networks, peers.
 kube_cluster_setup() {
@@ -1719,7 +1718,7 @@ kube_health_report() {
 }
 
 # kube_cluster_check — the Hub's cluster check input (contract §6): the apps
-# namespace's PSA labels and the eleven bindings, written as the ConfigMap
+# namespace's PSA labels and the twelve bindings, written as the ConfigMap
 # portcullis-cluster-check (checked_at RFC 3339 UTC, ok true|false, why).
 # The Hub refuses every runtime operation once it is 24 h old: `up` writes
 # it, and so does `kube check`, which the portcullis-kube-check.timer init
@@ -1885,10 +1884,9 @@ kube_forward_core() {
 _kube_forward() {
   local log i lp="" pid parent=$$ target="$1"
   case "$target" in */*) ;; *) target="svc/$target" ;; esac
-  log="$(mktemp)"
-  kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$2" >"$log" 2>&1 9>&- &
-  pid=$!
-  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  kube_ctx; log="$(mktemp)"  # kubectl itself below (see kube_port_forward)
+  kubectl --context "$PORTCULLIS_KUBE_CONTEXT" -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$2" >"$log" 2>&1 9>&- & pid=$!
+  ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 9>&- &
   for ((i = 0; i < 100; i++)); do
     lp="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> .*/\1/p' "$log" | head -n1)"
     [ -z "$lp" ] || break
@@ -2290,7 +2288,7 @@ help_kube_check() {
 Usage: portcullis kube check
 
 Kubernetes only. Re-checks the apps namespace's Pod Security labels and the
-eleven admission bindings and writes the result into the ConfigMap
+twelve admission bindings and writes the result into the ConfigMap
 portcullis-cluster-check (checked_at, ok, why), which the Hub reads: it
 refuses every runtime operation while the check failed or is more than 24 h
 old. `up` writes it too; init installs portcullis-kube-check.timer, which

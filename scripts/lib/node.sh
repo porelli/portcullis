@@ -114,6 +114,56 @@ kube_first_node_addresses() {
   kube_ctl annotate node "$node" "portcullis.io/addresses=$a" >/dev/null || warn "could not record node $node's addresses (nodeadm writes no cluster addresses without them)"
 }
 
+# ── the API servers after a server join or removal (Task 30 fix round 1) ──
+
+# kube_detect_settled — kube_detect_cidrs + kube_cluster_addresses (init's
+# strict detection), retried for up to 60 s while only the API servers
+# disagree (a server joined or left: the EndpointSlice and nodeadm's
+# document catch up within seconds of each other).
+kube_detect_settled() {
+  local i
+  for ((i = 0; ; i++)); do
+    kube_detect_cidrs && kube_cluster_addresses && return 0
+    case "${_K_ERR:-}" in *"list the API servers"*) ;; *) return 1 ;; esac
+    [ "$i" -lt "${KUBE_API_SETTLE_TRIES:-6}" ] || return 1
+    sleep "${KUBE_API_SETTLE_WAIT:-10}"
+  done
+}
+
+# kube_api_endpoints_follow — after kube_detect_settled: when the cluster's
+# API servers (the default/kubernetes EndpointSlice) differ from .env's
+# PORTCULLIS_KUBE_API_ENDPOINTS and nodeadm manages the membership, .env
+# takes the cluster's — only when nodeadm's cluster addresses document
+# exists and names exactly them (kube_cluster_addresses checked it), every
+# one a mesh address on 6443, and the pod / service networks are .env's
+# (fail closed: anything else is left for kube_runtime_check to refuse,
+# naming both values). Never a hand edit of .env.
+kube_api_endpoints_follow() {
+  local cur="${PORTCULLIS_KUBE_API_ENDPOINTS:-}" ep rc=0
+  [ -n "$cur" ] && [ -n "${_K_API_EP:-}" ] && [ "$cur" != "$_K_API_EP" ] || return 0
+  kube_nodeadm_on || return 0
+  [ "${_K_POD_CIDR:-}" = "${PORTCULLIS_POD_CIDR:-}" ] && [ "${_K_SVC_CIDR:-}" = "${PORTCULLIS_SERVICE_CIDR:-}" ] || return 0
+  kube_doc_addresses >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 0 ] || return 0
+  for ep in $_K_API_EP; do
+    [ "${ep##*:}" = 6443 ] && cidr_contains "$KUBE_MESH_CIDR" "${ep%:*}" || return 0
+  done
+  [ "$(printf '%s\n' $_K_DOC_API | sed 's#/32$#:6443#' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')" = "$_K_API_EP" ] || return 0
+  env_set PORTCULLIS_KUBE_API_ENDPOINTS "$_K_API_EP" || return 0
+  export PORTCULLIS_KUBE_API_ENDPOINTS="$_K_API_EP"
+  info "The cluster's API servers changed (a server joined or left): PORTCULLIS_KUBE_API_ENDPOINTS=$_K_API_EP in .env (was $cur). ./portcullis up re-applies the network policies that name them." >&2
+}
+
+# kube_api_endpoints_refresh — after `node remove|revoke`: the strict
+# re-detection and kube_api_endpoints_follow (a warning, never a failure).
+kube_api_endpoints_refresh() {
+  if kube_detect_settled; then
+    kube_api_endpoints_follow
+  else
+    warn "the cluster's API servers can't be read yet ($_K_ERR): the next ./portcullis command updates PORTCULLIS_KUBE_API_ENDPOINTS"
+  fi
+}
+
 # kube_nodeadm_values <values file> — nodeadm's chart values merged in.
 kube_nodeadm_values() {
   local f="$1" on=false
@@ -137,14 +187,16 @@ kube_params_generation() {
 # every address of every pending and active node, of every removed node
 # whose Node object still exists, and every InternalIP / ExternalIP of every
 # live Node (the union: the document is nodeadm's, the Node objects the API
-# server's); _K_DOC_API = api; each a /32, sorted unique, space-separated.
+# server's); _K_DOC_API = api; each a /32, sorted unique, space-separated;
+# _K_DOC_REMOVED = removed_names (every node name nodeadm removed, sorted
+# unique, each a node id; params removedNodes, portcullis-removed-nodes).
 # Strict IPv4 only (an IPv4 single-stack cluster: octets 0–255, no leading
 # zero; any IPv6 or malformed entry refuses the whole document). 0 = used;
 # 2 = no document yet; 1 = refused (_K_ERR): it doesn't parse, a live Node
 # is missing from it, or kube_cluster_addresses refuses it (fail closed).
 kube_doc_addresses() {
   local out doc vals live
-  _K_DOC_NODES="" _K_DOC_API=""
+  _K_DOC_NODES="" _K_DOC_API="" _K_DOC_REMOVED=""
   if ! out="$(kube_ctl -n "$(kube_ns)" get configmap "$KUBE_CLUSTER_ADDRESSES" -o json 2>&1)"; then
     case "$out" in *NotFound*) return 2 ;; esac
     _K_ERR="the cluster addresses (ConfigMap $KUBE_CLUSTER_ADDRESSES) can't be read"; return 1
@@ -160,6 +212,7 @@ kube_doc_addresses() {
       ([$live.items[].metadata.name]) as $names
       | ([$live.items[].status.addresses[]? | select(.type == "InternalIP" or .type == "ExternalIP") | .address]) as $laddr
       | select((.nodes | type == "object") and (.api | type == "array" and all(ip4))
+          and (.removed_names | type == "array" and all(type == "string" and test("^[a-z][a-z0-9-]{0,30}$")))
           and (.nodes | all(.[]; (.state == "pending" or .state == "active" or .state == "removed")
                and (.mesh | ip4) and (.lan | type == "array" and all(ip4)) and (.public | type == "array" and all(ip4))))
           and ($laddr | all(type == "string")))
@@ -167,25 +220,26 @@ kube_doc_addresses() {
       | if ($missing | length) > 0 then "MISSING\t" + ($missing | join(" "))
         else [([(.nodes | to_entries[] | select(.value.state != "removed" or (.key as $k | $names | index($k)))
                  | .value | .mesh, .lan[], .public[]), ($laddr[] | select(ip4))] | map(. + "/32") | unique | join(" ")),
-              (.api | map(. + "/32") | unique | join(" "))] | @tsv end' 2>/dev/null)"
+              (.api | map(. + "/32") | unique | join(" ")), (.removed_names | unique | join(" "))] | @tsv end' 2>/dev/null)"
   case "$vals" in
     "") _K_ERR="the cluster addresses (ConfigMap $KUBE_CLUSTER_ADDRESSES) don't parse: nothing is changed"; return 1 ;;
     MISSING*) _K_ERR="the cluster addresses don't list the node(s) ${vals#MISSING$'\t'}: nothing is changed"; return 1 ;;
   esac
-  IFS=$'\t' read -r _K_DOC_NODES _K_DOC_API <<< "$vals"
+  IFS=$'\t' read -r _K_DOC_NODES _K_DOC_API _K_DOC_REMOVED <<< "$vals"
   [ -n "$_K_DOC_NODES" ] && [ -n "$_K_DOC_API" ] || { _K_ERR="the cluster addresses list no node or no API server: nothing is changed"; return 1; }
 }
 
 # kube_params_addresses — the nodeAddresses / apiAddresses kube_admission_params
 # writes: the cluster addresses document's once it exists (refused while it
 # doesn't validate), else PORTCULLIS_KUBE_NODE_ADDRESSES (or the nodes') and
-# PORTCULLIS_KUBE_API_ENDPOINTS. Sets _K_PARAM_NODES / _K_PARAM_API.
+# PORTCULLIS_KUBE_API_ENDPOINTS. Sets _K_PARAM_NODES / _K_PARAM_API, and
+# _K_PARAM_REMOVED (the document's removed names; none without one).
 kube_params_addresses() {
   local a ep rc=0
-  _K_PARAM_NODES="" _K_PARAM_API=""
+  _K_PARAM_NODES="" _K_PARAM_API="" _K_PARAM_REMOVED=""
   kube_doc_addresses || rc=$?
   case "$rc" in
-    0) _K_PARAM_NODES="$_K_DOC_NODES" _K_PARAM_API="$_K_DOC_API"; return 0 ;;
+    0) _K_PARAM_NODES="$_K_DOC_NODES" _K_PARAM_API="$_K_DOC_API" _K_PARAM_REMOVED="$_K_DOC_REMOVED"; return 0 ;;
     1) fail "$_K_ERR (admission params)" ;;
   esac
   for a in ${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}; do _K_PARAM_NODES+="${_K_PARAM_NODES:+ }$a/32"; done
@@ -229,8 +283,11 @@ kube_params_sync() {
     | jq -r '.data // {} | del(.generation) | to_entries[] | "\(.key)\t\(.value)"' 2>/dev/null || true)"
   [ -n "$base" ] || fail "params-sync: the active params portcullis-admission-params-$cur can't be read"
   hub="$(printf '%s\n' "$base" | awk -F'\t' '$1 == "hubImage" { print $2 }')"
-  params="$(printf '%s\n' "$base" | awk -F'\t' -v n="$_K_DOC_NODES" -v a="$_K_DOC_API" -v p="$_K_POD_CIDR" -v s="$_K_SVC_CIDR" 'BEGIN { OFS = "\t" }
-    $1 == "nodeAddresses" { $2 = n } $1 == "apiAddresses" { $2 = a } $1 == "podCIDR" { $2 = p } $1 == "serviceCIDR" { $2 = s } { print }')"
+  # removedNodes (Task 30 fix round 1): the document's removed names,
+  # written even when the active params lack the key (never left out).
+  params="$(printf '%s\n' "$base" | awk -F'\t' -v n="$_K_DOC_NODES" -v a="$_K_DOC_API" -v p="$_K_POD_CIDR" -v s="$_K_SVC_CIDR" -v r="$_K_DOC_REMOVED" 'BEGIN { OFS = "\t" }
+    $1 == "nodeAddresses" { $2 = n } $1 == "apiAddresses" { $2 = a } $1 == "podCIDR" { $2 = p } $1 == "serviceCIDR" { $2 = s }
+    $1 == "removedNodes" { $2 = r; seen = 1 } { print } END { if (!seen) print "removedNodes", r }')"
   gen="$(printf '%s\n' "$params" | kube_params_generation)"
   if [ "$gen" = "$cur" ]; then
     # Unchanged only when it still judges (review I3): every binding of the
@@ -572,14 +629,48 @@ kube_other_nodes_apparmor() {
 #     (root's 0600 file; the CLI never reads it), the CSR printed;
 #   - Vault pki_node/sign/node-cluster (the root token, as link.control):
 #     <id>.cluster.portcullis.internal, client + server, 30 d;
+#   - its serial recorded in the ConfigMap portcullis-first-node (core
+#     namespace, the CLI's identity only), where nodeadm's removal finds
+#     it: nodeadm holds no record of this node, so `node remove|revoke`
+#     of it revokes every unexpired serial listed there (review I2);
 #   - `nodeagent adopt` with the certificate, the CA, the node's id, mesh
 #     address, site and class on stdin: the state, the unit started.
 # Again when the certificate has ⅓ of its life left or the binary differs
-# from nodeadm's. Fail closed: any check failing installs nothing.
+# from nodeadm's. Fail closed: any check failing installs nothing; the new
+# binary goes into place only once Vault signed and its serial is
+# recorded, and the old one comes back when adopt refuses (review M4).
 
 KUBE_NODEAGENT_BIN=/usr/local/lib/portcullis/nodeagent
 KUBE_NODEAGENT_STATE=/var/lib/portcullis/nodeagent
 KUBE_CLUSTER_DOMAIN=cluster.portcullis.internal
+KUBE_FIRST_NODE_CM=portcullis-first-node
+
+# kube_first_node_record <id> <certificate file> — the certificate's serial
+# (Vault's form: lowercase colon hex) and notAfter added to the ConfigMap
+# portcullis-first-node {"v":1,"id","serials":[{serial,not_after}]}, the
+# expired ones dropped. Another id there is refused (one first node per
+# install). nodeadm's removal of <id> revokes every listed serial.
+kube_first_node_record() {
+  local id="$1" crt="$2" serial na cur now
+  serial="$(openssl x509 -in "$crt" -noout -serial 2>/dev/null | sed -n 's/^serial=//p' | tr 'A-F' 'a-f' | sed 's/../&:/g; s/:$//')"
+  na="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | sed -n 's/^notAfter=//p')"
+  na="$(to_epoch "$na")"
+  [[ "$serial" =~ ^[0-9a-f]{2}(:[0-9a-f]{2})+$ ]] && [ "${na:-0}" -gt 0 ] || { warn "first node: the certificate's serial can't be read"; return 1; }
+  if ! cur="$(kube_ctl -n "$(kube_ns)" get configmap "$KUBE_FIRST_NODE_CM" -o json 2>&1)"; then
+    case "$cur" in *NotFound*) cur='{}' ;; *) warn "first node: $KUBE_FIRST_NODE_CM can't be read"; return 1 ;; esac
+  fi
+  now="${KUBE_NODEAGENT_NOW:-$(date +%s)}"
+  printf '%s' "$cur" | ID="$id" S="$serial" NA="$na" NOW="$now" NS="$(kube_ns)" N="$KUBE_FIRST_NODE_CM" jq -e '
+      (.data["first-node.json"] // "{\"v\":1,\"serials\":[]}" | fromjson) as $d
+      | select(($d.id // env.ID) == env.ID)
+      | {apiVersion: "v1", kind: "ConfigMap",
+         metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
+         data: {"first-node.json": ({v: 1, id: env.ID,
+           serials: ([($d.serials // [])[] | select((.not_after | fromdateiso8601) > (env.NOW | tonumber)) | select(.serial != env.S)]
+                     + [{serial: env.S, not_after: (env.NA | tonumber | todateiso8601)}])} | tojson)}}' \
+    | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \
+    || { warn "first node: its certificate's serial couldn't be recorded in $KUBE_FIRST_NODE_CM (a removal couldn't revoke it): nothing installed"; return 1; }
+}
 
 # kube_first_node_name — this host's Kubernetes Node: the --node-name init
 # gave k3s here (its unit's ExecStart, which install.sh writes), never a
@@ -617,10 +708,14 @@ _kn_agent_from_image() {
   fi
   [ "$have" = "$dig" ] || { _KN_WHY="containerd holds $ref as ${have:-nothing}, not its pinned digest"; return 1; }
   mnt="$(_ki_sudo mktemp -d)" || return 1
-  _ki_sudo k3s ctr -n k8s.io images mount --platform "linux/$arch" "$ref" "$mnt" >/dev/null 2>&1 || rc=1
-  [ "$rc" != 0 ] || _ki_sudo cat "$mnt$KUBE_NODEAGENT_BIN-$arch" > "$out" 2>/dev/null || rc=1
-  _ki_sudo k3s ctr -n k8s.io images unmount "$mnt" >/dev/null 2>&1 || true
-  _ki_sudo rmdir "$mnt" 2>/dev/null || true
+  # The mount never outlives the copy (review M4): unmounted with its
+  # snapshot removed (--rm) on every exit of the subshell, an interrupt
+  # included.
+  # shellcheck disable=SC2064  # expand now: the trap must unmount this dir
+  ( trap "_ki_sudo k3s ctr -n k8s.io images unmount --rm '$mnt' >/dev/null 2>&1 || true; _ki_sudo rmdir '$mnt' 2>/dev/null || true" EXIT
+    trap 'exit 130' INT TERM
+    _ki_sudo k3s ctr -n k8s.io images mount --platform "linux/$arch" "$ref" "$mnt" >/dev/null 2>&1 \
+      && _ki_sudo cat "$mnt$KUBE_NODEAGENT_BIN-$arch" > "$out" 2>/dev/null ) || rc=1
   [ "$rc" = 0 ] && [ -s "$out" ] || { _KN_WHY="nodeagent-$arch couldn't be read from nodeadm's image $ref"; return 1; }
 }
 
@@ -707,19 +802,30 @@ kube_first_nodeagent() {
   [[ "$site" =~ $NODE_ID_RE ]] && case "$class" in small|home|cloud) true ;; *) false ;; esac \
     || { rm -rf "$tmp"; warn "first node: node $id has no portcullis.io/site and class labels (init sets them): its nodeagent isn't installed"; return 1; }
   info "First node $id: installing / renewing its nodeagent..." >&2
-  _ki_sudo mkdir -p "$(_ki_p "$(dirname "$KUBE_NODEAGENT_BIN")")" \
-    && _ki_sudo install -m 0755 "$tmp/nodeagent" "$(_ki_p "$KUBE_NODEAGENT_BIN").new" \
-    && _ki_sudo mv -f "$(_ki_p "$KUBE_NODEAGENT_BIN").new" "$(_ki_p "$KUBE_NODEAGENT_BIN")" \
-    || { rm -rf "$tmp"; warn "first node: could not install $KUBE_NODEAGENT_BIN"; return 1; }
-  _ki_sudo "$(_ki_p "$KUBE_NODEAGENT_BIN")" adopt-csr "$id" > "$tmp/csr" 2> "$tmp/err" \
-    || { warn "first node: nodeagent adopt-csr: $(head -c 300 "$tmp/err")"; rm -rf "$tmp"; return 1; }
-  _kn_sign_node_cluster "$id.$KUBE_CLUSTER_DOMAIN" "$tmp/csr" "$tmp/crt" || { rm -rf "$tmp"; return 1; }
+  local bin new
+  bin="$(_ki_p "$KUBE_NODEAGENT_BIN")" new="$(_ki_p "$KUBE_NODEAGENT_BIN").new"
+  # The new binary beside the old one (root's, 0755): its adopt-csr makes
+  # the key and the CSR; it replaces the old one only once Vault signed
+  # and the serial is recorded (review M4).
+  _ki_sudo mkdir -p "$(dirname "$bin")" && _ki_sudo install -m 0755 "$tmp/nodeagent" "$new" \
+    || { rm -rf "$tmp"; warn "first node: could not stage $KUBE_NODEAGENT_BIN.new"; return 1; }
+  _ki_sudo "$new" adopt-csr "$id" > "$tmp/csr" 2> "$tmp/err" \
+    || { warn "first node: nodeagent adopt-csr: $(head -c 300 "$tmp/err")"; _ki_sudo rm -f "$new"; rm -rf "$tmp"; return 1; }
+  { _kn_sign_node_cluster "$id.$KUBE_CLUSTER_DOMAIN" "$tmp/csr" "$tmp/crt" && kube_first_node_record "$id" "$tmp/crt"; } \
+    || { _ki_sudo rm -f "$new"; rm -rf "$tmp"; return 1; }
+  # In place, the old binary kept until adopt took the new one.
+  _ki_sudo rm -f "$bin.old"
+  if _ki_sudo test -e "$bin"; then _ki_sudo cp -p "$bin" "$bin.old" || { _ki_sudo rm -f "$new"; rm -rf "$tmp"; warn "first node: could not keep the old $KUBE_NODEAGENT_BIN"; return 1; }; fi
+  _ki_sudo mv -f "$new" "$bin" || { _ki_sudo rm -f "$new" "$bin.old"; rm -rf "$tmp"; warn "first node: could not install $KUBE_NODEAGENT_BIN"; return 1; }
   if ! jq -n --arg id "$id" --arg ip "$KUBE_MESH_IP" --arg site "$site" --arg class "$class" \
         --rawfile cert "$tmp/crt" --rawfile ca "$PORTCULLIS_ROOT/certs/node-ca.crt" \
         '{id: $id, mesh_ip: $ip, site: $site, class: $class, certificate: $cert, ca: $ca}' \
-      | _ki_sudo "$(_ki_p "$KUBE_NODEAGENT_BIN")" adopt > /dev/null 2> "$tmp/err"; then
-    warn "first node: nodeagent adopt: $(head -c 300 "$tmp/err")"; rm -rf "$tmp"; return 1
+      | _ki_sudo "$bin" adopt > /dev/null 2> "$tmp/err"; then
+    warn "first node: nodeagent adopt: $(head -c 300 "$tmp/err")"
+    if _ki_sudo test -e "$bin.old"; then _ki_sudo mv -f "$bin.old" "$bin" || warn "first node: the old $KUBE_NODEAGENT_BIN couldn't be put back"; else _ki_sudo rm -f "$bin"; fi
+    rm -rf "$tmp"; return 1
   fi
+  _ki_sudo rm -f "$bin.old"
   rm -rf "$tmp"
   ok "First node $id: its nodeagent runs (certificate until $(_ki_sudo openssl x509 -in "$(_ki_p "$KUBE_NODEAGENT_STATE/node.pem")" -noout -enddate 2>/dev/null | cut -d= -f2))." >&2
 }
@@ -731,7 +837,9 @@ kube_first_nodeagent() {
 # host control socket. The Hub does the work, so its op, its audit (actor
 # cli) and its Lease apply once. Requests go on stdin, never argv: the
 # Hub's argv is only the subcommand and an id. The join code is printed
-# alone on stdout (once; never logged); everything else goes to stderr.
+# alone on stdout (once; never logged; it passes through a 0600 file in a
+# 0700 temporary directory, removed on every exit, an interrupt
+# included); everything else goes to stderr.
 
 NODE_ID_RE='^[a-z][a-z0-9-]{0,30}$'
 
@@ -751,11 +859,20 @@ HELP
 help_node_add() {
   cat <<'HELP'
 Usage: portcullis node add <id> [--role server|agent] [--class small|home|cloud] [--site <site>]
+                           [--public-endpoint <ip>:<port>]
 
 Kubernetes only. Has the Hub make a join code for the cluster node <id>
 (its Kubernetes name, ^[a-z][a-z0-9-]{0,30}$): the same as Servers → Add
 server on the Hub, audited as server.add by actor cli. Role and class
 default to the Hub's suggestion, site to main.
+
+--public-endpoint: the node is behind NAT and its router forwards a UDP
+port to its UDP 51830 (the node mesh): the router's public IPv4 address
+and that port. The first node of a site needs one reachable on UDP 51830
+(a cloud node, or one forwarded port); the Hub offers this endpoint to
+the other sites and keeps it once a handshake from another site proves it.
+A name that was revoked can't be used again (its old kubelet certificate
+still names it): pick another id.
 
 The join code alone goes to stdout (redirect it to a 0600 file if you need
 to carry it); the one-liner to run on the new machine and the rest go to
@@ -771,8 +888,10 @@ help_node_list() {
 Usage: portcullis node list [--json]
 
 Kubernetes only. The servers the Hub lists (the cluster's nodes, joining
-ones included): id, role, class, site, mesh address and state. --json
-prints the Hub's answer as it is.
+ones included): id, role, class, site, mesh address and state. A revoked
+node shows "revoked" (with "goes on" while nodeadm finishes it, or the
+parked reason) until the Hub drops it. --json prints the Hub's answer as
+it is. Needs column (util-linux / bsdextrautils).
 HELP
 }
 
@@ -833,10 +952,12 @@ _node_id() {
 }
 
 _node_add() {
-  local id="" role="" class="" site="" body tmp code rc=0
+  local id="" role="" class="" site="" pub="" body tmp rc=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) help_node_add; return 0 ;;
+      --public-endpoint) need_value "node add" "$1" "${2:-}"; pub="$2"; shift ;;
+      --public-endpoint=*) pub="${1#*=}" ;;
       --role) need_value "node add" "$1" "${2:-}"; role="$2"; shift ;;
       --role=*) role="${1#*=}" ;;
       --class) need_value "node add" "$1" "${2:-}"; class="$2"; shift ;;
@@ -853,25 +974,34 @@ _node_add() {
   case "$role" in ""|server|agent) ;; *) usage_error "node add" "--role must be server or agent" ;; esac
   case "$class" in ""|small|home|cloud) ;; *) usage_error "node add" "--class must be small, home or cloud" ;; esac
   [ -z "$site" ] || [[ "$site" =~ $NODE_ID_RE ]] || usage_error "node add" "--site must match ^[a-z][a-z0-9-]{0,30}\$"
+  # The forwarded endpoint's shape here; the Hub judges the address (a
+  # public IPv4, never private, special-purpose or the cluster's).
+  [ -z "$pub" ] || [[ "$pub" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$ ]] || usage_error "node add" "--public-endpoint must be <ipv4>:<port>"
   _node_kube add
-  body="$(jq -nc --arg id "$id" --arg role "$role" --arg class "$class" --arg site "$site" \
-    '{id: $id} + (if $role != "" then {role: $role} else {} end) + (if $class != "" then {class: $class} else {} end) + (if $site != "" then {site: $site} else {} end)')" \
+  body="$(jq -nc --arg id "$id" --arg role "$role" --arg class "$class" --arg site "$site" --arg pub "$pub" \
+    '{id: $id} + (if $role != "" then {role: $role} else {} end) + (if $class != "" then {class: $class} else {} end) + (if $site != "" then {site: $site} else {} end)
+     + (if $pub != "" then {public_endpoint: $pub} else {} end)')" \
     || fail "could not build the request"
   tmp="$(mktemp -d)" || fail "no temporary directory"
   chmod 700 "$tmp"
+  # The code never outlives the command (review M3): the directory goes on
+  # every exit, a Ctrl-C or a failure included.
+  # shellcheck disable=SC2064  # expand now: the trap must remove this dir
+  trap "rm -rf '$tmp'" EXIT
+  trap 'exit 130' INT TERM
   # The code into a 0600 file (never a variable a trace could print), the
   # answer's rest into another.
   (umask 077 && printf '%s' "$body" | _node_hub add-cluster-node > "$tmp/code" 2> "$tmp/rest") || rc=$?
   if [ "$rc" != 0 ]; then
     # A refusal's text (no code in it); kubectl's own errors too.
-    sed -e 's/pcj2\.[A-Za-z0-9_-]*/<redacted>/g' "$tmp/rest" >&2
-    rm -rf "$tmp"
+    sed -e 's/pcj2\.[A-Za-z0-9_.=-]*/<redacted>/g' "$tmp/rest" >&2
     fail "the Hub made no join code for $id"
   fi
-  code="$(tr -d '\r\n' < "$tmp/code")"
-  case "$code" in pcj2.?*) ;; *) rm -rf "$tmp"; fail "the Hub answered no join code" ;; esac
+  # One line, the code's shape; checked in the file, never read into a
+  # variable.
+  { [ "$(grep -c . "$tmp/code")" = 1 ] && grep -qxE 'pcj2\.[A-Za-z0-9_.=-]+' <(tr -d '\r' < "$tmp/code"); } \
+    || fail "the Hub answered no join code"
   if ! jq -e 'type == "object" and (.command | type == "string")' "$tmp/rest" >/dev/null 2>&1; then
-    rm -rf "$tmp"
     fail "the Hub's answer is unreadable (the code is not shown: make a new one with ./portcullis node add)"
   fi
   {
@@ -883,8 +1013,9 @@ _node_add() {
     echo "and paste the join code below when it asks (it isn't shown there). It is a secret: never put it on a command line, in a chat or a ticket."
     echo "Progress: ./portcullis node list, or the Hub's Servers page."
   } >&2
+  tr -d '\r\n' < "$tmp/code"; echo
   rm -rf "$tmp"
-  printf '%s\n' "$code"
+  trap - EXIT INT TERM
 }
 
 _node_list() {
@@ -899,14 +1030,20 @@ _node_list() {
     shift
   done
   _node_kube list
+  [ "$json" = true ] || command -v column >/dev/null 2>&1 || fail "node list: column is missing (install util-linux or bsdextrautils), or use --json"
   out="$(_node_hub list </dev/null)" || fail "the Hub didn't list its servers"
   if [ "$json" = true ]; then printf '%s\n' "$out"; return 0; fi
-  printf '%s' "$out" | jq -r '
+  local rows
+  # A revoked node is revoked (Task 30 fix round 1), its revocation
+  # confirmed or going on.
+  rows="$(printf '%s' "$out" | jq -r '
     ["ID", "ROLE", "CLASS", "SITE", "MESH IP", "STATE"],
     (.servers[] | select(.kind == "cluster-node" or .id == "primary")
-      | [.id, (.role // "-"), (.class // "-"), (.site // "-"), (.mesh_ip // "-"), (.state + (if .error then " (" + .error + ")" else "" end))])
-    | @tsv' | column -t -s "$(printf '\t')" \
-    || fail "the Hub's server list is unreadable"
+      | [.id, (.role // "-"), (.class // "-"), (.site // "-"), (.mesh_ip // "-"),
+         (.state + (if .state == "revoked" and (.revoke_confirmed | not) and (.error // "") == "" then " (goes on)" else "" end)
+          + (if .error then " (" + .error + ")" else "" end))])
+    | @tsv' 2>/dev/null)" && [ -n "$rows" ] || fail "the Hub's server list is unreadable"
+  printf '%s\n' "$rows" | column -t -s "$(printf '\t')"
 }
 
 # _node_confirm <cmd> <id> — the typed id, read from stdin (a terminal, or
@@ -920,24 +1057,107 @@ _node_confirm() {
 }
 
 # _node_wait <id> <op_id> — polls the Hub's op until it finished (60 min,
-# the Hub's own enrol/removal bounds are shorter); 0 it succeeded.
+# the Hub's own enrol/removal bounds are shorter); 0 it succeeded. A Hub
+# that doesn't answer is named after 30 s (and every 5 min); Ctrl-C says
+# the operation goes on in the Hub.
 _node_wait() {
-  local rec i last=""
+  local rec i last="" miss=0
+  # shellcheck disable=SC2064  # expand now: the message names this op
+  trap "echo >&2; warn 'node: stopped waiting; the Hub'\''s operation $2 goes on (./portcullis node list, or the Hub'\''s Servers page)'; exit 130" INT TERM
   for ((i = 0; i < 1200; i++)); do
     rec="$(_node_hub op "$1" "$2" </dev/null 2>/dev/null)" || rec=""
-    if [ -n "$rec" ] && printf '%s' "$rec" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    if [ -z "$rec" ] || ! printf '%s' "$rec" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      miss=$((miss + 1))
+      [ $((miss % 100)) != 10 ] || warn "node: the Hub doesn't answer about operation $2 ($((miss * 3)) s); still waiting"
+    else
+      miss=0
       local step
       step="$(printf '%s' "$rec" | jq -r '[(.steps // [])[] | select(.state == "running") | .label] | first // empty' 2>/dev/null)"
       [ -z "$step" ] || [ "$step" = "$last" ] || { echo "    $step..." >&2; last="$step"; }
       if printf '%s' "$rec" | jq -e '.running != true' >/dev/null 2>&1; then
+        trap - INT TERM
         printf '%s' "$rec" | jq -e '.ok == true' >/dev/null 2>&1 && return 0
         warn "node: the Hub's operation failed: $(printf '%s' "$rec" | jq -r '.error // "no reason given"')"
         return 1
       fi
     fi
-    sleep 3
+    sleep "${NODE_POLL:-3}"
   done
+  trap - INT TERM
   warn "node: the Hub's operation is still running after 60 min: ./portcullis node list"
+  return 1
+}
+
+# _node_server <list json> <id> — node <id>'s entry in `hub servers list`
+# (empty: not listed).
+_node_server() {
+  printf '%s' "$1" | jq -c --arg id "$2" 'first(.servers[]? | select(.id == $id)) // empty' 2>/dev/null
+}
+
+# _node_revoke_send <id> — `hub servers revoke <id>` (the typed id as the
+# confirm body); its answer in _NODE_OUT. 0 answered, 1 the Hub's own
+# refusal (its text on stderr), 2 not answered: the exec broke before the
+# Hub's command ended (no "command terminated with exit code N" from
+# kubectl), or that command's exit 3 (the Hub not running, its answer cut,
+# a 5xx: a new Hub pod standing by, nodeadm unreachable — found live).
+_node_revoke_send() {
+  local errf rc=0
+  errf="$(mktemp)" || fail "no temporary file"
+  _NODE_OUT="$(jq -nc --arg id "$1" '{confirm: $id}' | kube_ctl -n "$(kube_ns)" exec -i "$(_node_hub_ref)" -c hub -- hub servers revoke "$1" 2> "$errf")" || rc=$?
+  if [ "$rc" = 0 ]; then rm -f "$errf"; return 0; fi
+  if grep -qx 'command terminated with exit code 3' "$errf"; then
+    grep -vE '^command terminated with exit code [0-9]+$' "$errf" | head -n 3 >&2; rm -f "$errf"; return 2
+  fi
+  if grep -qE '^command terminated with exit code [0-9]+$' "$errf"; then
+    grep -vE '^command terminated with exit code [0-9]+$' "$errf" >&2; rm -f "$errf"; return 1
+  fi
+  rm -f "$errf"; return 2
+}
+
+# _node_revoke_outcome <id> — after a revoke whose exec broke before the
+# Hub answered (the servers restart for the token rotation, so the API
+# server goes away under kubectl; Task 30 fix round 1): the revoke's real
+# state, polled from the Hub's list (`hub servers list`, the Hub keeps the
+# revoke going without its caller) until the node is revoked and
+# confirmed, parked, or gone from the list (30 min) — gone counts only for
+# a node the Hub listed before the revoke (<listed> = 1). While the Hub
+# answers but doesn't list it revoked, the revoke is asked again (once a
+# minute; idempotent: a revoke that finished answers done): the Hub itself
+# may have restarted mid-call (its Lease lost while the servers restarted,
+# found live) and recorded nothing. 0 revoked, 1 not.
+_node_revoke_outcome() {
+  local id="$1" listed="$2" i out s miss=0 last=-100 rc
+  info "The connection to the Hub broke during the revoke (the servers restart for the token rotation): asking the Hub how it ended..." >&2
+  for ((i = 0; i < 600; i++)); do
+    if ! out="$(_node_hub list </dev/null 2>/dev/null)" || ! printf '%s' "$out" | jq -e '.servers | type == "array"' >/dev/null 2>&1; then
+      miss=$((miss + 1))
+      [ $((miss % 100)) != 10 ] || warn "node revoke: the Hub doesn't answer ($((miss * ${NODE_POLL:-3})) s); still asking"
+    else
+      miss=0
+      s="$(_node_server "$out" "$id")"
+      if [ -z "$s" ]; then
+        [ "$listed" = 1 ] || { warn "node revoke: the Hub doesn't list $id"; return 1; }
+        ok "$id revoked (the Hub no longer lists it)" >&2; return 0
+      fi
+      case "$(printf '%s' "$s" | jq -r '[.state, (.revoke_confirmed // false | tostring), (.error // "")] | join("|")')" in
+        "revoked|true|revoked; waiting for quorum"*)
+          warn "$(printf '%s' "$s" | jq -r .error)"
+          ok "$id revoked (parked: the Hub finishes the removal once etcd has quorum)" >&2; return 0 ;;
+        revoked\|true\|*) ok "$id revoked" >&2; return 0 ;;
+        revoked\|*) [ $((i % 20)) != 0 ] || info "  the revocation of $id goes on in nodeadm..." >&2 ;;
+        # Not marked: asked again (the Hub records it once nodeadm answers).
+        *)
+          if [ $((i - last)) -ge 20 ]; then
+            last=$i rc=0
+            info "  the Hub lists $id as $(printf '%s' "$s" | jq -r .state): asking it to revoke $id again..." >&2
+            _node_revoke_send "$id" || rc=$?
+            [ "$rc" != 1 ] || return 1
+          fi ;;
+      esac
+    fi
+    sleep "${NODE_POLL:-3}"
+  done
+  warn "node revoke: the outcome for $id isn't known after 30 min: ./portcullis node list"
   return 1
 }
 
@@ -956,8 +1176,21 @@ _node_remove() {
   _node_id "$cmd" "$id"
   _node_kube "$cmd"
   _node_confirm "$cmd" "$id"
-  out="$(jq -nc --arg id "$id" '{confirm: $id}' | _node_hub "$cmd" "$id")" || fail "the Hub refused to $cmd $id"
   if [ "$cmd" = revoke ]; then
+    # The exec breaks when the servers restart for the token rotation:
+    # only an exit the Hub's command itself gave (kubectl's "command
+    # terminated with exit code N") is its refusal; anything else is a
+    # broken call, and the outcome is asked of the Hub (Task 30 fix round 1).
+    local rc=0 listed=0
+    [ -z "$(_node_server "$(_node_hub list </dev/null 2>/dev/null || true)" "$id")" ] || listed=1
+    _node_revoke_send "$id" || rc=$?
+    [ "$rc" != 1 ] || fail "the Hub refused to revoke $id"
+    if [ "$rc" = 2 ]; then
+      _node_revoke_outcome "$id" "$listed" || fail "$id isn't known to be revoked (see above)"
+      kube_api_endpoints_refresh || true
+      return 0
+    fi
+    out="$_NODE_OUT"
     if printf '%s' "$out" | jq -e '.parked == true' >/dev/null 2>&1; then
       warn "$(printf '%s' "$out" | jq -r '.warning // empty')"
       warn "$(printf '%s' "$out" | jq -r '.detail // empty')"
@@ -965,14 +1198,17 @@ _node_remove() {
     else
       ok "$id revoked" >&2
     fi
+    kube_api_endpoints_refresh || true
     return 0
   fi
+  out="$(jq -nc --arg id "$id" '{confirm: $id}' | _node_hub "$cmd" "$id")" || fail "the Hub refused to $cmd $id"
   local op
   op="$(printf '%s' "$out" | jq -r '.op_id // empty')"
   [ -n "$op" ] || fail "the Hub's answer names no operation"
   info "Removing $id (the Hub's operation $op)..." >&2
   _node_wait "$id" "$op" || fail "$id wasn't removed (see above; the Hub's Servers page has the steps)"
   ok "$id removed" >&2
+  kube_api_endpoints_refresh || true
 }
 
 cmd_node() {

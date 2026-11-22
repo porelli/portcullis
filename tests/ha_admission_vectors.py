@@ -384,6 +384,39 @@ def vectors():
     out.append({"policy": FS, "name": "frontdoor-status: this params generation's probe is refused", "allowed": False, "as": intruder, "object": probe("e2e0ha0000000000"),
                 "update": True, "reason_contains": "admission probe: params generation e2e0ha0000000000 in effect"})
     fsv("another params generation's probe (a dry run) is let by", probe("fedcba9876543210"), intruder, True)
+    # portcullis-removed-nodes (Task 30 fix round 1): a removed node's
+    # kubelet identity (its client certificate still authenticates) can't
+    # register its Node again. The e2e params list vector-removed and
+    # vector-gone (e2e-ha-admission.sh); the Node is otherwise admissible
+    # (portcullis-node-labels: exactly the unlabelled taint).
+    RN = "portcullis-removed-nodes"
+
+    def kubelet(name):
+        return {"user": "system:node:" + name, "groups": ["system:nodes", "system:authenticated"]}
+
+    def node(name, ann=None):
+        md = {"name": name}
+        if ann:
+            md["annotations"] = ann
+        return {"apiVersion": "v1", "kind": "Node", "metadata": md,
+                "spec": {"taints": [{"key": "nodeadm.portcullis/unlabelled", "value": "true", "effect": "NoSchedule"}]}}
+
+    def rnv(name, o, who, allowed, also=None, reason=None):
+        v = {"policy": RN, "name": f"removed nodes: {name}", "allowed": allowed, "as": who, "object": o}
+        if also:
+            v["also_refused_by"] = also
+        if reason:
+            v["reason_contains"] = reason
+        out.append(v)
+    rnv("a removed node's kubelet registers its Node again", node("vector-removed"), kubelet("vector-removed"), False,
+        reason="node vector-removed was removed from the cluster")
+    rnv("another removed node's kubelet registers its Node again", node("vector-gone"), kubelet("vector-gone"), False)
+    rnv("a removed node's kubelet registers a Node of another name", node("vector-fresh"), kubelet("vector-removed"), False,
+        also="is not allowed to modify node")
+    rnv("a node that was never removed registers its Node", node("vector-fresh"), kubelet("vector-fresh"), True)
+    rnv("its generation probe is refused", node("vector-fresh", {"portcullis.io/removed-nodes-generation": "e2e0ha0000000000"}), kubelet("vector-fresh"), False,
+        reason="admission probe: params generation e2e0ha0000000000 in effect")
+    rnv("another generation's probe is let by", node("vector-fresh", {"portcullis.io/removed-nodes-generation": "0123456789abcdef"}), kubelet("vector-fresh"), True)
     return out
 
 

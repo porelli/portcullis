@@ -19117,5 +19117,182 @@
   },
   "policy": "portcullis-frontdoor-status",
   "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-removed"
+  },
+  "name": "removed nodes: a removed node's kubelet registers its Node again",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "node vector-removed was removed from the cluster"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-gone"
+  },
+  "name": "removed nodes: another removed node's kubelet registers its Node again",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-gone"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes"
+ },
+ {
+  "allowed": false,
+  "also_refused_by": "is not allowed to modify node",
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-removed"
+  },
+  "name": "removed nodes: a removed node's kubelet registers a Node of another name",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-fresh"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes"
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-fresh"
+  },
+  "name": "removed nodes: a node that was never removed registers its Node",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-fresh"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-fresh"
+  },
+  "name": "removed nodes: its generation probe is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "annotations": {
+     "portcullis.io/removed-nodes-generation": "e2e0ha0000000000"
+    },
+    "name": "vector-fresh"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "admission probe: params generation e2e0ha0000000000 in effect"
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-fresh"
+  },
+  "name": "removed nodes: another generation's probe is let by",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "annotations": {
+     "portcullis.io/removed-nodes-generation": "0123456789abcdef"
+    },
+    "name": "vector-fresh"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes"
  }
 ]

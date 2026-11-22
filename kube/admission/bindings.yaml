@@ -5,7 +5,8 @@
 # portcullis-nodeadm-guard-tokens on kube-system and
 # portcullis-ingress-guard-pods on portcullis-ingress and
 # portcullis-nodes-guard-labels on Nodes (cluster-scoped) and
-# portcullis-core-guard-frontdoor-status on the core namespace (eleven); the params
+# portcullis-core-guard-frontdoor-status on the core namespace and
+# portcullis-nodes-guard-removed on Nodes (twelve); the params
 # ConfigMap portcullis-admission-params in the core namespace (written only
 # by the CLI identity, ruling R-ADM: no Role of the Hub or nodeadm there;
 # missing = deny), Deny. The CLI applies each as
@@ -180,6 +181,24 @@ metadata:
   name: portcullis-core-guard-frontdoor-status
 spec:
   policyName: portcullis-frontdoor-status
+  validationActions: ["Deny"]
+  paramRef:
+    name: portcullis-admission-params
+    namespace: portcullis
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis
+---
+# Task 30 fix round 1: Nodes (cluster-scoped: the namespaceSelector has no
+# effect on them) as removed node identities.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-nodes-guard-removed
+spec:
+  policyName: portcullis-removed-nodes
   validationActions: ["Deny"]
   paramRef:
     name: portcullis-admission-params

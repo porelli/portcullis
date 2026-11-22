@@ -1968,3 +1968,58 @@ spec:
       variables.cli || variables.otherProbe || (variables.pod != '' && has(object.data) && 'leader' in object.data && object.data['leader'] == variables.pod
         && 'status.json' in object.data && object.data['status.json'].contains('"leader":"' + variables.pod + '"'))
     message: the front door writes frontdoor-status only as its own pod (leader = its pod name)
+---
+# portcullis-removed-nodes (NEW, HA; Task 30 fix round 1, the agent-token
+# fix's concern 1): a removed or revoked node's kubelet client certificate
+# (system:node:<name>, k3s's client CA, about a year) still authenticates
+# after its removal, so with the API reachable it could register its Node
+# again and from it get kubelet certificates and a new node-password. No
+# node identity (group system:nodes) creates or updates a Node (nodes,
+# nodes/status) whose name, or whose identity's own name, nodeadm lists
+# removed: params removedNodes, from portcullis-cluster-addresses'
+# removed_names (nodeadm keeps every removed name; a cooperatively removed
+# one leaves the list when a new join code is made for it, a revoked one
+# never does). Controllers and the CLI aren't matched (a parked revoke's
+# Node is still marked NotReady by the node lifecycle controller). The
+# probe: its own annotation portcullis.io/removed-nodes-generation (the
+# probe Node of portcullis-node-labels carries portcullis.io/params-generation,
+# which this policy doesn't read, so each binding refuses only its own
+# probe), on a Node otherwise admissible by both policies.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-removed-nodes
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ''
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - nodes
+      - nodes/status
+  matchConditions:
+  - name: node-identities
+    expression: "'system:nodes' in request.userInfo.groups || request.userInfo.username.startsWith('system:node:')"
+  variables:
+  - name: removed
+    expression: "has(params.data.removedNodes) ? params.data.removedNodes.split(' ').filter(n, n != '') : []"
+  - name: self
+    expression: "request.userInfo.username.startsWith('system:node:') ? request.userInfo.username.substring(12) : ''"
+  validations:
+  - expression: >-
+      !has(object.metadata.annotations) || !('portcullis.io/removed-nodes-generation' in object.metadata.annotations)
+      || object.metadata.annotations['portcullis.io/removed-nodes-generation'] != params.data.generation
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+  - expression: "!(object.metadata.name in variables.removed) && !(variables.self in variables.removed)"
+    messageExpression: >-
+      'node ' + (variables.self in variables.removed ? variables.self : object.metadata.name)
+      + ' was removed from the cluster: its kubelet identity can neither register nor update a Node (a new join code frees a removed name, never a revoked one)'

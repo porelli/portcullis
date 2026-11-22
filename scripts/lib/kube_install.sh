@@ -663,6 +663,13 @@ _kube_probe_ha() {
       M="$m" jq -n '{apiVersion: "v1", kind: "Node", metadata: (env.M | fromjson),
           spec: {taints: [{key: "nodeadm.portcullis/unlabelled", value: "true", effect: "NoSchedule"}]}}' \
         | kube_ctl --as=system:node:portcullis-admission-probe --as-group=system:nodes --as-group=system:authenticated create --dry-run=server -f - ;;
+    portcullis-nodes-guard-removed)
+      # Task 30 fix round 1: the same Node as portcullis-node-labels' probe
+      # (otherwise admissible by both), marked with this policy's own
+      # annotation instead (each binding refuses only its own probe).
+      G="$g" jq -n '{apiVersion: "v1", kind: "Node", metadata: {name: "portcullis-admission-probe", annotations: {"portcullis.io/removed-nodes-generation": env.G}},
+          spec: {taints: [{key: "nodeadm.portcullis/unlabelled", value: "true", effect: "NoSchedule"}]}}' \
+        | kube_ctl --as=system:node:portcullis-admission-probe --as-group=system:nodes --as-group=system:authenticated create --dry-run=server -f - ;;
     portcullis-core-guard-frontdoor-status)
       # Task 28 fix round 1: a dry-run CREATE of frontdoor-status (every
       # identity's first rule refuses this generation's probe).

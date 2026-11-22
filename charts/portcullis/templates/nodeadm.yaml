@@ -20,7 +20,10 @@ Its rights (the security delta of hardening.md):
     frontdoor-control-tls and nodeadm-state (its own state: the join codes'
     hashes, which are secret-equivalent, and the enrolled nodes);
     configmaps update on portcullis-cluster-addresses and get on
-    portcullis-admission-active; leases get / update on portcullis-nodeadm;
+    portcullis-admission-active and portcullis-first-node (the CLI's
+    record of the first node's certificate serials: a removal of that node
+    revokes them; Task 30 fix round 1); leases get / update on
+    portcullis-nodeadm;
   - HA only, Role in longhorn-system: Longhorn's nodes get / patch (a
     cooperative removal asks Longhorn to evict the node's replicas);
   - HA only, Role in portcullis-fencing: SelfNodeRemediations create /
@@ -129,7 +132,7 @@ rules:
     verbs: ["update"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["portcullis-admission-active"]
+    resourceNames: ["portcullis-admission-active", "portcullis-first-node"]
     verbs: ["get"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
