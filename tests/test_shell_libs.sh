@@ -8391,6 +8391,20 @@ expect_eq "core.env node addresses: the cluster addresses document's (the params
 expect_eq "core.env node addresses: no document yet → the nodes' (as the params then)" \
   "$(na_run 'kube_doc_addresses() { return 2; }')" "PORTCULLIS_KUBE_NODE_ADDRESSES=10.215.0.1 10.215.0.2"
 
+# The copy's manifest (run here on two trees, /vol swapped): a directory's
+# setgid bit (fsGroup on the replicated volume) doesn't count; a file's
+# content or mode does.
+if stat -c %a / >/dev/null 2>&1; then
+  MF="$WORK/manifest"; rm -rf "$MF"; mkdir -p "$MF/a/d" "$MF/b/d"; echo x > "$MF/a/d/f"; echo x > "$MF/b/d/f"; chmod 2750 "$MF/b/d"; chmod 750 "$MF/a/d"
+  mf() { ( cd "$MF/$1" && sh -c "$(printf '%s' "$HA_MANIFEST_SH_T" | sed 's#cd /vol#cd .#')" ); }
+  HA_MANIFEST_SH_T="$(bash -c 'source "'"$HERE"'/../scripts/lib/common.sh" >/dev/null 2>&1; printf "%s" "$HA_MANIFEST_SH"')"
+  expect_eq "the copy's manifest: a directory's setgid bit doesn't count" "$( [ "$(mf a)" = "$(mf b)" ] && echo same)" same
+  chmod 600 "$MF/b/d/f"
+  expect_eq "the copy's manifest: a file's mode counts" "$( [ "$(mf a)" != "$(mf b)" ] && echo differ)" differ
+  chmod 644 "$MF/b/d/f"; echo y > "$MF/b/d/f"
+  expect_eq "the copy's manifest: a file's content counts" "$( [ "$(mf a)" != "$(mf b)" ] && echo differ)" differ
+fi
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

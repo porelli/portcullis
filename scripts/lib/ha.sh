@@ -2673,12 +2673,19 @@ _ha_copy_pod() {
 
 # The manifest of a volume (in its helper pod): every entry but the root
 # and Longhorn's lost+found, sorted — type, mode, owner, a file's sha256,
-# a link's target — hashed; exit 3 when anything can't be read.
+# a link's target — hashed; exit 3 when anything can't be read. A
+# directory counts by its path and permission bits without the setgid bit
+# and without its owner (found live): on the replicated volume the
+# kubelet's fsGroup makes the root setgid, so every directory made in it
+# inherits the bit, and an unprivileged copy owns what it creates (an
+# empty root-owned mount point such as hub-state's backups/, which the
+# Hub's hub-backups volume covers). Files and links keep their full mode
+# and owner.
 # shellcheck disable=SC2016  # the pod's own shell
 HA_MANIFEST_SH='cd /vol || exit 3
 find . -mindepth 1 \( -path ./lost+found -prune \) -o -print | LC_ALL=C sort | while IFS= read -r f; do
   if [ -L "$f" ]; then printf "l %s %s %s\n" "$(stat -c "%u %g" "$f")" "$f" "$(readlink "$f")"
-  elif [ -d "$f" ]; then printf "d %s %s\n" "$(stat -c "%a %u %g" "$f")" "$f"
+  elif [ -d "$f" ]; then m="$(stat -c %a "$f")"; case "$m" in 2???) m="${m#2}" ;; 3???) m="1${m#3}" ;; 6???) m="4${m#6}" ;; 7???) m="5${m#7}" ;; esac; printf "d %s %s\n" "$m" "$f"
   elif [ -f "$f" ]; then h="$(sha256sum < "$f" | cut -d" " -f1)" || h=UNREADABLE; printf "f %s %s %s\n" "$(stat -c "%a %u %g" "$f")" "${h:-UNREADABLE}" "$f"
   else printf "o %s %s\n" "$(stat -c "%F %a %u %g" "$f")" "$f"; fi
 done > /tmp/manifest || exit 3
