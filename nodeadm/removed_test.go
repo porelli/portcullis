@@ -144,14 +144,31 @@ func TestRemovedNameCooperative(t *testing.T) {
 	if d := docOf(t, h); !slices.Equal(d.RemovedNames, []string{"n4"}) {
 		t.Fatalf("an expired code unlisted n4: %v", d.RemovedNames)
 	}
-	// A new code, and the new node enrols with it: unlisted.
+	// A new code whose enrolment fails at the signing (security review):
+	// still listed, so the old kubelet's registration stays refused.
 	h.setNow(vecNow)
 	_ = j2
+	jf := h.issue(t, "n4", "agent", "home", "main", "10.215.0.4")
+	h.enroll.mu.Lock()
+	h.enroll.fail = errors.New("vault sealed")
+	h.enroll.mu.Unlock()
+	if w := h.enrol(t, jf, ""); w.Code/100 == 2 {
+		t.Fatalf("an enrolment with the signing failing passed: %d", w.Code)
+	}
+	h.enroll.mu.Lock()
+	h.enroll.fail = nil
+	h.enroll.mu.Unlock()
+	if d := docOf(t, h); !slices.Equal(d.RemovedNames, []string{"n4"}) {
+		t.Fatalf("a failed signing unlisted n4: %v", d.RemovedNames)
+	}
+	// A new code, and the new node enrols with it: unlisted.
 	j3 := h.issue(t, "n4", "agent", "home", "main", "10.215.0.4")
 	if d := docOf(t, h); !slices.Equal(d.RemovedNames, []string{"n4"}) {
 		t.Fatalf("before the enrolment: %v", d.RemovedNames)
 	}
-	h.enrol(t, j3, "")
+	if w := h.enrol(t, j3, ""); w.Code != 200 {
+		t.Fatalf("the enrolment: %d %s", w.Code, w.Body)
+	}
 	if _, ok := h.state(t).RemovedNames["n4"]; ok {
 		t.Fatal("the new node enrolled and n4 is still listed removed")
 	}

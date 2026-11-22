@@ -434,15 +434,6 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 		}
 		cur.Used, cur.KeySHA256 = true, ""
 		code = *cur
-		// The new node enrolled (Task 30 fix round 1, security review): a
-		// cooperatively removed name leaves the removed list only now. The
-		// next document drops it, and the join's release waits for an
-		// admission generation built after it (one holding this node's
-		// addresses), so its kubelet registers. A revoked name never gets
-		// here (no code is issued for it).
-		if rn := st.RemovedNames[req.ServerID]; rn != nil && !rn.Revoked {
-			delete(st.RemovedNames, req.ServerID)
-		}
 		st.Nodes[req.ServerID] = &nodeRecord{Role: cur.Role, Class: cur.Class, Site: cur.Site, MeshIP: cur.MeshIP,
 			Ingress: cur.Ingress, Storage: cur.Storage, Mesh: req.Mesh, Forward: cur.Forward, EnrolledAt: now, JoinState: joinEnrolled}
 		return nil
@@ -475,6 +466,16 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 			return errVoided
 		}
 		n.Serial, n.NotAfter = normSerial(signed.Serial), signed.NotAfter
+		// The new node enrolled (Task 30 fix round 1, security review): a
+		// cooperatively removed name leaves the removed list only here, in
+		// the mutate that records its certificate — any failure before
+		// (the proof, the report, Sign) leaves it listed. The next document
+		// drops it, and the join's release waits for an admission generation
+		// built after it (one holding this node's addresses), so its kubelet
+		// registers. A revoked name never gets here (no code is issued).
+		if rn := st.RemovedNames[req.ServerID]; rn != nil && !rn.Revoked {
+			delete(st.RemovedNames, req.ServerID)
+		}
 		return nil
 	}); err != nil {
 		if errors.Is(err, errVoided) {
