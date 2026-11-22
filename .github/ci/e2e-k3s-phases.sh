@@ -87,7 +87,11 @@ lh_prereqs() {
     [ -d /sys/module/iscsi_tcp ] || miss="$miss iscsi_tcp"
     [ -e /usr/sbin/mount.nfs ] || [ -e /sbin/mount.nfs ] || miss="$miss nfs-common"
     if [ -e /usr/sbin/multipathd ] || [ -e /sbin/multipathd ] || pgrep -x multipathd >/dev/null; then
-      cat /etc/multipath.conf /etc/multipath/conf.d/*.conf 2>/dev/null | sed 's/#.*//' | awk '/^[[:space:]]*blacklist[[:space:]]*\{/ { b = 1; next } b && /\}/ { b = 0 }
+      # cat's own status never counts (found on the GitHub runner: Ubuntu's
+      # /etc/multipath is 0700 root, so the conf.d glob fails to read, and
+      # under pipefail that failed the whole check); the awk decides, as in
+      # the CLI's probe.
+      { cat /etc/multipath.conf /etc/multipath/conf.d/*.conf 2>/dev/null || true; } | sed 's/#.*//' | awk '/^[[:space:]]*blacklist[[:space:]]*\{/ { b = 1; next } b && /\}/ { b = 0 }
         b { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); if ($0 == "devnode \"^sd[a-z0-9]+\"") f = 1 } END { exit !f }' || miss="$miss multipathd-blacklist"
     fi
     if [ -n "$miss" ]; then
