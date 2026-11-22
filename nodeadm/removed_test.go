@@ -316,9 +316,17 @@ func TestRevokeAgainIsDone(t *testing.T) {
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=revoke", nil); w.Code != 204 {
 		t.Fatalf("revoke: %d %s", w.Code, w.Body)
 	}
-	h.putState(t, func(st *nodeadmState) { delete(st.Nodes, "n4") }) // dropped once the params left it
+	h.putState(t, func(st *nodeadmState) {
+		delete(st.Nodes, "n4") // dropped once the params left it
+		// Its burnt code's record (fix round 2, found live: the revoke ran
+		// again from the start, restarting every server again).
+		st.Codes["n4"] = &codeRecord{Used: true, Role: "agent", MeshIP: "10.215.0.4", IssuedAt: vecNow, ExpiresAt: vecNow.Add(codeTTL)}
+	})
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=revoke", nil); w.Code != 204 {
 		t.Fatalf("the revoke asked again: %d %s", w.Code, w.Body)
+	}
+	if n := strings.Count(h.logs.String(), "revocation recorded"); n != 1 {
+		t.Fatalf("the revoke asked again started a new revocation (%d recorded)", n)
 	}
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n9?mode=revoke", nil); w.Code != 404 {
 		t.Fatalf("an unknown node: %d %s", w.Code, w.Body)

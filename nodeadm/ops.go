@@ -17,8 +17,10 @@ package main
 //	                 one restart), recorded per node (the revoked node
 //	                 skipped); agents hold no shared token: nothing to apply;
 //	node_deleted     its Node object deleted          } gated by etcd's
-//	published        the cluster addresses list it    } quorum (a server:
-//	                 removed                          } revokeQuorum)
+//	                 (only once its name is refused   } quorum (a server:
+//	                 on every API server: R-I2)       } revokeQuorum)
+//	published        the cluster addresses list it    }
+//	                 removed                          }
 //	etcd_removed     (a server) its etcd member removed through a surviving
 //	                 server's nodeagent;
 //	server_rotated2  (a server) the token rotated again, the same way:
@@ -137,13 +139,16 @@ func (s *Server) revoke(ctx context.Context, id string) error {
 		n, err := s.getNode(ctx, id)
 		var ae *apiError
 		if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
+			// Revoked and finished (Task 30 fix round 1): its name is
+			// listed revoked for good, so a revoke asked again (the Hub
+			// restarted mid-call, the CLI asks once more) is done — also
+			// while its burnt code's record is still kept (fix round 2,
+			// found live: each resend ran a whole new revoke, restarting
+			// the servers again). A revoked name gets no new code.
+			if rn := st.RemovedNames[id]; rn != nil && rn.Revoked && st.Nodes[id] == nil {
+				return nil
+			}
 			if st.Nodes[id] == nil && st.Codes[id] == nil {
-				// Revoked and finished (Task 30 fix round 1): its name is
-				// listed revoked for good, so a revoke asked again (the
-				// Hub restarted mid-call, the CLI asks once more) is done.
-				if rn := st.RemovedNames[id]; rn != nil && rn.Revoked {
-					return nil
-				}
 				return err
 			}
 			n = nil
@@ -379,8 +384,10 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 		if err := s.clearRemediation(ctx, id); err != nil {
 			return err
 		}
-		if err := s.kube.CoreV1().Nodes().Delete(ctx, id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("deleting node %s: %w", id, err)
+		// Only once its name is refused on every API server (fix round 2,
+		// R-I2); else the step fails, the op parks here and is retried.
+		if err := s.deleteRemovedNode(ctx, id); err != nil {
+			return err
 		}
 	case "published":
 		if err := s.publishAddresses(ctx); err != nil {

@@ -118,6 +118,7 @@ func run(log *slog.Logger) error {
 		http:       &http.Client{Timeout: 30 * time.Second}}
 	s.agents = agentClient{s: s}
 	s.bootstrap = k3sBootstrap{}
+	s.probe = &apiProbe{base: rc, kube: kube}
 	// The state must load (strictly) before anything starts: an older or
 	// foreign format refuses the start with a clear error.
 	if _, _, err := s.store.Load(context.Background()); err != nil {

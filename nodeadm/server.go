@@ -97,11 +97,14 @@ type Timing struct {
 	NodeReady     time.Duration // a node Ready again after a token apply
 	LonghornEvict time.Duration // Longhorn's replicas off the node
 	NodeGone      time.Duration // a deleted server's Node gone (k3s's etcd finalizer) (5 min)
+	// RemovedConfirm: a removed name confirmed in force on every API
+	// server before its Node is deleted (90 s; removedparams.go).
+	RemovedConfirm time.Duration
 }
 
 func defaultTiming() Timing {
 	return Timing{Poll: 2 * time.Second, PDBRefusal: 120 * time.Second, DrainMax: 10 * time.Minute,
-		NodeReady: 5 * time.Minute, LonghornEvict: 10 * time.Minute, NodeGone: 5 * time.Minute}
+		NodeReady: 5 * time.Minute, LonghornEvict: 10 * time.Minute, NodeGone: 5 * time.Minute, RemovedConfirm: 90 * time.Second}
 }
 
 // Server is nodeadm.
@@ -145,6 +148,12 @@ type Server struct {
 	// binaries (node → their sums), so each is asked once per process.
 	upMu     sync.Mutex
 	upgraded map[string]string
+	// probe confirms the removed-node params (removedparams.go);
+	// removedMu serialises their writes, removedProven is the last
+	// generation/resourceVersion every API server confirmed.
+	probe         AdmissionProbe
+	removedMu     sync.Mutex
+	removedProven string
 }
 
 // pkiState holds the pki_node CA and nodeadm's own node-nodeadm

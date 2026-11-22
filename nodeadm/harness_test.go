@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -311,6 +312,7 @@ type harness struct {
 	enroll  *fakeEnroll
 	agents  *fakeAgents
 	boot    *fakeBoot
+	probe   *fakeProbe
 	store   *memStore
 	logs    *bytes.Buffer
 	ca      *testCA // signs the internal clients (and, unless replaced, node certificates)
@@ -352,6 +354,8 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 	objs = append(objs,
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tokenSecret, Namespace: coreNS}, Data: map[string][]byte{tokenKey: []byte(testServerToken + "\n")}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: addressesCM, Namespace: coreNS}},
+		// The CLI's empty removed-node params (removedparams.go).
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: removedCM, Namespace: coreNS}, Data: removedData(nil)},
 	)
 	h.kube = fake.NewSimpleClientset(objs...)
 	cfg := Config{Domain: "example.org", CoreNS: coreNS, NodeadmNS: "portcullis-nodeadm", IngressNS: "portcullis-ingress",
@@ -367,12 +371,14 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 	}
 	s := newServer(cfg)
 	s.kube, s.store, s.enroll, s.agents, s.bootstrap, s.leader = h.kube, h.store, h.enroll, h.agents, h.boot, h.leader
+	h.probe = &fakeProbe{kube: h.kube}
+	s.probe = h.probe
 	s.limit = newLimiter(1000, 1000, 1000, 1000)
 	s.now = func() time.Time { return h.now.Load().(time.Time) }
 	s.rand = rand.Reader
 	s.log = slog.New(slog.NewTextHandler(&lockedBuf{b: h.logs}, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	s.timing = Timing{Poll: 5 * time.Millisecond, PDBRefusal: 60 * time.Millisecond, DrainMax: 2 * time.Second,
-		NodeReady: time.Second, LonghornEvict: 200 * time.Millisecond}
+		NodeReady: time.Second, LonghornEvict: 200 * time.Millisecond, RemovedConfirm: 50 * time.Millisecond}
 	if err := s.pki.setCA(vs.PKI.CAPEM); err != nil {
 		t.Fatal(err)
 	}
@@ -511,3 +517,39 @@ func mustJSON(v any) string {
 }
 
 var _ = fmt.Sprint
+
+// fakeProbe plays every API server's answer to the removed-node probe:
+// the generation in the ConfigMap is in force, unless down (no answer) or
+// stale (the servers still judge with inForce).
+type fakeProbe struct {
+	kube    *fake.Clientset
+	mu      sync.Mutex
+	down    bool
+	stale   bool
+	inForce []string // the names the servers judge by
+	calls   int
+}
+
+func (p *fakeProbe) Confirm(ctx context.Context, gen string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if p.down {
+		return errors.New("the API server 10.215.0.1:6443 doesn't answer")
+	}
+	cm, err := p.kube.CoreV1().ConfigMaps(coreNS).Get(ctx, removedCM, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if p.stale || cm.Data["generation"] != gen {
+		return errors.New("the API server 10.215.0.1:6443 doesn't confirm generation " + gen + " yet")
+	}
+	p.inForce = strings.Fields(cm.Data[removedKey])
+	return nil
+}
+
+func (p *fakeProbe) refuses(id string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Contains(p.inForce, id)
+}

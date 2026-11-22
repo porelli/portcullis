@@ -556,7 +556,9 @@ func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses, re
 	// not enroll is up), the serial queued in PendingRevokes; then every
 	// pending serial revoked; a failed one stays queued and is retried by
 	// reconcile, the record kept until none is left (review N6).
+	listed := false
 	if err := s.mutate(ctx, func(st *nodeadmState) error {
+		listed = false
 		if c := st.Codes[id]; c != nil {
 			c.KeySHA256, c.Used = "", true
 		}
@@ -587,9 +589,23 @@ func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses, re
 			rec.Renewal = nil
 		}
 		rec.Removed, rec.Serial = true, ""
+		listed = true
 		return nil
 	}); err != nil {
 		return err
+	}
+	// The name refused at once (fix round 2): its CSRs and status writes
+	// from here on, well before its Node goes. Not waited for here (the
+	// security steps never wait); the Node delete is gated on it
+	// (removedInForce).
+	if listed {
+		wait := 10 * time.Second
+		if s.timing.RemovedConfirm > 0 && s.timing.RemovedConfirm < wait {
+			wait = s.timing.RemovedConfirm
+		}
+		if _, err := s.pushRemoved(ctx, wait); err != nil {
+			s.log.Warn("removed-node params not confirmed yet (the Node delete waits for them)", "node", id, "err", err.Error())
+		}
 	}
 	return s.revokePending(ctx, id)
 }
@@ -718,7 +734,15 @@ func (s *Server) removeCooperative(ctx context.Context, id string) error {
 			return err
 		}
 		s.log.Info("enrolment voided", "node", id)
-		return s.forget(ctx, id, nil, false)
+		if err := s.forget(ctx, id, nil, false); err != nil {
+			return err
+		}
+		// No Node to delete, but its kubelet may hold material: a listed
+		// name is in force before the void answers (fix round 2, R-I2).
+		if listedRemoved(ctx, s, id) {
+			return s.removedInForce(ctx, id)
+		}
+		return nil
 	}
 	if err != nil {
 		return err
@@ -753,21 +777,24 @@ func (s *Server) removeCooperative(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	if err := s.kube.CoreV1().Nodes().Delete(ctx, id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("deleting node %s: %w", id, err)
-	}
+	// Only once its name is refused on every API server (fix round 2,
+	// R-I2): else the old kubelet could register the Node again. A
+	// server's delete is finishEtcd's first step.
 	if isServer(n) {
 		if err := s.finishEtcd(ctx, id, cn.Mesh); err != nil {
 			return err
 		}
+	} else if err := s.deleteRemovedNode(ctx, id); err != nil {
+		return err
 	}
 	s.log.Info("node removed", "node", id, "mode", "cooperative")
 	return nil
 }
 
-// finishEtcd is a cooperative server removal's last step (review M1): the
-// document says it is removed, its Node is gone, its etcd member is gone,
-// then EtcdPending is cleared. k3s itself removes the member: its
+// finishEtcd is a cooperative server removal's last step (review M1): its
+// Node deleted once its name is refused (deleteRemovedNode, fix round 2),
+// the document says it is removed, its Node is gone, its etcd member is
+// gone, then EtcdPending is cleared. k3s itself removes the member: its
 // managed-etcd-controller (pinned v1.37.2+k3s1 pkg/etcd/member_controller.go,
 // nodes.OnRemove → RemovePeer) is a finalizer that holds the Node's delete
 // until the member is removed (refused while it is the only voter); while
@@ -776,6 +803,11 @@ func (s *Server) removeCooperative(ctx context.Context, id string) error {
 // then the nodeagent removes the member if k3s didn't (an absent member is
 // success). A failure leaves EtcdPending: the next try starts here.
 func (s *Server) finishEtcd(ctx context.Context, id, mesh string) error {
+	// A retry after a stop between the record and the delete: the Node is
+	// deleted here (its name in force first), never waited for in vain.
+	if err := s.deleteRemovedNode(ctx, id); err != nil {
+		return err
+	}
 	if err := s.publishAddresses(ctx); err != nil {
 		return err
 	}
@@ -838,4 +870,15 @@ func (s *Server) removeEtcdMember(ctx context.Context, n clusterNode) error {
 		}
 	}
 	return errors.New("no Ready server to remove the etcd member through")
+}
+
+// listedRemoved: whether id is listed removed in the state (true when
+// the state can't be read: removedInForce then reads it again, fail closed).
+func listedRemoved(ctx context.Context, s *Server, id string) bool {
+	st, err := s.load(ctx)
+	if err != nil {
+		return true
+	}
+	_, ok := st.RemovedNames[id]
+	return ok
 }

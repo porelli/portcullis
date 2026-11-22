@@ -102,6 +102,11 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) error {
 	switch {
 	case !serverIDRe.MatchString(req.ServerID):
 		return errPlain(400, "server_id must match ^[a-z][a-z0-9-]{0,30}$")
+	case strings.HasPrefix(req.ServerID, reservedIDPrefix):
+		// The admission probes' node identity (fix round 2, nit 2): a node
+		// of that name, once removed, would make every probe meet the
+		// removed-node refusal instead.
+		return errPlain(400, "server_id %s is reserved (%s… names the admission probes)", req.ServerID, reservedIDPrefix)
 	case req.Role != "server" && req.Role != "agent":
 		return errPlain(400, "role must be server or agent")
 	case !slices.Contains(classes, req.Class):
@@ -195,6 +200,20 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) error {
 		for id, c := range st.Codes {
 			if id != req.ServerID && c.MeshIP == req.MeshIP && c.KeySHA256 != "" {
 				return errPlain(409, "mesh ip %s is used by %s", req.MeshIP, id)
+			}
+		}
+		// A forwarded endpoint already another node's (fix round 2, nit 1:
+		// a likely typo; the handshake would never confirm it anyway).
+		if req.PublicEndpoint != "" {
+			for id, n := range st.Nodes {
+				if id != req.ServerID && !n.Removed && (n.Forward == req.PublicEndpoint || (n.Mesh.Public != nil && *n.Mesh.Public == req.PublicEndpoint)) {
+					return errPlain(409, "public_endpoint %s is already node %s's", req.PublicEndpoint, id)
+				}
+			}
+			for id, c := range st.Codes {
+				if id != req.ServerID && c.KeySHA256 != "" && c.Forward == req.PublicEndpoint {
+					return errPlain(409, "public_endpoint %s is already node %s's", req.PublicEndpoint, id)
+				}
 			}
 		}
 		// A new code for the id voids the older one.
@@ -470,9 +489,9 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 		// cooperatively removed name leaves the removed list only here, in
 		// the mutate that records its certificate — any failure before
 		// (the proof, the report, Sign) leaves it listed. The next document
-		// drops it, and the join's release waits for an admission generation
-		// built after it (one holding this node's addresses), so its kubelet
-		// registers. A revoked name never gets here (no code is issued).
+		// drops it, and the join's release waits until the removed-node
+		// params without it are in force on every API server (pushRemoved),
+		// so its kubelet registers. A revoked name never gets here (no code is issued).
 		if rn := st.RemovedNames[req.ServerID]; rn != nil && !rn.Revoked {
 			delete(st.RemovedNames, req.ServerID)
 		}
@@ -714,6 +733,15 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		s.setJoinState(ctx, id, joinWaitAdmission)
 		s.kick()
+		return errWaitAdmission
+	}
+	// A re-used, cooperatively removed name (fix round 2): its kubelet
+	// registers only once the list that dropped it is in force.
+	if names, err := s.pushRemoved(ctx, 0); err != nil || slices.Contains(names, id) {
+		if err != nil {
+			s.log.Warn("join waits: the removed-node params aren't confirmed", "server_id", id, "err", err.Error())
+		}
+		s.setJoinState(ctx, id, joinWaitAdmission)
 		return errWaitAdmission
 	}
 	serverIP := firstServer(cl, id)

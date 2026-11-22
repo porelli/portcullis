@@ -255,6 +255,11 @@ func (s *Server) reconcile(ctx context.Context) {
 	if err := s.sweepCodes(ctx); err != nil {
 		s.log.Warn("couldn't sweep the join codes", "err", err.Error())
 	}
+	// The removed-node params follow the state (one probe try; a removal
+	// waits for its own confirmation in removedInForce).
+	if _, err := s.pushRemoved(ctx, 0); err != nil {
+		s.log.Warn("removed-node params", "err", err.Error())
+	}
 	s.resumeOps(ctx)
 	s.revokeOldOwnCerts(ctx)
 	if err := s.ensureFrontdoorCert(ctx); err != nil {
