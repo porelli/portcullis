@@ -158,12 +158,12 @@ func runFrontdoor(stderr io.Writer) int {
 	fence := frontdoor.NewFence(kc, ns, pod)
 	w.Fence = fence
 	metrics := frontdoor.NewMetrics()
-	sink := frontdoor.ConfigMapSink{Client: kc, Namespace: ns}
+	sink := frontdoor.ConfigMapSink{Client: kc, Namespace: ns, Leader: pod}
 	r := &frontdoor.Runner{
 		Engine: frontdoor.NewEngine(w.Names()), Writer: w,
 		Source: frontdoor.MTLSSource{NodeadmURL: env("FRONTDOOR_NODEADM_URL", "https://nodeadm.portcullis-nodeadm.svc:8443"),
 			TLSDir: env("FRONTDOOR_TLS_DIR", "/run/portcullis/frontdoor-tls"), Policy: policy},
-		Status: sink, Metrics: metrics, Log: logger, Redact: clean,
+		Status: sink, Metrics: metrics, Log: logger, Redact: clean, Identity: pod,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)

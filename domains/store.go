@@ -65,8 +65,11 @@ type Domain struct {
 	// HAAddrs / HAChanged (high availability, ha.go): each address-set
 	// name's A / AAAA values after the follower's last step, and when it
 	// last changed (one change per name per 60 s).
+	// HAOurs: the addresses the follower wrote per name (the only ones it
+	// ever removes; a foreign record stays).
 	HAAddrs   map[string][]string  `json:"ha_addrs,omitempty"`
 	HAChanged map[string]time.Time `json:"ha_changed,omitempty"`
+	HAOurs    map[string][]string  `json:"ha_ours,omitempty"`
 	// CAAAccountURI: the ACME account URI the live CAA pin was written
 	// with ("" = none written); another current URI makes caa due.
 	CAAAccountURI string `json:"caa_account_uri,omitempty"`

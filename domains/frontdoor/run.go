@@ -25,10 +25,27 @@ type Runner struct {
 	// credentials; the provider is already behind the redacting wrapper).
 	Redact func(string) string
 
+	// Identity is the front door's Lease identity (its pod name), written
+	// as the status's leader.
+	Identity string
+
 	// lastPub is the last address set read (the status keeps it while a
-	// round can't read the provider).
-	lastPub map[string][]string
+	// round can't read the provider); lastCluster / lastSnapAt the last
+	// snapshot (a round without one keeps its probes and sites, marked
+	// stale: never an empty view).
+	lastPub     map[string][]string
+	lastCluster Cluster
+	lastSnapAt  time.Time
+	// lastBody / lastWrite / generation: the status is written when it
+	// changes, else as a heartbeat every StatusHeartbeat (its written_at
+	// tells a follower it is current).
+	lastBody   string
+	lastWrite  time.Time
+	generation int64
 }
+
+// StatusHeartbeat: an unchanged status is written again this often.
+const StatusHeartbeat = 30 * time.Second
 
 // ClusterTimeout bounds the snapshot and the probes of a round (each
 // probe has its own 3 s).
@@ -58,7 +75,10 @@ func (r *Runner) Step(ctx context.Context, now time.Time) []Change {
 		// Fail closed: no snapshot, no decision (and the next round isn't
 		// consecutive with the last one: Engine.Step sees the gap).
 		r.logf("frontdoor: no cluster snapshot, nothing changes this round: %v%s", err, deadline(cctx))
-		r.writeStatus(ctx, r.lastPub, Cluster{}, r.Engine.View())
+		r.writeStatus(ctx, now, r.lastPub, r.lastCluster, r.Engine.View(), false)
+		if r.Metrics != nil {
+			r.Metrics.SnapshotFailed()
+		}
 		return nil
 	}
 	for _, w := range c.Warnings {
@@ -71,7 +91,8 @@ func (r *Runner) Step(ctx context.Context, now time.Time) []Change {
 	pub, err := r.Writer.Published(ctx)
 	if err != nil {
 		r.logf("frontdoor: reading the address set, nothing changes this round: %v", err)
-		r.writeStatus(ctx, r.lastPub, c, r.Engine.View())
+		r.lastCluster, r.lastSnapAt = c, now
+		r.writeStatus(ctx, now, r.lastPub, c, r.Engine.View(), true)
 		return nil
 	}
 	changes := r.Engine.Step(now, Inputs{Lease: r.leading(), Nodes: c.Nodes, Ready: c.Ready, Probes: probes, Published: pub})
@@ -93,7 +114,8 @@ func (r *Runner) Step(ctx context.Context, now time.Time) []Change {
 		done = append(done, ch)
 	}
 	r.lastPub = pub
-	r.writeStatus(ctx, pub, c, r.Engine.View())
+	r.lastCluster, r.lastSnapAt = c, now
+	r.writeStatus(ctx, now, pub, c, r.Engine.View(), true)
 	if r.Metrics != nil {
 		r.Metrics.Update(now, pub, c, r.Engine.View())
 	}
@@ -121,20 +143,40 @@ func applyTo(set []string, c Change) []string {
 	return out
 }
 
-func (r *Runner) writeStatus(ctx context.Context, pub map[string][]string, c Cluster, v View) {
+func (r *Runner) writeStatus(ctx context.Context, now time.Time, pub map[string][]string, c Cluster, v View, snapOK bool) {
 	if r.Status == nil {
 		return
 	}
-	sctx, cancel := context.WithTimeout(ctx, ReadTimeout)
-	defer cancel()
-	ctx = sctx
-	b, err := marshalStatus(BuildStatus(r.leading(), r.Writer.Names(), pub, r.Writer.TTL, c, v))
+	st := BuildStatus(r.leading(), r.Writer.Names(), pub, r.Writer.TTL, c, v)
+	st.Leader, st.SnapshotOK = r.Identity, snapOK
+	// The comparison leaves out the times (snapshot_at moves every round;
+	// written_at and generation are the write's own): they go with the next
+	// change or heartbeat.
+	body, err := marshalStatus(st)
+	if err != nil {
+		r.logf("frontdoor: writing %s: %v", StatusConfigMap, err)
+		return
+	}
+	if string(body) == r.lastBody && now.Sub(r.lastWrite) < StatusHeartbeat {
+		return
+	}
+	if !r.lastSnapAt.IsZero() {
+		at := r.lastSnapAt.UTC()
+		st.SnapshotAt = &at
+	}
+	st.WrittenAt = now.UTC()
+	st.Generation = max(now.UnixMilli(), r.generation+1)
+	b, err := marshalStatus(st)
 	if err == nil {
-		err = r.Status.Write(ctx, b)
+		sctx, cancel := context.WithTimeout(ctx, ReadTimeout)
+		err = r.Status.Write(sctx, b)
+		cancel()
 	}
 	if err != nil {
 		r.logf("frontdoor: writing %s: %v", StatusConfigMap, err)
+		return
 	}
+	r.lastBody, r.lastWrite, r.generation = string(body), now, st.Generation
 }
 
 // Run steps every 10 s until ctx ends.

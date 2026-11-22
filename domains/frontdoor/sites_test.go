@@ -2,8 +2,10 @@ package frontdoor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -12,7 +14,10 @@ import (
 	"time"
 
 	"github.com/libdns/libdns"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -264,9 +269,10 @@ func TestWholeSiteDownOneNamePer60s(t *testing.T) {
 	}
 }
 
-// TestFrontdoorCrossSiteVectors: the cross-site cases of
-// frontdoor_vectors.json (the shared file, byte-copied to the Hub) run
-// and pass; there are cases for each R10/R11 rule.
+// TestFrontdoorCrossSiteVectors: the plan's named entry point for the
+// cross-site cases of frontdoor_vectors.json (the shared file, byte-copied
+// to the Hub). TestFrontdoorVectors (Task 27) already replays every case;
+// this one adds only the floor of cross-site cases (review nit2).
 func TestFrontdoorCrossSiteVectors(t *testing.T) {
 	n := 0
 	for _, v := range loadVectors(t) {
@@ -384,6 +390,140 @@ func gauge(t *testing.T, m *Metrics, metric, site string) float64 {
 					return mt.GetGauge().GetValue()
 				}
 			}
+		}
+	}
+	return -1
+}
+
+// flakySource fails Cluster while fail is set.
+type flakySource struct {
+	*staticSource
+	fail bool
+}
+
+func (f *flakySource) Cluster(ctx context.Context) (Cluster, error) {
+	if f.fail {
+		return Cluster{}, errors.New("nodeadm unreachable")
+	}
+	return f.staticSource.Cluster(ctx)
+}
+
+// TestNoSnapshotKeepsSites (review M8): a round without nodeadm's snapshot
+// keeps the last snapshot's sites and probes, says snapshot_ok false with
+// the snapshot's time, and marks the site gauges stale
+// (portcullis_frontdoor_snapshot_ok 0); never sites: {}.
+func TestNoSnapshotKeepsSites(t *testing.T) {
+	p := newFake(t, []string{"198.51.100.1", "198.51.100.2", "198.51.100.3"})
+	leading := true
+	w := &Writer{Domain: "example.org", Zone: "example.org.", P: p, TTL: 60 * time.Second, Fence: testFence{&leading}, Policy: docs}
+	src := &flakySource{staticSource: &staticSource{ready: map[string]bool{"n1": true, "n2": true, "n3": true}}}
+	sink := &memSink{}
+	m := NewMetrics()
+	r := &Runner{Engine: NewEngine(w.Names()), Writer: w, Source: src, Status: sink, Metrics: m, Identity: "fd-1"}
+	r.Step(context.Background(), t0)
+	src.fail = true
+	r.Step(context.Background(), t0.Add(Round))
+	if len(sink.docs) != 2 {
+		t.Fatalf("%d status writes", len(sink.docs))
+	}
+	var first, second Status
+	if err := json.Unmarshal([]byte(sink.docs[0]), &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(sink.docs[1]), &second); err != nil {
+		t.Fatal(err)
+	}
+	if !first.SnapshotOK || second.SnapshotOK || second.SnapshotAt == nil || !second.SnapshotAt.Equal(t0) {
+		t.Errorf("snapshot_ok %v → %v, snapshot_at %v", first.SnapshotOK, second.SnapshotOK, second.SnapshotAt)
+	}
+	if len(second.Sites) == 0 || !reflect.DeepEqual(first.Sites, second.Sites) || len(second.Probes) != 3 {
+		t.Errorf("sites %v → %v, probes %v", first.Sites, second.Sites, second.Probes)
+	}
+	if second.Leader != "fd-1" || second.Generation <= first.Generation || !second.WrittenAt.Equal(t0.Add(Round)) {
+		t.Errorf("leader %q, generation %d → %d, written_at %v", second.Leader, first.Generation, second.Generation, second.WrittenAt)
+	}
+	if g := gaugeNamed(t, m, "portcullis_frontdoor_snapshot_ok"); g != 0 {
+		t.Errorf("snapshot_ok gauge %v after a failed snapshot", g)
+	}
+	if g := gauge(t, m, "portcullis_frontdoor_site_healthy", "main"); g != 1 {
+		t.Errorf("site gauge %v: kept (stale) while the snapshot is missing", g)
+	}
+	src.fail = false
+	r.Step(context.Background(), t0.Add(2*Round))
+	if g := gaugeNamed(t, m, "portcullis_frontdoor_snapshot_ok"); g != 1 {
+		t.Errorf("snapshot_ok gauge %v after a good round", g)
+	}
+}
+
+// TestStatusHeartbeat: an unchanged status is written once, then again
+// only after StatusHeartbeat (its written_at and generation move); the
+// ConfigMap gets the leader key next to status.json.
+func TestStatusHeartbeat(t *testing.T) {
+	p := newFake(t, []string{"198.51.100.1", "198.51.100.2", "198.51.100.3"})
+	leading := true
+	w := &Writer{Domain: "example.org", Zone: "example.org.", P: p, TTL: 60 * time.Second, Fence: testFence{&leading}, Policy: docs}
+	cs := fake.NewClientset(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: StatusConfigMap, Namespace: testNS}})
+	var writes int
+	cs.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) { writes++; return false, nil, nil })
+	sink := ConfigMapSink{Client: cs, Namespace: testNS, Leader: "fd-1"}
+	r := &Runner{Engine: NewEngine(w.Names()), Writer: w, Source: &staticSource{ready: map[string]bool{"n1": true, "n2": true, "n3": true}}, Status: sink, Identity: "fd-1"}
+	for i := range 3 { // 0, 10, 20 s: one write
+		r.Step(context.Background(), t0.Add(time.Duration(i)*Round))
+	}
+	if writes != 1 {
+		t.Fatalf("%d writes in 20 s of unchanged rounds", writes)
+	}
+	r.Step(context.Background(), t0.Add(StatusHeartbeat))
+	if writes != 2 {
+		t.Fatalf("%d writes after the heartbeat", writes)
+	}
+	cm, _ := cs.CoreV1().ConfigMaps(testNS).Get(context.Background(), StatusConfigMap, metav1.GetOptions{})
+	var st Status
+	if err := json.Unmarshal([]byte(cm.Data["status.json"]), &st); err != nil || cm.Data[StatusLeaderKey] != "fd-1" || st.Leader != "fd-1" || !st.WrittenAt.Equal(t0.Add(StatusHeartbeat)) {
+		t.Errorf("configmap %v: %+v %v", cm.Data[StatusLeaderKey], st, err)
+	}
+}
+
+// TestSiteSeriesGoAway (review M7): a site that leaves the snapshot loses
+// its series.
+func TestSiteSeriesGoAway(t *testing.T) {
+	m := NewMetrics()
+	two := Cluster{Nodes: map[string]Node{"n1": {Site: "main", Ingress: true}, "e1": {Site: "edge", Ingress: true}}}
+	m.Update(t0, nil, two, View{Judgements: map[string]Judgement{"n1": {}, "e1": {}}})
+	if gauge(t, m, "portcullis_frontdoor_site_healthy", "edge") != 1 {
+		t.Fatal("no edge series")
+	}
+	m.Update(t0, nil, Cluster{Nodes: map[string]Node{"n1": {Site: "main", Ingress: true}}}, View{Judgements: map[string]Judgement{"n1": {}}})
+	if g := gauge(t, m, "portcullis_frontdoor_site_healthy", "edge"); g != -1 {
+		t.Errorf("edge's site_healthy stayed (%v)", g)
+	}
+	if g := gauge(t, m, "portcullis_frontdoor_blind_probers", "edge"); g != -1 {
+		t.Errorf("edge's blind_probers stayed (%v)", g)
+	}
+}
+
+// TestSiteAddressesArePublicOnly (review nit1): sites.<s>.addresses come
+// from the snapshot's public addresses, which ParseSnapshot has already
+// filtered through the policy: a private address on record never shows.
+func TestSiteAddressesArePublicOnly(t *testing.T) {
+	c, err := ParseSnapshot([]byte(strings.Replace(snap, `"public": ["198.51.100.7"]`, `"public": ["198.51.100.7", "10.0.0.7"]`, 1)), snapAt, docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := BuildSites(c, View{})["main"].Addresses; slices.Contains(a, "10.0.0.7") || !slices.Contains(a, "198.51.100.7") {
+		t.Errorf("main's addresses %v", a)
+	}
+}
+
+func gaugeNamed(t *testing.T, m *Metrics, metric string) float64 {
+	t.Helper()
+	mfs, err := m.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == metric && len(mf.GetMetric()) == 1 {
+			return mf.GetMetric()[0].GetGauge().GetValue()
 		}
 	}
 	return -1

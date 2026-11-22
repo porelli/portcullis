@@ -81,7 +81,11 @@ type Config struct {
 	// FrontdoorStatusFile; only addresses AddrPolicy admits are written.
 	HA                  bool
 	FrontdoorStatusFile string
-	AddrPolicy          frontdoor.AddrPolicy
+	// ClusterAddressesFile: portcullis-cluster-addresses' addresses.json
+	// (nodeadm's, mounted read-only): every followed address must be an
+	// active node's public address.
+	ClusterAddressesFile string
+	AddrPolicy           frontdoor.AddrPolicy
 	// ACMEHTTPClient overrides lego's HTTP client (tests: Pebble's TLS).
 	ACMEHTTPClient *http.Client
 	Now            func() time.Time
@@ -115,8 +119,14 @@ type Service struct {
 	// builds, so a shutdown ends them.
 	runCtx context.Context
 
-	// ha: the front door's sets (HA only; guarded by mu), haRefresh.
-	ha haSets
+	// ha: the front door's document as judged last (HA only; guarded by
+	// mu), haRefresh; haGood the last good one, haSeen the highest
+	// generation seen per leader, haNoted the residual notices logged per
+	// domain.
+	ha      haSets
+	haGood  haSets
+	haSeen  map[string]int64
+	haNoted map[string]string
 
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
@@ -168,7 +178,7 @@ func NewService(cfg Config, store *Store) (*Service, error) {
 		}
 	}
 	return &Service{cfg: cfg, store: store, findZone: legoZoneFinder, doc: doc, busy: map[string]*job{}, kick: make(chan struct{}, 1),
-		plans: map[string]cachedPlan{}}, nil
+		plans: map[string]cachedPlan{}, haSeen: map[string]int64{}, haNoted: map[string]string{}}, nil
 }
 
 // job is one running attempt for a domain. rec (a one-slot semaphore) is
@@ -502,6 +512,10 @@ func copyDomain(d *Domain) *Domain {
 		c.HAAddrs[n] = append([]string(nil), as...)
 	}
 	c.HAChanged = maps.Clone(d.HAChanged)
+	c.HAOurs = make(map[string][]string, len(d.HAOurs))
+	for n, as := range d.HAOurs {
+		c.HAOurs[n] = append([]string(nil), as...)
+	}
 	c.Records = make(map[string][]RecordRef, len(d.Records))
 	for z, refs := range d.Records {
 		c.Records[z] = append([]RecordRef(nil), refs...)
@@ -853,7 +867,7 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		// The cached plan predates this step's writes (records, other
 		// zones' CAA, signing): dropped (the next read rebuilds it; a
 		// successful step caches a fresh one below).
-		if len(sets) > 0 || len(otherZones) > 0 || snap.SignRequested {
+		if len(sets) > 0 || len(otherZones) > 0 || snap.SignRequested || haStep {
 			s.mu.Lock()
 			delete(s.plans, name)
 			s.mu.Unlock()
@@ -878,12 +892,17 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 				if err == nil && contains(sets, dnsplan.SetAddress) {
 					d.AppliedIPv4, d.AppliedIPv6 = addrString(s.cfg.IPv4), addrString(s.cfg.IPv6)
 				}
+				// An early follower error (nil maps) keeps what was stored
+				// (review M1): the 60 s clock and the published set.
 				if haStep && har.addrs != nil {
-					d.HAAddrs, d.HAChanged = har.addrs, har.changed
+					d.HAAddrs, d.HAChanged, d.HAOurs = har.addrs, har.changed, har.ours
 				}
 			})
 		}
 		j.unlock()
+		if haStep && har.addrs != nil {
+			s.haLogNotices(name)
+		}
 		if err != nil {
 			s.update(name, gen, func(d *Domain) { d.RecordsOK = false })
 			fail(err)
@@ -1251,7 +1270,7 @@ func (s *Service) buildMainPlan(ctx context.Context) dnsplan.Plan {
 		AccountURI: s.cfg.MainAccountURI, IODEF: s.cfg.CAAIODEF, Main: true}
 	if s.cfg.HA {
 		// The main domain's set is the front door's (it writes it).
-		sp.HA = s.haSpecAddrs()
+		sp.HA = s.haSpecAddrs(nil)
 	}
 	if s.cfg.MailOn {
 		sp.MailHost = s.cfg.MailHostname

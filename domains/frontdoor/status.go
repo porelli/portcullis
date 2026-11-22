@@ -15,10 +15,24 @@ import (
 type Status struct {
 	V int `json:"v"`
 	// State is "leading" or "standing by" (§20.5).
-	State  string                 `json:"state"`
-	Names  map[string]NameStatus  `json:"names"`
-	Probes map[string]ProbeStatus `json:"probes"`
-	Sites  map[string]SiteStatus  `json:"sites"`
+	State string `json:"state"`
+	// Leader is the writing front door's Lease identity (its pod name):
+	// admission lets the front door's ServiceAccount write the document
+	// only with leader = its own pod (kube/admission/policies.yaml
+	// portcullis-frontdoor-status), so a follower can tell who wrote it.
+	Leader string `json:"leader"`
+	// Generation grows with every write (Unix milliseconds of the write,
+	// strictly increasing in one front door); WrittenAt is the write time:
+	// a follower refuses a document older than it has seen, or stale.
+	Generation int64     `json:"generation"`
+	WrittenAt  time.Time `json:"written_at"`
+	// SnapshotOK: the round read nodeadm's snapshot; false keeps the last
+	// snapshot's probes and sites (SnapshotAt), never an empty view.
+	SnapshotOK bool                   `json:"snapshot_ok"`
+	SnapshotAt *time.Time             `json:"snapshot_at"`
+	Names      map[string]NameStatus  `json:"names"`
+	Probes     map[string]ProbeStatus `json:"probes"`
+	Sites      map[string]SiteStatus  `json:"sites"`
 }
 
 // NameStatus is one name's published set.
@@ -85,11 +99,16 @@ type StatusSink interface {
 
 // ConfigMapSink writes status.json into the ConfigMap frontdoor-status
 // (created empty by the chart; the front door's Role may get and update
-// only it).
+// only it), with the key leader = Leader (the admission policy compares
+// it with the writing pod, and the follower with status.json's leader).
 type ConfigMapSink struct {
 	Client    kubernetes.Interface
 	Namespace string
+	Leader    string
 }
+
+// StatusLeaderKey is the ConfigMap key naming the writer.
+const StatusLeaderKey = "leader"
 
 // StatusConfigMap is the status ConfigMap's name.
 const StatusConfigMap = "frontdoor-status"
@@ -100,13 +119,14 @@ func (s ConfigMapSink) Write(ctx context.Context, doc []byte) error {
 	if err != nil {
 		return err
 	}
-	if cm.Data["status.json"] == string(doc) {
+	if cm.Data["status.json"] == string(doc) && cm.Data[StatusLeaderKey] == s.Leader {
 		return nil
 	}
 	if cm.Data == nil {
 		cm.Data = map[string]string{}
 	}
 	cm.Data["status.json"] = string(doc)
+	cm.Data[StatusLeaderKey] = s.Leader
 	_, err = cms.Update(ctx, cm, metav1.UpdateOptions{})
 	return err
 }
@@ -147,6 +167,7 @@ type Metrics struct {
 	unhealthy *prometheus.GaugeVec
 	siteOK    *prometheus.GaugeVec
 	blind     *prometheus.GaugeVec
+	snapOK    prometheus.Gauge
 }
 
 // NewMetrics registers portcullis_frontdoor_addresses{name},
@@ -164,12 +185,19 @@ func NewMetrics() *Metrics {
 		blind: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "portcullis_frontdoor_blind_probers",
 			Help: "Probers of the site whose last counted round was blind (their own uplink lost)."}, []string{"site"}),
 	}
-	m.Registry.MustRegister(m.addresses, m.unhealthy, m.siteOK, m.blind)
+	m.snapOK = prometheus.NewGauge(prometheus.GaugeOpts{Name: "portcullis_frontdoor_snapshot_ok",
+		Help: "1 when the last round read nodeadm's snapshot; 0 = the site series are the last good round's (stale)."})
+	m.Registry.MustRegister(m.addresses, m.unhealthy, m.siteOK, m.blind, m.snapOK)
 	return m
 }
 
+// SnapshotFailed marks a round without nodeadm's snapshot: the other
+// series keep the last good round's values, stale while this is 0.
+func (m *Metrics) SnapshotFailed() { m.snapOK.Set(0) }
+
 // Update sets the series from a round.
 func (m *Metrics) Update(now time.Time, published map[string][]string, c Cluster, v View) {
+	m.snapOK.Set(1)
 	owner := map[string]string{}
 	for id, n := range c.Nodes {
 		for _, a := range n.Public {

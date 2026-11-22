@@ -329,6 +329,7 @@ func run() error {
 		}
 		cfg.HA, cfg.AddrPolicy = true, pol
 		cfg.FrontdoorStatusFile = env("DOMAINS_FRONTDOOR_STATUS", "/run/portcullis/frontdoor-status/status.json")
+		cfg.ClusterAddressesFile = env("DOMAINS_CLUSTER_ADDRESSES", "/run/portcullis/cluster-addresses/addresses.json")
 	case "", "off":
 	default:
 		return fmt.Errorf("PORTCULLIS_HA=%q: on or off", v)

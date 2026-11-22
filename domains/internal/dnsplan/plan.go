@@ -158,7 +158,12 @@ type Spec struct {
 
 // HAAddrs are the front door's addresses (frontdoor-status): Apex for
 // <d> (and any other owned name, e.g. a mail host), Wild for *.<d>.
-type HAAddrs struct{ Apex, Wild []netip.Addr }
+// Notices are the follower's warnings (its status problem, records it
+// keeps): one Warning item each, never written.
+type HAAddrs struct {
+	Apex, Wild []netip.Addr
+	Notices    []string
+}
 
 // addrsFor are the wanted addresses at owned name n of d (FQDN or bare
 // alike): HA's per name, else the server's IPv4 / IPv6.
@@ -566,6 +571,12 @@ func cloudflareAddr(s string) bool {
 func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func(string) []libdns.RR) []Item {
 	s := in.Spec
 	var out []Item
+	if s.HA != nil {
+		for _, note := range s.HA.Notices {
+			out = append(out, Item{Set: SetAddress, Name: bare(d), Type: "", Want: []string{}, Live: []string{}, Status: StatusUnknown,
+				Severity: SevWarning, Fix: FixManual, Steps: []string{note}})
+		}
+	}
 	for _, n := range addressNames(s, d) {
 		qname := n
 		if n == "*."+d {

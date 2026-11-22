@@ -351,7 +351,7 @@ func (s *Service) spec(d *Domain, accountURI string) dnsplan.Spec {
 	sp := dnsplan.Spec{Name: d.Name, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
 		AccountURI: accountURI, IODEF: s.cfg.CAAIODEF, NoMail: contains(d.Sets, dnsplan.SetNoMail), Owned: refsToPlan(owned)}
 	if s.cfg.HA {
-		sp.HA = s.haSpecAddrs()
+		sp.HA = s.haSpecAddrs(d)
 	}
 	if contains(d.Sets, dnsplan.SetMail) {
 		sp.Mail = d.MailWanted
