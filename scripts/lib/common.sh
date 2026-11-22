@@ -269,6 +269,8 @@ cli_lock() {
     # The admission params' swap (kube params-sync, its 30 s timer, and
     # kube check) runs one at a time with up / upgrade (review I3).
     kube) case "$sub" in params-sync|check) ;; *) return 0 ;; esac ;;
+    # ha enable runs up and the CAA account switch: never alongside them.
+    ha) case "$sub" in enable) ;; *) return 0 ;; esac ;;
     *) return 0 ;;
   esac
   [ -z "${PORTCULLIS_LOCKED:-}" ] || return 0

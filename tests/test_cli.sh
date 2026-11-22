@@ -86,9 +86,9 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 60 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 60
-# plan Task 30: the cluster-node commands (`ha` comes with Task 31).
-for c in "node add" "node list" "node remove" "node revoke"; do
+expect_eq "help lists 62 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 62
+# plan Tasks 30 / 31 (Task 30 review M6): the cluster-node and HA commands.
+for c in "node add" "node list" "node remove" "node revoke" "ha status" "ha enable"; do
   case "$HELP" in *"  $c  "*) t_pass "help lists $c" ;; *) t_fail "help misses $c" ;; esac
 done
 while IFS= read -r c; do
@@ -119,7 +119,7 @@ expect_eq "every --help works with no engine: the engine was never asked" "$(cat
 run init --help
 case "$OUT" in *"--runtime docker|podman"*"CONTAINER_RUNTIME"*"never switched"*) t_pass "init --help documents --runtime" ;; *) t_fail "init --help lacks --runtime" ;; esac
 
-for g in vault pki keycloak oidc dns cert config signin vpn mail node; do
+for g in vault pki keycloak oidc dns cert config signin vpn mail node ha; do
   run "$g";        expect_eq "'$g' without subcommand exits 2" "$RC" 2
   run "$g" --help; expect_eq "'$g --help' exits 0" "$RC" 0
   run "$g" bogus;  expect_eq "'$g bogus' exits 2" "$RC" 2
@@ -215,6 +215,11 @@ node remove x;y|invalid node id
 node remove n4 n5|unexpected argument: n5
 node revoke|expected <id>
 node revoke n4 --force|unknown option: --force
+ha frob|unknown subcommand: frob
+ha status now|unexpected argument: now
+ha status --yes|unknown option: --yes
+ha enable --force|unknown option: --force
+ha enable --json|unknown option: --json
 signin reset-core|no terminal to confirm on: pass --yes
 vpn init extra|unexpected argument: extra
 vpn init --builtin|--builtin needs a value

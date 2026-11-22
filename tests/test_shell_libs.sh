@@ -8143,6 +8143,218 @@ expect_eq "_kube_forward's kubectl ends with the CLI (no orphan)" "$OUT" 0
 pkill -f "pf-stub-sleep-471[1]" 2>/dev/null || true
 rm -rf "$PFB"
 
+# ── ./portcullis ha status | enable (plan Task 31) ──
+# A kubectl stub as the cluster: the Hub pod hub-abc answers `hub ha
+# checklist` from $HE/view.json; PVCs, pods and the writers' replicas are
+# files under $HE/k; every call's argv goes to calls, writes to order.
+HE="$WORK/haenable"
+rm -rf "$HE"; mkdir -p "$HE/bin" "$HE/root/secrets/kube" "$HE/k"
+printf 'CONTAINER_RUNTIME=kubernetes\nPORTCULLIS_KUBE_CONTEXT=ci\nPORTCULLIS_NAMESPACE=portcullis\nPORTCULLIS_DOMAIN=ha.example.org\nDNS_PROVIDER=cloudflare\nCLOUDFLARE_API_TOKEN=CF-SECRET-TOKEN-9\n' > "$HE/root/.env"
+cat > "$HE/bin/kubectl" <<'KSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HE/calls"
+a="$*"; a="${a#--context ci }"; a="${a#-n portcullis }"
+set -f; set -- $a
+case "$a" in
+  "get lease portcullis-hub -o jsonpath={.spec.holderIdentity}") printf 'hub-abc' ;;
+  "get pod hub-abc -o name") echo pod/hub-abc ;;
+  "exec pod/hub-abc -c hub -- hub ha checklist")
+    [ -s "$HE/view.json" ] || { echo "the Hub isn't running" >&2; echo "command terminated with exit code 1" >&2; exit 1; }
+    cat "$HE/view.json" ;;
+  "get configmap portcullis-vault-shrink -o json") echo 'Error from server (NotFound): configmaps "portcullis-vault-shrink" not found' >&2; exit 1 ;;
+  "get pvc "*" -o name") [ -e "$HE/k/pvc-$3" ] && echo "persistentvolumeclaim/$3" || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
+  "get pvc "*" -o json") [ -e "$HE/k/pvc-$3" ] || exit 1
+    echo '{"metadata":{"name":"'"$3"'","annotations":{"portcullis.io/uid":"10001","portcullis.io/gid":"10001","portcullis.io/mode":"0750","other":"x"}},"spec":{"resources":{"requests":{"storage":"1Gi"}}}}' ;;
+  "get pvc "*) [ "$#" = 3 ] && [ -e "$HE/k/pvc-$3" ] || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
+  "get deployment "*" -o name") [ -e "$HE/k/deploy-$3" ] && echo "deployment.apps/$3" || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
+  "get deployment "*" -o jsonpath={.spec.replicas}") [ -e "$HE/k/deploy-$3" ] || exit 1; cat "$HE/k/deploy-$3" ;;
+  "scale deployment "*) d="$3" r="${4#--replicas=}"; echo "$r" > "$HE/k/deploy-$d"; echo "scale $d $r" >> "$HE/order" ;;
+  "wait --for=delete pod -l portcullis.io/component="*) echo "gone ${5#portcullis.io/component=}" >> "$HE/order" ;;
+  "get pods -l portcullis.io/component="*" -o json") echo '{"items":[]}' ;;
+  "create -f -")
+    j="$(cat)"; k="$(printf '%s' "$j" | jq -r .kind)" n="$(printf '%s' "$j" | jq -r .metadata.name)"
+    case "$k" in
+      Pod) c="$(printf '%s' "$j" | jq -r '.spec.volumes[] | select(.name == "vol") | .persistentVolumeClaim.claimName')"
+        ro="$(printf '%s' "$j" | jq -r '.spec.volumes[] | select(.name == "vol") | .persistentVolumeClaim.readOnly')"
+        echo "$c" > "$HE/k/pod-$n"; echo "create pod $c ro=$ro" >> "$HE/order" ;;
+      PersistentVolumeClaim) printf '%s' "$j" > "$HE/k/pvc-$n"; echo "create pvc $n" >> "$HE/order" ;;
+    esac ;;
+  "wait --for=condition=Ready pod/"*) ;;
+  "delete pod "*) echo "delete pod $(cat "$HE/k/pod-$3" 2>/dev/null)" >> "$HE/order"; rm -f "$HE/k/pod-$3" ;;
+  "wait --for=delete pod/"*) ;;
+  "exec "*" -- find /vol "*) echo "empty $(cat "$HE/k/pod-$2")" >> "$HE/order" ;;
+  "exec "*" -- sh -c cd /vol && find . -mindepth 1 -maxdepth 1"*) echo 2 ;;
+  "exec "*" -- tar -cf - -C /vol -T /tmp/list") echo "tar from $(cat "$HE/k/pod-$2")" >> "$HE/order"; echo TARDATA ;;
+  "exec -i "*" -- tar -xpf - -C /vol") cat >/dev/null; echo "untar into $(cat "$HE/k/pod-$3")" >> "$HE/order"; [ ! -e "$HE/fault-tar" ] ;;
+  "exec "*" -- sh -c cd /vol || exit 3"*)
+    c="$(cat "$HE/k/pod-$2")"
+    if [ -e "$HE/fault-manifest" ] && [ "${c%-r}" != "$c" ]; then printf '%064d\n' 2; else printf '%064d\n' 1; fi ;;
+  "apply --server-side "*) cat > "$HE/k/applied.$(date +%s%N)"; echo "apply" >> "$HE/order" ;;
+  "get secret frontdoor-cert -o json") cat "$HE/k/frontdoor-cert.json" 2>/dev/null || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
+  "exec "*" -- cat /vol/acme.json") cat "$HE/acme.json" ;;
+  *) echo "unexpected kubectl $*" >&2; exit 98 ;;
+esac
+KSTUB
+chmod +x "$HE/bin/kubectl"
+he_green='{"experimental":true,"enabled":false,"checklist":[{"id":"nodes","ok":true,"text":""},{"id":"watchdog","ok":true,"text":""}],"guarantee":"Degraded: one more failure may lose the last writes","nodes":[{"name":"n1","role":"server","class":"cloud","site":"main","ready":true,"fencing":false,"n_minus_1":"green"}],"quorum":{"etcd":{"voters":1,"healthy":1},"vault":{"voters":1,"healthy":1},"sentinel":{"voters":0,"healthy":0}},"frontdoor":{"state":"","error":""},"warnings":[]}'
+# hacli <stdin> <setup code> <args…> — cmd_ha in the CLI's libraries.
+hacli() {
+  local in="$1" setup="$2"; shift 2
+  rm -f "$HE/calls" "$HE/order"
+  RC=0
+  printf '%s' "$in" | (unset CONTAINER_RUNTIME _RT_CHECKED; export PATH="$HE/bin:$PATH" PORTCULLIS_ROOT="$HE/root" HE HA_POLL=0
+    bash -c 'cd "$PORTCULLIS_ROOT"; for l in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" "$1/portcullis"); do . "$1/scripts/lib/$l.sh"; done
+      kube_runtime_check() { :; }; runtime_check() { :; }; export HA_CLI_PID=$$; eval "$2"; shift 2; cmd_ha "$@"' _ "$HERE/.." "$setup" "$@") >"$HE/out" 2>"$HE/err" || RC=$?
+  OUT="$(cat "$HE/out")"; ERR="$(cat "$HE/err")"
+}
+he_writes() { grep -cE ' (apply|create|patch|scale|delete|annotate|label|replace|run|rollout|set|edit|cp) ' "$HE/calls" 2>/dev/null || true; }
+
+# Docker: refused before anything.
+printf 'CONTAINER_RUNTIME=docker\nPORTCULLIS_DOMAIN=ha.example.org\n' > "$HE/root.docker.env"
+cp "$HE/root/.env" "$HE/root.kube.env"; cp "$HE/root.docker.env" "$HE/root/.env"
+hacli "" "" enable --yes
+case "$RC:$ERR" in "1:"*"high availability needs Kubernetes"*) t_pass "ha enable: refuses on docker: 'high availability needs Kubernetes'" ;; *) t_fail "ha enable docker: $RC $ERR" ;; esac
+expect_eq "ha enable on docker: no cluster call, no record" "$( (cat "$HE/calls" 2>/dev/null || true) | grep -c .):$(ls "$HE/root/secrets/kube")" "0:"
+hacli "" "" status
+case "$RC:$ERR" in "1:"*"high availability needs Kubernetes"*) t_pass "ha status: refuses on docker" ;; *) t_fail "ha status docker: $RC $ERR" ;; esac
+cp "$HE/root.kube.env" "$HE/root/.env"
+
+# A red checklist (the Hub's, and the CLI's own) changes nothing.
+printf '%s' "$he_green" | jq -c '.checklist[1] = {id: "watchdog", ok: false, text: "node n3 has no watchdog: fencing can'"'"'t be confirmed"}' > "$HE/view.json"
+hacli "" "" enable --yes
+case "$RC:$ERR" in "1:"*"Watchdogs (fencing): node n3 has no watchdog"*"1 checklist item(s) not green: nothing changed"*) t_pass "ha enable: a red checklist item refuses, naming it" ;; *) t_fail "ha enable red: $RC $ERR" ;; esac
+expect_eq "ha enable: a red checklist changes nothing (no kubectl write recorded, no record)" "$(he_writes):$(ls "$HE/root/secrets/kube")" "0:"
+printf '%s' "$he_green" > "$HE/view.json"
+sed -i.bak '/^CLOUDFLARE_API_TOKEN=/d' "$HE/root/.env"
+hacli "" "" enable --yes
+case "$RC:$ERR" in "1:"*"DNS provider (DNS_PROVIDER=cloudflare) must be automated with its credentials"*"nothing changed"*) t_pass "ha enable: the front door's DNS credentials missing → refused" ;; *) t_fail "ha enable no creds: $RC $ERR" ;; esac
+expect_eq "ha enable: the CLI's red item changes nothing either" "$(he_writes):$(ls "$HE/root/secrets/kube")" "0:"
+cp "$HE/root.kube.env" "$HE/root/.env"
+rm -f "$HE/view.json"
+hacli "" "" enable --yes
+case "$RC:$ERR" in "1:"*"can't read the Hub's HA checklist (the Hub isn't running): nothing changed"*) t_pass "ha enable: an unreadable checklist refuses" ;; *) t_fail "ha enable no hub: $RC $ERR" ;; esac
+expect_eq "ha enable: an unreadable checklist changes nothing" "$(he_writes):$(ls "$HE/root/secrets/kube")" "0:"
+printf '%s' "$he_green" > "$HE/view.json"
+hacli "" "" enable
+case "$RC:$ERR" in "2:"*"no terminal to confirm on: pass --yes"*) t_pass "ha enable: no terminal and no --yes → usage error" ;; *) t_fail "ha enable no tty: $RC $ERR" ;; esac
+
+# test_ha_enable_resumes_each_step: every step stubbed (logging its name);
+# a fault after step n's work (before its record) → a re-run starts at n,
+# the recorded steps 1..n-1 are never run again; after a full run nothing
+# runs again.
+HE_STUBS='for s in $HA_ENABLE_STEPS; do eval "ha_enable_step_$s() { echo $s >> \"\$HE/ran\"; [ \"\${HE_FAULT:-}\" != $s ] || fail \"fault in $s\"; }"; done'
+he_resume_ok=1
+for f in checklist confirm installs volumes switch postgres vault sessions frontdoor status; do
+  rm -f "$HE/root/secrets/kube/ha-enable.json" "$HE/ran"
+  hacli "" "$HE_STUBS; export HE_FAULT=$f" enable --yes
+  first="$(tr '\n' ' ' < "$HE/ran")"
+  n="$(jq -r '.done | length' "$HE/root/secrets/kube/ha-enable.json" 2>/dev/null || echo 0)"
+  rm -f "$HE/ran"
+  hacli "" "$HE_STUBS" enable --yes
+  second="$(tr '\n' ' ' < "$HE/ran")"
+  want_n=$(( $(printf '%s\n' checklist confirm installs volumes switch postgres vault sessions frontdoor status | grep -n "^$f\$" | cut -d: -f1) - 1 ))
+  case "$first" in *"$f ") ;; *) he_resume_ok=0; t_fail "fault at $f: first run ran '$first'" ;; esac
+  [ "$n" = "$want_n" ] || { he_resume_ok=0; t_fail "fault at $f: $n steps recorded, want $want_n"; }
+  case "$second" in "$f "*) ;; *) he_resume_ok=0; t_fail "fault at $f: the re-run began with '$second'" ;; esac
+  expect_eq "ha enable: after a fault at $f the re-run runs each remaining step once" "$(printf '%s' "$second" | wc -w | tr -d ' ')" $((10 - want_n))
+done
+[ "$he_resume_ok" = 0 ] || t_pass "test_ha_enable_resumes_each_step: a fault at step n → the re-run starts at n, steps 1..n-1 not repeated"
+expect_eq "ha enable: the record names every step in order with its number" "$(jq -r '[.done[] | "\(.n):\(.step)"] | join(" ")' "$HE/root/secrets/kube/ha-enable.json")" \
+  "1:checklist 2:confirm 3:installs 4:volumes 5:switch 6:postgres 7:vault 8:sessions 9:frontdoor 10:status"
+expect_eq "ha enable: the record is 0600" "$(stat -c %a "$HE/root/secrets/kube/ha-enable.json" 2>/dev/null || stat -f %Lp "$HE/root/secrets/kube/ha-enable.json")" 600
+rm -f "$HE/ran"
+hacli "" "$HE_STUBS" enable --yes
+case "$RC:$OUT$ERR" in "0:"*"every step of ha enable is done"*) t_pass "ha enable: done → nothing runs again" ;; *) t_fail "ha enable done: $RC $ERR" ;; esac
+expect_eq "ha enable: done → no step ran" "$(cat "$HE/ran" 2>/dev/null)" ""
+
+# Stop (SIGINT) between steps: the record holds the finished steps (valid
+# JSON), the CLI says how to resume, the re-run resumes there.
+rm -f "$HE/root/secrets/kube/ha-enable.json" "$HE/ran"
+hacli "" "$HE_STUBS; ha_enable_step_installs() { echo installs >> \"\$HE/ran\"; kill -INT \$HA_CLI_PID; sleep 1; echo after >> \"\$HE/ran\"; }" enable --yes
+case "$RC:$ERR" in "130:"*"ha enable stopped"*"resume at step 3 (installs)"*) t_pass "ha enable: Stop (SIGINT) between steps leaves a resumable record" ;; *) t_fail "ha enable SIGINT: $RC $ERR" ;; esac
+expect_eq "ha enable: after SIGINT the record is whole (steps 1-2), nothing past the stop ran" \
+  "$(jq -r '[.done[].step] | join(" ")' "$HE/root/secrets/kube/ha-enable.json"):$(grep -c after "$HE/ran")" "checklist confirm:0"
+rm -f "$HE/ran"
+hacli "" "$HE_STUBS" enable --yes
+expect_eq "ha enable: after SIGINT the re-run resumes at step 3" "$RC:$(head -n1 "$HE/ran")" "0:installs"
+
+# ha status mid-way: the record's progress; the Hub stopped by step 4.
+printf '{"v":1,"done":[{"step":"checklist","n":1,"at":"t"},{"step":"confirm","n":2,"at":"t"},{"step":"installs","n":3,"at":"t"},{"step":"volumes","n":4,"at":"t"}]}' > "$HE/root/secrets/kube/ha-enable.json"
+rm -f "$HE/view.json"
+hacli "" "" status
+case "$RC:$OUT" in "0:High availability: off"*"ha enable: 4 of 10 steps done; next: step 5 (switch)"*"The Hub is stopped by ha enable"*) t_pass "ha status: the progress, and the Hub stopped by ha enable after step 4" ;; *) t_fail "ha status mid: $RC $OUT" ;; esac
+printf '%s' "$he_green" > "$HE/view.json"
+hacli "" "" status
+case "$RC:$OUT" in "0:"*"ok       3 or more nodes"*"Guarantee: Degraded"*"Quorum: etcd 1/1, Vault 1/1, Sentinel 0/0"*"n1"*"server"*"main"*) t_pass "ha status: the checklist, guarantee, quorum and nodes" ;; *) t_fail "ha status: $RC $OUT" ;; esac
+hacli "" "" status --json
+expect_eq "ha status --json: {ha, enable, hub}" "$(printf '%s' "$OUT" | jq -c '[.ha, (.enable.done | length), .hub.experimental]')" '[false,4,true]'
+expect_eq "ha status reads only" "$(he_writes)" 0
+rm -f "$HE/root/secrets/kube/ha-enable.json"
+
+# test_ha_enable_never_two_writers (step 4, real code against the stub):
+# the writers are at 0 and gone before any helper pod; the copy's target
+# is <pvc>-r on the replicated class with Helm's ownership; the source is
+# mounted read-only; a fault in the copy (the stream, or the manifests
+# differing) → refused, the writers stay at 0 on their old volumes (never
+# scaled up, never pointed at the new one), both helpers removed.
+he_vols() { rm -rf "$HE/k"; mkdir -p "$HE/k"; for v in hub-state hub-secrets hub-backups domains-data wg-data; do touch "$HE/k/pvc-$v"; done; for d in hub domains wg; do echo 1 > "$HE/k/deploy-$d"; done; }
+he_vols
+hacli "" "" status >/dev/null
+hacli "" "need_env; ha_enable_step_volumes; exit 0" status
+expect_eq "ha enable step 4: copied" "$RC:$(grep -c '^create pvc .*-r$' "$HE/order"):$(grep -c '^untar into ' "$HE/order")" "0:5:5"
+first_pod="$(grep -n '^create pod' "$HE/order" | head -n1 | cut -d: -f1)"
+last_scale="$(grep -n '^gone ' "$HE/order" | tail -n1 | cut -d: -f1)"
+expect_eq "test_ha_enable_never_two_writers: hub, domains, wg at 0 and gone before the first helper pod" \
+  "$(grep -c '^scale \(hub\|domains\|wg\) 0$' "$HE/order"):$([ "$last_scale" -lt "$first_pod" ] && echo before)" "3:before"
+expect_eq "step 4: no writer ever scaled up" "$(grep -c '^scale .* [1-9]' "$HE/order")" 0
+expect_eq "step 4: every source mounted read-only, every target read-write" \
+  "$(grep -c '^create pod [a-z-]*[^r] ro=true$\|^create pod [a-z-]*-[^r][a-z]* ro=true$' "$HE/order"):$(grep -c '^create pod .*-r ro=false$' "$HE/order")" "5:5"
+expect_eq "step 4: every helper pod removed" "$(grep -c '^create pod' "$HE/order"):$(grep -c '^delete pod' "$HE/order")" "10:10"
+expect_eq "step 4: the new PVCs: replicated class, the owner annotations, Helm's ownership" \
+  "$(jq -c '[.spec.storageClassName, .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["meta.helm.sh/release-name"], .metadata.annotations["meta.helm.sh/release-namespace"], .metadata.annotations["portcullis.io/uid"], .metadata.annotations.other, .spec.resources.requests.storage]' "$HE/k/pvc-hub-state-r")" \
+  '["portcullis-core-replicated","Helm","portcullis","portcullis","10001",null,"1Gi"]'
+for fault in fault-tar fault-manifest; do
+  he_vols; touch "$HE/$fault"
+  hacli "" "need_env; ha_enable_step_volumes; exit 0" status
+  case "$RC:$ERR" in "1:"*"the copy of hub-state failed"*"stay stopped on their old volumes"*) t_pass "step 4 ($fault): refused, naming the volume and how to resume" ;; *) t_fail "step 4 $fault: $RC $ERR" ;; esac
+  expect_eq "test_ha_enable_never_two_writers ($fault): the writers stay at 0, never scaled up; both helpers removed" \
+    "$(cat "$HE/k/deploy-hub"):$(grep -c '^scale .* [1-9]' "$HE/order"):$(grep -c '^create pod' "$HE/order"):$(grep -c '^delete pod' "$HE/order")" "0:0:2:2"
+  expect_eq "step 4 ($fault): no Deployment pointed at the new volume" "$(grep -c ' patch \| set \| apply ' "$HE/calls")" 0
+  rm -f "$HE/$fault"
+done
+
+# frontdoor-env: the credentials reach the Secret through jq's environment
+# and kubectl's stdin, never argv.
+rm -f "$HE"/k/applied.*
+hacli "" "need_env; ha_frontdoor_env_sync; exit 0" status
+expect_eq "ha_frontdoor_env_sync: credentials.json = the provider and its dns-tool keys" \
+  "$(cat "$HE"/k/applied.* | jq -r '.data["credentials.json"]' | base64 -d | jq -c .)" '{"provider":"cloudflare","credentials":{"api_token":"CF-SECRET-TOKEN-9"}}'
+expect_eq "ha_frontdoor_env_sync: the token never on kubectl's argv" "$(grep -c 'CF-SECRET' "$HE/calls")" 0
+expect_eq "up syncs frontdoor-env in HA" "$(grep -c 'kube_sync_secrets; ! kube_ha_on || ha_frontdoor_env_sync' "$HERE/../scripts/lib/kube.sh")" 1
+
+# Before Traefik moves (Task 29 carry): Traefik's certificate of <d> and
+# *.<d> becomes frontdoor-cert's served pair, with Helm's ownership (the
+# release adopts the Secret, its data kept); the key on pipes only.
+he_vols; touch "$HE/k/pvc-traefik-acme"; rm -f "$HE"/k/applied.*
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=ha.example.org" \
+  -addext "subjectAltName=DNS:ha.example.org,DNS:*.ha.example.org" -keyout "$HE/le.key" -out "$HE/le.crt" >/dev/null 2>&1
+he_b64() { base64 < "$1" | tr -d '\n'; }
+jq -n --arg c "$(he_b64 "$HE/le.crt")" --arg k "$(he_b64 "$HE/le.key")" '{letsencrypt: {Account: {Registration: {uri: "https://acme.example/acct/7"}, PrivateKey: "ACCOUNT-KEY"},
+  Certificates: [{domain: {main: "other.example.org"}, certificate: "X", key: "Y"}, {domain: {main: "ha.example.org", sans: ["*.ha.example.org"]}, certificate: $c, key: $k, Store: "default"}]}}' > "$HE/acme.json"
+hacli "" "need_env; _ha_frontdoor_cert_seed; exit 0" status
+expect_eq "frontdoor-cert seed: Traefik's pair, its account, Helm's ownership" \
+  "$RC|$(cat "$HE"/k/applied.* | jq -c --arg c "$(he_b64 "$HE/le.crt")" --arg k "$(he_b64 "$HE/le.key")" '[.metadata.name, .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["meta.helm.sh/release-name"], .metadata.annotations["helm.sh/resource-policy"], (.data["tls.crt"] == $c), (.data["tls.key"] == $k), (.data["account-uri"] | @base64d)]')" \
+  '0|["frontdoor-cert","Helm","portcullis","keep",true,true,"https://acme.example/acct/7"]'
+expect_eq "frontdoor-cert seed: no key on argv, the helper removed" "$(grep -c 'PRIVATE\|ACCOUNT-KEY' "$HE/calls"):$(grep -c '^delete pod traefik-acme' "$HE/order")" "0:1"
+rm -f "$HE"/k/applied.*
+echo '{"data":{"tls.crt":"T0xE"}}' > "$HE/k/frontdoor-cert.json"
+hacli "" "need_env; _ha_frontdoor_cert_seed; exit 0" status
+expect_eq "frontdoor-cert seed: a pair already there is kept" "$RC:$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" "0:0"
+rm -f "$HE/k/frontdoor-cert.json"
+jq '.letsencrypt.Certificates |= map(select(.domain.main != "ha.example.org"))' "$HE/acme.json" > "$HE/acme.json.t" && mv "$HE/acme.json.t" "$HE/acme.json"
+hacli "" "need_env; _ha_frontdoor_cert_seed; exit 0" status
+case "$RC:$ERR:$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" in "0:"*"Traefik holds no current certificate of ha.example.org"*":0") t_pass "frontdoor-cert seed: none in acme.json → warned, nothing written" ;; *) t_fail "seed none: $RC $ERR" ;; esac
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

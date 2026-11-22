@@ -2381,3 +2381,703 @@ kube_frontdoor_backup_step() {
 kube_frontdoor_restore_step() {
   _kube_restore_frontdoor "$1" || fail "could not restore the front door's Secrets (frontdoor-acme, frontdoor-cert) from $1/frontdoor.age: the main domain has no certificate until they are (secrets/domains/age.key from another install?). Everything else is restored; run the same ./portcullis restore again once the key matches (the front-door step is its last)"
 }
+
+# ── ./portcullis ha status | enable (plan Task 31, D5) ────
+#
+# `ha enable` turns a Kubernetes install's single-node shape into HA as one
+# resumable operation; `ha status` shows where it is and the Hub's HA page
+# (`hub ha checklist`, its CLI twin: the checklist, quorum, nodes,
+# guarantee). Docker and Podman never change (§20: "high availability needs
+# Kubernetes"); there is no `ha disable` (R4: backup → init → restore).
+#
+# The steps, each recorded in secrets/kube/ha-enable.json (0600, written
+# atomically) only after it succeeded, so a re-run (after a refusal, a
+# failure, Stop / SIGINT, a CLI crash or a node lost) starts at the first
+# step not recorded and never repeats a recorded one:
+#    1 checklist  the Hub's checklist all green, and the CLI's own: an
+#                 automated DNS provider for the main domain with its
+#                 credentials (the front door writes its addresses and
+#                 orders its certificate), no unfinished Vault HA off; any
+#                 red item refuses, naming each, before anything is written;
+#    2 confirm    one confirmation naming the sign-in downtime, that HA is
+#                 experimental and the CAA wait (--yes: none);
+#    3 installs   external-snapshotter, Longhorn, fencing (Self Node
+#                 Remediation, every node's agent ready or it stops), then
+#                 cert-manager and the barman-cloud plugin (Task 26 M5:
+#                 before Postgres scales out, so its replicas archive);
+#    4 volumes    the writers (Hub, domains, wg) scaled to 0 and gone, then
+#                 hub-state, hub-secrets, hub-backups, domains-data and
+#                 wg-data each copied into <name>-r on the replicated tier
+#                 (owner-uid helper pods, pod to pod), the two sides'
+#                 manifests (paths, types, modes, owners, sha256) equal; the
+#                 writers stay at 0 (never two writers, never the old and
+#                 the new volume attached to a running writer);
+#    5 switch     the front door's DNS credentials (Secret frontdoor-env)
+#                 and the main domain's current certificate (Traefik's, from
+#                 acme.json) as the front door's served pair (frontdoor-cert),
+#                 so the HA ingress serves the same certificate from its
+#                 first second until the account switch orders the front
+#                 door's own (Task 29: in HA no other certificate is served);
+#                 the copies checked again; PORTCULLIS_HA=on in .env; `up`
+#                 (the chart in HA: the gates ×N, Keycloak ×2/3, Vault ×3,
+#                 Postgres ×2/3, Sentinel + replica, Traefik as a DaemonSet
+#                 on the ingress nodes, the front door);
+#    6 postgres   CloudNativePG's instances ready and a synchronous standby
+#                 streaming;
+#    7 vault      raft lists 3 voters;
+#    8 sessions   two Valkey pods, three Sentinels agreeing on the master
+#                 with its replica;
+#    9 frontdoor  the CAA account switch to the front door's ACME account
+#                 (dns_flip_main_account: relax, settle, order, re-pin; not
+#                 settled yet = run it again later), then the old Traefik's
+#                 traefik-acme volume deleted;
+#   10 status     `ha status` all green.
+# Deviation from the plan's order (5–7 before 8): the chart renders Vault's
+# peers, the Sentinel StatefulSet and Postgres' HA placement only from
+# ha.enabled, so they scale out with the switch and steps 6–8 wait for them.
+
+HA_ENABLE_STEPS="checklist confirm installs volumes switch postgres vault sessions frontdoor status"
+# The core volumes on the replicated tier in HA (contract §20.1 "Core
+# volumes", the chart's portcullis.pvcName): <pvc>:<uid>:<gid>.
+HA_ENABLE_VOLUMES="hub-state:$CT_UID_HUB:$CT_UID_HUB hub-secrets:$CT_UID_HUB:$CT_UID_HUB hub-backups:$CT_UID_HUB:$CT_UID_HUB domains-data:$CT_UID_DOMAINS:$CT_UID_DOMAINS wg-data:$CT_UID_WG:$CT_UID_HUB"
+# Their writers (Deployments), stopped for the copy.
+HA_ENABLE_WRITERS="hub domains wg"
+HA_TEXT_NEEDS_KUBE="high availability needs Kubernetes"
+
+_ha_enable_file() { echo "$(kube_dir)/ha-enable.json"; }
+
+# _ha_enable_done <step> — the record lists it.
+_ha_enable_done() {
+  jq -e --arg s "$1" 'any(.done[]?; .step == $s)' "$(_ha_enable_file)" >/dev/null 2>&1
+}
+
+# _ha_enable_next — the first step not recorded (nothing: all done).
+_ha_enable_next() {
+  local s
+  for s in $HA_ENABLE_STEPS; do _ha_enable_done "$s" || { echo "$s"; return 0; }; done
+}
+
+# _ha_step_n <step> — its number (1–10).
+_ha_step_n() {
+  local s n=0
+  for s in $HA_ENABLE_STEPS; do n=$((n + 1)); [ "$s" != "$1" ] || { echo "$n"; return 0; }; done
+  echo 0
+}
+
+# _ha_enable_record <step> — the step appended to the record, atomically
+# (a temp file in the same 0700 directory, then rename): an interruption
+# leaves the previous record whole.
+_ha_enable_record() {
+  local f d tmp old='{"v":1,"done":[]}'
+  f="$(_ha_enable_file)"; d="$(dirname "$f")"
+  (umask 077 && mkdir -p "$d")
+  [ ! -s "$f" ] || old="$(cat "$f")"
+  tmp="$(umask 077 && mktemp "$d/.ha-enable.XXXXXX")" || fail "could not write $f"
+  if ! printf '%s' "$old" | S="$1" N="$(_ha_step_n "$1")" AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       jq '.v = 1 | .done = ((.done // []) + [{step: env.S, n: (env.N | tonumber), at: env.AT}])' > "$tmp" \
+     || ! mv -f "$tmp" "$f"; then
+    rm -f "$tmp"; fail "could not record step $1 in $f"
+  fi
+}
+
+# _ha_hub_view — _HA_VIEW = the Hub's HA view (`hub ha checklist` in the
+# writer Hub pod); exit 1 with _HA_VIEW empty and the reason in _HA_ERR.
+# Call it in the caller's shell (not in a $(…)): it sets both.
+_ha_hub_view() {
+  local errf rc=0
+  _HA_VIEW="" _HA_ERR=""
+  errf="$(mktemp)"
+  _HA_VIEW="$(kube_ctl -n "$(kube_ns)" exec "$(_node_hub_ref)" -c hub -- hub ha checklist </dev/null 2>"$errf")" || rc=$?
+  _HA_ERR="$(grep -v '^command terminated with exit code' "$errf" | tr '\n' ' ' | sed 's/ *$//' | cut -c1-300)"
+  rm -f "$errf"
+  if [ "$rc" != 0 ] || ! printf '%s' "$_HA_VIEW" | jq -e 'type == "object" and (.checklist | type == "array")' >/dev/null 2>&1; then
+    [ -n "$_HA_ERR" ] || _HA_ERR="the Hub's answer isn't its HA view"
+    _HA_VIEW=""
+    return 1
+  fi
+  _HA_ERR=""
+}
+
+# _ha_cli_items — the CLI's own checklist items (JSON array of {id, ok,
+# text}): the main domain's DNS provider automated with its credentials
+# (the front door's), no unfinished Vault HA off.
+_ha_cli_items() {
+  local p="${DNS_PROVIDER:-none}" dns=true dtext="" vs=true vtext="" rec
+  if ! _dns_automated "$p" || ! _dns_creds_present "$p"; then
+    dns=false dtext="the main domain's DNS provider (DNS_PROVIDER=$p) must be automated with its credentials in .env: in HA the front door moves the main domain's addresses and orders its certificate"
+  fi
+  if ! rec="$(_kube_vault_shrink_record)"; then vs=false vtext="can't read ConfigMap $KUBE_VAULT_SHRINK_CM"
+  elif [ -n "$rec" ]; then vs=false vtext="Vault's HA off isn't finished (ConfigMap $KUBE_VAULT_SHRINK_CM): run ./portcullis up first"; fi
+  jq -nc --argjson d "$dns" --arg dt "$dtext" --argjson v "$vs" --arg vt "$vtext" \
+    '[{id: "dns_provider", ok: $d, text: $dt}, {id: "vault_shrink", ok: $v, text: $vt}]'
+}
+
+HA_ITEM_LABELS='{"nodes":"3 or more nodes","servers":"3 or more servers","storage":"Storage nodes","ingress":"Ingress nodes",
+  "backup_destination":"Offsite backup destination","n_minus_1":"N−1 check","watchdog":"Watchdogs (fencing)",
+  "site_gateway":"A reachable node at every site","site_rtt":"Servers within 100 ms of each other",
+  "dns_provider":"The main domain'"'"'s DNS provider","vault_shrink":"No unfinished Vault HA off"}'
+
+# _ha_checklist_lines <items JSON> — one line per item.
+_ha_checklist_lines() {
+  printf '%s' "$1" | jq -r --argjson l "$HA_ITEM_LABELS" '.[] | (if .ok then "  ok       " else "  not yet  " end) + ($l[.id] // .id) + (if .ok then "" else ": " + .text end)'
+}
+
+# ha_enable_step_checklist — step 1. Refuses (exit 1) naming every red
+# item; reads only.
+ha_enable_step_checklist() {
+  local items red
+  _ha_hub_view || fail "can't read the Hub's HA checklist (${_HA_ERR}): nothing changed. Is the Hub running? (./portcullis status)"
+  items="$(jq -c --argjson cli "$(_ha_cli_items)" '.checklist + $cli' <<<"$_HA_VIEW")"
+  red="$(jq -r '[.[] | select(.ok != true)] | length' <<<"$items")"
+  if [ "$red" != 0 ]; then
+    warn "High availability can't be turned on yet:"
+    _ha_checklist_lines "$(jq -c '[.[] | select(.ok != true)]' <<<"$items")" >&2
+    fail "$red checklist item(s) not green: nothing changed. Fix them (the Hub's Settings → High availability shows the same list), then run ./portcullis ha enable again"
+  fi
+  ok "The HA checklist is green."
+}
+
+# ha_enable_step_confirm <yes> — step 2: one confirmation (or --yes).
+ha_enable_step_confirm() {
+  cat >&2 <<EOC
+Turning high availability on — EXPERIMENTAL. This:
+  - installs Longhorn, fencing (Self Node Remediation), the snapshot controller,
+    cert-manager and CloudNativePG's backup plugin;
+  - stops the Hub, the domains service and the VPN service while their volumes are
+    copied to the replicated tier (the Hub's pages and new VPN sign-ins are down);
+  - moves Traefik to the ingress nodes: SIGN-IN IS DOWN for a few minutes while it
+    restarts there (and while Keycloak, Vault and Postgres scale out);
+  - switches the main domain's certificate to the front door's own ACME account:
+    the CAA record is relaxed to CA-only and the switch WAITS until no cache can hold
+    the old pin (its TTL + 1 min, at most 15 min per run; a longer TTL means running
+    ./portcullis ha enable again later). The current certificate stays served meanwhile.
+There is no ha disable: leaving HA is backup → init → restore.
+EOC
+  if [ "$1" != true ]; then
+    local reply=""
+    read -rp 'Type "enable" to turn high availability on: ' reply || reply=""
+    [ "$reply" = enable ] || fail "Cancelled: nothing changed."
+  fi
+}
+
+# ha_enable_step_installs — step 3 (each install fails closed: nothing of
+# it installed past its own refusal; a re-run installs again, idempotent).
+ha_enable_step_installs() {
+  ha_install_snapshotter
+  ha_install_longhorn
+  ha_install_fencing
+  ha_fencing_ready >&2 || fail "fencing isn't ready on every node (above): HA stops here; run ./portcullis ha enable again once it is"
+  ha_install_certmanager
+  ha_install_barman
+}
+
+# _ha_scale_writers — the writers to 0 and their pods gone (each one that
+# exists; fail closed on anything unreadable).
+_ha_scale_writers() {
+  local ns d out
+  ns="$(kube_ns)"
+  for d in $HA_ENABLE_WRITERS; do
+    out="$(kube_ctl -n "$ns" get deployment "$d" -o name 2>&1)" || {
+      case "$out" in *NotFound*|*"not found"*) continue ;; esac
+      fail "can't read the Deployment $d: nothing copied"
+    }
+    kube_ctl -n "$ns" scale deployment "$d" --replicas=0 >/dev/null || fail "could not stop $d (scale to 0): nothing copied"
+  done
+  for d in $HA_ENABLE_WRITERS; do
+    kube_ctl -n "$ns" wait --for=delete pod -l "portcullis.io/component=$d" --timeout=180s >/dev/null 2>&1 \
+      || [ "$(kube_ctl -n "$ns" get pods -l "portcullis.io/component=$d" -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null)" = 0 ] \
+      || fail "$d's pods are still there after 3 min: nothing copied (run ./portcullis ha enable again)"
+  done
+}
+
+# _ha_writers_stopped — every writer that exists is at 0 replicas with no pod.
+_ha_writers_stopped() {
+  local ns d r
+  ns="$(kube_ns)"
+  for d in $HA_ENABLE_WRITERS; do
+    r="$(kube_ctl -n "$ns" get deployment "$d" -o jsonpath='{.spec.replicas}' 2>/dev/null)" || continue
+    [ "$r" = 0 ] || return 1
+    [ "$(kube_ctl -n "$ns" get pods -l "portcullis.io/component=$d" -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null)" = 0 ] || return 1
+  done
+}
+
+# _ha_replicated_pvc <pvc> — <pvc>-r on portcullis-core-replicated, made
+# like <pvc> (its size and the K3 owner annotations, as the chart's
+# portcullis.pvc renders it in HA) with Helm's ownership metadata, so the
+# release adopts it at the switch (helm v4.3.1 pkg/action/validate.go
+# checkOwnership: managed-by Helm, release name and namespace). Kept when
+# it exists.
+_ha_replicated_pvc() {
+  local src ns
+  ns="$(kube_ns)"
+  kube_ctl -n "$ns" get pvc "$1-r" -o name >/dev/null 2>&1 && return 0
+  src="$(kube_ctl -n "$ns" get pvc "$1" -o json 2>/dev/null)" || { echo "can't read the PVC $1" >&2; return 1; }
+  printf '%s' "$src" | N="$1-r" NS="$ns" R="$KUBE_RELEASE" jq '{apiVersion: "v1", kind: "PersistentVolumeClaim",
+      metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "Helm"},
+        annotations: ((.metadata.annotations // {} | with_entries(select(.key | startswith("portcullis.io/"))))
+          + {"helm.sh/resource-policy": "keep", "meta.helm.sh/release-name": env.R, "meta.helm.sh/release-namespace": env.NS})},
+      spec: {storageClassName: "portcullis-core-replicated", accessModes: ["ReadWriteOnce"],
+        resources: {requests: {storage: .spec.resources.requests.storage}}}}' | kube_ctl create -f - >/dev/null
+}
+
+# _ha_copy_pod <pvc> <uid> <gid> <ro|rw> — a helper pod (the volume's
+# owner, the helper image, no network: _kube_helper_pod's shape) with
+# fsGroup <gid> (a fresh Longhorn volume's root is root's: the kubelet
+# gives it the group, as it does the chart's pods); its name.
+_ha_copy_pod() {
+  local name
+  name="ha-copy-$(openssl rand -hex 4)"
+  N="$name" NS="$(kube_ns)" P="$1" U="$2" G="$3" RO="$4" IMG="$PORTCULLIS_HELPER_IMAGE" jq -n '
+    {apiVersion: "v1", kind: "Pod",
+     metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "volume-helper"}},
+     spec: {restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false,
+       securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.G | tonumber), fsGroup: (env.G | tonumber),
+         fsGroupChangePolicy: "OnRootMismatch", seccompProfile: {type: "RuntimeDefault"}},
+       tolerations: [{key: "portcullis.io/small", operator: "Exists", effect: "NoSchedule"}],
+       containers: [{name: "helper", image: env.IMG, command: ["sleep", "3600"],
+         resources: {limits: {memory: "256Mi"}, requests: {memory: "256Mi"}},
+         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},
+         volumeMounts: [{name: "tmp", mountPath: "/tmp"}, {name: "vol", mountPath: "/vol", readOnly: (env.RO == "ro")}]}],
+       volumes: [{name: "tmp", emptyDir: {medium: "Memory"}}, {name: "vol", persistentVolumeClaim: {claimName: env.P, readOnly: (env.RO == "ro")}}]}}' \
+    | kube_ctl create -f - >/dev/null || return 1
+  if ! kube_ctl -n "$(kube_ns)" wait --for=condition=Ready "pod/$name" --timeout="${KUBE_POD_WAIT:-300}s" >/dev/null; then
+    _kube_pod_diag "$name"; _kube_helper_done "$name"; return 1
+  fi
+  echo "$name"
+}
+
+# The manifest of a volume (in its helper pod): every entry but the root
+# and Longhorn's lost+found, sorted — type, mode, owner, a file's sha256,
+# a link's target — hashed; exit 3 when anything can't be read.
+# shellcheck disable=SC2016  # the pod's own shell
+HA_MANIFEST_SH='cd /vol || exit 3
+find . -mindepth 1 \( -path ./lost+found -prune \) -o -print | LC_ALL=C sort | while IFS= read -r f; do
+  if [ -L "$f" ]; then printf "l %s %s %s\n" "$(stat -c "%u %g" "$f")" "$f" "$(readlink "$f")"
+  elif [ -d "$f" ]; then printf "d %s %s\n" "$(stat -c "%a %u %g" "$f")" "$f"
+  elif [ -f "$f" ]; then h="$(sha256sum < "$f" | cut -d" " -f1)" || h=UNREADABLE; printf "f %s %s %s\n" "$(stat -c "%a %u %g" "$f")" "${h:-UNREADABLE}" "$f"
+  else printf "o %s %s\n" "$(stat -c "%F %a %u %g" "$f")" "$f"; fi
+done > /tmp/manifest || exit 3
+grep -q UNREADABLE /tmp/manifest && exit 3
+sha256sum < /tmp/manifest | cut -d" " -f1'
+# The entries to copy (the root's children but lost+found), for tar -T.
+HA_LIST_SH='cd /vol && find . -mindepth 1 -maxdepth 1 ! -name lost+found > /tmp/list && cat /tmp/list | wc -l'
+
+# _ha_manifest <pod> — its volume's manifest hash (nothing, exit 1: unreadable).
+_ha_manifest() {
+  local m
+  m="$(kube_ctl -n "$(kube_ns)" exec "$1" -- sh -c "$HA_MANIFEST_SH" 2>/dev/null)" || return 1
+  [[ "$m" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$m"
+}
+
+# _ha_copy_volume <pvc> <uid> <gid> — <pvc> into <pvc>-r: the target
+# emptied (a resumed copy starts over), the source's entries streamed pod
+# to pod (tar, as the owner), then both manifests compared. Exit 1 on any
+# failure or difference (the source is never written: mounted read-only).
+_ha_copy_volume() {
+  local pvc="$1" u="$2" g="$3" src dst n ms md rc=0 ns
+  ns="$(kube_ns)"
+  _ha_replicated_pvc "$pvc" || { warn "could not make the PVC $pvc-r"; return 1; }
+  src="$(_ha_copy_pod "$pvc" "$u" "$g" ro)" || { warn "no helper pod on $pvc"; return 1; }
+  dst="$(_ha_copy_pod "$pvc-r" "$u" "$g" rw)" || { _kube_helper_done "$src"; warn "no helper pod on $pvc-r"; return 1; }
+  kube_ctl -n "$ns" exec "$dst" -- find /vol -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} + || rc=1
+  if [ "$rc" = 0 ]; then
+    n="$(kube_ctl -n "$ns" exec "$src" -- sh -c "$HA_LIST_SH" 2>/dev/null | tr -d ' ')" || rc=1
+    if [ "$rc" = 0 ] && [ "${n:-0}" != 0 ]; then
+      kube_ctl -n "$ns" exec "$src" -- tar -cf - -C /vol -T /tmp/list \
+        | kube_ctl -n "$ns" exec -i "$dst" -- tar -xpf - -C /vol || rc=1
+    fi
+  fi
+  if [ "$rc" = 0 ]; then
+    ms="$(_ha_manifest "$src")" && md="$(_ha_manifest "$dst")" && [ "$ms" = "$md" ] || rc=1
+    [ "$rc" = 0 ] || warn "$pvc and $pvc-r differ after the copy (or one can't be read: a file not owned by $u?)"
+  fi
+  _kube_helper_done "$dst"; _kube_helper_done "$src"
+  # Both helpers gone before anything mounts either volume again.
+  kube_ctl -n "$ns" wait --for=delete "pod/$dst" "pod/$src" --timeout=120s >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+# _ha_volumes_same — every <pvc> and <pvc>-r still have equal manifests
+# (the switch's check: nothing wrote since the copy).
+_ha_volumes_same() {
+  local spec pvc u g src dst ms md rc=0
+  for spec in $HA_ENABLE_VOLUMES; do
+    IFS=: read -r pvc u g <<< "$spec"
+    kube_ctl -n "$(kube_ns)" get pvc "$pvc-r" -o name >/dev/null 2>&1 || return 1
+    src="$(_ha_copy_pod "$pvc" "$u" "$g" ro)" || return 1
+    dst="$(_ha_copy_pod "$pvc-r" "$u" "$g" ro)" || { _kube_helper_done "$src"; return 1; }
+    ms="$(_ha_manifest "$src")" && md="$(_ha_manifest "$dst")" && [ "$ms" = "$md" ] || rc=1
+    _kube_helper_done "$dst"; _kube_helper_done "$src"
+    kube_ctl -n "$(kube_ns)" wait --for=delete "pod/$dst" "pod/$src" --timeout=120s >/dev/null 2>&1 || true
+    [ "$rc" = 0 ] || return 1
+  done
+}
+
+# ha_enable_step_volumes — step 4: writers stopped, then each volume
+# copied and checked. A failure stops here with the writers still at 0 on
+# their old volumes (the copy is redone by the re-run).
+ha_enable_step_volumes() {
+  local spec pvc u g
+  for spec in $HA_ENABLE_VOLUMES; do
+    kube_ctl -n "$(kube_ns)" get pvc "${spec%%:*}" -o name >/dev/null 2>&1 || fail "the PVC ${spec%%:*} doesn't exist (or can't be read): nothing copied"
+  done
+  info "Stopping the Hub, the domains service and the VPN service for the copy..."
+  _ha_scale_writers
+  for spec in $HA_ENABLE_VOLUMES; do
+    IFS=: read -r pvc u g <<< "$spec"
+    info "Copying $pvc to $pvc-r (replicated)..."
+    _ha_copy_volume "$pvc" "$u" "$g" || fail "the copy of $pvc failed (above): the Hub, domains and wg stay stopped on their old volumes; run ./portcullis ha enable again to redo it"
+    ok "$pvc copied, the manifests equal."
+  done
+}
+
+# ha_frontdoor_env_sync — the Secret frontdoor-env (credentials.json: the
+# main domain's provider and its credentials, the dns tool's keys) from
+# .env, the front door's alone (contract §20.8). The values reach jq
+# through its environment and kubectl on stdin, never argv or a file.
+ha_frontdoor_env_sync() {
+  local p="${DNS_PROVIDER:-none}" line var key map="[]"
+  _dns_automated "$p" && _dns_creds_present "$p" || fail "the front door needs the main domain's DNS credentials: DNS_PROVIDER=$p is not automated or its credentials aren't in .env"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    var="${line%%:*}" key="${line#*:}"
+    [ -n "${!var:-}" ] || continue
+    export "${var?}"
+    map="$(jq -c --arg v "$var" --arg k "$key" '. + [{var: $v, key: $k}]' <<<"$map")"
+  done < <(_dns_cred_keys "$p")
+  NS="$(kube_ns)" P="$p" jq -n --argjson map "$map" '{apiVersion: "v1", kind: "Secret", type: "Opaque",
+      metadata: {name: "frontdoor-env", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/owner": "core"}},
+      data: {"credentials.json": ({provider: env.P, credentials: ($map | map({key: .key, value: env[.var]}) | from_entries)} | tojson | @base64)}}' \
+    | _ha_apply || fail "could not write the Secret frontdoor-env (the front door's DNS credentials)"
+}
+
+# _ha_frontdoor_cert_seed — before Traefik moves: the main domain's
+# certificate Traefik serves now (acme.json's certificate for <d> with
+# exactly *.<d>, valid for another day) as frontdoor-cert's served pair
+# (tls.crt, tls.key, account-uri = Traefik's account), with Helm's
+# ownership metadata (the chart creates the Secret empty: the release
+# adopts it, its data kept). The front door keeps a served pair until its
+# own account's slot holds a servable one (domains/frontdoor/cert.go
+# Promote), so no other certificate is served before the account switch.
+# Nothing when frontdoor-cert already holds a pair, or Traefik has no such
+# certificate (warned: the main domain then has the certificates of
+# traefik/dynamic only until step 9). The key travels pod → jq → kubectl
+# on pipes only.
+_ha_frontdoor_cert_seed() {
+  local ns pod pem d="$PORTCULLIS_DOMAIN" have
+  ns="$(kube_ns)"
+  have="$(kube_ctl -n "$ns" get secret frontdoor-cert -o json 2>/dev/null | jq -r '.data["tls.crt"] // empty' 2>/dev/null)" || have=""
+  [ -z "$have" ] || { info "frontdoor-cert already holds a certificate: kept."; return 0; }
+  _kube_volume_exists traefik_acme || { warn "no traefik-acme volume: no certificate of $d to carry over (until the account switch, step 9, only traefik/dynamic's certificates are served)"; return 0; }
+  # shellcheck disable=SC2016  # jq's own variables
+  local sel='(.letsencrypt.Certificates // []) | map(select(.domain.main == env.D and ((.domain.sans // []) | sort) == ["*." + env.D])) | .[0] // empty'
+  pod="$(_kube_helper_pod traefik-acme 65532:65532 ro "$PORTCULLIS_HELPER_IMAGE")" || fail "no helper pod on traefik-acme: nothing switched"
+  pem="$(kube_ctl -n "$ns" exec "$pod" -- cat /vol/acme.json 2>/dev/null | D="$d" jq -r "$sel | .certificate" 2>/dev/null | base64 -d 2>/dev/null)" || pem=""
+  if [ -z "$pem" ] || ! printf '%s\n' "$pem" | openssl x509 -noout -checkend 86400 >/dev/null 2>&1; then
+    _kube_helper_done "$pod"
+    warn "Traefik holds no current certificate of $d and *.$d: nothing to carry over (until the account switch, step 9, only traefik/dynamic's certificates are served)"
+    return 0
+  fi
+  kube_ctl -n "$ns" exec "$pod" -- cat /vol/acme.json \
+    | D="$d" NS="$ns" R="$KUBE_RELEASE" jq -c "($sel) as \$c | (.letsencrypt.Account.Registration.uri // \"\") as \$u
+        | if \$c == null then error(\"no certificate\") else . end
+        | {apiVersion: \"v1\", kind: \"Secret\", type: \"Opaque\",
+           metadata: {name: \"frontdoor-cert\", namespace: env.NS, labels: {\"app.kubernetes.io/managed-by\": \"Helm\"},
+             annotations: {\"helm.sh/resource-policy\": \"keep\", \"meta.helm.sh/release-name\": env.R, \"meta.helm.sh/release-namespace\": env.NS}},
+           data: {\"tls.crt\": \$c.certificate, \"tls.key\": \$c.key, \"account-uri\": (\$u | @base64)}}" \
+    | _ha_apply || { _kube_helper_done "$pod"; fail "could not carry Traefik's certificate of $d into frontdoor-cert: nothing switched"; }
+  _kube_helper_done "$pod"
+  ok "Traefik's certificate of $d (until $(printf '%s\n' "$pem" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)) is the front door's served one until the account switch."
+}
+
+# ha_enable_step_switch — step 5.
+ha_enable_step_switch() {
+  if ! _ha_writers_stopped || ! _ha_volumes_same; then
+    info "Something wrote to the core volumes since the copy (or a writer runs again): copying them again..."
+    ha_enable_step_volumes
+  fi
+  ha_frontdoor_env_sync
+  _ha_frontdoor_cert_seed
+  env_set PORTCULLIS_HA on
+  export PORTCULLIS_HA=on
+  info "HA on (PORTCULLIS_HA=on in .env): deploying the HA shape (./portcullis up)..."
+  stack_up
+}
+
+# _ha_until <seconds> <what> <cmd…> — cmd every 5 s until it passes; fails
+# naming what.
+_ha_until() {
+  local s="$1" what="$2" t0
+  shift 2
+  t0="$(date +%s)"
+  until "$@" >/dev/null 2>&1; do
+    [ $(( $(date +%s) - t0 )) -lt "$s" ] || fail "$what within $s s: HA stops here; run ./portcullis ha enable again to wait on"
+    sleep "${HA_POLL:-5}"
+  done
+}
+
+# _ha_pg_synced — the Cluster at its HA instances (min(3, the labelled
+# non-small nodes at main)), all ready, and with 2 or more a standby
+# streaming synchronously (pg_stat_replication on the primary).
+_ha_pg_synced() {
+  local want c n
+  want="$(kube_pg_nodes_at_primary)" || return 1
+  [ "$want" -le 3 ] || want=3; [ "$want" -ge 1 ] || want=1
+  c="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null)" || return 1
+  W="$want" jq -e '(.spec.instances | tostring) == env.W and (.status.readyInstances // 0) == .spec.instances' <<<"$c" >/dev/null || return 1
+  [ "$want" -ge 2 ] || return 0
+  n="$(_kube_pg_exec psql -tAqc "select count(*) from pg_stat_replication where state = 'streaming' and sync_state in ('sync', 'quorum')" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ]
+}
+ha_enable_step_postgres() {
+  info "Waiting for Postgres' instances and a synchronous standby..."
+  _ha_until "${HA_PG_WAIT:-900}" "Postgres didn't reach its HA instances with a synchronous standby" _ha_pg_synced
+  ok "Postgres: every instance ready, a synchronous standby streaming."
+}
+
+# _ha_vault_voters3 — StatefulSet vault 3/3 ready and raft listing 3 voters.
+_ha_vault_voters3() {
+  local n
+  [ "$(kube_ctl -n "$(kube_ns)" get statefulset vault -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = 3 ] || return 1
+  _K_VAULT_POD=""; kube_vault_pod_set
+  n="$(vexec operator raft list-peers -format=json 2>/dev/null | jq -r '[.data.config.servers[] | select(.voter == true)] | length' 2>/dev/null)" || return 1
+  [ "$n" = 3 ]
+}
+ha_enable_step_vault() {
+  vault_admin_env >/dev/null || fail "Vault's root token (secrets/vault-init.json) is needed to read its raft peers"
+  info "Waiting for Vault's 3 raft voters..."
+  _ha_until "${HA_VAULT_WAIT:-600}" "Vault's raft didn't list 3 voters" _ha_vault_voters3
+  ok "Vault: 3 raft voters."
+}
+
+# _ha_sentinel_ok — 2 Valkey pods and 3 Sentinels ready, and a Sentinel
+# sees the master with a replica and the 2 other Sentinels.
+_ha_sentinel_ok() {
+  local ns out
+  ns="$(kube_ns)"
+  [ "$(kube_ctl -n "$ns" get statefulset sessions -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = 2 ] || return 1
+  [ "$(kube_ctl -n "$ns" get statefulset sessions-sentinel -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = 3 ] || return 1
+  out="$(kube_ctl -n "$ns" exec sessions-sentinel-0 -- valkey-cli --no-auth-warning -t 2 --user sessions-admin -h 127.0.0.1 -p 26379 \
+    SENTINEL master "$KUBE_SESSIONS_MASTER" </dev/null 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | awk 'p == "flags" { f = $0 } p == "num-slaves" { s = $0 } p == "num-other-sentinels" { o = $0 } { p = $0 }
+    END { exit !(f == "master" && s + 0 >= 1 && o + 0 == 2) }'
+}
+ha_enable_step_sessions() {
+  info "Waiting for the session store's Sentinels and replica..."
+  _ha_until "${HA_SESSIONS_WAIT:-600}" "the Sentinels didn't agree on the session store's master with its replica" _ha_sentinel_ok
+  ok "Sessions: a master, its replica, 3 Sentinels."
+}
+
+# ha_enable_step_frontdoor — step 9: the CAA account switch, then the old
+# Traefik's volume (its account and certificate: nothing serves them now).
+ha_enable_step_frontdoor() {
+  local uri rc=0
+  uri="$(dns_frontdoor_account_uri)" || fail "the front door's ACME account couldn't be read: run ./portcullis ha enable again"
+  dns_flip_main_account "$uri" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) fail "the CAA account switch isn't done yet (above): the current certificate stays served; run ./portcullis ha enable again at the time given" ;;
+    *) fail "the CAA account switch failed (above): the current certificate stays served; run ./portcullis ha enable again" ;;
+  esac
+  dns_relax_done
+  kube_ctl -n "$(kube_ns)" delete pvc traefik-acme --ignore-not-found --wait=false >/dev/null || warn "could not delete the old Traefik's volume traefik-acme (delete it by hand: kubectl -n $(kube_ns) delete pvc traefik-acme)"
+  ok "The main domain's certificate and CAA pin are the front door's ($uri)."
+}
+
+# _ha_green <view> — enabled, every item ok, every quorum full (etcd ≥ 3,
+# Vault and Sentinel 3), zero loss, the front door leading or standing by,
+# every replicated volume healthy. Prints the reasons it isn't.
+_ha_green() {
+  jq -r --argjson l "$HA_ITEM_LABELS" '
+    [ (if .enabled != true then "HA isn'"'"'t on in the Hub (HUB_HA)" else empty end),
+      (.checklist[]? | select(.ok != true) | ($l[.id] // .id) + ": " + .text),
+      (.quorum // {} | to_entries[] | select(.value.healthy != .value.voters or .value.voters < 3) | "\(.key): \(.value.healthy)/\(.value.voters) healthy"),
+      (if .guarantee != "Zero loss on one failure" then "Postgres: " + (.guarantee // "unknown") else empty end),
+      (if (.frontdoor.state // "") == "" then "the front door: " + (.frontdoor.error // "no state") else empty end),
+      (.volumes[]? | select(.robustness != "healthy") | "volume \(.name): \(.robustness)")
+    ] | .[]' <<<"$1"
+}
+ha_enable_step_status() {
+  local t0 why
+  t0="$(date +%s)"
+  info "Waiting for ha status to be all green..."
+  while :; do
+    if _ha_hub_view; then
+      why="$(_ha_green "$_HA_VIEW")"
+      [ -n "$why" ] || break
+    else
+      why="the Hub's HA view: $_HA_ERR"
+    fi
+    if [ $(( $(date +%s) - t0 )) -ge "${HA_STATUS_WAIT:-900}" ]; then
+      printf '  %s\n' "$why" >&2
+      fail "ha status isn't all green (above): run ./portcullis ha enable again to wait on"
+    fi
+    sleep "${HA_POLL:-5}"
+  done
+  ok "ha status: all green."
+}
+
+# _ha_stopped — Stop (SIGINT / SIGTERM) between or during steps: the
+# record holds every finished step (written atomically), the next run
+# resumes at the first one not in it.
+_ha_stopped() {
+  echo >&2
+  warn "ha enable stopped: steps done are recorded in $(_ha_enable_file); run ./portcullis ha enable again to resume at step $(_ha_step_n "$(_ha_enable_next)") ($(_ha_enable_next))"
+  exit 130
+}
+
+ha_enable() {
+  local yes="$1" s n
+  if kube_ha_on && [ ! -s "$(_ha_enable_file)" ]; then
+    ok "High availability is already on (PORTCULLIS_HA=on)."
+    ha_status; return
+  fi
+  if [ -z "$(_ha_enable_next)" ]; then
+    ok "High availability is on: every step of ha enable is done."
+    ha_status; return
+  fi
+  if ! _ha_enable_done confirm && [ "$yes" != true ] && [ ! -t 0 ]; then
+    usage_error "ha enable" "no terminal to confirm on: pass --yes to enable without asking"
+  fi
+  trap _ha_stopped INT TERM
+  for s in $HA_ENABLE_STEPS; do
+    _ha_enable_done "$s" && continue
+    n="$(_ha_step_n "$s")"
+    info "ha enable: step $n of 10 ($s)..."
+    case "$s" in
+      confirm) ha_enable_step_confirm "$yes" ;;
+      *) "ha_enable_step_$s" ;;
+    esac
+    _ha_enable_record "$s"
+  done
+  trap - INT TERM
+  ok "High availability is on (experimental). ./portcullis ha status shows it; the Hub's Settings → High availability too."
+}
+
+# ha_status [--json] — the enable record and the Hub's HA view.
+ha_status() {
+  local json="${1:-false}" view="" rec='{"v":1,"done":[]}' next
+  [ ! -s "$(_ha_enable_file)" ] || rec="$(cat "$(_ha_enable_file)")"
+  _ha_hub_view || true
+  view="$_HA_VIEW"
+  if [ "$json" = true ]; then
+    jq -n --argjson r "$rec" --arg v "$view" --arg e "${_HA_ERR:-}" --arg ha "${PORTCULLIS_HA:-off}" \
+      '{ha: ($ha == "on"), enable: $r, hub: (if $v == "" then null else ($v | fromjson) end), hub_error: (if $v == "" then $e else null end)}'
+    return 0
+  fi
+  next="$(_ha_enable_next)"
+  if kube_ha_on; then
+    printf 'High availability: on (experimental)\n'
+  else
+    printf 'High availability: off (experimental: ./portcullis ha enable turns it on)\n'
+  fi
+  if [ -s "$(_ha_enable_file)" ]; then
+    if [ -n "$next" ]; then
+      printf 'ha enable: %s of 10 steps done; next: step %s (%s): run ./portcullis ha enable to resume\n' \
+        "$(jq -r '.done | length' <<<"$rec")" "$(_ha_step_n "$next")" "$next"
+    else
+      printf 'ha enable: done (%s)\n' "$(jq -r '.done[-1].at' <<<"$rec")"
+    fi
+  fi
+  if [ -z "$view" ]; then
+    if [ -n "$next" ] && _ha_enable_done volumes && ! _ha_enable_done switch; then
+      printf 'The Hub is stopped by ha enable (its volumes are copied: step 4 done) until the switch (step 5).\n'
+    else
+      printf 'The Hub'"'"'s HA view: unreadable (%s)\n' "${_HA_ERR:-?}"
+    fi
+    return 0
+  fi
+  printf '\nChecklist:\n'
+  _ha_checklist_lines "$(jq -c '.checklist' <<<"$view")"
+  jq -r '"\nGuarantee: " + (.guarantee // "?"),
+    ((.quorum // {}) as $q | "Quorum: " + ([["etcd", "etcd"], ["vault", "Vault"], ["sentinel", "Sentinel"]] | map(.[1] + " " + (($q[.[0]] // {healthy: 0, voters: 0}) | "\(.healthy)/\(.voters)")) | join(", "))),
+    (if .enabled then "Front door: " + (if (.frontdoor.state // "") != "" then .frontdoor.state else "unknown (" + (.frontdoor.error // "?") + ")" end) else empty end),
+    "\nNodes:",
+    "  NODE                 ROLE    CLASS  SITE     READY  FENCING  N-1",
+    (.nodes[]? | "  " + (.name + "                    ")[0:20] + " " + (.role + "        ")[0:7] + " " + ((.class // "-") + "       ")[0:6] + " " + ((.site // "-") + "         ")[0:8] + " " + (if .ready then "yes  " else "no   " end) + "  " + (if .fencing then "yes    " else "no     " end) + "  " + .n_minus_1),
+    (if (.warnings // []) | length > 0 then "\nWarnings:", (.warnings[] | "  " + .) else empty end)' <<<"$view"
+}
+
+help_ha() {
+  cat <<'HELP'
+Usage: portcullis ha <subcommand>
+
+  status   High availability: the checklist, quorum, nodes and guarantee
+  enable   Turn high availability on (experimental; resumable)
+
+Kubernetes only. Run 'portcullis ha <subcommand> --help' for details.
+HELP
+}
+
+help_ha_status() {
+  cat <<'HELP'
+Usage: portcullis ha status [--json]
+
+Kubernetes only. Prints whether high availability is on, how far
+`ha enable` got (its record, secrets/kube/ha-enable.json), and the Hub's HA
+view (`hub ha checklist`, as Settings → High availability shows it): the
+checklist ha enable needs all green, the Postgres guarantee, the etcd,
+Vault and Sentinel quorums, each node (role, class, site, ready, fencing,
+N−1) and the warnings. While ha enable has the Hub stopped (its volumes
+copied, before the switch) it says so. --json prints
+{ha, enable, hub, hub_error}.
+HELP
+}
+
+help_ha_enable() {
+  cat <<'HELP'
+Usage: portcullis ha enable [--yes]
+
+Kubernetes only; EXPERIMENTAL. Turns this cluster's single-node shape into
+high availability, step by step, each step recorded in
+secrets/kube/ha-enable.json once it succeeded; run it again after a
+refusal, a failure or Stop (Ctrl-C) and it resumes at the first step not
+recorded:
+   1  the checklist all green (nothing changes on a red item; each is named)
+   2  one confirmation (it names the sign-in downtime and the CAA wait)
+   3  Longhorn, fencing, the snapshot controller, cert-manager, the backup plugin
+   4  the Hub, domains and wg stopped; their volumes copied to the replicated
+      tier and checked
+   5  the switch: the front door's credentials and the current certificate,
+      PORTCULLIS_HA=on, ./portcullis up (Traefik moves to the ingress nodes:
+      sign-in is down for a few minutes)
+   6  Postgres: its instances and a synchronous standby
+   7  Vault: 3 raft voters
+   8  the session store: its replica and 3 Sentinels
+   9  the CAA account switch to the front door's ACME account (waits until no
+      cache can hold the old pin; if longer than one run waits, run it again
+      later), then the old Traefik volume deleted
+  10  ha status all green
+There is no ha disable: leaving HA is backup, init, restore.
+
+Options:
+  --yes   don't ask (scripts); without a terminal --yes is required
+HELP
+}
+
+cmd_ha() {
+  local sub="${1:-}" yes=false json=false
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    ""|-h|--help|help) help_ha; [ -n "$sub" ] || exit 2; return 0 ;;
+    status|enable) ;;
+    *) usage_error ha "unknown subcommand: $sub" ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) "help_ha_$sub"; return 0 ;;
+      --yes|-y) [ "$sub" = enable ] || usage_error "ha $sub" "unknown option: $1"; yes=true ;;
+      --json) [ "$sub" = status ] || usage_error "ha $sub" "unknown option: $1"; json=true ;;
+      -*) usage_error "ha $sub" "unknown option: $1" ;;
+      *) usage_error "ha $sub" "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+  need_env
+  _rt_is_kube || fail "$HA_TEXT_NEEDS_KUBE (CONTAINER_RUNTIME is $(runtime_name)): Docker and Podman installs don't change"
+  case "$sub" in
+    status) ha_status "$json" ;;
+    enable) ha_enable "$yes" ;;
+  esac
+}

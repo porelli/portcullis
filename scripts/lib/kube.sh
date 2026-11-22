@@ -1758,7 +1758,7 @@ _rtk_up() {
   [ "${KUBE_HELM_WAIT:-true}" = true ] || wait=()
   kube_images_ready
   hub_env_write
-  kube_sync_secrets
+  kube_sync_secrets; ! kube_ha_on || ha_frontdoor_env_sync  # the front door's DNS credentials (ha.sh)
   kube_cluster_setup
   kube_pg_sync_secrets
   kube_lldap_schema_retry

@@ -104,6 +104,8 @@ Kubernetes:
   node list                   The cluster's nodes, as the Hub lists them
   node remove                 Drain and remove a cluster node (asks for its typed id)
   node revoke                 Cut a lost or compromised node off now (asks for its typed id)
+  ha status                   High availability: the checklist, quorum, nodes and guarantee
+  ha enable                   Turn high availability on (experimental; resumable)
 
 YubiKey and browser certificates:
   cert enroll                 New key + YubiKey certificate on a YubiKey
@@ -131,7 +133,7 @@ main() {
   worker_role_guard "$cmd" "$@"
   cli_lock "$cmd" "$@"
   case "$cmd" in
-    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|link|mail|ssh|kube|node|worker)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|link|mail|ssh|kube|node|ha|worker)
       "cmd_$cmd" "$@" ;;
     lldap-ui) cmd_lldap_ui "$@" ;;
     *)
