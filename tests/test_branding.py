@@ -2,7 +2,10 @@
 """The branding copies in the Keycloak login theme (polish batch 1): the
 favicon and the Raised-gate mark (dark variant) are byte copies of the
 branding sources (sha256 pinned), and the theme's stylesheet puts the mark
-above the login card. Stdlib only: `python3 tests/test_branding.py`."""
+above the login card. The gate (mockup gate-styles-v2 option A): the arch and
+the portcullis art reuse the logo's shapes, the stylesheet draws them behind
+the card with the drop / rise / still rules, and the theme's script is listed.
+Stdlib only: `python3 tests/test_branding.py`."""
 
 import hashlib
 import os
@@ -38,6 +41,40 @@ class ThemeBrandingTest(unittest.TestCase):
         css = read(os.path.join("resources", "css", "portcullis.css"))
         self.assertIn("../img/portcullis-mark.svg", css)
         self.assertIn("#kc-header-wrapper::before", css)
+
+
+class GateTest(unittest.TestCase):
+    def test_theme_properties_scripts(self):
+        self.assertIn("scripts=js/portcullis-gate.js", read("theme.properties").splitlines())
+        self.assertTrue(os.path.isfile(os.path.join(LOGIN, "resources", "js", "portcullis-gate.js")))
+
+    def test_art_reuses_the_logo(self):
+        mark = read(os.path.join("resources", "img", "portcullis-mark.svg"))
+        arch = read(os.path.join("resources", "img", "portcullis-arch.svg"))
+        gate = read(os.path.join("resources", "img", "portcullis-gate.svg"))
+        # The logo's colours: stone #e8edf5, brass #e3ac52 (the gate at 60%).
+        self.assertIn('fill="#e8edf5"', mark)
+        self.assertIn('fill="#e3ac52"', mark)
+        self.assertIn('fill="#e8edf5"', arch)
+        self.assertIn('fill="#e3ac52" opacity=".6"', gate)
+        for svg in (arch, gate):
+            self.assertIn('viewBox="0 0 32 34"', svg)
+            self.assertNotIn("<script", svg)
+        # The logo's arch (a 14-radius outer, 12 inner here) run to the foot.
+        self.assertIn("a14 14 0 0 1 28 0", arch)
+        self.assertIn("a12 12 0 0 0-24 0", arch)
+
+    def test_stylesheet_draws_the_gate(self):
+        css = read(os.path.join("resources", "css", "portcullis.css"))
+        for want in ('url("../img/portcullis-arch.svg")', 'url("../img/portcullis-gate.svg")',
+                     "@keyframes pc-gate-drop", "@keyframes pc-gate-rise", "animation:pc-gate-drop 460ms",
+                     'data-page-id="login-portcullis-let-through"', "animation:pc-gate-rise 560ms cubic-bezier(.2,.7,.3,1)",
+                     ".pc-gate-still #keycloak-bg::before", ".pf-v5-c-alert.pf-m-danger",
+                     "@media (prefers-reduced-motion:reduce)", "#keycloak-bg>.pf-v5-c-login{position:relative;z-index:1}"):
+            with self.subTest(rule=want):
+                self.assertIn(want, css)
+        # The drop's overshoot: 0.8 units past down (-4) at 82% of its progress.
+        self.assertIn("96.09%{background-position-y:calc(-3.2 * var(--pc-u))", css)
 
 
 if __name__ == "__main__":

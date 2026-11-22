@@ -323,6 +323,15 @@ def main() -> int:
             assert got["status"] == 200, f"favicon {href}: HTTP {got['status']}"
             digest = hashlib.sha256(bytes(got["bytes"])).hexdigest()
             assert digest == FAVICON_ICO_SHA256, f"favicon {href}: sha256 {digest}"
+            # The gate (css/portcullis.css): the arch and the dropping portcullis behind the card.
+            gate = page.evaluate("""() => {
+                const b = document.querySelector('#keycloak-bg');
+                const g = getComputedStyle(b, '::before'), a = getComputedStyle(b, '::after');
+                return {gate: g.backgroundImage, arch: a.backgroundImage, anim: g.animationName,
+                        script: !!document.querySelector('script[src$="/js/portcullis-gate.js"]')};
+            }""")
+            assert "portcullis-gate.svg" in gate["gate"] and "portcullis-arch.svg" in gate["arch"] and gate["script"], gate
+            assert gate["anim"] in ("pc-gate-drop", "none"), gate
         check("login_theme_brand", login_theme_brand)
 
         def setup_link_signs_in():
@@ -484,12 +493,29 @@ def main() -> int:
             if "creds" not in saved:
                 raise AssertionError("needs the registered passkey")
             key2 = Authenticator(page, saved["creds"])
-            page.goto(HWK + "/", wait_until="domcontentloaded")
-            passkey_flow(page, until=HWK, label="second", expect_stepups=0)
+            # Contract §8.1 "Let through": Keycloak redirects to the required action's page
+            # (execution=portcullis-let-through) after the touch; its HTML is kept here.
+            let_through: list = []
+
+            def on_response(r):
+                if "/login-actions/required-action?" in r.url and "execution=portcullis-let-through" in r.url and r.status == 200:
+                    let_through.append(r.text())
+            page.on("response", on_response)
+            try:
+                page.goto(HWK + "/", wait_until="domcontentloaded")
+                passkey_flow(page, until=HWK, label="second", expect_stepups=0)
+            finally:
+                page.remove_listener("response", on_response)
             shot(page, "hwk-second-login")
             assert "Hostname" in page.inner_text("body"), page.url
             assert (key2.asserted, key2.registered) == (1, 0), f"assertions={key2.asserted} registrations={key2.registered}"
-        check("second login: one passkey touch reaches a webauthn app", second_login_one_touch)
+            # One page, naming the app's host (forward-auth: from oauth2-proxy's state, never
+            # auth.<domain>), continued by its own script to the app.
+            hwk_host = HWK.split("://", 1)[1]
+            assert len(let_through) == 1, f"{len(let_through)} Let through pages"
+            assert f"Let through — opening {hwk_host}…" in let_through[0], re.sub(r"\s+", " ", let_through[0])[-600:]
+            assert 'id="portcullis-let-through-form"' in let_through[0] and "/js/portcullis-let-through.js" in let_through[0]
+        check("second login: one passkey touch reaches a webauthn app, through one Let through page naming it", second_login_one_touch)
         close(ctx, "second")
 
         # ── 3. a user outside the group, and the bootstrap admin ──

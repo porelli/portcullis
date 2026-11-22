@@ -920,7 +920,7 @@ case "$p" in
   # The authenticator-app actions: absent until configure registers them
   # (POST register-required-action), then the last PUT; their config is the
   # last PUT unless KC_OTP_KEEP is set (Keycloak keeping the old one).
-  "$R/authentication/required-actions/CONFIGURE_TOTP"|"$R/authentication/required-actions/delete_credential")
+  "$R/authentication/required-actions/CONFIGURE_TOTP"|"$R/authentication/required-actions/delete_credential"|"$R/authentication/required-actions/portcullis-let-through")
     jq -sc --arg p "$p" --arg a "${p##*/}" '([.[] | select(.m == "PUT" and .p == $p) | .b | fromjson] | last)
         // (if any(.[]; .m == "POST" and (.p | endswith("/register-required-action")) and (.b | fromjson | .providerId) == $a)
             then {alias: $a, providerId: $a, name: $a, enabled: false, defaultAction: false, priority: 1000, config: {}} else {} end)' "$KC_LOG" ;;
@@ -963,7 +963,7 @@ expect_eq "keycloak configure: OTP settings equal realm-export.json's" \
   "$(jq -cS 'with_entries(select(.key | startswith("otpPolicy")))' "$HERE/../keycloak/realm-export.json")" \
   "$(bash -c ". '$HERE/../scripts/lib/keycloak.sh'; printf '%s' \"\$KC_REALM_OTP_SETTINGS\"" | jq -cS .)"
 expect_eq "keycloak configure registers CONFIGURE_TOTP and delete_credential when the realm lacks them" \
-  "$(jq -sc '[.[] | select(.m == "POST" and (.p | endswith("/authentication/register-required-action"))) | .b | fromjson]' "$WORK/kc/log")" \
+  "$(jq -sc '[.[] | select(.m == "POST" and (.p | endswith("/authentication/register-required-action"))) | .b | fromjson | select(.providerId != "portcullis-let-through")]' "$WORK/kc/log")" \
   '[{"providerId":"CONFIGURE_TOTP","name":"Configure OTP"},{"providerId":"delete_credential","name":"Delete Credential"}]'
 expect_eq "keycloak configure enables both (CONFIGURE_TOTP at 85, delete_credential at 100, never a default action)" \
   "$(jq -sc '[.[] | select(.m == "PUT" and (.p | test("/required-actions/(CONFIGURE_TOTP|delete_credential)$"))) | .b | fromjson | [.alias, .enabled, .defaultAction, .priority]]' "$WORK/kc/log")" \
@@ -1025,6 +1025,12 @@ expect_eq "keycloak configure: stock webauthn-register (two-factor) required act
 expect_eq "keycloak configure (stub admin API): the impersonation mapper POSTed onto the acr scope, the disabled notice action enabled (never registered)" \
   "$(jq -sc '[.[] | select(.m != "GET") | select(.p | test("acr-id/protocol-mappers|required-actions/portcullis-impersonation-notice")) | .m + " " + .p + " " + (.b | fromjson | .protocolMapper // (.enabled | tostring))]' "$WORK/kc/log")" \
   '["POST /admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models oidc-amr-mapper","POST /admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models portcullis-impersonation","PUT /admin/realms/portcullis/authentication/required-actions/portcullis-impersonation-notice true"]'
+expect_eq "keycloak configure (stub admin API): the missing let-through action registered, then enabled last (priority 1000, never a default action)" \
+  "$(jq -sc '[.[] | select(.m != "GET") | select((.p | endswith("/required-actions/portcullis-let-through")) or ((.p | endswith("/register-required-action")) and (.b | fromjson | .providerId) == "portcullis-let-through")) | .m + " " + (.p | sub(".*/"; "")) + " " + (.b | fromjson | if .priority then "\(.enabled) \(.defaultAction) \(.priority) \(.name)" else .name end)]' "$WORK/kc/log")" \
+  '["POST register-required-action Let through","PUT portcullis-let-through true false 1000 Let through"]'
+expect_eq "realm-export: requiredActions has exactly the pinned portcullis-let-through entry (KC_LET_THROUGH)" \
+  "$(jq -cS '[.requiredActions[] | select(.alias == "portcullis-let-through" or .providerId == "portcullis-let-through")]' "$HERE/../keycloak/realm-export.json")" \
+  "$(sed -n "s/^KC_LET_THROUGH='\(.*\)'\$/\1/p" "$HERE/../scripts/lib/keycloak.sh" | jq -cS '[.]')"
 
 # ── keycloak configure: the impersonation mapper and the notice action
 # (contract §8, sign-in part 3; F5), with kc_get / kc_send stubbed ──

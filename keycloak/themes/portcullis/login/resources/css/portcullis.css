@@ -2,3 +2,42 @@
    variant: Keycloak's login header is dark) above the login card. Loaded
    after keycloak.v2's css/styles.css (theme.properties `styles`). */
 #kc-header-wrapper::before{content:"";display:block;width:64px;height:64px;margin:0 auto 12px;background:url("../img/portcullis-mark.svg") center/contain no-repeat}
+
+/* The gate (mockup gate-styles-v2 option A, "the page is the gateway"): a
+   large stone arch (img/portcullis-arch.svg, the logo's arch run down to the
+   page's foot) frames the page and a brass portcullis
+   (img/portcullis-gate.svg, the logo's bars at 60%) sits inside it, behind
+   the sign-in card. Both art files share the mockup's 32 x 34 viewBox; one
+   unit is --pc-u. The arch (body::after) never moves. The gate (body::before)
+   is a box the size of the arch's opening (24 x 30 units, a semicircle on
+   top: border-radius clips its background to the opening) whose background
+   moves: background-position-y -38 units = up, out of the opening, -4 = down.
+   - every sign-in page: the drop (460 ms, the mockup's cubic-bezier(.55,0,.9,.4)
+     over the whole drop with the 0.8-unit overshoot at 82% of its progress:
+     split at that point into two exact sub-curves, 96.09% of the time);
+   - pages after the first of a sign-in (js/portcullis-gate.js:
+     html.pc-gate-still) and every page with an error: down, still — refused,
+     the gate stays down;
+   - the "Let through" page (the extension's portcullis-let-through.ftl):
+     the rise (560 ms, cubic-bezier(.2,.7,.3,1)), then the page continues;
+   - prefers-reduced-motion: reduce: down and still everywhere (the
+     extension's script then continues at once). */
+:root{--pc-u:min(calc(100vh / 35),calc(100vw / 33))}
+#keycloak-bg::before,#keycloak-bg::after{content:"";position:fixed;bottom:0;z-index:0;pointer-events:none}
+#keycloak-bg::after{left:calc(50% - 16 * var(--pc-u));width:calc(32 * var(--pc-u));height:calc(34 * var(--pc-u));background:url("../img/portcullis-arch.svg") 0 0/100% 100% no-repeat}
+#keycloak-bg::before{left:calc(50% - 12 * var(--pc-u));width:calc(24 * var(--pc-u));height:calc(30 * var(--pc-u));border-radius:50% 50% 0 0/40% 40% 0 0;background:url("../img/portcullis-gate.svg") no-repeat;background-size:calc(32 * var(--pc-u)) calc(34 * var(--pc-u));background-position:calc(-4 * var(--pc-u)) calc(-4 * var(--pc-u));animation:pc-gate-drop 460ms .15s both}
+#keycloak-bg>.pf-v5-c-login{position:relative;z-index:1}
+@keyframes pc-gate-drop{
+  0%{background-position-y:calc(-38 * var(--pc-u));animation-timing-function:cubic-bezier(.513,0,.859,.392)}
+  96.09%{background-position-y:calc(-3.2 * var(--pc-u));animation-timing-function:cubic-bezier(.401,.321,.735,.654)}
+  100%{background-position-y:calc(-4 * var(--pc-u))}
+}
+@keyframes pc-gate-rise{
+  0%{background-position-y:calc(-4 * var(--pc-u))}
+  100%{background-position-y:calc(-38 * var(--pc-u))}
+}
+.pc-gate-still #keycloak-bg::before,#keycloak-bg:has(.pf-v5-c-alert.pf-m-danger,#input-error,.kc-feedback-text)::before{animation:none}
+#keycloak-bg[data-page-id="login-portcullis-let-through"]::before{animation:pc-gate-rise 560ms cubic-bezier(.2,.7,.3,1) .08s both}
+@media (prefers-reduced-motion:reduce){#keycloak-bg::before,#keycloak-bg[data-page-id="login-portcullis-let-through"]::before{animation:none}}
+.portcullis-let-through-text{margin:0;font-size:1.05rem;color:var(--pf-v5-global--success-color--100,#3e8635)}
+.portcullis-let-through-tick{margin-right:.35em;font-weight:700}
