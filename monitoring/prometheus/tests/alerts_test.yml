@@ -283,6 +283,26 @@ tests:
               description: >-
                 The engine's data root or the agent's data dir is nearly full: images, volumes and backups on that server will fail. Free space on the worker.
 
+  # HA: the front door's certificate under 14 days (or none) for 1h.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_frontdoor_certificate_expiry_timestamp_seconds{job="frontdoor",instance="frontdoor:9106"}'
+        values: '864000x120'
+      - series: 'portcullis_frontdoor_certificate_expiry_timestamp_seconds{job="frontdoor",instance="other:9106"}'
+        values: '2592000x120'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PortcullisFrontdoorCertExpiring
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: PortcullisFrontdoorCertExpiring
+        exp_alerts:
+          - exp_labels: {severity: critical, job: frontdoor, instance: "frontdoor:9106"}
+            exp_annotations:
+              summary: "The main domain's certificate (front door) expires in under 14 days, or there is none"
+              description: >-
+                The front door renews it with 30 days left only while it belongs to its current ACME account. ./portcullis status names why it isn't renewing (a pending ACME_STAGING flip: run ./portcullis up; the front door's log says the rest).
+
   # Servers: an unhealthy container for 5m.
   - interval: 1m
     input_series:

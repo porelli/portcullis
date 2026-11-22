@@ -74,6 +74,12 @@ monitoring_prepare() {
   # tls-targets.json: the public endpoint (Traefik's ACME certificate).
   jq -n --arg d "${PORTCULLIS_DOMAIN:-portcullis.local}" \
     '[{targets: ["auth." + $d + ":443"], labels: {probe: "public-cert"}}]' > "$m/prometheus/tls-targets.json"
+  # frontdoor-targets.json: the front door's metrics in HA only (Task 29).
+  if _rt_is_kube && kube_ha_on; then
+    jq -n --arg t "frontdoor.$(kube_ns).svc.cluster.local:9106" '[{targets: [$t], labels: {}}]' > "$m/prometheus/frontdoor-targets.json"
+  else
+    echo '[]' > "$m/prometheus/frontdoor-targets.json"
+  fi
   # wg-targets.json: the wg job's target only while the profile is on (V13).
   if declare -F vpn_prom_targets >/dev/null; then vpn_prom_targets; fi
   alertmanager_config > "$m/alertmanager/alertmanager.yml.tmp"

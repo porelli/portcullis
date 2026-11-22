@@ -173,11 +173,11 @@ func TestIssueMainPebble(t *testing.T) {
 	if err != nil || uri == "" {
 		t.Fatalf("AccountURI: %q %v", uri, err)
 	}
-	if err := c1.IssueMainFor(ctx, "https://other.example/acct/1"); !errors.Is(err, frontdoor.ErrOtherAccount) {
+	if _, err := c1.IssueMainFor(ctx, "https://other.example/acct/1"); !errors.Is(err, frontdoor.ErrOtherAccount) {
 		t.Fatalf("IssueMainFor another account: %v", err)
 	}
-	if err := c1.IssueMainFor(ctx, uri); err != nil {
-		t.Fatalf("IssueMain: %v", err)
+	if issued, err := c1.IssueMainFor(ctx, uri); err != nil || !issued {
+		t.Fatalf("IssueMain: %v %v", issued, err)
 	}
 	got := e.stored(t)
 	if got.AccountURI != uri {
@@ -199,6 +199,17 @@ func TestIssueMainPebble(t *testing.T) {
 	}
 	if rrs := e.zone.Records("_acme-challenge." + testMain); len(rrs) != 0 {
 		t.Errorf("challenge records left: %v", rrs)
+	}
+	// Fix round 1 (M2): asked again for the same account with 90 days
+	// left, nothing is ordered (a rerun after a failed re-pin).
+	e.mu.Lock()
+	nw := len(e.writes)
+	e.mu.Unlock()
+	if issued, err := c1.IssueMainFor(ctx, uri); err != nil || issued {
+		t.Fatalf("IssueMainFor with a current certificate: issued %v, %v", issued, err)
+	}
+	if same := e.stored(t); same.ChainPEM != got.ChainPEM || len(e.writes) != nw {
+		t.Fatal("a current certificate was ordered again")
 	}
 	doc, dropped := buildDynamic(map[string]*Domain{}, &mainCert{CertPEM: got.ChainPEM, KeyPEM: got.KeyPEM}, testMain, "", time.Now())
 	if len(doc.TLS.Certificates) != 1 || len(dropped) != 0 {
@@ -279,8 +290,12 @@ func TestFrontdoorAccountSeparate(t *testing.T) {
 		t.Fatal(err)
 	}
 	var acct Account
-	if err := json.Unmarshal(sec.Data[frontdoor.AccountKey], &acct); err != nil {
-		t.Fatalf("frontdoor-acme[%s]: %v", frontdoor.AccountKey, err)
+	k := frontdoor.AccountKeyFor(env.svc.cfg.CAServer)
+	if len(sec.Data) != 1 || !strings.HasPrefix(k, "frontdoor-127.0.0.1-") {
+		t.Fatalf("frontdoor-acme keys %v, want only %s", len(sec.Data), k)
+	}
+	if err := json.Unmarshal(sec.Data[k], &acct); err != nil {
+		t.Fatalf("frontdoor-acme[%s]: %v", k, err)
 	}
 	if acct.KeyPEM == "" || acct.KeyPEM == env.svc.doc.Account.KeyPEM {
 		t.Fatal("the front door's account key is empty or the added-domains account's")
@@ -290,7 +305,7 @@ func TestFrontdoorAccountSeparate(t *testing.T) {
 	}
 	// Another CA (an ACME_STAGING flip) makes it stale: a new account.
 	c.ACME = &frontdoorACME{email: env.svc.cfg.Email, caServer: env.svc.cfg.CAServer + "?other", hc: env.svc.cfg.ACMEHTTPClient}
-	if c.ACME.CurrentURI(sec.Data[frontdoor.AccountKey]) != "" {
+	if c.ACME.CurrentURI(sec.Data[k]) != "" {
 		t.Fatal("an account of another CA counted as current")
 	}
 }
@@ -310,8 +325,8 @@ func TestFrontdoorControlClient(t *testing.T) {
 		code := runFrontdoorClient(args, addr, &out, &errb)
 		return code, out.String(), errb.String()
 	}
-	if code, _, msg := run("account-uri"); code != exitProblem || !strings.Contains(msg, "no ACME account") {
-		t.Fatalf("standby account-uri: %d %s", code, msg)
+	if code, out, msg := run("account-uri"); code != exitProblem || !strings.Contains(msg, "no ACME account") || !strings.Contains(out, `"refused"`) {
+		t.Fatalf("standby account-uri: %d %q %s (a refusal names itself on stdout too)", code, out, msg)
 	}
 	fence.set(true)
 	code, out, msg := run("account-uri")
@@ -329,11 +344,84 @@ func TestFrontdoorControlClient(t *testing.T) {
 	if code != exitOK || !strings.Contains(out, `"issued":true`) || !strings.Contains(out, uri) {
 		t.Fatalf("issue: %d %s %s", code, out, msg)
 	}
+	code, out, _ = run("issue", "--account-uri", uri)
+	if code != exitOK || !strings.Contains(out, `"issued":false`) || !strings.Contains(out, `"current":true`) {
+		t.Fatalf("issue again (current): %d %s", code, out)
+	}
+	code, out, _ = run("cert-status")
+	if code != exitOK || !strings.Contains(out, `"renews_on_its_own":true`) || !strings.Contains(out, `"present":true`) {
+		t.Fatalf("cert-status: %d %s", code, out)
+	}
 	if code, _, _ := run("bogus"); code != exitUsage {
 		t.Fatalf("bogus: %d", code)
 	}
 	var b strings.Builder
 	if code := runFrontdoorClient([]string{"account-uri"}, "10.0.0.1:8091", &b, &b); code != exitUsage {
 		t.Fatalf("non-loopback control address: %d", code)
+	}
+}
+
+// TestAccountPerCARevertKeepsOld (fix round 1, C1): an ACME_STAGING flip
+// registers the new CA's account under its own key; the old CA's account
+// (the one the CAA still pins) stays, so a stopped or reverted flip
+// renews with it again.
+func TestAccountPerCARevertKeepsOld(t *testing.T) {
+	e := newFdEnv(t, 90*24*time.Hour)
+	ctx := context.Background()
+	lead := &leadFence{lead: true}
+	cA := e.certs(lead, nil)
+	uriA, err := cA.AccountURI(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cA.IssueMainFor(ctx, uriA); err != nil {
+		t.Fatal(err)
+	}
+	// The flip: the front door on CA B (another directory host:port).
+	caB, hcB := fdPebble(t, "127.0.0.1:1", 90*24*time.Hour)
+	cB := e.certs(lead, nil)
+	cB.ACME = &frontdoorACME{email: "ci@example.org", caServer: caB, hc: hcB, skipPropagation: true}
+	uriB, err := cB.AccountURI(ctx)
+	if err != nil || uriB == "" || uriB == uriA {
+		t.Fatalf("CA B's account %q (A's %q): %v", uriB, uriA, err)
+	}
+	if ordered, err := cB.Renew(ctx); ordered || err != nil {
+		t.Fatalf("CA B renewed CA A's certificate: %v %v", ordered, err)
+	}
+	sec, err := e.cs.CoreV1().Secrets(fdNS).Get(ctx, frontdoor.AccountSecret, metav1.GetOptions{})
+	if err != nil || len(sec.Data) != 2 {
+		t.Fatalf("frontdoor-acme holds %d accounts, want both CAs': %v", len(sec.Data), err)
+	}
+	// Reverted: back on CA A, the same account, and it renews on its own.
+	later := func() time.Time { return time.Now().Add(61 * 24 * time.Hour) }
+	cA2 := e.certs(lead, later)
+	if again, err := cA2.AccountURI(ctx); err != nil || again != uriA {
+		t.Fatalf("after the revert: %q %v, want CA A's %q", again, err, uriA)
+	}
+	if ordered, err := cA2.Renew(ctx); !ordered || err != nil {
+		t.Fatalf("after the revert the old account didn't renew: %v %v", ordered, err)
+	}
+	if got := e.stored(t); got.AccountURI != uriA {
+		t.Fatalf("renewed with %q", got.AccountURI)
+	}
+}
+
+// TestCertStatus: the status line's source says why a certificate isn't
+// renewed on its own.
+func TestCertStatus(t *testing.T) {
+	e := newFdEnv(t, 90*24*time.Hour)
+	ctx := context.Background()
+	c := e.certs(&leadFence{lead: true}, nil)
+	st, err := c.Status(ctx)
+	if err != nil || st.Present || !strings.Contains(st.Why, "no certificate yet") {
+		t.Fatalf("no certificate: %+v %v", st, err)
+	}
+	chain, key := mkCert(t, []string{testMain, "*." + testMain}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	if err := (frontdoor.SecretStore{Client: e.cs, Namespace: fdNS}).SaveCert(ctx, frontdoor.Cert{ChainPEM: chain, KeyPEM: key, AccountURI: "https://old.example/acct/7"}); err != nil {
+		t.Fatal(err)
+	}
+	st, err = c.Status(ctx)
+	if err != nil || !st.Present || st.RenewsOnItsOwn || st.Due || !strings.Contains(st.Why, "old.example") || st.NotAfter == "" {
+		t.Fatalf("another account's certificate: %+v %v", st, err)
 	}
 }

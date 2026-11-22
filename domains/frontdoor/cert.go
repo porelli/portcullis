@@ -8,8 +8,10 @@ package frontdoor
 // the domains service mounts read-only and serves to every Traefik replica
 // over its mTLS HTTP provider.
 //
-//   - The account lives in the Secret frontdoor-acme under the key
-//     "frontdoor" (only the front door's Role may read it).
+//   - The accounts live in the Secret frontdoor-acme, one key per CA
+//     (AccountKeyFor: "frontdoor-<CA host>"; only the front door's Role may
+//     read it): a stopped or reverted ACME_STAGING flip never destroys the
+//     account the CAA still pins.
 //   - A first certificate with an account is ordered only when asked
 //     (IssueMain, run by ./portcullis after the CAA flip: relax → settle →
 //     issue → re-pin, scripts/lib/dns.sh dns_flip_main_account): the CAA
@@ -26,6 +28,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -39,10 +42,11 @@ import (
 // The front door's store (Secrets in the core namespace, created empty by
 // the chart; the front door's Role may get and update only these two).
 const (
-	// AccountSecret holds the ACME account (its key and registration) under
-	// AccountKey: read by the front door only.
-	AccountSecret = "frontdoor-acme"
-	AccountKey    = "frontdoor"
+	// AccountSecret holds the ACME accounts (each one's key and
+	// registration), one key per CA (AccountKeyFor): read by the front door
+	// only.
+	AccountSecret    = "frontdoor-acme"
+	AccountKeyPrefix = "frontdoor-"
 	// CertSecret holds the main domain's certificate: tls.crt (the full
 	// chain), tls.key and account-uri (the account that ordered it).
 	// Mounted read-only by the domains service, which serves it.
@@ -51,6 +55,32 @@ const (
 	CertKeyKey     = "tls.key"
 	CertAccountKey = "account-uri"
 )
+
+// AccountKeyFor is the account's key in frontdoor-acme for the ACME
+// directory caServer: "frontdoor-<host>" (the host lowercased, a port as
+// "-<port>"; anything outside [a-z0-9.-] becomes "-"). Two directories on
+// one host share a key: the stored account names its CA, so the other
+// one's is registered over it (CurrentURI).
+func AccountKeyFor(caServer string) string {
+	u, err := url.Parse(caServer)
+	h := ""
+	if err == nil {
+		h = strings.ToLower(u.Host)
+	}
+	var b strings.Builder
+	for _, r := range h {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	if b.Len() == 0 {
+		return AccountKeyPrefix + "unknown"
+	}
+	return AccountKeyPrefix + b.String()
+}
 
 // RenewBefore: a certificate with less than this left is renewed (as the
 // domains service's, contract §12.4).
@@ -65,8 +95,8 @@ type Cert struct {
 
 // CertStore persists the account and the certificate.
 type CertStore interface {
-	LoadAccount(ctx context.Context) ([]byte, error)
-	SaveAccount(ctx context.Context, acct []byte) error
+	LoadAccount(ctx context.Context, key string) ([]byte, error)
+	SaveAccount(ctx context.Context, key string, acct []byte) error
 	LoadCert(ctx context.Context) (Cert, error)
 	SaveCert(ctx context.Context, c Cert) error
 }
@@ -80,6 +110,8 @@ type DNS01 interface {
 
 // ACME is the CA side (the domains binary's lego client, acme.go).
 type ACME interface {
+	// CAServer is the ACME directory (AccountKeyFor).
+	CAServer() string
 	// CurrentURI is the URI of the stored account when it is current
 	// (this CA), "" otherwise (none, unreadable, another CA). No network.
 	CurrentURI(acct []byte) string
@@ -118,7 +150,11 @@ type Certs struct {
 	// failures / retryAt: Renew's backoff after a failed order.
 	failures int
 	retryAt  time.Time
+	// lastWhy: the last not-due reason logged (once per change).
+	lastWhy string
 }
+
+func (c *Certs) key() string { return AccountKeyFor(c.ACME.CAServer()) }
 
 func (c *Certs) now() time.Time {
 	if c.Now != nil {
@@ -146,7 +182,7 @@ func (c *Certs) AccountURI(ctx context.Context) (string, error) {
 }
 
 func (c *Certs) accountLocked(ctx context.Context) ([]byte, string, error) {
-	stored, err := c.Store.LoadAccount(ctx)
+	stored, err := c.Store.LoadAccount(ctx, c.key())
 	if err != nil {
 		return nil, "", fmt.Errorf("reading the ACME account (%s): %w", AccountSecret, err)
 	}
@@ -163,7 +199,7 @@ func (c *Certs) accountLocked(ctx context.Context) ([]byte, string, error) {
 	if !c.leading() {
 		return nil, "", ErrStandingBy
 	}
-	if err := c.Store.SaveAccount(ctx, acct); err != nil {
+	if err := c.Store.SaveAccount(ctx, c.key(), acct); err != nil {
 		return nil, "", fmt.Errorf("saving the ACME account (%s): %w", AccountSecret, err)
 	}
 	c.logf("frontdoor: registered the ACME account %s", uri)
@@ -173,45 +209,68 @@ func (c *Certs) accountLocked(ctx context.Context) ([]byte, string, error) {
 // IssueMain orders <d> and *.<d> now with the current account (DNS-01
 // through the front door's own credentials) and stores the certificate.
 // Only the Lease holder orders.
-func (c *Certs) IssueMain(ctx context.Context) error { return c.issue(ctx, "") }
+func (c *Certs) IssueMain(ctx context.Context) error {
+	_, err := c.issue(ctx, "")
+	return err
+}
 
-// IssueMainFor is IssueMain for the account want only (ErrOtherAccount).
-func (c *Certs) IssueMainFor(ctx context.Context, want string) error { return c.issue(ctx, want) }
+// IssueMainFor is IssueMain for the account want only (ErrOtherAccount),
+// and a no-op (issued false) when the stored certificate already is that
+// account's, servable, with more than RenewBefore left: a rerun of the
+// CAA flip after a failed re-pin doesn't order a duplicate (the CA's
+// duplicate-certificate limit).
+func (c *Certs) IssueMainFor(ctx context.Context, want string) (issued bool, err error) {
+	return c.issue(ctx, want)
+}
 
-func (c *Certs) issue(ctx context.Context, want string) error {
+func (c *Certs) renewBefore() time.Duration {
+	if c.RenewBefore == 0 {
+		return RenewBefore
+	}
+	return c.RenewBefore
+}
+
+func (c *Certs) issue(ctx context.Context, want string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.leading() {
-		return ErrStandingBy
+		return false, ErrStandingBy
 	}
 	acct, uri, err := c.accountLocked(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if want != "" && want != uri {
-		return fmt.Errorf("%w (asked %s, current %s)", ErrOtherAccount, want, uri)
+		return false, fmt.Errorf("%w (asked %s, current %s)", ErrOtherAccount, want, uri)
+	}
+	if want != "" && c.Check != nil {
+		if cur, err := c.Store.LoadCert(ctx); err == nil && cur.AccountURI == uri && c.Check(cur.ChainPEM, cur.KeyPEM, c.now()) == nil {
+			if na, err := NotAfter(cur.ChainPEM); err == nil && na.Sub(c.now()) > c.renewBefore() {
+				return false, nil
+			}
+		}
 	}
 	chain, key, err := c.ACME.Obtain(ctx, acct, c.Domain, c.DNS)
 	if err != nil {
-		return fmt.Errorf("ordering %s and *.%s: %w", c.Domain, c.Domain, err)
+		return false, fmt.Errorf("ordering %s and *.%s: %w", c.Domain, c.Domain, err)
 	}
 	if c.Check == nil {
-		return errors.New("no certificate check configured: refusing to store")
+		return false, errors.New("no certificate check configured: refusing to store")
 	}
 	if err := c.Check(chain, key, c.now()); err != nil {
-		return fmt.Errorf("the issued certificate is refused (nothing stored): %w", err)
+		return false, fmt.Errorf("the issued certificate is refused (nothing stored): %w", err)
 	}
 	if !c.leading() {
-		return ErrStandingBy
+		return false, ErrStandingBy
 	}
 	if err := c.Store.SaveCert(ctx, Cert{ChainPEM: chain, KeyPEM: key, AccountURI: uri}); err != nil {
-		return fmt.Errorf("saving the certificate (%s): %w", CertSecret, err)
+		return false, fmt.Errorf("saving the certificate (%s): %w", CertSecret, err)
 	}
 	c.failures, c.retryAt = 0, time.Time{}
 	if na, err := NotAfter(chain); err == nil {
 		c.logf("frontdoor: certificate for %s and *.%s stored (account %s, valid until %s)", c.Domain, c.Domain, uri, na.UTC().Format(time.RFC3339))
 	}
-	return nil
+	return true, nil
 }
 
 // RenewDue says whether Renew would order now: the stored certificate is
@@ -226,7 +285,7 @@ func (c *Certs) RenewDue(ctx context.Context) (bool, string, error) {
 	if cert.ChainPEM == "" {
 		return false, "no certificate yet: the CAA flip orders the first one", nil
 	}
-	stored, err := c.Store.LoadAccount(ctx)
+	stored, err := c.Store.LoadAccount(ctx, c.key())
 	if err != nil {
 		return false, "", fmt.Errorf("reading %s: %w", AccountSecret, err)
 	}
@@ -238,11 +297,7 @@ func (c *Certs) RenewDue(ctx context.Context) (bool, string, error) {
 	if err != nil {
 		return true, "the stored certificate doesn't parse", nil
 	}
-	rb := c.RenewBefore
-	if rb == 0 {
-		rb = RenewBefore
-	}
-	if na.Sub(c.now()) < rb {
+	if na.Sub(c.now()) < c.renewBefore() {
 		return true, fmt.Sprintf("valid until %s", na.UTC().Format(time.RFC3339)), nil
 	}
 	return false, "", nil
@@ -262,9 +317,25 @@ func (c *Certs) Renew(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	due, why, err := c.RenewDue(ctx)
-	if err != nil || !due {
+	if err != nil {
 		return false, err
 	}
+	if !due {
+		// A stopped renewal is never silent: its reason, once per change
+		// (the status line and the expiry alert show it too).
+		c.mu.Lock()
+		if why != c.lastWhy {
+			c.lastWhy = why
+			if why != "" {
+				c.logf("frontdoor: the certificate of %s isn't renewed on its own: %s", c.Domain, why)
+			}
+		}
+		c.mu.Unlock()
+		return false, nil
+	}
+	c.mu.Lock()
+	c.lastWhy = ""
+	c.mu.Unlock()
 	c.logf("frontdoor: renewing the certificate of %s (%s)", c.Domain, why)
 	if err := c.IssueMain(ctx); err != nil {
 		c.mu.Lock()
@@ -275,6 +346,40 @@ func (c *Certs) Renew(ctx context.Context) (bool, error) {
 		return true, err
 	}
 	return true, nil
+}
+
+// CertStatus is what `domains frontdoor cert-status` prints.
+type CertStatus struct {
+	Present           bool   `json:"present"`
+	NotAfter          string `json:"not_after,omitempty"`
+	AccountURI        string `json:"account_uri,omitempty"`
+	CurrentAccountURI string `json:"current_account_uri"`
+	RenewsOnItsOwn    bool   `json:"renews_on_its_own"`
+	Due               bool   `json:"due"`
+	Why               string `json:"why,omitempty"`
+}
+
+// Status is the stored certificate's state (no network; any replica).
+func (c *Certs) Status(ctx context.Context) (CertStatus, error) {
+	var st CertStatus
+	cert, err := c.Store.LoadCert(ctx)
+	if err != nil {
+		return st, fmt.Errorf("reading %s: %w", CertSecret, err)
+	}
+	stored, err := c.Store.LoadAccount(ctx, c.key())
+	if err != nil {
+		return st, fmt.Errorf("reading %s: %w", AccountSecret, err)
+	}
+	st.CurrentAccountURI = c.ACME.CurrentURI(stored)
+	if cert.ChainPEM != "" {
+		st.Present, st.AccountURI = true, cert.AccountURI
+		if na, err := NotAfter(cert.ChainPEM); err == nil {
+			st.NotAfter = na.UTC().Format(time.RFC3339)
+		}
+		st.RenewsOnItsOwn = st.CurrentAccountURI != "" && cert.AccountURI == st.CurrentAccountURI
+	}
+	st.Due, st.Why, err = c.RenewDue(ctx)
+	return st, err
 }
 
 // NotAfter is the leaf's expiry of a PEM chain.
@@ -305,7 +410,8 @@ func (w *Writer) CleanUpTXT(ctx context.Context, fqdn, value string) error {
 	return w.txt(ctx, fqdn, value, false)
 }
 
-// ChallengeTTL is the challenge record's TTL (the provider may raise it).
+// ChallengeTTL is the challenge record's TTL when the Writer has none (the
+// Writer's TTL is the provider's minimum, as for the address set).
 const ChallengeTTL = 60 * time.Second
 
 func (w *Writer) txt(ctx context.Context, fqdn, value string, add bool) error {
@@ -325,7 +431,11 @@ func (w *Writer) txt(ctx context.Context, fqdn, value string, add bool) error {
 	}
 	defer done()
 	if add {
-		_, err = w.P.AppendRecords(wctx, w.Zone, []libdns.Record{libdns.TXT{Name: w.rel(name), TTL: ChallengeTTL, Text: value}})
+		ttl := w.TTL
+		if ttl <= 0 {
+			ttl = ChallengeTTL
+		}
+		_, err = w.P.AppendRecords(wctx, w.Zone, []libdns.Record{libdns.TXT{Name: w.rel(name), TTL: ttl, Text: value}})
 	} else {
 		_, err = w.P.DeleteRecords(wctx, w.Zone, []libdns.Record{libdns.TXT{Name: w.rel(name), Text: value}})
 	}
@@ -368,16 +478,17 @@ func (s SecretStore) update(ctx context.Context, name string, data map[string][]
 	return err
 }
 
-func (s SecretStore) LoadAccount(ctx context.Context) ([]byte, error) {
+func (s SecretStore) LoadAccount(ctx context.Context, key string) ([]byte, error) {
 	sec, err := s.get(ctx, AccountSecret)
 	if err != nil {
 		return nil, err
 	}
-	return sec.Data[AccountKey], nil
+	return sec.Data[key], nil
 }
 
-func (s SecretStore) SaveAccount(ctx context.Context, acct []byte) error {
-	return s.update(ctx, AccountSecret, map[string][]byte{AccountKey: acct})
+// SaveAccount writes only that CA's key (the other CAs' accounts stay).
+func (s SecretStore) SaveAccount(ctx context.Context, key string, acct []byte) error {
+	return s.update(ctx, AccountSecret, map[string][]byte{key: acct})
 }
 
 func (s SecretStore) LoadCert(ctx context.Context) (Cert, error) {

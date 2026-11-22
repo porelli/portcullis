@@ -277,8 +277,8 @@ func parseLeaf(chain string) (*x509.Certificate, error) {
 
 // frontdoorACME is the front door's ACME side: its OWN account, never the
 // added-domains one (one account per name, CAA accounturi; spec §11.2),
-// kept in the front door's store under the key "frontdoor" (the Secret
-// frontdoor-acme, frontdoor.AccountKey; the same Account shape as the
+// kept in the front door's store, one key per CA (the Secret
+// frontdoor-acme, frontdoor.AccountKeyFor; the same Account shape as the
 // domains service's store). Only the CA decides whether the stored account
 // is current: an ACME_EMAIL change keeps it (a new account would need the
 // CAA flip).
@@ -305,6 +305,9 @@ func (a *frontdoorACME) parse(stored []byte) (*Account, *acmeUser, error) {
 	}
 	return &acct, u, nil
 }
+
+// CAServer is the ACME directory.
+func (a *frontdoorACME) CAServer() string { return a.caServer }
 
 // CurrentURI: the stored account's URI when it belongs to this CA.
 func (a *frontdoorACME) CurrentURI(stored []byte) string {

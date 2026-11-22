@@ -174,6 +174,8 @@ func runFrontdoor(args []string, stdout, stderr io.Writer) int {
 	}
 	fence := frontdoor.NewFence(kc, ns, pod)
 	w.Fence = fence
+	// The domains service's mail-host exclusion (servableHA), the same value.
+	mailHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAINS_MAIL_HOSTNAME")), "."))
 	ctlAddr := env("FRONTDOOR_CONTROL_ADDR", frontdoorControlAddr)
 	if !loopbackAddr(ctlAddr) {
 		logger.Printf("refusing to start: FRONTDOOR_CONTROL_ADDR=%q is not a loopback address", ctlAddr)
@@ -188,7 +190,7 @@ func runFrontdoor(args []string, stdout, stderr io.Writer) int {
 		Domain: domain, Store: frontdoor.SecretStore{Client: kc, Namespace: ns}, DNS: w, Fence: fence,
 		ACME: &frontdoorACME{email: env("ACME_EMAIL", "admin@"+domain), caServer: env("ACME_CA_SERVER", "https://acme-v02.api.letsencrypt.org/directory"),
 			skipPropagation: skip},
-		Check: func(chain, key string, now time.Time) error { return servableHA(chain, key, domain, "", now) },
+		Check: func(chain, key string, now time.Time) error { return servableHA(chain, key, domain, mailHost, now) },
 		Log:   func(m string) { logger.Print(clean(m)) },
 	}
 	metrics := frontdoor.NewMetrics()
@@ -299,7 +301,11 @@ func loopbackAddr(a string) bool {
 // frontdoorControl is the loopback control API:
 //
 //	GET  /v1/account                  {"account_uri"} (the leader registers one when there is none)
-//	POST /v1/issue?account_uri=<uri>  order <d> and *.<d> now with that (the current) account
+//	POST /v1/issue?account_uri=<uri>  order <d> and *.<d> now with that (the current) account:
+//	                                  {"issued", "current", "account_uri", "not_after"} (issued false,
+//	                                  current true: the stored certificate already is that account's
+//	                                  with more than 30 days left, nothing ordered)
+//	GET  /v1/cert                     the stored certificate's state (frontdoor.CertStatus)
 //
 // Errors: 409 standing by / no account / another account, 502 the CA or
 // the provider (the message redacted).
@@ -328,7 +334,8 @@ func frontdoorControl(c *frontdoor.Certs, clean func(string) string) http.Handle
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), issueTimeout)
 		defer cancel()
-		if err := c.IssueMainFor(ctx, want); err != nil {
+		issued, err := c.IssueMainFor(ctx, want)
+		if err != nil {
 			fail(rw, err)
 			return
 		}
@@ -338,7 +345,15 @@ func frontdoorControl(c *frontdoor.Certs, clean func(string) string) http.Handle
 			return
 		}
 		na, _ := frontdoor.NotAfter(cert.ChainPEM)
-		writeJSON(rw, http.StatusOK, map[string]any{"issued": true, "account_uri": cert.AccountURI, "not_after": na.UTC().Format(time.RFC3339)})
+		writeJSON(rw, http.StatusOK, map[string]any{"issued": issued, "current": true, "account_uri": cert.AccountURI, "not_after": na.UTC().Format(time.RFC3339)})
+	})
+	mux.HandleFunc("GET /v1/cert", func(rw http.ResponseWriter, r *http.Request) {
+		st, err := c.Status(r.Context())
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, http.StatusOK, st)
 	})
 	return mux
 }
@@ -351,7 +366,7 @@ func frontdoorControl(c *frontdoor.Certs, clean func(string) string) http.Handle
 // unreachable).
 func runFrontdoorClient(args []string, addr string, stdout, stderr io.Writer) int {
 	usage := func(msg string) int {
-		fmt.Fprintf(stderr, "domains frontdoor: %s\nusage: domains frontdoor [account-uri | issue --account-uri <uri>]\n", msg)
+		fmt.Fprintf(stderr, "domains frontdoor: %s\nusage: domains frontdoor [account-uri | cert-status | issue --account-uri <uri>]\n", msg)
 		return exitUsage
 	}
 	if !loopbackAddr(addr) {
@@ -361,6 +376,8 @@ func runFrontdoorClient(args []string, addr string, stdout, stderr io.Writer) in
 	switch {
 	case len(args) == 1 && args[0] == "account-uri":
 		req, _ = http.NewRequest(http.MethodGet, "http://"+addr+"/v1/account", nil)
+	case len(args) == 1 && args[0] == "cert-status":
+		req, _ = http.NewRequest(http.MethodGet, "http://"+addr+"/v1/cert", nil)
 	case len(args) == 3 && args[0] == "issue" && args[1] == "--account-uri":
 		if !dnsplan.ValidAccountURI(args[2]) {
 			return usage(fmt.Sprintf("%q is not an ACME account URI", args[2]))
@@ -397,6 +414,10 @@ func runFrontdoorClient(args []string, addr string, stdout, stderr io.Writer) in
 	msg, _ := body["error"].(string)
 	fmt.Fprintf(stderr, "domains frontdoor: %s\n", msg)
 	if resp.StatusCode == http.StatusConflict {
+		// The refusal also on stdout, so a caller over kubectl exec tells
+		// it apart from kubectl's own exit 1 (a lost connection, no pod).
+		b, _ := json.Marshal(map[string]string{"refused": msg})
+		fmt.Fprintln(stdout, string(b))
 		return exitProblem
 	}
 	return exitFailure

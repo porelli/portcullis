@@ -290,6 +290,36 @@ done < <(K get serviceaccounts -A -o json | jq -r --arg a "$NS" --arg b "$APPS" 
 [ "$n" -ge 4 ] || fail "only $n ServiceAccounts found in our namespaces"
 pass "Secret access: Traefik only $EDGE (no Secret there, never portcullis-env), the Hub only $APPS, and in $NS the Secret pub-mcp-credentials by name, the other $((n - 2)) ServiceAccounts none"
 
+# ── the front door's two Secrets by name (Task 29 fix round 1, M5) ──
+# The chart's HA front-door RBAC (rendered with the CI's HA values: this
+# install isn't HA) applied for the check, then removed: its ServiceAccount
+# may get / update exactly frontdoor-acme and frontdoor-cert, list none and
+# read no other Secret; the Hub and Traefik read neither.
+jq '{images: (.images | with_entries(if (.value | type) == "string" then . else .value = ((.value.tag_ref | sub(":[^:]*$"; "")) + "@sha256:" + ("0" * 64)) end))}' \
+  charts/portcullis/images.json > "$T/images-values.json"
+helm template portcullis charts/portcullis -n "$NS" -f tests/k8s-ci-values.yaml -f tests/k8s-ci-values-ha.yaml -f "$T/images-values.json" \
+    --show-only templates/frontdoor.yaml > "$T/frontdoor.yaml" || fail "the chart's front door doesn't render with the HA CI values"
+K create --dry-run=client -o json -f "$T/frontdoor.yaml" \
+  | jq '{apiVersion: "v1", kind: "List", items: [(if .kind == "List" then .items[] else . end) | select(.kind == "ServiceAccount" or .kind == "Role" or .kind == "RoleBinding")]}' \
+  > "$T/frontdoor-rbac.json"
+[ "$(jq '.items | length' "$T/frontdoor-rbac.json")" = 3 ] || fail "the front door's ServiceAccount, Role and RoleBinding didn't render"
+K apply -f "$T/frontdoor-rbac.json" >/dev/null
+FD="system:serviceaccount:$NS:frontdoor"
+for s in frontdoor-acme frontdoor-cert; do
+  for verb in get update; do
+    [ "$(K auth can-i "$verb" "secret/$s" -n "$NS" --as="$FD" 2>/dev/null || true)" = yes ] || { K delete -f "$T/frontdoor-rbac.json" >/dev/null 2>&1; fail "the front door can't $verb secret/$s"; }
+  done
+  for who in "system:serviceaccount:$NS:portcullis-hub" "system:serviceaccount:$NS:traefik" "system:serviceaccount:portcullis-ingress:traefik"; do
+    [ "$(K auth can-i get "secret/$s" -n "$NS" --as="$who" 2>/dev/null || true)" = no ] || { K delete -f "$T/frontdoor-rbac.json" >/dev/null 2>&1; fail "$who can get secret/$s"; }
+  done
+done
+for chk in "list secrets" "get secrets" "watch secrets" "get secret/portcullis-env" "create secrets" "delete secret/frontdoor-acme"; do
+  # shellcheck disable=SC2086  # the verb and resource, split on purpose
+  [ "$(K auth can-i $chk -n "$NS" --as="$FD" 2>/dev/null || true)" = no ] || { K delete -f "$T/frontdoor-rbac.json" >/dev/null 2>&1; fail "the front door can $chk"; }
+done
+K delete -f "$T/frontdoor-rbac.json" >/dev/null
+pass "the front door: get / update of frontdoor-acme and frontdoor-cert only (no list, no other Secret); the Hub and Traefik read neither"
+
 # ── revocation within 10 s ──
 SER="$(cat "$T/../e2e-k3s-serial" 2>/dev/null || true)"
 if [ -n "${E2E_REVOKE_SERIAL:-}" ]; then SER="$E2E_REVOKE_SERIAL"; fi

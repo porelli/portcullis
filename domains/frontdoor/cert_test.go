@@ -56,6 +56,8 @@ type fakeACME struct {
 	chain    string
 }
 
+func (a *fakeACME) CAServer() string { return "https://ca.example/dir" }
+
 func (a *fakeACME) CurrentURI(acct []byte) string {
 	if string(acct) == "acct:"+a.uri {
 		return a.uri
@@ -118,5 +120,36 @@ func TestIssueRefusesUncheckedCert(t *testing.T) {
 	}
 	if got, _ := st.LoadCert(ctx); got.ChainPEM != "garbage" {
 		t.Fatal("the stored certificate changed")
+	}
+}
+
+// TestNotDueReasonLoggedOnce (fix round 1, M1): a certificate that isn't
+// renewed on its own says why, once per change of reason.
+func TestNotDueReasonLoggedOnce(t *testing.T) {
+	st := newStore()
+	lead := true
+	var logs []string
+	a := &fakeACME{uri: "https://ca.example/acct/1"}
+	c := &Certs{Domain: "example.org", Store: st, ACME: a, Fence: testFence{&lead}, Now: func() time.Time { return t0 },
+		Log: func(m string) { logs = append(logs, m) }, Check: func(string, string, time.Time) error { return nil }}
+	ctx := context.Background()
+	for range 3 {
+		if _, err := c.Renew(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.SaveCert(ctx, Cert{ChainPEM: "x", KeyPEM: "k", AccountURI: "https://old.example/acct/2"}); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := c.Renew(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(logs) != 2 || !strings.Contains(logs[0], "no certificate yet") || !strings.Contains(logs[1], "old.example") {
+		t.Fatalf("logs %q", logs)
+	}
+	if a.obtains != 0 {
+		t.Fatal("ordered")
 	}
 }

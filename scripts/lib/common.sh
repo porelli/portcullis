@@ -250,7 +250,7 @@ _rt_docker_only() {
 }
 
 # cli_lock <cmd> [args] — the commands that change the stack (up, down,
-# upgrade, restore, backup, mail enable|disable|rotate|cert) run one at a
+# upgrade, restore, backup, config apply, mail enable|disable|rotate|cert) run one at a
 # time: an exclusive flock on $PORTCULLIS_ROOT/.portcullis.lock, held for
 # the process's life, shared with the backup and mail timers (they run
 # these commands). Waits up to PORTCULLIS_LOCK_WAIT seconds (1800), then
@@ -262,6 +262,10 @@ cli_lock() {
   case "$cmd" in
     up|down|upgrade|restore|backup) ;;
     mail) case "$sub" in enable|disable|rotate|cert) ;; *) return 0 ;; esac ;;
+    # config apply: an ACME_STAGING flip relaxes the CAA and waits up to
+    # 15 min, then rewrites .env; never alongside up / upgrade (Task 29 fix
+    # round 1, I1).
+    config) case "$sub" in apply) ;; *) return 0 ;; esac ;;
     # The admission params' swap (kube params-sync, its 30 s timer, and
     # kube check) runs one at a time with up / upgrade (review I3).
     kube) case "$sub" in params-sync|check) ;; *) return 0 ;; esac ;;

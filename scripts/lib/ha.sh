@@ -2308,3 +2308,66 @@ ha_coredns_revert() {
     && kube_ctl delete clusterrole portcullis-dns --ignore-not-found >/dev/null \
     || fail "could not put CoreDNS back to k3s's layout (HA off)"
 }
+
+# ── the front door's Secrets in a core backup (HA; Task 29 fix round 1, I2) ──
+# frontdoor-acme (its ACME accounts, one per CA) and frontdoor-cert (the
+# main domain's certificate) live only in the cluster: a fresh cluster
+# without them serves no main certificate and holds no account the live
+# CAA pins. The backup keeps them as frontdoor.age, age-encrypted to the
+# domains service's own key (secrets/domains/age.key, like store.age), by a
+# domains-image helper pod (no PVC, no network label): the Secrets' data
+# never touches the disk in clear, and never argv.
+
+# _kube_domains_recipient — the age public key of secrets/domains/age.key.
+_kube_domains_recipient() {
+  sed -n 's/^# public key: \(age1[0-9a-z]*\)$/\1/p' "$PORTCULLIS_ROOT/secrets/domains/age.key" 2>/dev/null | head -n1
+}
+
+# _kube_backup_frontdoor <work> — <work>/frontdoor.age (HA with the
+# Secrets only; fails closed when they exist but can't be sealed).
+_kube_backup_frontdoor() {
+  local work="$1" ns pod rcpt rc=0
+  kube_ha_on || return 0
+  ns="$(kube_ns)"
+  kube_ctl -n "$ns" get secret frontdoor-acme frontdoor-cert >/dev/null 2>&1 || return 0
+  rcpt="$(_kube_domains_recipient)"
+  [ -n "$rcpt" ] || { echo "secrets/domains/age.key has no public key line: the front door's Secrets can't be sealed" >&2; return 1; }
+  pod="$(_kube_helper_pod "" "$CT_UID_DOMAINS:$CT_UID_DOMAINS" ro "$(_kube_image_of domains)" frontdoor-seal)" || return 1
+  kube_ctl -n "$ns" get secret frontdoor-acme frontdoor-cert -o json \
+    | jq -c '{v: 1, secrets: [.items[] | {name: .metadata.name, data: (.data // {})}]}' \
+    | kube_ctl -n "$ns" exec -i "$pod" -- domains seal "$rcpt" > "$work/frontdoor.age" || rc=$?
+  _kube_helper_done "$pod"
+  [ "$rc" -eq 0 ] && grep -q '^-----BEGIN AGE ENCRYPTED FILE-----' "$work/frontdoor.age" || { rm -f "$work/frontdoor.age"; return 1; }
+}
+
+# _kube_restore_frontdoor <dir> — frontdoor.age back into the two Secrets
+# (after the release created them): each one's data replaced from the
+# unsealed document (the identity on the helper's stdin, never argv).
+_kube_restore_frontdoor() {
+  local dir="$1" ns pod name rc=0
+  [ -f "$dir/frontdoor.age" ] || return 0
+  kube_ha_on || { warn "the backup holds the front door's Secrets (HA) but this install isn't HA: not restored"; return 0; }
+  ns="$(kube_ns)"
+  pod="$(_kube_helper_pod "" "$CT_UID_DOMAINS:$CT_UID_DOMAINS" ro "$(_kube_image_of domains)" frontdoor-seal)" || return 1
+  for name in frontdoor-acme frontdoor-cert; do
+    cat "$PORTCULLIS_ROOT/secrets/domains/age.key" "$dir/frontdoor.age" \
+      | kube_ctl -n "$ns" exec -i "$pod" -- domains unseal \
+      | N="$name" jq -c '{data: ([.secrets[] | select(.name == env.N)][0].data // error("no \(env.N) in frontdoor.age"))}' \
+      | kube_ctl -n "$ns" patch secret "$name" --type=merge --patch-file=/dev/stdin >/dev/null || { rc=1; break; }
+  done
+  _kube_helper_done "$pod"
+  [ "$rc" -eq 0 ] || return 1
+  ok "The front door's ACME accounts and certificate restored (frontdoor-acme, frontdoor-cert)."
+}
+
+# kube_frontdoor_backup_step <work> / kube_frontdoor_restore_step <dir> —
+# the backup's and the restore's front-door step (kube.sh calls them).
+kube_frontdoor_backup_step() {
+  kube_ha_on || return 0
+  printf '  %-26s' "front door (age)"
+  _kube_backup_frontdoor "$1" || fail "could not back up the front door's Secrets (frontdoor-acme, frontdoor-cert)"
+  printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
+}
+kube_frontdoor_restore_step() {
+  _kube_restore_frontdoor "$1" || fail "could not restore the front door's Secrets (frontdoor-acme, frontdoor-cert) from $1/frontdoor.age: the main domain has no certificate until they are (secrets/domains/age.key from another install?)"
+}

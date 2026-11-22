@@ -78,6 +78,13 @@ scrape_configs:
         regex: '.+'
         action: drop
 
+  # The front door (HA only, contract §20.8): file_sd written by
+  # ./portcullis (monitoring_prepare): its Service's :9106 on Kubernetes in
+  # HA, [] everywhere else (no target, no TargetDown).
+  - job_name: frontdoor
+    file_sd_configs:
+      - files: [/etc/portcullis/frontdoor-targets.json]
+
   # Multiple servers (contract §17.2): the link role's own metrics and the
   # worker agents' (fetched over the tunnel by wg, labelled server=<id>),
   # from the same wg target as job wg (one process, ruling P25); each job

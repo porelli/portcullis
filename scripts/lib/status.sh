@@ -269,6 +269,12 @@ status_run() {
     # archiving or Longhorn's target unavailable is a problem.
     kx="$(printf '%s' "$kx" | jq -c --argjson b "$(kube_backup_status_json)" '. + {backup_destination: $b}')"
     kube_backup_status_lines "$(printf '%s' "$kx" | jq -c '.backup_destination')" >/dev/null || problems=1
+    # HA: the main domain's certificate from the front door (Task 29 fix
+    # round 1, M1): missing, unreadable or under 14 days is a problem.
+    if kube_ha_on; then
+      kx="$(printf '%s' "$kx" | jq -c --argjson f "$(dns_frontdoor_cert_json)" '. + {frontdoor_cert: $f}')"
+      dns_frontdoor_cert_lines "$(printf '%s' "$kx" | jq -c '.frontdoor_cert')" >/dev/null || problems=1
+    fi
   else
     # A docker error is a problem too (fail closed), shown as one line.
     shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
@@ -445,6 +451,7 @@ status_run() {
     fi
     kube_cluster_check_lines "$(printf '%s' "$kx" | jq -c '.cluster_check')" || true
     kube_backup_status_lines "$(printf '%s' "$kx" | jq -c '.backup_destination')" || true
+    if kube_ha_on; then dns_frontdoor_cert_lines "$(printf '%s' "$kx" | jq -c '.frontdoor_cert')" || true; fi
   fi
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
   if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi

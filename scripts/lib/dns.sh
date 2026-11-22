@@ -427,8 +427,18 @@ dns_main_env_write() {
   mkdir -p "$d"
   (umask 077; printf '%s\n' "$new" > "$f.tmp") && mv -f "$f.tmp" "$f" && chmod 600 "$f" \
     || { rm -f "$f.tmp"; warn "could not write $f"; return 1; }
-  info "Traefik's ACME account: $uri (secrets/domains/main-domain.env)"
+  local who="${DNS_MAIN_ENV_WHO:-}"
+  [ -n "$who" ] || who="Traefik's"
+  info "$who ACME account: $uri (secrets/domains/main-domain.env)"
   if [ "$when" = if-running ] && ! rt_running domains; then
+    return 0
+  fi
+  if _rt_is_kube; then
+    # Kubernetes (fix round 1, M3): the file reaches the domains service as
+    # the Secret domains-env (envFrom): synced now, then domains restarted
+    # so it judges the main plan against the new pin before the next up.
+    { kube_sync_secrets >/dev/null 2>&1 && kube_ctl -n "$(kube_ns)" rollout restart deployment/domains >/dev/null 2>&1; } \
+      || warn "could not sync main-domain.env to the domains service (it reads it at the next ./portcullis up)"
     return 0
   fi
   rt_up_service --deps domains >/dev/null 2>&1 || warn "could not restart the domains service to read main-domain.env"
@@ -463,7 +473,7 @@ dns_tighten_main() {
   local caa poll=false uri="" deadline every
   # HA: Traefik has no ACME account; the pin follows the front door's,
   # written only by dns_flip_main_account (relax → settle → issue → re-pin).
-  if _rt_is_kube && kube_ha_on; then return 0; fi
+  if _rt_is_kube && kube_ha_on; then dns_ha_flip_finish; return 0; fi
   caa="$(_dns_flag DNS_CAA true 2>/dev/null)" || { warn "DNS_CAA must be true or false: the CAA pin is left alone"; return 0; }
   [ "$caa" != true ] || ! _dns_automated "${DNS_PROVIDER:-none}" || poll=true
   if [ "$poll" = true ]; then
@@ -737,7 +747,9 @@ dns_relax_main() {
       _dns_relax_put "$now" "$ttl" "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
     fi
   fi
-  info "Relaxing the CAA of $d to CA-only (${DNS_RELAX_WHO:-Traefik} registers a new ACME account), then waiting until no cache can hold the old pin (the TTL caches got + 1 min, at most 15 min; ${DNS_RELAX_WHO:-Traefik} keeps serving the current certificate meanwhile)..."
+  local keeps="Traefik keeps running meanwhile"
+  [ -z "${DNS_RELAX_WHO:-}" ] || keeps="$DNS_RELAX_WHO keeps its current account and certificate meanwhile"
+  info "Relaxing the CAA of $d to CA-only (${DNS_RELAX_WHO:-Traefik} registers a new ACME account), then waiting until no cache can hold the old pin (the TTL caches got + 1 min, at most 15 min; $keeps)..."
   rc=0
   # The tool's settle point is saved the moment it prints it, right after
   # the write (I8); a failed save fails.
@@ -846,34 +858,70 @@ dns_frontdoor_account_uri() {
 # settled yet / refused (run it again later); 2 an older domains image;
 # 3 a failure.
 dns_flip_main_account() {
-  local uri="$1" d="${PORTCULLIS_DOMAIN:-the domain}" caa managed=false relaxed="" rc out
+  local uri="$1"
   _dns_uri_ok "$uri" || { warn "not an ACME account URI: '$uri'"; return 3; }
-  caa="$(_dns_flag DNS_CAA true)" || return 3
-  if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}" && _dns_creds_present "${DNS_PROVIDER:-none}"; then
-    managed=true
-  fi
-  # (1) relax + (2) settle.
-  if [ "$managed" = true ]; then
+  dns_flip_main_settle || return $?
+  dns_flip_main_finish "$uri"
+}
+
+# _dns_caa_managed — Portcullis writes the main domain's CAA (DNS_CAA=true,
+# an automated provider with its credentials).
+_dns_caa_managed() {
+  local caa
+  caa="$(_dns_flag DNS_CAA true 2>/dev/null)" || return 1
+  [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}" && _dns_creds_present "${DNS_PROVIDER:-none}"
+}
+
+# dns_flip_main_settle — the flip's first half, before ANY account or CA
+# change (fix round 1, C1): (1) relax the CAA to CA-only and (2) wait until
+# no cache can hold the old pin (where Portcullis manages the CAA), then
+# the public would-issue check. Exit 0 settled; 1 not yet / refused; 2 an
+# older domains image; 3 a failure. Nothing it does stops the current
+# account from renewing (CA-only lets every account of the CA order).
+dns_flip_main_settle() {
+  local d="${PORTCULLIS_DOMAIN:-the domain}" relaxed="" rc
+  _dns_flag DNS_CAA true >/dev/null || return 3
+  if _dns_caa_managed; then
     rc=0
     DNS_RELAX_WHO="the front door" dns_relax_main || rc=$?
-    [ "$rc" -eq 0 ] || { warn "The CAA account switch of $d stops before the order (see above): the front door orders nothing against the old pin."; return "$rc"; }
+    [ "$rc" -eq 0 ] || { warn "The CAA account switch of $d stops before the order (see above): the front door's CA and account are unchanged, and nothing is ordered against the old pin."; return "$rc"; }
     relaxed=1
   fi
   # The public check the Docker flip runs too (N2): a pin still live or
   # cached where Portcullis can't see it refuses.
-  dns_flip_guard "$(_dns_ca_server)" "$relaxed" || { warn "The CAA account switch of $d stops before the order: nothing was ordered."; return 1; }
-  # (3) issue.
+  dns_flip_guard "$(_dns_ca_server)" "$relaxed" || { warn "The CAA account switch of $d stops before the order: the front door's CA and account are unchanged, nothing was ordered."; return 1; }
+}
+
+# dns_flip_main_finish <uri> — the flip's second half, once settled: (3)
+# the front door orders with <uri> (nothing when it already holds that
+# account's certificate with more than 30 days left: a rerun after a failed
+# re-pin goes straight on), then (4) the CAA pinned to <uri> and
+# main-domain.env records it (synced to the domains service in HA).
+dns_flip_main_finish() {
+  local uri="$1" d="${PORTCULLIS_DOMAIN:-the domain}" rc out
+  _dns_uri_ok "$uri" || { warn "not an ACME account URI: '$uri'"; return 3; }
   info "The front door orders the certificate of $d and *.$d with its ACME account $uri..."
   rc=0
   out="$(_dns_frontdoor issue --account-uri "$uri")" || rc=$?
   case "$rc" in
-    0) ok "The front door holds a certificate of $d from $uri (until $(printf '%s' "$out" | jq -r '.not_after // "?"' 2>/dev/null))." ;;
-    1) warn "The front door refused the order (see above): the CAA of $d stays CA-only; run it again."; return 1 ;;
+    0)
+      if [ "$(printf '%s' "$out" | jq -r '.issued // false' 2>/dev/null)" = true ]; then
+        ok "The front door holds a certificate of $d from $uri (until $(printf '%s' "$out" | jq -r '.not_after // "?"' 2>/dev/null))."
+      else
+        ok "The front door already holds a current certificate of $d from $uri (until $(printf '%s' "$out" | jq -r '.not_after // "?"' 2>/dev/null)): nothing ordered."
+      fi ;;
+    1)
+      # The front door's refusal names itself on stdout; anything else is
+      # kubectl's own exit 1 (the connection, the pod gone).
+      if printf '%s' "$out" | jq -e '.refused' >/dev/null 2>&1; then
+        warn "The front door refused the order (see above): the CAA of $d stays CA-only; run it again."; return 1
+      fi
+      warn "The front door couldn't be reached to order (kubectl exec failed, see above): the CAA of $d stays CA-only; run it again."; return 3 ;;
     *) warn "The front door's order failed (see above): the CAA of $d stays CA-only; run it again."; return 3 ;;
   esac
   # (4) re-pin.
-  dns_main_env_write "$uri" if-running || true
-  [ "$managed" = true ] || return 0
+  DNS_MAIN_ENV_WHO="The front door's" dns_main_env_write "$uri" if-running || true
+  _dns_caa_managed || return 0
   info "Pinning the CAA of $d to the front door's ACME account..."
   rc=0
   out="$(_dns_caa_apply "$uri")" || rc=$?
@@ -884,6 +932,78 @@ dns_flip_main_account() {
     2) warn "could not pin the CAA of $d: the dns tool refused the arguments, the domains image is older than this CLI"; return 2 ;;
     *) warn "could not pin the CAA of $d to the front door's account: the write failed (the message is above). The certificate is ordered and the CAA is CA-only (still one CA, DNS-01 only): run it again."; return 3 ;;
   esac
+}
+
+# dns_frontdoor_cert_json — the front door's certificate state
+# (`domains frontdoor cert-status`: present, not_after, account_uri,
+# current_account_uri, renews_on_its_own, due, why), null when it can't be
+# read. HA only.
+dns_frontdoor_cert_json() {
+  local out
+  out="$(_dns_frontdoor cert-status 2>/dev/null)" || { echo null; return 0; }
+  printf '%s' "$out" | jq -c 'if type == "object" and has("present") then . else null end' 2>/dev/null || echo null
+}
+
+# dns_frontdoor_cert_lines <json> — status's line: a problem (exit 1) when
+# unreadable, missing, or under 14 days left; a warning when it isn't
+# renewed on its own (a flip pending: another account's certificate).
+dns_frontdoor_cert_lines() {
+  local j="$1" na left why now
+  now="${KUBE_NOW:-$(date +%s)}"
+  if [ -z "$j" ] || [ "$j" = null ]; then
+    _st_line fail "front door: its certificate state can't be read (domains frontdoor cert-status): is it running?"
+    return 1
+  fi
+  if [ "$(printf '%s' "$j" | jq -r '.present')" != true ]; then
+    _st_line fail "front door: no certificate of $PORTCULLIS_DOMAIN yet: the main domain has none in HA until the CAA account switch orders it"
+    return 1
+  fi
+  na="$(printf '%s' "$j" | jq -r '.not_after // empty')"
+  left="$(printf '%s' "$j" | jq -r --argjson now "$now" '((.not_after // "1970-01-01T00:00:00Z") | fromdateiso8601) - $now | floor')"
+  why="$(printf '%s' "$j" | jq -r '.why // ""')"
+  if [ "$left" -lt $((14 * 86400)) ]; then
+    _st_line fail "front door: the certificate of $PORTCULLIS_DOMAIN expires $na (under 14 days)${why:+: $why}"
+    return 1
+  fi
+  if [ "$(printf '%s' "$j" | jq -r '.renews_on_its_own')" != true ]; then
+    [ -n "$why" ] || why="it is another account's"
+    _st_line warn "front door: the certificate of $PORTCULLIS_DOMAIN (until $na) isn't renewed on its own: $why"
+    return 0
+  fi
+  _st_line ok "front door: certificate of $PORTCULLIS_DOMAIN until $na, renewed on its own (account $(printf '%s' "$j" | jq -r '.account_uri'))"
+}
+
+# _dns_ha_flip_pending — the target ACME_STAGING value of an HA flip whose
+# settle passed in config apply (certs/.acme-ha-flip-pending), nothing
+# without one.
+_dns_ha_flip_file() { printf '%s/certs/.acme-ha-flip-pending' "$PORTCULLIS_ROOT"; }
+
+# dns_ha_flip_finish — after `up` / `upgrade`'s helm release (HA): the
+# front door now runs on the CA the chart rendered from .env; a pending
+# flip's second half runs (its account URI, the order, the re-pin), then
+# the sentinel. Only warns: `up` doesn't fail on it (rerun up).
+dns_ha_flip_finish() {
+  local f target uri cur
+  f="$(_dns_ha_flip_file)"
+  [ -f "$f" ] || return 0
+  target="$(cat "$f" 2>/dev/null)"
+  cur="$(_bool "$(env_get ACME_STAGING)" false)"
+  if [ "$target" != "$cur" ]; then
+    # ACME_STAGING reverted since: the flip is abandoned; the front door is
+    # back on its old CA and account (one key per CA, never overwritten).
+    rm -f "$f"
+    return 0
+  fi
+  uri="$(dns_frontdoor_account_uri)" || { warn "The ACME_STAGING flip in HA isn't finished: the front door's new account couldn't be read. Run ./portcullis up again."; return 0; }
+  if dns_flip_main_finish "$uri"; then
+    echo "$target" > "$PORTCULLIS_ROOT/certs/.acme-staging-last"
+    rm -f "$f"
+    dns_relax_done
+    ok "ACME_STAGING=$target in HA: the front door's account $uri holds the certificate and the CAA pin."
+  else
+    warn "The ACME_STAGING flip in HA isn't finished (see above): the CAA stays CA-only and the current certificate stays served. Run ./portcullis up again."
+  fi
+  return 0
 }
 
 # dns_main_refresh — after the dns tool wrote the main domain's records

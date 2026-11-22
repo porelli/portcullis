@@ -2003,7 +2003,7 @@ _backup_create_kube() {
   [ ! -d "$PORTCULLIS_ROOT/config" ] || cp -a "$PORTCULLIS_ROOT/config" "$work/config"
   [ ! -d "$PORTCULLIS_ROOT/certs" ] || cp -a "$PORTCULLIS_ROOT/certs" "$work/certs"
   [ ! -d "$PORTCULLIS_ROOT/secrets" ] || cp -a "$PORTCULLIS_ROOT/secrets" "$work/secrets"
-  _strip_host_files "$work/secrets"
+  _strip_host_files "$work/secrets"; kube_frontdoor_backup_step "$work"
   printf '  %-26s' "vault (raft snapshot)"; _backup_vault_snapshot "$work/vault.snap"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
   # The CNPG databases (plan Task 23): keycloak as postgres.dump (the layout
   # every runtime shares), LLDAP's as lldap.dump (no lldap_data volume here).
@@ -2193,7 +2193,7 @@ _backup_restore_kube() {
   # Re-review M-b: a stack that doesn't come up names the replaced databases.
   ( wait_healthy 300 vault postgres lldap keycloak ) \
     || fail "the restored stack isn't healthy: the databases this restore replaced are kept as keycloak_pre_restore / lldap_pre_restore (rename them back by hand; dumps in $pre)"
-  _kube_pg_drop_pre_restore
+  kube_frontdoor_restore_step "$dir"; _kube_pg_drop_pre_restore
   ok "Restore complete. Previous .env/secrets/certs and databases: $pre. Verify with ./portcullis status"
   [ -z "${RESTORE_STOPPED_APPS:-}" ] || warn "Scaled to 0 for the restore and NOT started again: $RESTORE_STOPPED_APPS (their file-share passwords were voided). Start each one from the Hub."
   # Always the last line, as on docker / podman.

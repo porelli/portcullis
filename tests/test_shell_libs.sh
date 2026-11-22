@@ -3304,7 +3304,7 @@ expect_eq "status --json has runtime{}" "$(printf '%s' "$SJ" | jq -c '[.runtime.
 # recorded `domains frontdoor` (the leader's pod over kubectl exec).
 FD_URI="https://acme-staging-v02.api.letsencrypt.org/acme/acct/4242"
 FDF="export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123
-_dns_frontdoor() { echo \"frontdoor \$*\" >> \"\$STUB_DIR/dt/order\"; [ ! -f \"\$STUB_DIR/dt/fd-rc\" ] || return \"\$(cat \"\$STUB_DIR/dt/fd-rc\")\"; echo '{\"issued\":true,\"account_uri\":\"$FD_URI\",\"not_after\":\"2027-02-01T00:00:00Z\"}'; }"
+_dns_frontdoor() { echo \"frontdoor \$*\" >> \"\$STUB_DIR/dt/order\"; [ ! -f \"\$STUB_DIR/dt/fd-rc\" ] || { [ \"\$(cat \"\$STUB_DIR/dt/fd-rc\")\" != 1 ] || echo '{\"refused\":\"standing by\"}'; return \"\$(cat \"\$STUB_DIR/dt/fd-rc\")\"; }; echo '{\"issued\":true,\"account_uri\":\"$FD_URI\",\"not_after\":\"2027-02-01T00:00:00Z\"}'; }"
 rm -f "$STUB_DIR/dt/out-check" "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/fd-rc" "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
 echo '{"ttl": 300, "caa_relaxed": false}' > "$STUB_DIR/dt/out-ttl"
 wait_out true true 0
@@ -3328,7 +3328,7 @@ echo 1 > "$STUB_DIR/dt/rc-apply"
 OUT="$(dt "$FDF; dns_flip_main_account '$FD_URI'")"
 expect_eq "dns_flip_main_account: settle not reached → stops before issue (no order, no pin), exit 1, settle point saved" \
   "$(paste -sd' ' "$STUB_DIR/dt/order"):${OUT##*rc=}:$([ -e "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" ] && echo saved)" "ttl apply refresh:1:saved"
-case "$OUT" in *"stops before the order"*"orders nothing against the old pin"*) t_pass "dns_flip_main_account: unsettled → says it stops before the order" ;; *) t_fail "flip unsettled: $OUT" ;; esac
+case "$OUT" in *"stops before the order"*"nothing is ordered against the old pin"*) t_pass "dns_flip_main_account: unsettled → says it stops before the order" ;; *) t_fail "flip unsettled: $OUT" ;; esac
 # A saved settle point still in the future: no write at all, nothing ordered.
 rm -f "$STUB_DIR/dt/rc-apply"
 wait_out true true 0
@@ -3393,26 +3393,111 @@ expect_eq "_dns_frontdoor: no (or a malformed) Lease holder → exit 3, no exec"
 OUT="$(fdk "export PORTCULLIS_HA=off; _dns_frontdoor account-uri")"
 expect_eq "_dns_frontdoor: outside HA → exit 3, no kubectl" "$([ -s "$STUB_DIR/dt/kubectl" ] && echo ran):${OUT##*rc=}" ":3"
 rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env" "$STUB_DIR/dt/holder"
-# config apply in HA: an ACME_STAGING flip moves the front door onto the
-# new CA, reads its account, then flips; never touches Traefik or acme.json.
+# config apply in HA (fix round 1, C1): relax → settle → public check FIRST,
+# with the front door's CA and account untouched; only then the new CA in
+# .env and the pending mark; `up` (after the chart rolled the front door
+# onto it) finishes: its account, the order, the re-pin, the sentinel.
 FLH_ROOT="$WORK/fliph"; mkdir -p "$FLH_ROOT/certs"
-printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=true\n' > "$FLH_ROOT/.env"
-echo false > "$FLH_ROOT/certs/.acme-staging-last"
-fliph() {
+STG_CA=https://acme-staging-v02.api.letsencrypt.org/directory
+fliph() { # fliph <staging> <extra shell> [cmd]
   rm -f "$STUB_DIR/dt/argv" "$STUB_DIR/dt/order"
-  echo false > "$FLH_ROOT/certs/.acme-staging-last"
+  printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=%s\nACME_CA_SERVER=https://acme-v02.api.letsencrypt.org/directory\n' "$1" > "$FLH_ROOT/.env"
   (PATH="$WORK/dtbin:$PATH" PORTCULLIS_ROOT="$FLH_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FLH_ROOT' PORTCULLIS_HA=on; _rt_is_kube() { true; }
     config_build_ca_bundle() { :; }; kube_ctl() { echo \"kubectl \$*\" >> \"\$STUB_DIR/dt/order\"; }
-    dns_frontdoor_account_uri() { echo '$FD_URI'; }; dns_flip_main_account() { echo \"flip \$1 CA=\$ACME_CA_SERVER\" >> \"\$STUB_DIR/dt/order\"; return \"\${FLIP_RC:-0}\"; }
-    rt_stop() { echo STOP >> \"\$STUB_DIR/dt/order\"; }; _cfg_acme_clear() { echo CLEAR >> \"\$STUB_DIR/dt/order\"; }; $1; config_apply" 2>&1; echo "rc=$?")
+    dns_frontdoor_account_uri() { echo account-uri >> \"\$STUB_DIR/dt/order\"; echo '$FD_URI'; }
+    dns_flip_main_settle() { echo settle >> \"\$STUB_DIR/dt/order\"; return \"\${SETTLE_RC:-0}\"; }
+    dns_flip_main_finish() { echo \"finish \$1\" >> \"\$STUB_DIR/dt/order\"; return \"\${FINISH_RC:-0}\"; }
+    dns_relax_done() { echo relax-done >> \"\$STUB_DIR/dt/order\"; }
+    rt_stop() { echo STOP >> \"\$STUB_DIR/dt/order\"; }; _cfg_acme_clear() { echo CLEAR >> \"\$STUB_DIR/dt/order\"; }; $2; ${3:-config_apply}" 2>&1; echo "rc=$?")
 }
-OUT="$(fliph ":")"
-expect_eq "config apply flip in HA: the front door onto the new CA, rolled out, then the flip to its account; sentinel written" \
-  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(cat "$FLH_ROOT/certs/.acme-staging-last"):${OUT##*rc=}" \
-  "kubectl -n portcullis set env deployment/frontdoor ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory|kubectl -n portcullis rollout status deployment/frontdoor --timeout=180s|flip $FD_URI CA=https://acme-staging-v02.api.letsencrypt.org/directory:true:0"
-OUT="$(fliph "export FLIP_RC=1")"
-expect_eq "config apply flip in HA: an unfinished flip → rc 1, sentinel unchanged (the rerun redoes it), Traefik never stopped" \
-  "$(cat "$FLH_ROOT/certs/.acme-staging-last"):$(grep -c -e STOP -e CLEAR "$STUB_DIR/dt/order" || true):${OUT##*rc=}" "false:0:1"
+fl_state() { printf '%s|%s|%s' "$(sed -n 's/^ACME_CA_SERVER=//p' "$FLH_ROOT/.env")" "$(cat "$FLH_ROOT/certs/.acme-staging-last" 2>/dev/null)" "$(cat "$FLH_ROOT/certs/.acme-ha-flip-pending" 2>/dev/null)"; }
+echo false > "$FLH_ROOT/certs/.acme-staging-last"; rm -f "$FLH_ROOT/certs/.acme-ha-flip-pending"
+OUT="$(fliph true "export SETTLE_RC=1")"
+expect_eq "config apply flip in HA: relax not settled → the front door's CA and account unchanged (no .env CA, no kubectl, no account read, no pending mark), rc 1" \
+  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(fl_state):${OUT##*rc=}" "settle:https://acme-v02.api.letsencrypt.org/directory|false|:1"
+OUT="$(fliph true ":")"
+expect_eq "config apply flip in HA: settled → the new CA in .env and the pending mark; nothing patched out of band, nothing ordered, the sentinel unchanged" \
+  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(fl_state):${OUT##*rc=}" "settle:$STG_CA|false|true:0"
+case "$OUT" in *"Finish with: ./portcullis up"*) t_pass "config apply flip in HA: says up finishes it" ;; *) t_fail "HA flip message: $OUT" ;; esac
+# up's finish (dns_tighten_main → dns_ha_flip_finish), after the chart moved the front door.
+OUT="$(fliph true ":" dns_tighten_main)"
+expect_eq "up after the settled flip: the new account, the order + re-pin, then the sentinel; the mark and the settle point go" \
+  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(fl_state):${OUT##*rc=}" "account-uri|finish $FD_URI|relax-done:https://acme-v02.api.letsencrypt.org/directory|true|:0"
+# A finish that fails keeps the mark and the old sentinel (up warns, rerun).
+echo false > "$FLH_ROOT/certs/.acme-staging-last"; echo true > "$FLH_ROOT/certs/.acme-ha-flip-pending"
+OUT="$(fliph true "export FINISH_RC=3" dns_tighten_main)"
+expect_eq "up: an unfinished HA flip keeps the mark and the old sentinel, warns, rc 0" \
+  "$(grep -c relax-done "$STUB_DIR/dt/order" || true):$(cat "$FLH_ROOT/certs/.acme-staging-last"):$(cat "$FLH_ROOT/certs/.acme-ha-flip-pending"):${OUT##*rc=}" "0:false:true:0"
+case "$OUT" in *"isn't finished"*"Run ./portcullis up again"*) t_pass "up: the unfinished HA flip says rerun up" ;; *) t_fail "HA finish fail: $OUT" ;; esac
+# ACME_STAGING reverted mid-flip: the mark is dropped, no flip, no finish;
+# the front door goes back onto its old CA, whose account (its own key) renews.
+OUT="$(fliph false ":")"
+expect_eq "ACME_STAGING reverted mid-flip in HA: no settle, no flip, the pending mark dropped, the old CA in .env" \
+  "$(cat "$STUB_DIR/dt/order" 2>/dev/null | grep -c -e settle -e finish -e kubectl || true):$(fl_state):${OUT##*rc=}" "0:https://acme-v02.api.letsencrypt.org/directory|false|:0"
+OUT="$(fliph false ":" dns_tighten_main)"
+expect_eq "ACME_STAGING reverted: up's finish does nothing" "$([ -s "$STUB_DIR/dt/order" ] && echo ran):${OUT##*rc=}" ":0"
+expect_eq "config apply flip in HA: Traefik is never stopped and acme.json never cleared" "$(cat "$STUB_DIR/dt/order" 2>/dev/null | grep -c -e STOP -e CLEAR || true)" 0
+expect_eq "config apply runs under cli_lock (fix round 1, I1)" \
+  "$(sed -n '/^cli_lock() {/,/^}/p' "$HERE/../scripts/lib/common.sh" | grep -c 'config) case "$sub" in apply) ;; \*) return 0 ;; esac ;;')" 1
+expect_eq "config apply in HA never patches the front door out of band (fix round 1, M4)" "$(grep -c 'set env' "$HERE/../scripts/lib/config.sh" || true)" 0
+# dns_flip_main_finish: a current certificate → nothing ordered, the re-pin
+# still runs (M2); kubectl's own exit 1 (no refusal JSON) is a failure (n1).
+rm -f "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env"
+wait_out true true 0
+FDC="export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123
+_dns_frontdoor() { echo \"frontdoor \$*\" >> \"\$STUB_DIR/dt/order\"; echo '{\"issued\":false,\"current\":true,\"account_uri\":\"$FD_URI\",\"not_after\":\"2027-02-01T00:00:00Z\"}'; }"
+OUT="$(dt "$FDC; dns_flip_main_finish '$FD_URI'")"
+case "$OUT" in *"already holds a current certificate"*"nothing ordered"*"pinned to $FD_URI"*rc=0) t_pass "dns_flip_main_finish: a current certificate → no new order, straight to the re-pin" ;; *) t_fail "finish current: $OUT" ;; esac
+OUT="$(dt "export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123; _dns_frontdoor() { echo 'error: unable to upgrade connection' >&2; return 1; }; dns_flip_main_finish '$FD_URI'")"
+case "$OUT" in *"couldn't be reached"*rc=3) t_pass "dns_flip_main_finish: kubectl's own exit 1 is a failure (3), not the front door's refusal" ;; *) t_fail "finish kubectl: $OUT" ;; esac
+# M3: in HA the pin record reaches the domains service now.
+OUT="$(dt "export CONTAINER_RUNTIME=kubernetes; _rt_is_kube() { true; }; rt_running() { true; }; kube_sync_secrets() { echo SYNC >> \"\$STUB_DIR/dt/order\"; }; kube_ctl() { echo \"kubectl \$*\" >> \"\$STUB_DIR/dt/order\"; }
+  DNS_MAIN_ENV_WHO=\"The front door's\" dns_main_env_write 'https://ca.example/acct/99' if-running")"
+expect_eq "dns_main_env_write on kubernetes: domains-env synced, then domains restarted; worded for the front door" \
+  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(printf '%s' "$OUT" | grep -c "The front door's ACME account")" "SYNC|kubectl -n portcullis rollout restart deployment/domains:1"
+rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
+# M1: status's line from cert-status.
+for c in 'null|fail|be read' '{"present":false}|fail|no certificate' \
+  '{"present":true,"not_after":"2026-01-05T00:00:00Z","renews_on_its_own":true,"account_uri":"u"}|fail|under 14 days' \
+  '{"present":true,"not_after":"2026-03-01T00:00:00Z","renews_on_its_own":false,"why":"the certificate is account x"}|warn|the certificate is account x' \
+  '{"present":true,"not_after":"2026-03-01T00:00:00Z","renews_on_its_own":true,"account_uri":"u"}|ok|renewed on its own'; do
+  j="${c%%|*}"; rest="${c#*|}"; want="${rest%%|*}"; txt="${rest#*|}"
+  OUT="$(dt "_st_line() { echo \"LINE \$1 \$2\"; }; KUBE_NOW=1767225600 dns_frontdoor_cert_lines '$j'")"
+  case "$OUT" in *"LINE $want "*) case "$OUT" in *$txt*) t_pass "status front door certificate: $want ($txt)" ;; *) t_fail "cert line text: $OUT" ;; esac ;; *) t_fail "cert line $want: $OUT" ;; esac
+done
+# I2: the backup seals both Secrets to the domains key in a helper pod
+# (the recipient on argv, the data on stdin only); restore unseals and
+# patches each one's data from stdin.
+mkdir -p "$WORK/fdb/work" "$WORK/fdb/root/secrets/domains"
+printf '# created: x\n# public key: age1qqqqtestrecipient\nAGE-SECRET-KEY-1TESTIDENTITY\n' > "$WORK/fdb/root/secrets/domains/age.key"
+cat > "$WORK/fdb/stub.sh" <<'STUB'
+kube_ctl() {
+  echo "kubectl $*" >> "$FDB/calls"
+  case "$*" in
+    *"get secret frontdoor-acme frontdoor-cert -o json") echo '{"items":[{"metadata":{"name":"frontdoor-acme"},"data":{"frontdoor-x":"QUNDVC1LRVk="}},{"metadata":{"name":"frontdoor-cert"},"data":{"tls.key":"S0VZ"}}]}' ;;
+    *"get secret frontdoor-acme frontdoor-cert") return 0 ;;
+    *" exec -i "*"domains seal "*) cat > "$FDB/sealed-in"; echo '-----BEGIN AGE ENCRYPTED FILE-----'; echo 'Zm9v'; echo '-----END AGE ENCRYPTED FILE-----' ;;
+    *" exec -i "*"domains unseal") cat > "$FDB/unseal-in"; echo '{"v":1,"secrets":[{"name":"frontdoor-acme","data":{"frontdoor-x":"QUNDVC1LRVk="}},{"name":"frontdoor-cert","data":{"tls.key":"S0VZ"}}]}' ;;
+    *" patch secret "*) cat >> "$FDB/patches" ;;
+  esac
+}
+_kube_helper_pod() { echo "helper $*" >> "$FDB/calls"; echo helper-1; }
+_kube_helper_done() { :; }
+_kube_image_of() { echo localhost/portcullis-domains@sha256:abc; }
+STUB
+fdb() { rm -f "$WORK/fdb/calls" "$WORK/fdb/patches"; (export FDB="$WORK/fdb" PORTCULLIS_ROOT="$WORK/fdb/root" PORTCULLIS_HA=on CONTAINER_RUNTIME=kubernetes; bash -c "source '$HERE/../scripts/lib/common.sh' >/dev/null 2>&1; source '$WORK/fdb/stub.sh'; $1" 2>&1; echo "rc=$?"); }
+OUT="$(fdb "_kube_backup_frontdoor '$WORK/fdb/work'")"
+expect_eq "backup: frontdoor.age sealed in a domains helper pod to the domains key (recipient on argv only, the Secrets' data only on stdin)" \
+  "$(head -c 34 "$WORK/fdb/work/frontdoor.age"):$(grep -c 'exec -i helper-1 -- domains seal age1qqqqtestrecipient$' "$WORK/fdb/calls"):$(jq -r '.secrets | map(.name) | join(",")' "$WORK/fdb/sealed-in"):$(grep -c 'QUNDVC1LRVk\|S0VZ' "$WORK/fdb/calls" || true):${OUT##*rc=}" \
+  "-----BEGIN AGE ENCRYPTED FILE-----:1:frontdoor-acme,frontdoor-cert:0:0"
+OUT="$(fdb "_kube_restore_frontdoor '$WORK/fdb/work'")"
+expect_eq "restore: frontdoor.age unsealed with the domains key on stdin, each Secret's data patched from stdin" \
+  "$(grep -c -- '--type=merge --patch-file=/dev/stdin' "$WORK/fdb/calls"):$(jq -sc 'map(.data | keys[0])' "$WORK/fdb/patches"):$(grep -c 'AGE-SECRET-KEY-1TESTIDENTITY' "$WORK/fdb/unseal-in"):$(grep -c 'AGE-SECRET-KEY\|QUNDVC1LRVk' "$WORK/fdb/calls" || true):${OUT##*rc=}" \
+  '2:["frontdoor-x","tls.key"]:1:0:0'
+OUT="$(fdb "export PORTCULLIS_HA=; _kube_backup_frontdoor '$WORK/fdb/work2'")"
+expect_eq "backup outside HA: no front-door step" "$([ -s "$WORK/fdb/calls" ] && echo ran):${OUT##*rc=}" ":0"
+expect_eq "the kube backup and restore run the front-door steps" \
+  "$(grep -c 'kube_frontdoor_backup_step "$work"' "$HERE/../scripts/lib/kube.sh"):$(grep -c 'kube_frontdoor_restore_step "$dir"' "$HERE/../scripts/lib/kube.sh")" "1:1"
 
 # ══ runtime: CONTAINER_RUNTIME (scripts/lib/runtime.sh) ═════
 # docker stub: the engine's components by DOCKER_HOST — the rootless Podman

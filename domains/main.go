@@ -10,6 +10,7 @@
 //	domains enrolled   the number of enrolled domains
 //	domains dns …      the one-shot DNS tool (tool.go)
 //	domains frontdoor  the front-door role in HA (frontdoor_main.go, §20.8)
+//	domains seal <recipient> / unseal  the front door's Secrets in a backup (seal.go)
 //	domains traefik-account-uri <acme.json>, domains report --main --json|--refresh
 package main
 
@@ -108,6 +109,10 @@ func main() {
 			os.Exit(runMailTLSA(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr}))
 		case "frontdoor":
 			os.Exit(runFrontdoor(os.Args[2:], os.Stdout, os.Stderr))
+		case "seal":
+			os.Exit(runSeal(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+		case "unseal":
+			os.Exit(runUnseal(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 		case "traefik-account-uri":
 			os.Exit(runTraefikAccountURI(os.Args[2:], os.Stdout, os.Stderr))
 		case "report":

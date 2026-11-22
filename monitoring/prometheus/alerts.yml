@@ -235,6 +235,20 @@ groups:
           description: >-
             Its healthcheck has failed for 5 minutes. See the instance in the Hub (logs, restart).
 
+      # High availability (contract §20.8, Task 29 fix round 1 M1): the main
+      # domain's certificate in the front door's store (job frontdoor; no
+      # target outside HA). 0 = none yet: fires too (nothing is served).
+      - alert: PortcullisFrontdoorCertExpiring
+        expr: portcullis_frontdoor_certificate_expiry_timestamp_seconds - time() < 14 * 86400
+        for: 1h
+        labels: {severity: critical}
+        annotations:
+          summary: "The main domain's certificate (front door) expires in under 14 days, or there is none"
+          description: >-
+            The front door renews it with 30 days left only while it belongs to its current ACME
+            account. ./portcullis status names why it isn't renewing (a pending ACME_STAGING flip:
+            run ./portcullis up; the front door's log says the rest).
+
       # Mail (contract §19.8): the wired provider's contract gauges (job
       # mail-provider); MailCertExpiring is core's textfile metric.
       - alert: MailQueueHigh
