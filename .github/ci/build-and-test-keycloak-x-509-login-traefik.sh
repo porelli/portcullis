@@ -23,7 +23,9 @@ got_code() { grep -qiE '^location: .*[?&]code=' "$1"; }
 # redirects with the code) counts as authenticated too: every negative
 # check below refuses both, so the page can never hide a forged sign-in.
 let_through() { grep -q 'id="portcullis-let-through-form"' "$1"; }
-authenticated() { got_code "$1" || let_through "$1"; }
+# Keycloak usually gets there with a 302 to the required action's page.
+to_let_through() { grep -qiE '^location: [^ ]*/login-actions/required-action\?([^ ]*&)?execution=portcullis-let-through' "$1"; }
+authenticated() { got_code "$1" || let_through "$1" || to_let_through "$1"; }
 
 # 0) Without PKCE the forward-auth client issues no code (a stolen
 #    code for an extra-domain callback is useless without the verifier).
@@ -44,6 +46,14 @@ kc_tls() { curl -s -D - -b "$JAR" -c "$JAR" --cacert certs/ca-chain.crt \
   --cert /tmp/test-client.crt --key /tmp/test-client.key \
   --resolve "auth.portcullis.local:443:127.0.0.1" "$@" || true; }
 kc_tls "https://auth.portcullis.local$AUTHQ" > /tmp/kc-ok.h
+if to_let_through /tmp/kc-ok.h; then
+  NEXT=$(grep -i '^location: ' /tmp/kc-ok.h | head -1 | sed 's/^[Ll]ocation: //' | tr -d '\r')
+  case "$NEXT" in
+    https://auth.portcullis.local/realms/portcullis/login-actions/required-action\?*) ;;
+    *) echo "FAIL: the sign-in redirects to '$NEXT'"; exit 1 ;;
+  esac
+  kc_tls "$NEXT" > /tmp/kc-ok.h
+fi
 let_through /tmp/kc-ok.h || { echo "FAIL: X.509 login through Traefik did not reach the Let through page"; head -c 3000 /tmp/kc-ok.h; docker compose logs --tail=60 keycloak; exit 1; }
 if got_code /tmp/kc-ok.h; then echo "FAIL: a code before the Let through page was posted"; exit 1; fi
 ACTION=$(grep -o '<form id="portcullis-let-through-form" action="[^"]*"' /tmp/kc-ok.h | sed 's/.*action="//; s/"$//; s/&amp;/\&/g')
