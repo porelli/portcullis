@@ -519,6 +519,15 @@
       "defaultAction": false,
       "priority": 100,
       "config": { "max_auth_age": "300" }
+    },
+    {
+      "alias": "portcullis-let-through",
+      "name": "Let through",
+      "providerId": "portcullis-let-through",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 1000,
+      "config": {}
     }
   ],
   "components": {

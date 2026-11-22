@@ -1740,12 +1740,16 @@ jobs:
           RA=$(kc /authentication/required-actions/portcullis-impersonation-notice)
           echo "$RA" | jq -e '.enabled and (.defaultAction | not) and .providerId == "portcullis-impersonation-notice"' >/dev/null \
             || { echo "FAIL: the notice required action: $RA"; exit 1; }
+          # The "Let through" page (contract §8.1): enabled, last (1000), never a default action.
+          LT=$(kc /authentication/required-actions/portcullis-let-through)
+          echo "$LT" | jq -e '.enabled and (.defaultAction | not) and .priority == 1000 and .providerId == "portcullis-let-through"' >/dev/null \
+            || { echo "FAIL: the let-through required action: $LT"; exit 1; }
           # Idempotent: a second configure adds no second mapper.
           ./portcullis keycloak configure >/dev/null
           [ "$(kc "/client-scopes/$ACR/protocol-mappers/models" | jq '[.[] | select(.protocolMapper == "portcullis-impersonation")] | length')" = 1 ] \
             || { echo "FAIL: a second keycloak configure added another impersonation mapper"; exit 1; }
           rm -f "$TOK"
-          echo "PASS: the acr scope has amr and the impersonation mapper (access, ID, userinfo), once; the notice action is enabled"
+          echo "PASS: the acr scope has amr and the impersonation mapper (access, ID, userinfo), once; the notice and let-through actions are enabled"
 
       - name: Test users and groups deleted in LLDAP leave Keycloak
         run: bash .github/ci/build-and-test-users-groups-deleted-lldap-leave.sh
