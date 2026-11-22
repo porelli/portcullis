@@ -81,9 +81,16 @@ func TestStatusDocument(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var n atomic.Int32
-	go Run(ctx, path, 30*time.Millisecond, func() Doc { n.Add(1); return on }, time.Now, func(error) {})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		Run(ctx, path, 30*time.Millisecond, func() Doc { n.Add(1); return on }, time.Now, func(error) {})
+	}()
 	time.Sleep(200 * time.Millisecond)
 	cancel()
+	// Run returns once ctx ends; waited for, so no write of its (a temp
+	// file in dir) outlives the test and races t.TempDir's cleanup.
+	<-done
 	if n.Load() < 3 {
 		t.Fatalf("written %d times in 200 ms at 30 ms", n.Load())
 	}
