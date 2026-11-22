@@ -98,7 +98,12 @@ every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
 -}}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
-{{ include "portcullis.pvc" (list . "hub-data" .Values.uids.hub .Values.uids.hub "0750") }}
+{{- /* hub-data's root is 0751: group-gate and mcp-gate (group 10001) list
+and read it; Keycloak (its own uid, no Hub group) may only traverse it and
+open the Hub's world-readable files by name — signin-keycloak.json and
+impersonation.json (0644) — never list it or read the Hub's 0600 / 0640
+files. Compose's hub_data root is the Hub image's 0755 /data. */}}
+{{ include "portcullis.pvc" (list . "hub-data" .Values.uids.hub .Values.uids.hub "0751") }}
 ---
 {{ include "portcullis.pvc" (list . "hub-secrets" .Values.uids.hub .Values.uids.hub "0700") }}
 ---

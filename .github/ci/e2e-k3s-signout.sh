@@ -23,6 +23,21 @@ IP=198.51.100.1
 C=(curl -s --max-time 20 --cacert certs/ca-chain.crt --cert "$T/c.crt" --key "$T/c.key"
    --resolve "auth.$D:443:$IP" --resolve "$D:443:$IP" -c "$T/jar" -b "$T/jar")
 
+# Keycloak reads the Hub's sign-in file through hub-data (root 0751, the
+# mount read-only, no Hub group): it may open the file by name but never
+# list the volume (the Hub's other files stay out of reach).
+K -n "$NS" exec deploy/keycloak -c keycloak -- test -r /hub-data/signin-keycloak.json \
+  || fail "Keycloak can't read /hub-data/signin-keycloak.json (every sign-in method would be off)"
+if K -n "$NS" exec deploy/keycloak -c keycloak -- ls /hub-data >/dev/null 2>&1; then fail "Keycloak can list /hub-data"; fi
+if K -n "$NS" exec deploy/keycloak -c keycloak -- sh -c 'echo x > /hub-data/x' >/dev/null 2>&1; then fail "Keycloak can write /hub-data"; fi
+pass "Keycloak opens /hub-data/signin-keycloak.json read-only and can't list or write hub-data"
+# The extension re-reads the file when it changes; give it a moment after
+# the first readable look.
+for _ in $(seq 1 30); do
+  K -n "$NS" logs deploy/keycloak -c keycloak --since=30s 2>/dev/null | grep -q 'signin-keycloak.json refused' || break
+  sleep 2
+done
+
 # testuser's YubiKey-CA certificate (the root token on the vault pod's stdin).
 root="$(jq -r .root_token secrets/vault-init.json)"; echo "::add-mask::$root"
 # shellcheck disable=SC2016  # expanded by the pod's sh
