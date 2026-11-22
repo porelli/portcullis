@@ -575,6 +575,9 @@ kube_cluster_addresses() {
     _K_ERR="the cluster addresses (ConfigMap portcullis-cluster-addresses) can't be read"; return 1
   fi
   doc="$(printf '%s' "$out" | jq -r '.data["addresses.json"] // empty' 2>/dev/null)"
+  # Created empty by the CLI (kube_nodeadm_sync) until nodeadm writes it
+  # (found live, Task 30: a re-run of init before then refused): absent.
+  if printf '%s' "$out" | jq -e '(.data // {}) | length == 0' >/dev/null 2>&1; then _K_ERR=""; return 0; fi
   vals="$(printf '%s' "$doc" | jq -r 'def ip4: type == "string" and test("^[0-9]{1,3}([.][0-9]{1,3}){3}$");
     select(.v == 1 and (.mesh_cidr | type == "string") and (.cluster_cidr | type == "string") and (.service_cidr | type == "string")
       and (.api | type == "array" and length > 0 and all(ip4)) and (.nodes | type == "object" and length > 0)

@@ -559,3 +559,401 @@ kube_other_nodes_apparmor() {
     [ "$local_node" = true ] || _rt_chk warn "AppArmor stacking on node $name: not checked (it isn't this host): check kernel.apparmor_restrict_unprivileged_unconfined there (containerd#14485)"
   done < <(printf '%s' "$1" | jq -r '.items[] | [.metadata.name, ([.status.addresses[]? | select(.type == "InternalIP" or .type == "ExternalIP") | .address] | join(" "))] | @tsv' 2>/dev/null)
 }
+
+# ── the first node's nodeagent (plan Task 30 carry; contract §20.11) ──
+#
+# init's host is the cluster's first node: it never joins, so nothing gave
+# it the nodeagent every other node runs (the Hub pushes it the mesh peers
+# and reads its pcmesh key; nodeadm has it rotate tokens and remove etcd
+# members; joining nodes measure their RTT against its echo). `up` adopts
+# it once nodeadm runs, and renews its certificate (kube check too):
+#   - the binary from nodeadm's image (the copy it serves joining nodes,
+#     its sha256 checked against nodeadm's own), installed as
+#     /usr/local/lib/portcullis/nodeagent;
+#   - `nodeagent adopt-csr <id>`: the key made on this host by the agent
+#     (root's 0600 file; the CLI never reads it), the CSR printed;
+#   - Vault pki_node/sign/node-cluster (the root token, as link.control):
+#     <id>.cluster.portcullis.internal, client + server, 30 d;
+#   - `nodeagent adopt` with the certificate, the CA, the node's id, mesh
+#     address, site and class on stdin: the state, the unit started.
+# Again when the certificate has ⅓ of its life left or the binary differs
+# from nodeadm's. Fail closed: any check failing installs nothing.
+
+KUBE_NODEAGENT_BIN=/usr/local/lib/portcullis/nodeagent
+KUBE_NODEAGENT_STATE=/var/lib/portcullis/nodeagent
+KUBE_CLUSTER_DOMAIN=cluster.portcullis.internal
+
+# kube_first_node_name — the Kubernetes Node holding the first mesh
+# address (init's), or "".
+kube_first_node_name() {
+  kube_ctl get nodes -o json 2>/dev/null | jq -r --arg ip "$KUBE_MESH_IP" \
+    '[.items[] | select([.status.addresses[]? | select(.type == "InternalIP") | .address] | index($ip)) | .metadata.name][0] // empty' 2>/dev/null || true
+}
+
+# _kn_here_first — this host is the first node: init installed k3s here
+# (PORTCULLIS_K3S_VERSION), it runs the k3s server, and pcmesh holds the
+# first mesh address.
+_kn_here_first() {
+  [ -n "${PORTCULLIS_K3S_VERSION:-}" ] && _ki_sudo test -d "$(_ki_p /var/lib/rancher/k3s/server)" \
+    && { [ -n "${KUBE_INSTALL_PREFIX:-}" ] || ip -4 -o addr show dev "$KUBE_MESH_IF" 2>/dev/null | grep -q " $KUBE_MESH_IP/"; }
+}
+
+# _kn_agent_due <nodeadm sha256> — 0 when the adoption is owed: no state,
+# the installed binary isn't nodeadm's, or the certificate is missing or
+# has at most ⅓ of its life left (KUBE_NODEAGENT_NOW: the tests' clock).
+_kn_agent_due() {
+  local want="$1" have dates nb na now
+  _ki_sudo test -s "$(_ki_p "$KUBE_NODEAGENT_STATE/state.json")" || return 0
+  have="$(_ki_sudo cat "$(_ki_p "$KUBE_NODEAGENT_BIN")" 2>/dev/null | _kube_sha)"
+  [ "$have" = "$want" ] || return 0
+  # node.pem holds the key, then the certificate: x509 reads the certificate only.
+  dates="$(_ki_sudo openssl x509 -in "$(_ki_p "$KUBE_NODEAGENT_STATE/node.pem")" -noout -startdate -enddate 2>/dev/null)" || return 0
+  nb="$(to_epoch "$(printf '%s\n' "$dates" | sed -n 's/^notBefore=//p')")"
+  na="$(to_epoch "$(printf '%s\n' "$dates" | sed -n 's/^notAfter=//p')")"
+  { [ "${nb:-0}" -gt 0 ] && [ "${na:-0}" -gt "$nb" ]; } || return 0
+  now="${KUBE_NODEAGENT_NOW:-$(date +%s)}"
+  [ $((na - now)) -le $(((na - nb) / 3)) ]
+}
+
+# _kn_sign_node_cluster <cn> <csr file> <out file> — Vault's node-cluster
+# certificate for the CSR (pki_node/sign/node-cluster, the root token in a
+# header from a pipe, never argv), checked: CN, chains to the node CA for
+# server and client auth, the CSR's key.
+_kn_sign_node_cluster() {
+  local cn="$1" csr="$2" out="$3" ca="$PORTCULLIS_ROOT/certs/node-ca.crt" code resp want d
+  [ -s "$ca" ] || { warn "first node: $ca is empty (./portcullis pki setup)"; return 1; }
+  vault_admin_env >/dev/null 2>&1 || { warn "first node: no Vault root token (secrets/vault-init.json)"; return 1; }
+  want="$(openssl req -in "$csr" -noout -pubkey 2>/dev/null)"
+  [ -n "$want" ] || { warn "first node: nodeagent adopt-csr printed no readable CSR"; return 1; }
+  d="$(dirname "$out")"
+  code="$(jq -Rs --arg cn "$cn" '{csr: ., common_name: $cn, ttl: "720h", format: "pem"}' < "$csr" \
+    | curl -s --max-time 30 -o "$d/vault.json" -w '%{http_code}' -X POST \
+        -H @<(printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN") -H 'Content-Type: application/json' --data-binary @- \
+        "${VAULT_ADDR:-http://127.0.0.1:8200}/v1/pki_node/sign/node-cluster" || true)"
+  if [ "$code" != 200 ]; then
+    resp="$(jq -r '(.errors // []) | join("; ")' "$d/vault.json" 2>/dev/null | cut -c1-200)"
+    warn "first node: Vault refused to sign the node-cluster certificate (HTTP ${code:-none})${resp:+: $resp}"
+    return 1
+  fi
+  jq -r '.data.certificate // empty' "$d/vault.json" > "$out" 2>/dev/null
+  if [ "$(openssl x509 -in "$out" -noout -subject -nameopt RFC2253 2>/dev/null)" != "subject=CN=$cn" ] \
+     || ! openssl verify -CAfile "$ca" -purpose sslserver "$out" >/dev/null 2>&1 \
+     || ! openssl verify -CAfile "$ca" -purpose sslclient "$out" >/dev/null 2>&1 \
+     || [ "$(openssl x509 -in "$out" -noout -pubkey 2>/dev/null)" != "$want" ]; then
+    warn "first node: Vault's certificate isn't a $cn certificate (server + client auth) for the adoption key under certs/node-ca.crt: nothing installed"
+    return 1
+  fi
+}
+
+# kube_first_nodeagent — `up` (after the release is ready) and `kube
+# check`: the first node's nodeagent adopted or renewed when owed. Not
+# this host's business (no nodeadm, not init's k3s host): nothing. A
+# failure warns (joins need it: the Hub's doctor names the node) and
+# returns 1; nothing half-installed (the agent's own checks come first).
+kube_first_nodeagent() {
+  kube_nodeadm_on || return 0
+  # Without a terminal (kube check's timer) only with passwordless sudo.
+  if [ -z "${KUBE_INSTALL_PREFIX:-}" ] && [ "$(id -u)" != 0 ] && [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
+    [ -z "${PORTCULLIS_K3S_VERSION:-}" ] || warn "first node: its nodeagent is installed and renewed by ./portcullis up (no passwordless sudo here)"
+    return 0
+  fi
+  _kn_here_first || return 0
+  local id arch want tmp labels site class pod rc=0
+  id="$(kube_first_node_name)"
+  [[ "$id" =~ $NODE_ID_RE ]] || { warn "first node: no Node holds the mesh address $KUBE_MESH_IP: its nodeagent isn't installed"; return 1; }
+  case "$(_ki_arch)" in amd64|arm64) arch="$(_ki_arch)" ;; *) warn "first node: no nodeagent for $(_ki_arch)"; return 1 ;; esac
+  pod="$(kube_ctl -n "$KUBE_NODEADM_NS" get pods -l portcullis.io/component=nodeadm --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || pod=""
+  [ -n "$pod" ] || { warn "first node: nodeadm isn't running: its nodeagent waits for the next ./portcullis up"; return 1; }
+  want="$(kube_ctl -n "$KUBE_NODEADM_NS" exec "$pod" -c nodeadm -- sha256sum "$KUBE_NODEAGENT_BIN-$arch" 2>/dev/null | awk '{print $1}')"
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { warn "first node: nodeadm's nodeagent-$arch has no sha256"; return 1; }
+  _kn_agent_due "$want" || return 0
+  labels="$(kube_ctl get node "$id" -o json 2>/dev/null | jq -r '[.metadata.labels["portcullis.io/site"] // "", .metadata.labels["portcullis.io/class"] // ""] | @tsv')" || labels=""
+  IFS=$'\t' read -r site class <<< "$labels"
+  [[ "$site" =~ $NODE_ID_RE ]] && case "$class" in small|home|cloud) true ;; *) false ;; esac \
+    || { warn "first node: node $id has no portcullis.io/site and class labels (init sets them): its nodeagent isn't installed"; return 1; }
+  info "First node $id: installing / renewing its nodeagent..." >&2
+  tmp="$(mktemp -d)" || return 1
+  chmod 700 "$tmp"
+  kube_ctl -n "$KUBE_NODEADM_NS" exec "$pod" -c nodeadm -- cat "$KUBE_NODEAGENT_BIN-$arch" > "$tmp/nodeagent" 2>/dev/null || rc=1
+  if [ "$rc" != 0 ] || [ "$(_kube_sha "$tmp/nodeagent")" != "$want" ]; then
+    rm -rf "$tmp"; warn "first node: the nodeagent copied from nodeadm doesn't match its sha256: nothing installed"; return 1
+  fi
+  _ki_sudo mkdir -p "$(_ki_p "$(dirname "$KUBE_NODEAGENT_BIN")")" \
+    && _ki_sudo install -m 0755 "$tmp/nodeagent" "$(_ki_p "$KUBE_NODEAGENT_BIN").new" \
+    && _ki_sudo mv -f "$(_ki_p "$KUBE_NODEAGENT_BIN").new" "$(_ki_p "$KUBE_NODEAGENT_BIN")" \
+    || { rm -rf "$tmp"; warn "first node: could not install $KUBE_NODEAGENT_BIN"; return 1; }
+  _ki_sudo "$(_ki_p "$KUBE_NODEAGENT_BIN")" adopt-csr "$id" > "$tmp/csr" 2> "$tmp/err" \
+    || { warn "first node: nodeagent adopt-csr: $(head -c 300 "$tmp/err")"; rm -rf "$tmp"; return 1; }
+  _kn_sign_node_cluster "$id.$KUBE_CLUSTER_DOMAIN" "$tmp/csr" "$tmp/crt" || { rm -rf "$tmp"; return 1; }
+  if ! jq -n --arg id "$id" --arg ip "$KUBE_MESH_IP" --arg site "$site" --arg class "$class" \
+        --rawfile cert "$tmp/crt" --rawfile ca "$PORTCULLIS_ROOT/certs/node-ca.crt" \
+        '{id: $id, mesh_ip: $ip, site: $site, class: $class, certificate: $cert, ca: $ca}' \
+      | _ki_sudo "$(_ki_p "$KUBE_NODEAGENT_BIN")" adopt > /dev/null 2> "$tmp/err"; then
+    warn "first node: nodeagent adopt: $(head -c 300 "$tmp/err")"; rm -rf "$tmp"; return 1
+  fi
+  rm -rf "$tmp"
+  ok "First node $id: its nodeagent runs (certificate until $(_ki_sudo openssl x509 -in "$(_ki_p "$KUBE_NODEAGENT_STATE/node.pem")" -noout -enddate 2>/dev/null | cut -d= -f2))." >&2
+}
+
+# ── ./portcullis node … (plan Task 30; contract §20.1 "The CLI twins") ──
+#
+# Thin clients of the running Hub: `hub servers …` through `kubectl exec
+# -i` into the Hub pod (the Lease holder in HA), which talks to its own
+# host control socket. The Hub does the work, so its op, its audit (actor
+# cli) and its Lease apply once. Requests go on stdin, never argv: the
+# Hub's argv is only the subcommand and an id. The join code is printed
+# alone on stdout (once; never logged); everything else goes to stderr.
+
+NODE_ID_RE='^[a-z][a-z0-9-]{0,30}$'
+
+help_node() {
+  cat <<'HELP'
+Usage: portcullis node <subcommand>
+
+  add      A join code for a new cluster node (the code on stdout)
+  list     The cluster's nodes, as the Hub lists them
+  remove   Drain and remove a node (asks for its typed id)
+  revoke   Cut a lost or compromised node off now (asks for its typed id)
+
+Kubernetes only. Run 'portcullis node <subcommand> --help' for details.
+HELP
+}
+
+help_node_add() {
+  cat <<'HELP'
+Usage: portcullis node add <id> [--role server|agent] [--class small|home|cloud] [--site <site>]
+
+Kubernetes only. Has the Hub make a join code for the cluster node <id>
+(its Kubernetes name, ^[a-z][a-z0-9-]{0,30}$): the same as Servers → Add
+server on the Hub, audited as server.add by actor cli. Role and class
+default to the Hub's suggestion, site to main.
+
+The join code alone goes to stdout (redirect it to a 0600 file if you need
+to carry it); the one-liner to run on the new machine and the rest go to
+stderr. The code is a secret, valid 15 minutes and used once: on the new
+machine, run the printed `curl … | sudo sh` and paste the code when asked
+(it is never typed on a command line). Joining as a server gives that
+machine full control of the cluster.
+HELP
+}
+
+help_node_list() {
+  cat <<'HELP'
+Usage: portcullis node list [--json]
+
+Kubernetes only. The servers the Hub lists (the cluster's nodes, joining
+ones included): id, role, class, site, mesh address and state. --json
+prints the Hub's answer as it is.
+HELP
+}
+
+help_node_remove() {
+  cat <<'HELP'
+Usage: portcullis node remove <id>
+
+Kubernetes only. Removes the cluster node <id> cooperatively, as the Hub's
+Remove: cordon, drain (the replica and quorum minimums apply), Longhorn's
+replicas moved, its etcd member removed (a server), its Node deleted and
+its certificate revoked. Asks for the node's id, typed (read from stdin),
+and refuses on a mismatch. Waits for the Hub's operation and prints its
+outcome.
+HELP
+}
+
+help_node_revoke() {
+  cat <<'HELP'
+Usage: portcullis node revoke <id>
+
+Kubernetes only. Revokes the cluster node <id> at once, as the Hub's
+Revoke (a lost or compromised machine): its certificate revoked, its
+tokens deleted, the cluster's k3s tokens rotated, its Node and etcd member
+removed; no drain. Asks for the node's id, typed (read from stdin), and
+refuses on a mismatch. While etcd lacks quorum the removal is parked (the
+security steps done) and the Hub finishes it later.
+HELP
+}
+
+# _node_hub_ref — the Hub pod `hub servers` runs in: the holder of the
+# Lease portcullis-hub (the writer in HA) when that pod exists, else the
+# Deployment's.
+_node_hub_ref() {
+  local h
+  h="$(kube_ctl -n "$(kube_ns)" get lease portcullis-hub -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)" || h=""
+  if [[ "$h" =~ ^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ ]] && kube_ctl -n "$(kube_ns)" get pod "$h" -o name >/dev/null 2>&1; then
+    echo "pod/$h"
+  else
+    echo "deploy/hub"
+  fi
+}
+
+# _node_hub <args…> — `hub servers <args…>` in the Hub pod, stdin passed
+# through; its stdout and exit code (0 done, 1 refused, 2 usage), its
+# stderr minus kubectl's "command terminated" line.
+_node_hub() {
+  kube_ctl -n "$(kube_ns)" exec -i "$(_node_hub_ref)" -c hub -- hub servers "$@" \
+    2> >(awk '!/^command terminated with exit code [0-9]+$/ { print; fflush() }' >&2)
+}
+
+_node_kube() {
+  need_env
+  _rt_is_kube || fail "node $1: Kubernetes only (CONTAINER_RUNTIME is $(runtime_name)): a Docker or Podman server joins with the Hub's Add server and ./portcullis worker join"
+}
+
+_node_id() {
+  [[ "$2" =~ $NODE_ID_RE ]] || usage_error "node $1" "invalid node id: $2 (^[a-z][a-z0-9-]{0,30}\$)"
+}
+
+_node_add() {
+  local id="" role="" class="" site="" body tmp code rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) help_node_add; return 0 ;;
+      --role) need_value "node add" "$1" "${2:-}"; role="$2"; shift ;;
+      --role=*) role="${1#*=}" ;;
+      --class) need_value "node add" "$1" "${2:-}"; class="$2"; shift ;;
+      --class=*) class="${1#*=}" ;;
+      --site) need_value "node add" "$1" "${2:-}"; site="$2"; shift ;;
+      --site=*) site="${1#*=}" ;;
+      -*) usage_error "node add" "unknown option: $1" ;;
+      *) [ -z "$id" ] || usage_error "node add" "unexpected argument: $1"; id="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$id" ] || usage_error "node add" "expected <id>"
+  _node_id add "$id"
+  case "$role" in ""|server|agent) ;; *) usage_error "node add" "--role must be server or agent" ;; esac
+  case "$class" in ""|small|home|cloud) ;; *) usage_error "node add" "--class must be small, home or cloud" ;; esac
+  [ -z "$site" ] || [[ "$site" =~ $NODE_ID_RE ]] || usage_error "node add" "--site must match ^[a-z][a-z0-9-]{0,30}\$"
+  _node_kube add
+  body="$(jq -nc --arg id "$id" --arg role "$role" --arg class "$class" --arg site "$site" \
+    '{id: $id} + (if $role != "" then {role: $role} else {} end) + (if $class != "" then {class: $class} else {} end) + (if $site != "" then {site: $site} else {} end)')" \
+    || fail "could not build the request"
+  tmp="$(mktemp -d)" || fail "no temporary directory"
+  chmod 700 "$tmp"
+  # The code into a 0600 file (never a variable a trace could print), the
+  # answer's rest into another.
+  (umask 077 && printf '%s' "$body" | _node_hub add-cluster-node > "$tmp/code" 2> "$tmp/rest") || rc=$?
+  if [ "$rc" != 0 ]; then
+    # A refusal's text (no code in it); kubectl's own errors too.
+    sed -e 's/pcj2\.[A-Za-z0-9_-]*/<redacted>/g' "$tmp/rest" >&2
+    rm -rf "$tmp"
+    fail "the Hub made no join code for $id"
+  fi
+  code="$(tr -d '\r\n' < "$tmp/code")"
+  case "$code" in pcj2.?*) ;; *) rm -rf "$tmp"; fail "the Hub answered no join code" ;; esac
+  if ! jq -e 'type == "object" and (.command | type == "string")' "$tmp/rest" >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    fail "the Hub's answer is unreadable (the code is not shown: make a new one with ./portcullis node add)"
+  fi
+  {
+    jq -r --arg id "$id" '"Node \($id): join code made (role \(.role), class \(.class), site \(.site); valid until \(.expires_at), used once)."' "$tmp/rest"
+    jq -r '(.warnings // [])[] | "Warning: \(.)"' "$tmp/rest"
+    jq -r 'select(.notice) | .notice' "$tmp/rest"
+    echo "On the new machine, run:"
+    jq -r '"  \(.command)"' "$tmp/rest"
+    echo "and paste the join code below when it asks (it isn't shown there). It is a secret: never put it on a command line, in a chat or a ticket."
+    echo "Progress: ./portcullis node list, or the Hub's Servers page."
+  } >&2
+  rm -rf "$tmp"
+  printf '%s\n' "$code"
+}
+
+_node_list() {
+  local json=false out
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) help_node_list; return 0 ;;
+      --json) json=true ;;
+      -*) usage_error "node list" "unknown option: $1" ;;
+      *) usage_error "node list" "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+  _node_kube list
+  out="$(_node_hub list </dev/null)" || fail "the Hub didn't list its servers"
+  if [ "$json" = true ]; then printf '%s\n' "$out"; return 0; fi
+  printf '%s' "$out" | jq -r '
+    ["ID", "ROLE", "CLASS", "SITE", "MESH IP", "STATE"],
+    (.servers[] | select(.kind == "cluster-node" or .id == "primary")
+      | [.id, (.role // "-"), (.class // "-"), (.site // "-"), (.mesh_ip // "-"), (.state + (if .error then " (" + .error + ")" else "" end))])
+    | @tsv' | column -t -s "$(printf '\t')" \
+    || fail "the Hub's server list is unreadable"
+}
+
+# _node_confirm <cmd> <id> — the typed id, read from stdin (a terminal, or
+# a pipe for scripts); a mismatch refuses before the Hub is asked.
+_node_confirm() {
+  local typed=""
+  printf 'Type the node id (%s) to %s it: ' "$2" "$1" >&2
+  IFS= read -r typed || true
+  [ -t 0 ] || echo >&2
+  [ "$typed" = "$2" ] || fail "node $1: the typed id doesn't match $2: nothing was changed"
+}
+
+# _node_wait <id> <op_id> — polls the Hub's op until it finished (60 min,
+# the Hub's own enrol/removal bounds are shorter); 0 it succeeded.
+_node_wait() {
+  local rec i last=""
+  for ((i = 0; i < 1200; i++)); do
+    rec="$(_node_hub op "$1" "$2" </dev/null 2>/dev/null)" || rec=""
+    if [ -n "$rec" ] && printf '%s' "$rec" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      local step
+      step="$(printf '%s' "$rec" | jq -r '[(.steps // [])[] | select(.state == "running") | .label] | first // empty' 2>/dev/null)"
+      [ -z "$step" ] || [ "$step" = "$last" ] || { echo "    $step..." >&2; last="$step"; }
+      if printf '%s' "$rec" | jq -e '.running != true' >/dev/null 2>&1; then
+        printf '%s' "$rec" | jq -e '.ok == true' >/dev/null 2>&1 && return 0
+        warn "node: the Hub's operation failed: $(printf '%s' "$rec" | jq -r '.error // "no reason given"')"
+        return 1
+      fi
+    fi
+    sleep 3
+  done
+  warn "node: the Hub's operation is still running after 60 min: ./portcullis node list"
+  return 1
+}
+
+_node_remove() {
+  local cmd="$1" id="" out
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) "help_node_$cmd"; return 0 ;;
+      -*) usage_error "node $cmd" "unknown option: $1" ;;
+      *) [ -z "$id" ] || usage_error "node $cmd" "unexpected argument: $1"; id="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$id" ] || usage_error "node $cmd" "expected <id>"
+  _node_id "$cmd" "$id"
+  _node_kube "$cmd"
+  _node_confirm "$cmd" "$id"
+  out="$(jq -nc --arg id "$id" '{confirm: $id}' | _node_hub "$cmd" "$id")" || fail "the Hub refused to $cmd $id"
+  if [ "$cmd" = revoke ]; then
+    if printf '%s' "$out" | jq -e '.parked == true' >/dev/null 2>&1; then
+      warn "$(printf '%s' "$out" | jq -r '.warning // empty')"
+      warn "$(printf '%s' "$out" | jq -r '.detail // empty')"
+      ok "$id revoked (parked: the Hub finishes the removal once etcd has quorum)" >&2
+    else
+      ok "$id revoked" >&2
+    fi
+    return 0
+  fi
+  local op
+  op="$(printf '%s' "$out" | jq -r '.op_id // empty')"
+  [ -n "$op" ] || fail "the Hub's answer names no operation"
+  info "Removing $id (the Hub's operation $op)..." >&2
+  _node_wait "$id" "$op" || fail "$id wasn't removed (see above; the Hub's Servers page has the steps)"
+  ok "$id removed" >&2
+}
+
+cmd_node() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    ""|-h|--help|help) help_node; [ -n "$sub" ] || exit 2; return 0 ;;
+    add) _node_add "$@" ;;
+    list) _node_list "$@" ;;
+    remove|revoke) _node_remove "$sub" "$@" ;;
+    *) usage_error node "unknown subcommand: $sub" ;;
+  esac
+}

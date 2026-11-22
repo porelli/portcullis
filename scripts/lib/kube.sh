@@ -454,7 +454,7 @@ EOF
 kube_port_forward() {
   local svc="$1" port="$2" log i lp="" pid
   log="$(mktemp)"
-  kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "svc/$svc" ":$port" >"$log" 2>&1 &
+  kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "svc/$svc" ":$port" >"$log" 2>&1 9>&- &
   pid=$!
   _K_PF_PIDS="${_K_PF_PIDS:-} $pid"
   for ((i = 0; i < 100; i++)); do
@@ -1777,7 +1777,7 @@ _rtk_up() {
   fi
   (umask 077 && printf '%s\n' "$_K_IMAGES" > "$(kube_digests_file)")
   kube_vault_shrink_finish; kube_backup_after_release  # ha.sh: Vault's voters, CNPG's first base backup
-  kube_cluster_check
+  kube_cluster_check; [ "${#wait[@]}" -eq 0 ] || kube_first_nodeagent || true  # node.sh, once the release is ready
   kube_forward_core
 }
 
@@ -1886,7 +1886,7 @@ _kube_forward() {
   local log i lp="" pid parent=$$ target="$1"
   case "$target" in */*) ;; *) target="svc/$target" ;; esac
   log="$(mktemp)"
-  kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$2" >"$log" 2>&1 &
+  kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$2" >"$log" 2>&1 9>&- &
   pid=$!
   ( while kill -0 "$parent" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 1; done; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   for ((i = 0; i < 100; i++)); do
@@ -2320,7 +2320,7 @@ cmd_kube() {
   _rt_is_kube || { warn "kube check: CONTAINER_RUNTIME is $(runtime_name), not kubernetes"; exit 1; }
   _K_CHECK_WHY=""
   kube_cluster_check
-  ( kube_params_sync ) || warn "kube check: params-sync failed (see above): the active admission params stay"
+  ( kube_params_sync ) || warn "kube check: params-sync failed (see above): the active admission params stay"; ( kube_first_nodeagent ) || true
   [ -z "$_K_CHECK_WHY" ] || exit 1
   ok "cluster check ok (portcullis-cluster-check written)"
 }

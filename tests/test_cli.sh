@@ -86,7 +86,11 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 56 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 56
+expect_eq "help lists 60 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 60
+# plan Task 30: the cluster-node commands (`ha` comes with Task 31).
+for c in "node add" "node list" "node remove" "node revoke"; do
+  case "$HELP" in *"  $c  "*) t_pass "help lists $c" ;; *) t_fail "help misses $c" ;; esac
+done
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -115,7 +119,7 @@ expect_eq "every --help works with no engine: the engine was never asked" "$(cat
 run init --help
 case "$OUT" in *"--runtime docker|podman"*"CONTAINER_RUNTIME"*"never switched"*) t_pass "init --help documents --runtime" ;; *) t_fail "init --help lacks --runtime" ;; esac
 
-for g in vault pki keycloak oidc dns cert config signin vpn mail; do
+for g in vault pki keycloak oidc dns cert config signin vpn mail node; do
   run "$g";        expect_eq "'$g' without subcommand exits 2" "$RC" 2
   run "$g" --help; expect_eq "'$g --help' exits 0" "$RC" 0
   run "$g" bogus;  expect_eq "'$g bogus' exits 2" "$RC" 2
@@ -195,6 +199,22 @@ lldap-ui now|unknown argument: now
 signin reset-core --force|unknown argument: --force
 kube check --now|unknown argument: --now
 kube frob|unknown subcommand: frob
+node frob|unknown subcommand: frob
+node add|expected <id>
+node add Bad|invalid node id: Bad
+node add n4 n5|unexpected argument: n5
+node add n4 --role boss|--role must be server or agent
+node add n4 --class huge|--class must be small, home or cloud
+node add n4 --site Main|--site must match
+node add n4 --role|--role needs a value
+node add n4 --code pcj2.x|unknown option: --code
+node list now|unexpected argument: now
+node list --all|unknown option: --all
+node remove|expected <id>
+node remove x;y|invalid node id
+node remove n4 n5|unexpected argument: n5
+node revoke|expected <id>
+node revoke n4 --force|unknown option: --force
 signin reset-core|no terminal to confirm on: pass --yes
 vpn init extra|unexpected argument: extra
 vpn init --builtin|--builtin needs a value

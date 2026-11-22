@@ -5130,6 +5130,14 @@ ca "$(jq -c '.api = ["10.215.0.1"]' <<< "$CA_OK")"
 case "$(car)" in *"list the API servers 10.215.0.1:6443, but the cluster has 10.215.0.10:6443 10.215.0.1:6443"*"rc=1") t_pass "kube_cluster_addresses: an api list ≠ the cluster's EndpointSlice → refused naming both" ;; *) t_fail "ca api diff: $(car)" ;; esac
 ca "$(jq -c '.cluster_cidr = "10.99.0.0/16"' <<< "$CA_OK")"
 case "$(car)" in *"give pods 10.99.0.0/16 and services 10.43.0.0/16, but the cluster has 10.42.0.0/24"*"rc=1") t_pass "kube_cluster_addresses: a cluster CIDR ≠ the cluster's → refused" ;; *) t_fail "ca cidr: $(car)" ;; esac
+# Task 30 (found live): the CLI creates the ConfigMap empty for nodeadm;
+# until nodeadm writes it, it counts as absent (an init re-run passed).
+echo '{"metadata":{"name":"portcullis-cluster-addresses"}}' > "$KS/kube/cluster-addresses.json"
+expect_eq "kube_cluster_addresses: the empty ConfigMap (nodeadm hasn't written it yet) → as absent" "$(car)" "10.215.0.10:6443 10.215.0.1:6443
+rc=0"
+echo '{"data":{"other":"x"}}' > "$KS/kube/cluster-addresses.json"
+case "$(car)" in *"don't parse"*"rc=1") t_pass "kube_cluster_addresses: data without addresses.json → still refused" ;; *) t_fail "ca other key: $(car)" ;; esac
+ca "$(jq -c '.cluster_cidr = "10.99.0.0/16"' <<< "$CA_OK")"
 OUT="$(kt "PORTCULLIS_KUBE_API_ENDPOINTS='10.215.0.10:6443 10.215.0.1:6443'; kube_host_checks")"
 case "$OUT" in *"fail	can't read the cluster's networks: the cluster addresses give pods 10.99.0.0/16"*) t_pass "kube_host_checks: a mismatched cluster addresses document → fail" ;; *) t_fail "ca host: $OUT" ;; esac
 # ── HA Task 21: nodeadm's CLI side (scripts/lib/node.sh, ruling R-ADM) ──
@@ -7658,6 +7666,175 @@ expect_eq "kube_backup_destination_sync: no destination → the Secret deleted i
 expect_eq "the chart's Hub: HUB_BACKUP_DESTINATION from backup.destination only (never the URL)" \
   "$(grep -c '"HUB_BACKUP_DESTINATION" "value" (ternary "set" "" (.Values.backup.destination | default false))' "$HERE/../charts/portcullis/templates/hub.yaml"):$(grep -c 'destinationPath\|endpointURL\|backup-destination' "$HERE/../charts/portcullis/templates/hub.yaml" || true)" "1:0"
 expect_eq "kube_sync_secrets syncs the destination's Secret" "$(declare -f kube_sync_prepare_t26 | grep -c 'kube_backup_destination_sync')" 1
+
+# ── ./portcullis node … (plan Task 30): thin clients of the Hub ──
+# A kubectl stub as the cluster: the Lease names the Hub pod hub-abc;
+# `exec -i … hub servers …` answers like the Hub's socket client (code
+# alone on stdout, the rest on stderr). Each call's argv goes to calls,
+# its stdin to stdin.<n>.
+ND="$WORK/node"
+mkdir -p "$ND/bin" "$ND/root"
+printf 'CONTAINER_RUNTIME=kubernetes\nPORTCULLIS_KUBE_CONTEXT=ci\nPORTCULLIS_NAMESPACE=portcullis\n' > "$ND/root/.env"
+cat > "$ND/bin/kubectl" <<'KSTUB'
+#!/usr/bin/env bash
+n=$(( $(cat "$ND/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$ND/n"
+printf '%s\n' "$*" >> "$ND/calls"
+case "$*" in *" exec -i "*) cat > "$ND/stdin.$n" ;; esac
+case "$*" in
+  "--context ci -n portcullis get lease portcullis-hub -o jsonpath={.spec.holderIdentity}") printf 'hub-abc' ;;
+  "--context ci -n portcullis get pod hub-abc -o name") echo pod/hub-abc ;;
+  "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers add-cluster-node")
+    [ -f "$ND/refuse" ] && { echo "server n4 already exists" >&2; echo "command terminated with exit code 1" >&2; exit 1; }
+    echo '{"op_id":"op1","role":"agent","class":"cloud","site":"edge","expires_at":"2026-11-22T10:15:00Z","warnings":["w1"],"command":"curl -fsSL https://ex.org/node/join.sh | sudo sh"}' >&2
+    echo pcj2.SECRETCODE ;;
+  "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers list")
+    echo '{"servers":[{"id":"primary","state":"ready"},{"id":"nas","kind":"worker","state":"ready"},{"id":"n4","kind":"cluster-node","role":"agent","class":"cloud","site":"edge","mesh_ip":"10.215.0.4","state":"enrolling"}]}' ;;
+  "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers remove n4") echo '{"status":"removing","server":"n4","op_id":"op9","op":"server.remove"}' ;;
+  "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers op n4 op9") echo '{"op":"server.remove","op_id":"op9","ok":true,"steps":[{"key":"drain","label":"Draining","state":"done"}]}' ;;
+  "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers revoke n4") echo '{"status":"revoked","server":"n4"}' ;;
+  *) echo "unexpected kubectl $*" >&2; exit 98 ;;
+esac
+KSTUB
+chmod +x "$ND/bin/kubectl"
+# nodecli <stdin> <args…> — cmd_node in the CLI's libraries (the cluster
+# check stubbed); OUT = stdout, ERR = stderr, RC.
+nodecli() {
+  local in="$1"; shift
+  rm -f "$ND/calls" "$ND/n" "$ND"/stdin.*
+  RC=0
+  printf '%s' "$in" | (unset CONTAINER_RUNTIME _RT_CHECKED; export PATH="$ND/bin:$PATH" PORTCULLIS_ROOT="$ND/root" ND
+    bash -c 'cd "$PORTCULLIS_ROOT"; for l in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" "$1/portcullis"); do . "$1/scripts/lib/$l.sh"; done
+      kube_runtime_check() { :; }; shift; cmd_node "$@"' _ "$HERE/.." "$@") >"$ND/out" 2>"$ND/err" || RC=$?
+  OUT="$(cat "$ND/out")"; ERR="$(cat "$ND/err")"
+}
+nodecli "" add n4 --role agent --class cloud --site edge
+expect_eq "node add: request on stdin, nothing on argv but the subcommand" \
+  "$RC|$(grep -c 'exec -i pod/hub-abc -c hub -- hub servers add-cluster-node$' "$ND/calls")|$(cat "$ND"/stdin.* | jq -c .)" \
+  '0|1|{"id":"n4","role":"agent","class":"cloud","site":"edge"}'
+expect_eq "node add: no argument of the Hub call names the id, a flag or the code" "$(grep 'exec -i' "$ND/calls" | grep -c 'n4\|--role\|edge\|pcj2')" 0
+expect_eq "node add: the join code alone on stdout" "$OUT" "pcj2.SECRETCODE"
+case "$ERR" in *"Node n4: join code made (role agent, class cloud, site edge"*"Warning: w1"*"curl -fsSL https://ex.org/node/join.sh | sudo sh"*"paste the join code"*)
+  t_pass "node add: the one-liner, the role and the warnings on stderr" ;; *) t_fail "node add stderr: $ERR" ;; esac
+expect_eq "node add: the code never on stderr" "$(printf '%s' "$ERR" | grep -c SECRETCODE)" 0
+nodecli "" add n4
+expect_eq "node add: no flags → only the id in the request" "$(cat "$ND"/stdin.* | jq -c .)" '{"id":"n4"}'
+touch "$ND/refuse"
+nodecli "" add n4
+case "$RC:$OUT:$ERR" in "1::"*"server n4 already exists"*"the Hub made no join code for n4"*) t_pass "node add: the Hub's refusal → exit 1, its text, nothing on stdout" ;; *) t_fail "node add refused: $RC $OUT $ERR" ;; esac
+expect_eq "node add: kubectl's 'command terminated' line dropped" "$(printf '%s' "$ERR" | grep -c 'command terminated')" 0
+rm -f "$ND/refuse"
+nodecli "" list
+case "$RC:$OUT" in "0:ID"*"primary"*"n4"*"agent"*"edge"*"10.215.0.4"*"enrolling"*) t_pass "node list: the cluster nodes as a table" ;; *) t_fail "node list: $RC $OUT" ;; esac
+expect_eq "node list: a Docker worker isn't a cluster node" "$(printf '%s' "$OUT" | grep -c nas)" 0
+nodecli "n5"$'\n' remove n4
+case "$RC:$ERR" in "1:"*"the typed id doesn't match n4: nothing was changed"*) t_pass "node remove: typed id mismatch → refused" ;; *) t_fail "node remove mismatch: $RC $ERR" ;; esac
+expect_eq "node remove: a mismatch never reaches the Hub" "$( (cat "$ND/calls" 2>/dev/null || true) | grep -c 'hub servers')" 0
+nodecli "" revoke n4
+expect_eq "node revoke: nothing typed → refused, the Hub not asked" "$RC:$( (cat "$ND/calls" 2>/dev/null || true) | grep -c 'hub servers')" "1:0"
+nodecli "n4"$'\n' remove n4
+expect_eq "node remove: the typed id → the confirm body on stdin, the op waited for" \
+  "$RC|$(cat "$ND"/stdin.* | jq -c . | head -n1)|$(grep -c 'hub servers op n4 op9$' "$ND/calls")|$(printf '%s' "$ERR" | grep -c 'n4 removed')" '0|{"confirm":"n4"}|1|1'
+nodecli "n4"$'\n' revoke n4
+expect_eq "node revoke: the typed id → revoked" "$RC|$(cat "$ND"/stdin.* | jq -c .)|$(printf '%s' "$ERR" | grep -c 'n4 revoked')" '0|{"confirm":"n4"}|1'
+# Docker: refused before any cluster call.
+printf 'CONTAINER_RUNTIME=docker\n' > "$ND/root/.env"
+RC=0; ( export PATH="$ND/bin:$WORK/bin:$PATH" PORTCULLIS_ROOT="$ND/root" ND; unset CONTAINER_RUNTIME; rm -f "$ND/calls"
+  bash -c 'cd "$PORTCULLIS_ROOT"; for l in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" "$1/portcullis"); do . "$1/scripts/lib/$l.sh"; done; cmd_node add n4' _ "$HERE/..") >/dev/null 2>"$ND/err" || RC=$?
+case "$RC:$(cat "$ND/err")" in "1:"*"node add: Kubernetes only"*) t_pass "node add on Docker: refused (Kubernetes only)" ;; *) t_fail "node add docker: $RC $(cat "$ND/err")" ;; esac
+expect_eq "node add on Docker: no kubectl call" "$(cat "$ND/calls" 2>/dev/null)" ""
+
+# ── the first node's nodeagent (plan Task 30 carry): kube_first_nodeagent ──
+# A prefix as the host (init's k3s server dir), a kubectl stub as the
+# cluster (node-1 at 10.215.0.1, nodeadm's pod serving the agent), a
+# stand-in nodeagent (adopt-csr makes a key + CSR, adopt records its
+# stdin), a curl stub as Vault signing the CSR under a test node CA.
+FN="$WORK/fn"; FP="$FN/p"
+mkdir -p "$FN/bin" "$FN/root/certs" "$FN/root/secrets" "$FP/var/lib/rancher/k3s/server"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$FN/ca.key" -out "$FN/root/certs/node-ca.crt" \
+  -subj "/CN=test Node CA" -days 3650 -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign >/dev/null 2>&1
+printf '{"root_token":"VAULTROOTTOKEN"}' > "$FN/root/secrets/vault-init.json"
+cat > "$FN/agent.sh" <<'AGENT'
+#!/usr/bin/env bash
+d="$FN_P/var/lib/portcullis/nodeagent"; mkdir -p "$d"
+echo "agent $*" >> "$FN_CALLS"
+case "$1" in
+  adopt-csr) openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$d/adopt.key" -subj "/CN=$2.cluster.portcullis.internal" 2>/dev/null ;;
+  adopt) cat > "$FN_DIR/adopt.json"; jq -r .certificate "$FN_DIR/adopt.json" > "$d/crt"; cat "$d/adopt.key" "$d/crt" > "$d/node.pem"; echo '{"v":1,"adopted":true}' > "$d/state.json" ;;
+esac
+AGENT
+cat > "$FN/bin/kubectl" <<'KSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FN_CALLS"
+case "$*" in
+  "--context ci get nodes -o json") echo '{"items":[{"metadata":{"name":"node-2"},"status":{"addresses":[{"type":"InternalIP","address":"10.215.0.2"}]}},{"metadata":{"name":"node-1"},"status":{"addresses":[{"type":"InternalIP","address":"10.215.0.1"}]}}]}' ;;
+  "--context ci get node node-1 -o json") echo '{"metadata":{"labels":{"portcullis.io/site":"main","portcullis.io/class":"home"}}}' ;;
+  "--context ci -n portcullis-nodeadm get pods -l portcullis.io/component=nodeadm --field-selector=status.phase=Running -o jsonpath={.items[0].metadata.name}") printf nodeadm-x ;;
+  "--context ci -n portcullis-nodeadm exec nodeadm-x -c nodeadm -- sha256sum /usr/local/lib/portcullis/nodeagent-amd64") echo "$(sha256sum < "$FN_DIR/agent.sh" | cut -d' ' -f1)  /usr/local/lib/portcullis/nodeagent-amd64" ;;
+  "--context ci -n portcullis-nodeadm exec nodeadm-x -c nodeadm -- cat /usr/local/lib/portcullis/nodeagent-amd64") cat "$FN_DIR/agent.sh"; [ ! -f "$FN_DIR/tamper" ] || echo "# tampered" ;;
+  *) echo "unexpected kubectl $*" >&2; exit 98 ;;
+esac
+KSTUB
+cat > "$FN/bin/curl" <<'CSTUB'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$FN_CALLS"
+out=""; hdr=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; -H) case "$2" in @*) cat "${2#@}" >> "$FN_DIR/curl-headers" ;; esac; shift ;; esac; shift; done
+jq -r .csr > "$FN_DIR/req.csr"
+printf 'extendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:node-1.cluster.portcullis.internal\n' > "$FN_DIR/ext"
+if openssl x509 -req -in "$FN_DIR/req.csr" -CA "$FN_DIR/root/certs/node-ca.crt" -CAkey "$FN_DIR/ca.key" -CAcreateserial -days 30 -extfile "$FN_DIR/ext" -out "$FN_DIR/leaf.crt" 2>/dev/null; then
+  jq -n --rawfile c "$FN_DIR/leaf.crt" '{data: {certificate: $c}}' > "$out"; printf 200
+else printf 400; fi
+CSTUB
+chmod +x "$FN/bin/kubectl" "$FN/bin/curl" "$FN/agent.sh"
+# fnode [env…] — kube_first_nodeagent; prints its output, then rc=N.
+FN_IMG="ghcr.io/x/nodeadm@sha256:$(printf '%064d' 1)"
+fnode() {
+  # shellcheck disable=SC2163  # "$@": the caller's KEY=value overrides
+  ( export PATH="$FN/bin:$PATH" PORTCULLIS_ROOT="$FN/root" KUBE_INSTALL_PREFIX="$FP" KUBE_INSTALL_ARCH=amd64 FN_P="$FP" FN_DIR="$FN" FN_CALLS="$FN/calls" \
+      PORTCULLIS_KUBE_CONTEXT=ci PORTCULLIS_K3S_VERSION=v1.37.2+k3s1 VAULT_ADDR=http://127.0.0.1:18200 \
+      PORTCULLIS_NODEADM_IMAGE="$FN_IMG" "$@"
+    unset VAULT_TOKEN
+    bash -c 'for l in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" "$1/portcullis"); do . "$1/scripts/lib/$l.sh"; done; kube_first_nodeagent; echo "rc=$?"' _ "$HERE/.." ) 2>&1
+}
+rm -f "$FN/calls"
+OUT="$(fnode)"
+case "$OUT" in *"First node node-1: its nodeagent runs"*"rc=0") t_pass "first node: adopted (the nodeagent from nodeadm, Vault's certificate, adopt)" ;; *) t_fail "first node adopt: $OUT" ;; esac
+expect_eq "first node: the adoption request (id, mesh ip, site, class from the Node; the node CA)" \
+  "$(jq -c '[.id, .mesh_ip, .site, .class, (.ca == $ca)]' --rawfile ca "$FN/root/certs/node-ca.crt" "$FN/adopt.json" 2>/dev/null)" '["node-1","10.215.0.1","main","home",true]'
+expect_eq "first node: the certificate is node-1.cluster.portcullis.internal from the node CA" \
+  "$(jq -r .certificate "$FN/adopt.json" | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null)" "subject=CN=node-1.cluster.portcullis.internal"
+expect_eq "first node: the binary installed 0755 as nodeadm's copy" \
+  "$(file_mode "$FP/usr/local/lib/portcullis/nodeagent"):$(cmp -s "$FP/usr/local/lib/portcullis/nodeagent" "$FN/agent.sh" && echo same)" "755:same"
+expect_eq "first node: the CSR from adopt-csr <id>, then adopt (no argument)" "$(grep '^agent ' "$FN/calls" | tr '\n' '|')" "agent adopt-csr node-1|agent adopt|"
+expect_eq "first node: Vault's root token in a header from a pipe, never on argv" \
+  "$(grep -c VAULTROOTTOKEN "$FN/calls"):$(grep -c 'X-Vault-Token: VAULTROOTTOKEN' "$FN/curl-headers")" "0:1"
+expect_eq "first node: pki_node/sign/node-cluster" "$(grep -c '^curl .*/v1/pki_node/sign/node-cluster$' "$FN/calls")" 1
+rm -f "$FN/calls"
+OUT="$(fnode)"
+expect_eq "first node: adopted, the certificate fresh, the binary nodeadm's → nothing done" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^agent \|-- cat ' "$FN/calls")" "rc=0:0"
+rm -f "$FN/calls"
+OUT="$(fnode KUBE_NODEAGENT_NOW=$(( $(date +%s) + 25 * 86400 )))"
+expect_eq "first node: ⅓ of the certificate's life left → renewed (a new CSR, adopt again)" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^agent adopt' "$FN/calls")" "rc=0:2"
+rm -f "$FN/calls" "$FP/var/lib/portcullis/nodeagent/state.json"
+touch "$FN/tamper"
+OUT="$(fnode)"
+case "$OUT" in *"doesn't match its sha256: nothing installed"*"rc=1") t_pass "first node: a copy that isn't nodeadm's sha256 → refused" ;; *) t_fail "first node tamper: $OUT" ;; esac
+expect_eq "first node: a refused copy installs nothing and adopts nothing" "$(grep -c '^agent ' "$FN/calls")" 0
+rm -f "$FN/tamper" "$FN/calls"
+rm -rf "$FP/var/lib/rancher/k3s/server"
+OUT="$(fnode)"
+expect_eq "first node: not init's k3s server host → nothing (no cluster call)" "$OUT:$(cat "$FN/calls" 2>/dev/null)" "rc=0:"
+OUT="$(fnode PORTCULLIS_NODEADM_IMAGE=)"
+expect_eq "first node: no nodeadm → nothing" "$OUT" "rc=0"
+expect_eq "up adopts the first node after a waited release; kube check too" \
+  "$(grep -c '^  kube_cluster_check; \[ "\${#wait\[@\]}" -eq 0 \] || kube_first_nodeagent || true  #\|; ( kube_first_nodeagent ) || true$' "$HERE/../scripts/lib/kube.sh")" 2
+
+# Found live (Task 30): a background port-forward inherited the CLI lock
+# (fd 9) and, left behind, held it: params-sync waited for ever and no
+# join passed waiting_admission. Every background forward closes fd 9.
+expect_eq "every background kubectl port-forward closes the CLI lock's fd 9" \
+  "$(grep -h 'port-forward .*&$' "$HERE"/../scripts/lib/*.sh | grep -vc '9>&- &$')" 0
+expect_eq "the background port-forwards (kube_forward_core, _kube_with_forward, the probe's)" "$(grep -h 'port-forward .*9>&- &$' "$HERE"/../scripts/lib/*.sh | wc -l | tr -d ' ')" 3
 
 echo ""
 echo "$PASS passed, $FAIL failed"

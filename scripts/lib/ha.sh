@@ -1947,7 +1947,10 @@ _kube_with_forward() {
   log="$(mktemp)" || return 1
   # kubectl itself (not the kube_ctl function) is the background child, so
   # $! is the process to end.
-  kubectl --context "$PORTCULLIS_KUBE_CONTEXT" -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$port" >"$log" 2>&1 &
+  # Never the CLI lock (fd 9, cli_lock): a forward left behind would hold
+  # it, and params-sync (the joins) would wait for ever (found live, Task
+  # 30). kube.sh's two background forwards close it the same way.
+  kubectl --context "$PORTCULLIS_KUBE_CONTEXT" -n "$(kube_ns)" port-forward --address 127.0.0.1 "$target" ":$port" >"$log" 2>&1 9>&- &
   pid=$!
   # The CLI killed meanwhile (by pid): the forward ends with it (review N2).
   local parent=$$
