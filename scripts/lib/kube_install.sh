@@ -39,10 +39,15 @@ KUBE_FLANNEL_PORT=51840
 KUBE_CLUSTER_CIDR=10.42.0.0/16
 # Host paths (KUBE_INSTALL_PREFIX in front when written; the flags name them bare).
 KUBE_K3S_TOKEN_FILE=/etc/rancher/k3s/token
-# The agents' own token (--agent-token-file): agents never hold the server
-# token (nodeadm gives a joining agent a bootstrap token, a rotation gives
-# agents this one).
-KUBE_K3S_AGENT_TOKEN_FILE=/etc/rancher/k3s/agent-token
+# No --agent-token-file (agent-token fix): k3s then derives the node
+# credential from the server token, and its supported rotation (PUT
+# /v1-k3s/token, which re-saves the bootstrap data from disk) rotates both
+# at once. A separate agent token can't be rotated safely: k3s rewrites
+# cred/passwd's node line from it at start but never re-saves the
+# datastore's copy, so the next restart is fatal ("cred/passwd newer than
+# datastore"). Agents hold no shared token: a joining agent gets a
+# bootstrap token of its own (nodeadm, ≤15 min) and restarts on its node
+# identity (its kubelet client certificate).
 KUBE_FLANNEL_CONF=/etc/rancher/k3s/flannel-net-conf.json
 KUBE_K3S_YAML=/etc/rancher/k3s/k3s.yaml
 # The key lives under /etc/wireguard: Ubuntu's AppArmor profile for wg
@@ -150,7 +155,6 @@ kube_k3s_server_flags() {
 --disable=traefik
 --write-kubeconfig-mode=0600
 --token-file=$KUBE_K3S_TOKEN_FILE
---agent-token-file=$KUBE_K3S_AGENT_TOKEN_FILE
 --kubelet-arg=pod-max-pids=1024
 --kubelet-arg=sync-frequency=10s
 --kubelet-arg=address=$ip
@@ -446,11 +450,11 @@ _ki_fetch() {
   [ "$got" = "$2" ] || { rm -rf "$(dirname "$3")"; fail "$1 doesn't match its pinned sha256 (want $2, got $got): nothing was installed"; }
 }
 
-# _ki_token_file [path] — a k3s token (the server's, else the agents'
-# --agent-token-file): 32 random bytes as hex, generated once into a 0600
-# file (k3s reads it through the file; it never reaches argv).
+# _ki_token_file — the k3s server token: 32 random bytes as hex, generated
+# once into a 0600 file (k3s reads it through the file; it never reaches
+# argv).
 _ki_token_file() {
-  local f="${1:-$KUBE_K3S_TOKEN_FILE}"
+  local f="$KUBE_K3S_TOKEN_FILE"
   _ki_sudo sh -c 'mkdir -p "$(dirname "$1")" && umask 077 && { [ -s "$1" ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n" > "$1.tmp" && mv -f "$1.tmp" "$1"; }; } && chmod 600 "$1"' _ "$(_ki_p "$f")" \
     || fail "could not write the k3s token file $f"
 }
@@ -501,7 +505,6 @@ kube_install_k3s() {
   _ki_fetch "$KUBE_K3S_SCRIPT_URL" "$KUBE_K3S_SCRIPT_SHA256" "$tmp/install.sh"
   _ki_fetch "https://github.com/k3s-io/k3s/releases/download/$(printf '%s' "$KUBE_K3S_VERSION" | sed 's/+/%2B/')/$asset" "$sha" "$tmp/k3s"
   _ki_token_file
-  _ki_token_file "$KUBE_K3S_AGENT_TOKEN_FILE"
   kube_flannel_conf | _ki_write "$(_ki_p "$KUBE_FLANNEL_CONF")" 644 || fail "could not write $KUBE_FLANNEL_CONF"
   _ki_sudo mkdir -p "$(_ki_p /usr/local/bin)"
   _ki_sudo install -m 0755 "$tmp/k3s" "$(_ki_p /usr/local/bin/k3s)" || { rm -rf "$tmp"; fail "could not install the k3s binary"; }

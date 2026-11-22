@@ -74,14 +74,11 @@ kube_nodeadm_sync() {
   # The server token: once, from the server's own token file (root's);
   # nodeadm rotates it afterwards, so a later run never overwrites it.
   if ! kube_ctl -n "$ns" get secret nodeadm-k3s-token -o name >/dev/null 2>&1; then
-    # The agents' token in k3s's full form, K10<the CA hash>::node:<token>
-    # (the hash is the server token's prefix: no secret on argv).
+    # The server token only: there is no separate agent token (k3s derives
+    # the node credential from the server token; kube_install.sh).
     (umask 077 && _ki_sudo cat "$(_ki_p "$KUBE_K3S_SERVER_TOKEN")" > "$tmp/token") && [ -s "$tmp/token" ] \
       || { rm -rf "$tmp"; fail "could not read the k3s server token ($KUBE_K3S_SERVER_TOKEN)"; }
-    (umask 077 && { sed -n 's/^\(K10[0-9a-f]\{64\}\)::.*/\1::node:/p' "$tmp/token" | tr -d '\n'; _ki_sudo cat "$(_ki_p "$KUBE_K3S_AGENT_TOKEN_FILE")"; } > "$tmp/agent") \
-      && grep -q '^K10[0-9a-f]\{64\}::node:.' "$tmp/agent" \
-      || { rm -rf "$tmp"; fail "could not read the k3s agent token ($KUBE_K3S_AGENT_TOKEN_FILE)"; }
-    kube_ctl create secret generic nodeadm-k3s-token -n "$ns" --from-file=token="$tmp/token" --from-file=agent="$tmp/agent" --dry-run=client -o json \
+    kube_ctl create secret generic nodeadm-k3s-token -n "$ns" --from-file=token="$tmp/token" --dry-run=client -o json \
       | jq '.metadata.labels = {"app.kubernetes.io/managed-by": "portcullis"}' > "$tmp/token.json" \
       && _kn_create_once secret nodeadm-k3s-token "$ns" "$tmp/token.json" || { rm -rf "$tmp"; fail "could not create the Secret nodeadm-k3s-token"; }
   fi

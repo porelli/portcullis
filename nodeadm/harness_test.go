@@ -157,25 +157,29 @@ func (f *fakeAgents) EtcdRemoveMember(_ context.Context, via, _, node, mesh stri
 }
 
 // fakeBoot: server-bootstrap answers 200 for the rotated token, 401 else;
-// the agent call likewise for the agent token (the initial one until a
-// rotate-agent).
+// the agent call likewise for the node credential k3s derives from the
+// server token in effect (no --agent-token-file: the initial one until a
+// rotate).
 type fakeBoot struct {
 	mu      sync.Mutex
 	current string
-	agent   string
 }
 
 func (f *fakeBoot) AgentStatus(_ context.Context, _, token string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	cur := f.agent
+	cur := f.current
 	if cur == "" {
-		cur = testAgentToken
+		cur = testServerToken
 	}
-	if token == cur {
+	if token == nodeCredential(cur) {
 		return 200, nil
 	}
 	return 401, nil
+}
+
+func (f *fakeBoot) Ready(ctx context.Context, ip, token string) (int, error) {
+	return f.AgentStatus(ctx, ip, nodeCredential(token))
 }
 
 func (f *fakeBoot) Status(_ context.Context, _, token string) (int, error) {
@@ -244,7 +248,6 @@ func (ca *testCA) client(cn string) (*x509.Certificate, *ecdsa.PrivateKey) {
 
 const (
 	testServerToken = "K10b7335c14c0febed58f896145ef153d44a59bd0dfa5065771f18cc99c514c0edb::server:0123456789abcdef0123456789abcdef"
-	testAgentToken  = "K10b7335c14c0febed58f896145ef153d44a59bd0dfa5065771f18cc99c514c0edb::node:fedcba9876543210fedcba9876543210"
 	coreNS          = "portcullis"
 )
 
@@ -336,7 +339,7 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 		objs = append(objs, mkNode(n))
 	}
 	objs = append(objs,
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tokenSecret, Namespace: coreNS}, Data: map[string][]byte{tokenKey: []byte(testServerToken + "\n"), agentTokenKey: []byte(testAgentToken)}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tokenSecret, Namespace: coreNS}, Data: map[string][]byte{tokenKey: []byte(testServerToken + "\n")}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: addressesCM, Namespace: coreNS}},
 	)
 	h.kube = fake.NewSimpleClientset(objs...)

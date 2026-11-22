@@ -328,8 +328,6 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 	ip := "10.215.0.7"
 	var want []string
 	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-		// A joining server gets the agent token in the answer (written to
-		// init's --agent-token-file path).
 		if l == "--cluster-init" {
 			continue
 		}
@@ -435,11 +433,8 @@ func secretFlow(t *testing.T) (*harness, []string, [][]byte) {
 	}
 	h.agents.onRotate = func(_, step, tok string) {
 		h.boot.mu.Lock()
-		switch step {
-		case "rotate":
+		if step == "rotate" {
 			h.boot.current = tok
-		case "rotate-agent":
-			h.boot.agent = tok
 		}
 		h.boot.mu.Unlock()
 	}
@@ -467,7 +462,7 @@ func secretFlow(t *testing.T) (*harness, []string, [][]byte) {
 	}
 	keep(h.join(t, js, map[string]int{"n1": 150, "n2": 4, "n3": 5, "n6": 4}))
 	keep(h.join(t, js, map[string]int{"n1": 3, "n2": 4, "n3": 5, "n6": 4}))
-	secrets = append(secrets, testServerToken, "0123456789abcdef0123456789abcdef", testAgentToken, "fedcba9876543210fedcba9876543210")
+	secrets = append(secrets, testServerToken, "0123456789abcdef0123456789abcdef", nodeCredential(testServerToken))
 	h.putState(t, func(st *nodeadmState) {
 		st.Nodes["n3"] = &nodeRecord{Role: "server", Serial: "aa:bb", MeshIP: "10.215.0.3"}
 	})
@@ -506,11 +501,8 @@ func TestJoinNeverLogsSecrets(t *testing.T) {
 			}
 			var ja joinAnswer
 			json.Unmarshal(a, &ja)
-			// The contract's secrets: the token, and a server's agent token.
+			// The contract's secret: the token.
 			rest := strings.ReplaceAll(string(a), ja.Token, "")
-			if ja.AgentToken != "" {
-				rest = strings.ReplaceAll(rest, ja.AgentToken, "")
-			}
 			if ja.Token != "" && strings.Contains(rest, sc) {
 				t.Errorf("join answer %d carries a secret outside its token", i)
 			}
@@ -573,9 +565,10 @@ func TestDrainRefusesBelowMinimum(t *testing.T) {
 
 // TestRevokeRotatesServerToken: mode=revoke deletes the node, removes its
 // etcd member, revokes its certificate through enroll, and rotates the
-// server token (rotate on a surviving server, checked old 401 / new 200,
-// then apply servers one at a time, then the agents). A rotation not in
-// effect keeps the old token in the Secret.
+// server token (rotate on a surviving server, checked old 401 / new 200 for
+// the server token and the node credential k3s derives from it, then apply
+// to the servers one at a time). Agents get no token call (agent-token
+// fix). A rotation not in effect keeps the old token in the Secret.
 func TestRevokeRotatesServerToken(t *testing.T) {
 	agent := nodeSpec{"n4", "agent", "cloud", "edge", "10.215.0.4", nil, nil, true, false}
 	h := newHarness(t, append(append([]nodeSpec{}, baseNodes...), agent)...)
@@ -595,49 +588,36 @@ func TestRevokeRotatesServerToken(t *testing.T) {
 		t.Fatalf("etcd %v, revoked %v", h.agents.etcdRm, h.enroll.revoked)
 	}
 	// Rotated twice (a server target, fix round 6): the second round, after
-	// its etcd member is gone, carries the tokens finally in effect.
-	round := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n3", "apply-agent:n3", "apply:n4"}
+	// its etcd member is gone, carries the token finally in effect. One
+	// token, one restart per server per round; no agent call.
+	round := []string{"rotate:n1", "apply:n1", "apply:n3"}
 	if want := append(append([]string{}, round...), round...); !slices.Equal(h.agents.rotations, want) {
 		t.Fatalf("rotations %v", h.agents.rotations)
 	}
 	first := append([]string{}, h.agents.tokens[:len(round)]...)
 	h.agents.rotations, h.agents.tokens = h.agents.rotations[len(round):], h.agents.tokens[len(round):]
 	for _, tok := range first {
-		if tok == testServerToken || tok == testAgentToken || slices.Contains(h.agents.tokens, tok) {
+		if tok == testServerToken || slices.Contains(h.agents.tokens, tok) {
 			t.Fatal("the first round carried an old or the final token")
 		}
 	}
-	// Both tokens are new; no call to an agent ever carries a server token
-	// (old or new): agents get the new agent token, the servers the new
-	// server token (apply) and the new agent token (apply-agent).
-	sec, _ := h.kube.CoreV1().Secrets(coreNS).Get(ctx, tokenSecret, metav1.GetOptions{})
-	newAgent := string(sec.Data[agentTokenKey])
-	if newAgent == testAgentToken || !strings.HasPrefix(newAgent, "K10"+caHash(testServerToken)+"::node:") {
-		t.Fatalf("the agent token isn't rotated: %.20q", newAgent)
-	}
 	for i, step := range h.agents.rotations {
-		tok := h.agents.tokens[i]
-		switch {
-		case strings.HasSuffix(step, ":n4"):
-			if tok != newAgent || strings.Contains(tok, "::server:") {
-				t.Fatalf("the agent n4 was sent %.12q", tok)
-			}
-		case strings.HasPrefix(step, "apply-agent:"), strings.HasPrefix(step, "rotate-agent:"):
-			if tok != newAgent {
-				t.Fatalf("%s: not the new agent token", step)
-			}
-		default:
-			if !strings.Contains(tok, "::server:") || tok == testServerToken {
-				t.Fatalf("%s: not the new server token", step)
-			}
+		if tok := h.agents.tokens[i]; !strings.Contains(tok, "::server:") || tok == testServerToken {
+			t.Fatalf("%s: not the new server token", step)
 		}
 	}
-	// The revoked node's old agent token is refused, the new one admitted.
-	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", testAgentToken); st != 401 {
-		t.Fatalf("the old agent token answers %d", st)
+	// The Secret holds the server token only.
+	if _, other := h.secretTokens(t); other {
+		t.Fatal("nodeadm-k3s-token holds another key than the server token")
 	}
-	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", newAgent); st != 200 {
-		t.Fatalf("the new agent token answers %d", st)
+	// The node credential derived from the old server token is refused,
+	// the new one admitted.
+	tokNow, _ := h.s.serverToken(ctx)
+	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", nodeCredential(testServerToken)); st != 401 {
+		t.Fatalf("the old node credential answers %d", st)
+	}
+	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", nodeCredential(tokNow)); st != 200 {
+		t.Fatalf("the new node credential answers %d", st)
 	}
 	tok, _ := h.s.serverToken(ctx)
 	if tok == testServerToken || tok != h.boot.current || caHash(tok) != caHash(testServerToken) || !strings.Contains(tok, "::server:") {

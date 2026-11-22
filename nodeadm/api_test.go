@@ -376,7 +376,7 @@ func TestAPIVectors(t *testing.T) {
 				json.Unmarshal(w.Body.Bytes(), &got)
 				json.Unmarshal(c.Response.Body, &exp)
 				if got.Role != exp.Role || got.ServerURL != exp.ServerURL || got.Token != exp.Token ||
-					got.ClusterCIDR != exp.ClusterCIDR || got.AgentToken != exp.AgentToken {
+					got.ClusterCIDR != exp.ClusterCIDR {
 					t.Errorf("answer %+v, want %+v", got, exp)
 				}
 				for _, f := range exp.Flags {
@@ -506,7 +506,7 @@ func checkCaseEffects(t *testing.T, h *harness, c apiCase) {
 		}
 		// A server target: rotated twice (before the quorum-gated steps and
 		// after its etcd member is gone, fix round 6).
-		round := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n2", "apply-agent:n2", "apply:n4"}
+		round := []string{"rotate:n1", "apply:n1", "apply:n2"}
 		if want := append(append([]string{}, round...), round...); !slices.Equal(h.agents.rotations, want) {
 			t.Errorf("rotations %v, want %v", h.agents.rotations, want)
 		}

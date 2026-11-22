@@ -8,6 +8,18 @@ package main
 // group only (judged by the VAP portcullis-nodeadm-tokens). Both reach the
 // node in k3s's CA-pinned form K10<sha256 of the cluster CA>::<credentials>.
 // Logs carry a token's id at most (a bootstrap token's id, or "server").
+//
+// There is no separate agent token (agent-token fix): no server runs with
+// --agent-token-file, so k3s derives cred/passwd's node line from the
+// server token, and its supported rotation (PUT /v1-k3s/token) rotates
+// both and re-saves the datastore's bootstrap copy from that server's
+// disk. k3s v1.37.2 has no way to rotate a separate agent token: genUsers
+// rewrites passwd's node line from the file at every start, after the
+// bootstrap reconcile, and nothing re-saves the datastore's copy, so the
+// next start of every server is fatal ("cred/passwd newer than
+// datastore"). No agent holds a shared token: after its join it restarts
+// on its node identity (its kubelet client certificate, while its Node
+// exists).
 
 import (
 	"context"
@@ -27,7 +39,6 @@ import (
 const (
 	tokenSecret      = "nodeadm-k3s-token"
 	tokenKey         = "token"
-	agentTokenKey    = "agent"
 	bootstrapTTL     = 14 * time.Minute // inside the VAP's 15 min, with skew
 	bootstrapGroup   = "system:bootstrappers:k3s:default-node-token"
 	bootstrapNS      = "kube-system"
@@ -51,19 +62,17 @@ func (s *Server) serverToken(ctx context.Context) (string, error) {
 	return t, nil
 }
 
-// agentToken reads the agent token (k3s --agent-token-file, K10…::node:…):
-// what agents hold; never the server token.
-func (s *Server) agentToken(ctx context.Context) (string, error) {
-	sec, err := s.kube.CoreV1().Secrets(s.cfg.CoreNS).Get(ctx, tokenSecret, metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("reading the Secret %s: %w", tokenSecret, secretErr(err))
+// nodeCredential is the node user's credential k3s derives from a server
+// token (no --agent-token-file): K10<hash>::node:<the server passphrase>.
+// Only the rotation check uses it (the old one must answer 401); it is
+// never given to a node.
+func nodeCredential(serverTok string) string {
+	m := k10Re.FindStringSubmatch(serverTok)
+	if m == nil {
+		return ""
 	}
-	t := strings.TrimSpace(string(sec.Data[agentTokenKey]))
-	m := k10Re.FindStringSubmatch(t)
-	if m == nil || strings.HasPrefix(m[2], serverTokenLabel+":") {
-		return "", errors.New("the Secret " + tokenSecret + " doesn't hold a K10 agent token")
-	}
-	return t, nil
+	pass := strings.TrimPrefix(m[2], serverTokenLabel+":")
+	return "K10" + m[1] + "::node:" + pass
 }
 
 // caHash is the cluster CA's sha256 from the server token.

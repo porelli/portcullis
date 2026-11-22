@@ -5244,14 +5244,14 @@ expect_eq "kube_nodeadm_on: needs PORTCULLIS_K3S_VERSION and a nodeadm image by 
   "$(kt 'PORTCULLIS_K3S_VERSION=v1; PORTCULLIS_NODEADM_IMAGE=ghcr.io/x/nodeadm:edge; kube_nodeadm_on' | tail -n1):$(kt "PORTCULLIS_K3S_VERSION=v1; PORTCULLIS_NODEADM_IMAGE=ghcr.io/x/nodeadm@sha256:$(printf '%064d' 4); kube_nodeadm_on" | tail -n1)" "rc=1:rc=0"
 KN="$WORK/kn"; rm -rf "$KN"; mkdir -p "$KN/var/lib/rancher/k3s/server" "$KN/root/secrets/enroll"
 printf 'K10%064d::server:%s' 7 "s3cr3t-server-token-value" > "$KN/var/lib/rancher/k3s/server/token"
-mkdir -p "$KN/etc/rancher/k3s"; printf 'agent-s3cr3t-value' > "$KN/etc/rancher/k3s/agent-token"
 OUT="$(kt "PORTCULLIS_ROOT='$KN/root'; KUBE_INSTALL_PREFIX='$KN'; PORTCULLIS_K3S_VERSION=v1; PORTCULLIS_NODEADM_IMAGE=ghcr.io/x/nodeadm@sha256:$(printf '%064d' 4)
   kube_ctl() { printf 'ARGV %s\n' \"\$*\" >&2; case \"\$*\" in *'get secret nodeadm-k3s-token'*|*'get secret nodeadm-state'*|*'get configmap portcullis-cluster-addresses'*) return 1 ;;
     *'--dry-run=client -o json'*) printf '{\"metadata\":{}}' ;; *' get nodes -o json'*) echo '{\"items\":[]}' ;; esac; }
   kube_namespace_apply() { echo \"NS \$*\"; }; _kube_put() { echo PUT; }
   kube_nodeadm_prepare; kube_nodeadm_sync; stat -c %a '$KN/root/secrets/enroll/nodeadm-api-secret'")"
-case "$OUT" in *"NS portcullis-nodeadm restricted restricted restricted"*"--from-file=bearer="*"--from-file=token="*"--from-file=agent="*"create --field-manager"*"state.json"*"addr.json"*"600"*"rc=0") t_pass "kube_nodeadm_sync: its namespace, its bearer and the server token by --from-file, the state Secret and the addresses ConfigMap created" ;; *) t_fail "nodeadm sync: $OUT" ;; esac
-case "$OUT" in *"s3cr3t-server-token-value"*|*"agent-s3cr3t-value"*) t_fail "a k3s token reached argv or the output" ;; *) t_pass "kube_nodeadm_sync: the server and agent tokens are on no argv" ;; esac
+case "$OUT" in *"NS portcullis-nodeadm restricted restricted restricted"*"--from-file=bearer="*"--from-file=token="*"create --field-manager"*"state.json"*"addr.json"*"600"*"rc=0") t_pass "kube_nodeadm_sync: its namespace, its bearer and the server token by --from-file, the state Secret and the addresses ConfigMap created" ;; *) t_fail "nodeadm sync: $OUT" ;; esac
+case "$OUT" in *"s3cr3t-server-token-value"*) t_fail "a k3s token reached argv or the output" ;; *) t_pass "kube_nodeadm_sync: the server token is on no argv" ;; esac
+case "$OUT" in *"--from-file=agent="*) t_fail "kube_nodeadm_sync: an agent token in nodeadm-k3s-token" ;; *) t_pass "kube_nodeadm_sync: nodeadm-k3s-token holds the server token only (no agent token: agent-token fix)" ;; esac
 rm -f "$KS/kube/cluster-addresses.json"
 k_fixtures
 
@@ -5311,6 +5311,8 @@ expect_eq "kube_install_k3s: the installer skips its download and pins the versi
   "$(grep -cxE 'INSTALL_K3S_SKIP_DOWNLOAD=true|INSTALL_K3S_VERSION=v1\.37\.2\+k3s1' "$KI/env"):$(grep -c '^K3S_' "$KI/env" || true)" "2:0"
 expect_eq "kube_install_k3s: token never on argv (argv, environment, stdin, output, curl calls)" \
   "$(cat "$KI/argv" "$KI/env" "$KI/stdin" "$KI/curl-calls" | grep -c 'FIXTURE-K3S-TOKEN' || true):$(printf '%s' "$OUT" | grep -c 'FIXTURE-K3S-TOKEN' || true)" "0:0"
+expect_eq "kube_install_k3s: no separate agent token (no --agent-token-file, no agent-token file: k3s can't rotate one safely; agent-token fix)" \
+  "$(grep -c 'agent-token' "$KI/argv" || true):$(test -e "$KI/root/etc/rancher/k3s/agent-token" && echo file || echo none)" "0:none"
 expect_eq "kube_install_k3s: an existing token file is kept, 0600" "$(cat "$KI/root/etc/rancher/k3s/token"):$(file_mode "$KI/root/etc/rancher/k3s/token")" "FIXTURE-K3S-TOKEN-7f3a9c:600"
 expect_eq "kube_install_k3s: flannel's net-conf = tests/fixtures/k3s-flannel-net-conf.json (WireGuard on 51840, the cluster network)" \
   "$(diff "$KI/root/etc/rancher/k3s/flannel-net-conf.json" "$HERE/fixtures/k3s-flannel-net-conf.json" >/dev/null && echo same):$(jq -r '.Backend.ListenPort' "$KI/root/etc/rancher/k3s/flannel-net-conf.json")" "same:51840"

@@ -83,7 +83,7 @@ func TestFaultsNeverLeakSecrets(t *testing.T) {
 		if w.Code != 500 || minted == "" {
 			t.Fatalf("%d %s", w.Code, w.Body)
 		}
-		noLeak(t, h, w.Body.String(), append(joinerSecrets(j), minted, testServerToken, testAgentToken)...)
+		noLeak(t, h, w.Body.String(), append(joinerSecrets(j), minted, testServerToken, nodeCredential(testServerToken))...)
 	})
 	t.Run("the state write fails", func(t *testing.T) {
 		h := newHarness(t)
@@ -111,13 +111,13 @@ func TestFaultsNeverLeakSecrets(t *testing.T) {
 			if a.(k8stesting.GetAction).GetName() != tokenSecret {
 				return false, nil, nil
 			}
-			return true, nil, echoInvalid(testServerToken + " " + testAgentToken)
+			return true, nil, echoInvalid(testServerToken + " " + nodeCredential(testServerToken))
 		})
 		w := h.join(t, j, nearRTT)
 		if w.Code != 500 {
 			t.Fatalf("%d %s", w.Code, w.Body)
 		}
-		noLeak(t, h, w.Body.String(), append(joinerSecrets(j), testServerToken, testAgentToken,
+		noLeak(t, h, w.Body.String(), append(joinerSecrets(j), testServerToken, nodeCredential(testServerToken),
 			strings.SplitN(testServerToken, "::", 2)[1])...)
 	})
 	t.Run("Health fails", func(t *testing.T) {
@@ -129,7 +129,7 @@ func TestFaultsNeverLeakSecrets(t *testing.T) {
 		if w.Code != 409 || !strings.Contains(w.Body.String(), "mesh_pending") {
 			t.Fatalf("%d %s", w.Code, w.Body)
 		}
-		noLeak(t, h, w.Body.String(), append(joinerSecrets(j), testServerToken, testAgentToken)...)
+		noLeak(t, h, w.Body.String(), append(joinerSecrets(j), testServerToken, nodeCredential(testServerToken))...)
 	})
 	t.Run("TokenRotate fails echoing the token", func(t *testing.T) {
 		h := newHarness(t)
@@ -143,7 +143,7 @@ func TestFaultsNeverLeakSecrets(t *testing.T) {
 			t.Fatalf("%d %s", w.Code, w.Body)
 		}
 		op := h.state(t).Ops["n3"]
-		noLeak(t, h, w.Body.String()+op.LastError, testServerToken, testAgentToken, op.NewServer,
+		noLeak(t, h, w.Body.String()+op.LastError, testServerToken, nodeCredential(testServerToken), op.NewServer,
 			strings.SplitN(op.NewServer, "::", 2)[1])
 	})
 }

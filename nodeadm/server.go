@@ -57,6 +57,12 @@ type Agents interface {
 type K3sBootstrap interface {
 	Status(ctx context.Context, serverIP, token string) (int, error)
 	AgentStatus(ctx context.Context, serverIP, token string) (int, error)
+	// Ready: GET /v1-k3s/readyz with the node credential derived from the
+	// server token (k3s's own agents wait on it): 200 once that server's
+	// k3s runs with the token (its old process accepts only the one it
+	// started with) and its core is up (agent-token fix: a restart is
+	// proven before the next server's).
+	Ready(ctx context.Context, serverIP, serverToken string) (int, error)
 }
 
 // Config is nodeadm's configuration (from the chart's environment).

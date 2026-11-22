@@ -13,9 +13,9 @@ package main
 //     enablelb, storage, the Longhorn default disk at main; the small
 //     taint); the joining node registers with --node-taint=
 //     nodeadm.portcullis/unlabelled=true:NoSchedule until then.
-// A server also gets --agent-token-file (init's; the answer's agent_token
-// goes there, 0600, as the token does) and --cluster-cidr (the answer's
-// cluster_cidr, init's too).
+// A server also gets --cluster-cidr (the answer's cluster_cidr, init's
+// too). No node gets --agent-token-file (agent-token fix, tokens.go): k3s
+// can't rotate a separate agent token without a fatal restart.
 // An agent gets the subset k3s agent takes: --server, --token-file,
 // --node-name, --node-ip, the registration taint, the flannel interface and
 // net-conf, the kubelet args. The token itself is never a flag: the
@@ -24,12 +24,11 @@ package main
 import "sort"
 
 const (
-	k3sTokenFile      = "/etc/rancher/k3s/token"
-	k3sAgentTokenFile = "/etc/rancher/k3s/agent-token"
-	k3sFlannelConf    = "/etc/rancher/k3s/flannel-net-conf.json"
-	meshIface         = "pcmesh"
-	primarySite       = "main"
-	smallTaint        = "portcullis.io/small=true:NoSchedule"
+	k3sTokenFile   = "/etc/rancher/k3s/token"
+	k3sFlannelConf = "/etc/rancher/k3s/flannel-net-conf.json"
+	meshIface      = "pcmesh"
+	primarySite    = "main"
+	smallTaint     = "portcullis.io/small=true:NoSchedule"
 	// unlabelledTaint: a joining node's registration taint (its key outside
 	// the prefixes kubelets may not set), removed when nodeadm labels it.
 	taintUnlabelled = "nodeadm.portcullis/unlabelled"
@@ -78,7 +77,6 @@ func joinFlags(rec *nodeRecord, id, serverURL, clusterCIDR string) []string {
 	}
 	if rec.Role == "server" {
 		f = append(f,
-			"--agent-token-file="+k3sAgentTokenFile,
 			"--cluster-cidr="+clusterCIDR,
 			"--secrets-encryption",
 			"--disable=traefik",

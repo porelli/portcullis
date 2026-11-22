@@ -32,11 +32,8 @@ import (
 func (h *harness) bootFollows(_, step, tok string) {
 	h.boot.mu.Lock()
 	defer h.boot.mu.Unlock()
-	switch step {
-	case "rotate":
+	if step == "rotate" {
 		h.boot.current = tok
-	case "rotate-agent":
-		h.boot.agent = tok
 	}
 }
 
@@ -79,12 +76,14 @@ func (h *harness) resume(t *testing.T, id string) {
 	t.Fatal("the resumed op didn't finish")
 }
 
-func (h *harness) secretTokens(t *testing.T) (srv, agt string) {
+// secretTokens: the Secret's server token, and whether it holds any other
+// key (an agent token: never, agent-token fix).
+func (h *harness) secretTokens(t *testing.T) (srv string, other bool) {
 	sec, err := h.kube.CoreV1().Secrets(coreNS).Get(context.Background(), tokenSecret, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.TrimSpace(string(sec.Data[tokenKey])), string(sec.Data[agentTokenKey])
+	return strings.TrimSpace(string(sec.Data[tokenKey])), len(sec.Data) != 1
 }
 
 // TestRevokeResumesAtEachStep (review C1): a revoke failing at each step
@@ -100,10 +99,7 @@ func TestRevokeResumesAtEachStep(t *testing.T) {
 		{"etcd removal fails", "etcd", false, "published"},
 		{"rotate fails", "rotate", false, "tokens_deleted"},
 		{"rotate took effect, its answer lost", "rotate", true, "tokens_deleted"},
-		{"rotate ok, rotate-agent fails", "rotate-agent", false, "server_rotated"},
-		{"rotate-agent took effect, its answer lost", "rotate-agent", true, "server_rotated"},
-		{"an apply fails", "apply", false, "agent_rotated"},
-		{"an apply-agent fails", "apply-agent", false, "agent_rotated"},
+		{"an apply fails", "apply", false, "server_rotated"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			h := newHarness(t, append(append([]nodeSpec{}, baseNodes...), agent)...)
@@ -126,18 +122,15 @@ func TestRevokeResumesAtEachStep(t *testing.T) {
 				t.Fatalf("n2 isn't marked removed: %+v", r)
 			}
 			// A token the supervisor accepts is always persisted somewhere.
-			srv, agt := h.secretTokens(t)
+			srv, _ := h.secretTokens(t)
 			h.boot.mu.Lock()
-			cur, curAgent := h.boot.current, h.boot.agent
+			cur := h.boot.current
 			h.boot.mu.Unlock()
 			if cur != "" && cur != srv && cur != op.NewServer {
 				t.Fatal("the server token the supervisor accepts is lost")
 			}
-			if curAgent != "" && curAgent != agt && curAgent != op.NewAgent {
-				t.Fatal("the agent token the supervisor accepts is lost")
-			}
 			// No secret in the error, the answer or the log.
-			for _, sec := range []string{testServerToken, testAgentToken, op.NewServer, op.NewAgent, cur, curAgent} {
+			for _, sec := range []string{testServerToken, nodeCredential(testServerToken), op.NewServer, nodeCredential(op.NewServer), cur} {
 				if sec == "" {
 					continue
 				}
@@ -147,35 +140,35 @@ func TestRevokeResumesAtEachStep(t *testing.T) {
 			}
 			h.healAgents()
 			h.resume(t, "n2")
-			srv, agt = h.secretTokens(t)
+			srv, other := h.secretTokens(t)
 			h.boot.mu.Lock()
-			cur, curAgent = h.boot.current, h.boot.agent
+			cur = h.boot.current
 			h.boot.mu.Unlock()
-			if srv == testServerToken || srv != cur || agt == testAgentToken || agt != curAgent {
-				t.Fatal("after the resume the Secret doesn't hold the tokens in effect")
+			if srv == testServerToken || srv != cur || other {
+				t.Fatal("after the resume the Secret doesn't hold (only) the token in effect")
 			}
 			if !slices.Equal(h.agents.etcdRm, []string{"n1:n2:10.215.0.2"}) {
 				t.Fatalf("etcd removals %v", h.agents.etcdRm)
 			}
-			// Every survivor applied, its last apply with the final tokens
-			// (a server target: two rounds).
+			// Every surviving server applied, its last apply with the final
+			// token (a server target: two rounds); the agent n4 never got a
+			// token (agents hold no shared token: agent-token fix).
 			applied, last := map[string]int{}, map[string]string{}
 			for i, r := range h.agents.rotations {
+				if strings.HasSuffix(r, ":n4") {
+					t.Fatalf("the agent n4 got a token call: %v", h.agents.rotations)
+				}
 				if strings.HasPrefix(r, "apply") {
 					applied[r]++
 					last[r] = h.agents.tokens[i]
 				}
 			}
 			for r, tok := range last {
-				want := srv
-				if strings.HasPrefix(r, "apply-agent") || strings.HasSuffix(r, ":n4") {
-					want = agt
-				}
-				if tok != want {
+				if tok != srv {
 					t.Fatalf("%s's last apply carried a stale token", r)
 				}
 			}
-			for _, r := range []string{"apply:n1", "apply-agent:n1", "apply:n3", "apply-agent:n3", "apply:n4"} {
+			for _, r := range []string{"apply:n1", "apply:n3"} {
 				if applied[r] == 0 {
 					t.Fatalf("%s never ran: %v", r, h.agents.rotations)
 				}
@@ -633,10 +626,10 @@ func TestForgetMarksFirst(t *testing.T) {
 // all applied.
 func TestRotationSkipsReRegistered(t *testing.T) {
 	agent := nodeSpec{"n4", "agent", "cloud", "edge", "10.215.0.4", nil, nil, true, false}
-	back := nodeSpec{"n0", "agent", "home", "main", "10.215.0.9", nil, nil, true, false}
+	back := nodeSpec{"n0", "server", "home", "main", "10.215.0.9", nil, nil, true, false}
 	h := newHarness(t, append(append([]nodeSpec{}, baseNodes...), agent, back)...)
 	h.putState(t, func(st *nodeadmState) {
-		st.Nodes["n0"] = &nodeRecord{Role: "agent", Removed: true, MeshIP: "10.215.0.9"}
+		st.Nodes["n0"] = &nodeRecord{Role: "server", Removed: true, MeshIP: "10.215.0.9"}
 		st.Nodes["n3"] = &nodeRecord{Role: "server", Serial: "56:78", MeshIP: "10.215.0.3"}
 	})
 	h.agents.onRotate = h.bootFollows
@@ -648,8 +641,10 @@ func TestRotationSkipsReRegistered(t *testing.T) {
 			t.Fatal("the removed node was called")
 		}
 	}
-	if !slices.Contains(h.agents.rotations, "apply:n4") {
-		t.Fatalf("an agent after it wasn't applied: %v", h.agents.rotations)
+	// The server after it applied; the agent never called (it holds no
+	// shared token: agent-token fix).
+	if !slices.Contains(h.agents.rotations, "apply:n2") || slices.Contains(h.agents.rotations, "apply:n4") {
+		t.Fatalf("applied %v (want n2, never the agent n4)", h.agents.rotations)
 	}
 	if r := h.state(t).Nodes["n0"]; r == nil || !r.TokensStale {
 		t.Fatalf("the skip isn't recorded: %+v", r)
@@ -700,16 +695,17 @@ func TestRevokeParksSecurityDone(t *testing.T) {
 	if w := h.join(t, j, nearRTT); w.Code != 403 {
 		t.Fatalf("the revoked node's join: %d", w.Code)
 	}
-	// Parked, the k3s tokens are rotated already (fix round 5): the old
-	// server and agent tokens are refused, the Secret holds the new ones,
-	// the Ready survivor applied, the down ones deferred.
+	// Parked, the k3s token is rotated already (fix round 5): the old
+	// server token and the node credential derived from it are refused,
+	// the Secret holds the new one, the Ready survivor applied, the down
+	// ones deferred.
 	if st, _ := h.boot.Status(ctx, "10.215.0.1", testServerToken); st != 401 {
 		t.Fatalf("the old server token answers %d while parked", st)
 	}
-	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", testAgentToken); st != 401 {
-		t.Fatalf("the old agent token answers %d while parked", st)
+	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", nodeCredential(testServerToken)); st != 401 {
+		t.Fatalf("the old node credential answers %d while parked", st)
 	}
-	if srv, agt := h.secretTokens(t); srv == testServerToken || agt == testAgentToken {
+	if srv, _ := h.secretTokens(t); srv == testServerToken {
 		t.Fatal("the Secret keeps an old token while parked")
 	}
 	if !slices.Contains(h.agents.rotations, "apply:n1") || slices.Contains(h.agents.rotations, "apply:n2") || slices.Contains(h.agents.rotations, "apply:n5") {
@@ -726,7 +722,7 @@ func TestRevokeParksSecurityDone(t *testing.T) {
 	if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n5", metav1.GetOptions{}); !apierrors.IsNotFound(err) || len(h.agents.etcdRm) != 1 {
 		t.Fatal("the parked revoke didn't finish once quorum was back")
 	}
-	for _, r := range []string{"apply:n2", "apply-agent:n2", "apply:n3", "apply-agent:n3"} {
+	for _, r := range []string{"apply:n2", "apply:n3"} {
 		if !slices.Contains(h.agents.rotations, r) {
 			t.Fatalf("%s not applied after the resume: %v", r, h.agents.rotations)
 		}
@@ -767,7 +763,7 @@ func TestRevokeStepsVersion(t *testing.T) {
 		t.Fatalf("server rotations %d (want 2): %v", n, h.agents.rotations)
 	}
 	// done without the recorded rotations: refused.
-	op := &revokeOp{Node: "n9", Role: "server", Step: "applied2", StepsVersion: revokeStepsVersion, ServerRotated: true, AgentRotated: true}
+	op := &revokeOp{Node: "n9", Role: "server", Step: "applied2", StepsVersion: revokeStepsVersion, ServerRotated: true}
 	h.putState(t, func(st *nodeadmState) { st.Ops["n9"] = op })
 	if err := h.s.revokeStep(ctx, op); err == nil || !strings.Contains(err.Error(), "required token rotation") {
 		t.Fatalf("done without the second rotation: %v", err)
@@ -778,10 +774,11 @@ func TestRevokeStepsVersion(t *testing.T) {
 	}
 }
 
-// TestServerJoinGetsAgentToken (Task 9 ruling I2): a joining server gets
-// the agent token (agent_token, --agent-token-file) and the cluster CIDR;
-// an agent never gets the agent or server token.
-func TestServerJoinGetsAgentToken(t *testing.T) {
+// TestServerJoinGetsNoAgentToken (agent-token fix, replacing Task 9 ruling
+// I2): a joining server gets the server token and the cluster CIDR, no
+// agent token and no --agent-token-file (k3s derives the node credential
+// from the server token); an agent never gets the agent or server token.
+func TestServerJoinGetsNoAgentToken(t *testing.T) {
 	h := newHarness(t)
 	j := h.issue(t, "n5", "server", "home", "main", "10.215.0.5")
 	h.enrol(t, j, "")
@@ -790,9 +787,9 @@ func TestServerJoinGetsAgentToken(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &ans); w.Code != 200 || err != nil {
 		t.Fatalf("server join: %d %s", w.Code, w.Body)
 	}
-	if ans.Token != testServerToken || ans.AgentToken != testAgentToken || ans.ClusterCIDR != "10.42.0.0/16" ||
-		!slices.Contains(ans.Flags, "--agent-token-file=/etc/rancher/k3s/agent-token") {
-		t.Fatalf("server answer: cidr %q, agent token given %v, flags %v", ans.ClusterCIDR, ans.AgentToken != "", ans.Flags)
+	if ans.Token != testServerToken || ans.ClusterCIDR != "10.42.0.0/16" || strings.Contains(w.Body.String(), "agent_token") ||
+		strings.Contains(w.Body.String(), "agent-token") || strings.Contains(w.Body.String(), "::node:") {
+		t.Fatalf("server answer: cidr %q, flags %v", ans.ClusterCIDR, ans.Flags)
 	}
 	a := h.issue(t, "n6", "agent", "home", "main", "10.215.0.6")
 	h.enrol(t, a, "")

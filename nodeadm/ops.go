@@ -11,17 +11,18 @@ package main
 //	tokens_deleted   its bootstrap tokens deleted from kube-system;
 //	server_rotated   a new server token, generated and persisted in the op
 //	                 BEFORE the rotate call, in effect (server-bootstrap: the
-//	                 new one 200, the old one 401) and promoted to the Secret;
-//	agent_rotated    the same for the agent token;
-//	applied          every Ready surviving server then agent applied,
-//	                 recorded per node (the revoked node skipped);
+//	                 new one 200, the old one 401; the node credential k3s
+//	                 derives from it likewise) and promoted to the Secret;
+//	applied          every Ready surviving server applied (its token file,
+//	                 one restart), recorded per node (the revoked node
+//	                 skipped); agents hold no shared token: nothing to apply;
 //	node_deleted     its Node object deleted          } gated by etcd's
 //	published        the cluster addresses list it    } quorum (a server:
 //	                 removed                          } revokeQuorum)
 //	etcd_removed     (a server) its etcd member removed through a surviving
 //	                 server's nodeagent;
-//	server_rotated2  (a server) both tokens rotated again, the same way:
-//	agent_rotated2   until its member is gone the revoked server could read
+//	server_rotated2  (a server) the token rotated again, the same way:
+//	                 until its member is gone the revoked server could read
 //	                 the datastore (the first rotation's bootstrap data too);
 //	applied2         every survivor applied (the ones down so far too);
 //	done             refused unless every required rotation is recorded;
@@ -36,6 +37,17 @@ package main
 // new one means the rotate already took effect (promote it), the old one
 // means rotate again with the persisted new one. The op's tokens live in
 // nodeadm-state only (nodeadm-only; never logged, never in an answer).
+//
+// One token (agent-token fix, tokens.go): k3s's supported rotation, PUT
+// /v1-k3s/token on one server, rewrites that server's cred/passwd (the
+// server line, and the node line derived from it) and re-saves the
+// datastore's bootstrap copy from its disk; every other server takes the
+// new passwd from the datastore at its next start (the token file
+// written, one restart). No step changes passwd any other way, so no
+// server's disk is ever newer than the datastore. The agent token steps
+// (rotate-agent, apply-agent) are gone: k3s re-saves nothing after a
+// separate agent token changes, and the next start of every server was
+// fatal.
 
 import (
 	"context"
@@ -60,38 +72,36 @@ type revokeOp struct {
 	TokenIDs  []string       `json:"token_ids,omitempty"`
 	Step      string         `json:"step"`
 	NewServer string         `json:"new_server,omitempty"`
-	NewAgent  string         `json:"new_agent,omitempty"`
 	Applied   []string       `json:"applied,omitempty"`
 	Applied2  []string       `json:"applied2,omitempty"`
 	// StepsVersion: the step list the op was recorded under.
 	StepsVersion int `json:"steps_version"`
 	// The rotations proven in effect (done refuses without them).
 	ServerRotated  bool      `json:"server_rotated,omitempty"`
-	AgentRotated   bool      `json:"agent_rotated,omitempty"`
 	ServerRotated2 bool      `json:"server_rotated2,omitempty"`
-	AgentRotated2  bool      `json:"agent_rotated2,omitempty"`
 	Skipped        []string  `json:"skipped,omitempty"` // removed nodes the rotation didn't touch (N6)
 	Started        time.Time `json:"started"`
 	LastError      string    `json:"last_error,omitempty"`
 	LastKind       string    `json:"last_kind,omitempty"` // an error kind (quorum_minimum) for the answer
 }
 
-// Security first (fix rounds 5, 6): the tokens are rotated and applied to
-// the Ready survivors before the quorum-gated Node / etcd steps, which
-// blocks the node's supervisor joins at once. A server target is NOT fully
-// cut off while it stays an etcd member: it can read the datastore,
-// including the rotated token's bootstrap data. So for a server both
-// tokens are rotated AGAIN after etcd_removed (server_rotated2,
-// agent_rotated2) and applied to every survivor (applied2): the tokens
-// finally in effect never were in a datastore it could reach. An agent
-// needs the first rotation only (its *2 steps do nothing); applied2 then
-// gives the tokens to the survivors that were down.
-var revokeSteps = []string{"created", "marked", "tokens_deleted", "server_rotated", "agent_rotated", "applied",
-	"node_deleted", "published", "etcd_removed", "server_rotated2", "agent_rotated2", "applied2", "done"}
+// Security first (fix rounds 5, 6): the token is rotated and applied to
+// the Ready surviving servers before the quorum-gated Node / etcd steps,
+// which blocks the node's supervisor joins at once. A server target is NOT
+// fully cut off while it stays an etcd member: it can read the datastore,
+// including the rotated token's bootstrap data. So for a server the token
+// is rotated AGAIN after etcd_removed (server_rotated2) and applied to
+// every surviving server (applied2): the token finally in effect never was
+// in a datastore it could reach. An agent needs the first rotation only
+// (server_rotated2 does nothing); applied2 then gives the token to the
+// servers that were down.
+var revokeSteps = []string{"created", "marked", "tokens_deleted", "server_rotated", "applied",
+	"node_deleted", "published", "etcd_removed", "server_rotated2", "applied2", "done"}
 
 // revokeStepsVersion: an op recorded under another step list restarts from
-// marked (every step is idempotent; fail closed, fix round 6).
-const revokeStepsVersion = 3
+// marked (every step is idempotent; fail closed, fix round 6). 4: the
+// agent token steps are gone (agent-token fix).
+const revokeStepsVersion = 4
 
 func stepIndex(s string) int { return slices.Index(revokeSteps, s) }
 
@@ -316,7 +326,7 @@ func (s *Server) runRevoke(ctx context.Context, id string) error {
 			from := op.StepsVersion
 			if err := s.opStep(ctx, id, func(o *revokeOp) {
 				o.Step, o.StepsVersion = "created", revokeStepsVersion
-				o.ServerRotated, o.AgentRotated, o.ServerRotated2, o.AgentRotated2 = false, false, false, false
+				o.ServerRotated, o.ServerRotated2 = false, false
 				o.Applied, o.Applied2 = nil, nil
 			}); err != nil {
 				return err
@@ -380,7 +390,7 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 		if next == "server_rotated2" && op.Role != "server" {
 			break
 		}
-		if err := s.rotateOne(ctx, op, false); err != nil {
+		if err := s.rotateOne(ctx, op); err != nil {
 			return err
 		}
 		// Proven and promoted: the next rotation makes a new token.
@@ -389,19 +399,6 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 			op.ServerRotated = true
 		} else {
 			op.ServerRotated2 = true
-		}
-	case "agent_rotated", "agent_rotated2":
-		if next == "agent_rotated2" && op.Role != "server" {
-			break
-		}
-		if err := s.rotateOne(ctx, op, true); err != nil {
-			return err
-		}
-		op.NewAgent = ""
-		if next == "agent_rotated" {
-			op.AgentRotated = true
-		} else {
-			op.AgentRotated2 = true
 		}
 	case "applied":
 		if err := s.applyTokens(ctx, op, false, &op.Applied); err != nil {
@@ -412,10 +409,10 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 			return err
 		}
 	case "done":
-		if !op.ServerRotated || !op.AgentRotated || (op.Role == "server" && (!op.ServerRotated2 || !op.AgentRotated2)) {
+		if !op.ServerRotated || (op.Role == "server" && !op.ServerRotated2) {
 			return fmt.Errorf("the revocation of %s can't finish: a required token rotation isn't recorded", id)
 		}
-		op.NewServer, op.NewAgent = "", ""
+		op.NewServer = ""
 		if len(op.Skipped) > 0 {
 			skipped := op.Skipped
 			if err := s.mutate(ctx, func(st *nodeadmState) error {
@@ -432,8 +429,8 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 	}
 	op.Step = next
 	if err := s.opStep(ctx, id, func(o *revokeOp) {
-		o.Step, o.NewServer, o.NewAgent = next, op.NewServer, op.NewAgent
-		o.ServerRotated, o.AgentRotated, o.ServerRotated2, o.AgentRotated2 = op.ServerRotated, op.AgentRotated, op.ServerRotated2, op.AgentRotated2
+		o.Step, o.NewServer = next, op.NewServer
+		o.ServerRotated, o.ServerRotated2 = op.ServerRotated, op.ServerRotated2
 	}); err != nil {
 		return err
 	}
@@ -441,8 +438,9 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 	return nil
 }
 
-// survivors: the nodes a rotation applies to, refused while any of them
-// has no mesh address (it would keep the old token, M6). A node whose
+// survivors: the nodes a rotation applies to, refused while a server has
+// no mesh address (it would keep the old token, M6; agents hold no shared
+// token and get nothing). A node whose
 // record is removed (re-registered after a revoke, or another op's
 // target) is skipped, never called: the op records it in Skipped and the
 // snapshot names it (review N6).
@@ -464,8 +462,8 @@ func (s *Server) survivors(ctx context.Context, gone string) (servers, agents []
 			skipped = append(skipped, n.Name)
 			continue
 		}
-		if n.Mesh == "" {
-			return nil, nil, fmt.Errorf("node %s has no mesh address: the tokens can't be applied there", n.Name)
+		if n.Mesh == "" && n.Role == "server" {
+			return nil, nil, fmt.Errorf("node %s has no mesh address: the token can't be applied there", n.Name)
 		}
 		if n.Role == "server" {
 			servers = append(servers, n)
@@ -491,9 +489,10 @@ func (s *Server) survivors(ctx context.Context, gone string) (servers, agents []
 	return servers, agents, nil
 }
 
-// rotateOne rotates the server (agent false) or the agent token: the new
-// one persisted first, then the supervisor asked which one it accepts.
-func (s *Server) rotateOne(ctx context.Context, op *revokeOp, agent bool) error {
+// rotateOne rotates the server token (and with it the node credential k3s
+// derives from it): the new one persisted first, then the supervisor
+// asked which one it accepts.
+func (s *Server) rotateOne(ctx context.Context, op *revokeOp) error {
 	servers, _, err := s.survivors(ctx, op.Node)
 	if err != nil {
 		return err
@@ -506,66 +505,50 @@ func (s *Server) rotateOne(ctx context.Context, op *revokeOp, agent bool) error 
 		}
 	}
 	if rot == nil {
-		return errors.New("no Ready server to rotate the k3s tokens on")
+		return errors.New("no Ready server to rotate the k3s token on")
 	}
-	old, err := s.serverToken(ctx)
+	cur, err := s.serverToken(ctx)
 	if err != nil {
 		return err
 	}
-	cur := old
-	user, step, key := serverTokenLabel, "rotate", tokenKey
-	if agent {
-		if cur, err = s.agentToken(ctx); err != nil {
-			return err
-		}
-		user, step, key = "node", "rotate-agent", agentTokenKey
-	}
 	newTok := op.NewServer
-	if agent {
-		newTok = op.NewAgent
-	}
 	if newTok == "" {
-		if newTok, err = newK10(caHash(old), user); err != nil {
+		if newTok, err = newK10(caHash(cur), serverTokenLabel); err != nil {
 			return err
 		}
 		// Persisted BEFORE the rotate call.
-		if err := s.opStep(ctx, op.Node, func(o *revokeOp) {
-			if agent {
-				o.NewAgent = newTok
-			} else {
-				o.NewServer = newTok
-			}
-		}); err != nil {
+		if err := s.opStep(ctx, op.Node, func(o *revokeOp) { o.NewServer = newTok }); err != nil {
 			return err
 		}
-		if agent {
-			op.NewAgent = newTok
-		} else {
-			op.NewServer = newTok
-		}
+		op.NewServer = newTok
 	}
-	secrets := []string{old, cur, newTok}
-	status := func(tok string) (int, error) {
-		if s.bootstrap == nil {
-			return 0, errors.New("no supervisor check")
-		}
-		if agent {
-			return s.bootstrap.AgentStatus(ctx, rot.Mesh, tok)
-		}
-		return s.bootstrap.Status(ctx, rot.Mesh, tok)
+	secrets := []string{cur, newTok, nodeCredential(cur), nodeCredential(newTok)}
+	if s.bootstrap == nil {
+		return errors.New("no supervisor check")
 	}
 	if cur != newTok {
-		if st, err := status(newTok); err != nil || st != http.StatusOK {
+		if st, err := s.bootstrap.Status(ctx, rot.Mesh, newTok); err != nil || st != http.StatusOK {
 			// Not in effect yet: rotate (the nodeagent authenticates with its
 			// own token file, the old one).
-			if err := s.agents.TokenRotate(ctx, rot.Name, rot.Mesh, newTok, step); err != nil {
-				return fmt.Errorf("token %s on %s: %w", step, rot.Name, redactErr(err, secrets...))
+			if err := s.agents.TokenRotate(ctx, rot.Name, rot.Mesh, newTok, "rotate"); err != nil {
+				return fmt.Errorf("token rotate on %s: %w", rot.Name, redactErr(err, secrets...))
 			}
 		}
-		newSt, err1 := status(newTok)
-		oldSt, err2 := status(cur)
+		// In effect: the new token answers, the old one is refused, and so
+		// is the node credential derived from the old one (fail closed: a
+		// server whose k3s kept a separate agent token would leave that one
+		// working). The nodeagent restarts k3s --no-block: wait for the
+		// restart (Timing.NodeReady) rather than fail on the old process.
+		_ = s.waitToken(ctx, *rot, newTok)
+		newSt, err1 := s.bootstrap.Status(ctx, rot.Mesh, newTok)
+		oldSt, err2 := s.bootstrap.Status(ctx, rot.Mesh, cur)
+		newNode, err3 := s.bootstrap.AgentStatus(ctx, rot.Mesh, nodeCredential(newTok))
+		oldNode, err4 := s.bootstrap.AgentStatus(ctx, rot.Mesh, nodeCredential(cur))
 		if err1 != nil || err2 != nil || newSt != http.StatusOK || oldSt != http.StatusUnauthorized {
-			return fmt.Errorf("the rotated %s token isn't in effect on %s (new %d, old %d)", user, rot.Name, newSt, oldSt)
+			return fmt.Errorf("the rotated server token isn't in effect on %s (new %d, old %d)", rot.Name, newSt, oldSt)
+		}
+		if err3 != nil || err4 != nil || newNode != http.StatusOK || oldNode != http.StatusUnauthorized {
+			return fmt.Errorf("the node credential didn't rotate with the server token on %s (new %d, old %d): does its k3s run with --agent-token-file?", rot.Name, newNode, oldNode)
 		}
 	}
 	// Promote the proven token to the Secret.
@@ -576,24 +559,25 @@ func (s *Server) rotateOne(ctx context.Context, op *revokeOp, agent bool) error 
 	if sec.Data == nil {
 		sec.Data = map[string][]byte{}
 	}
-	sec.Data[key] = []byte(newTok)
+	sec.Data[tokenKey] = []byte(newTok)
 	sec.StringData = nil
 	if _, err := s.kube.CoreV1().Secrets(s.cfg.CoreNS).Update(ctx, sec, metav1.UpdateOptions{}); secretErr(err) != nil {
 		err = secretErr(err)
 		return fmt.Errorf("writing the Secret %s: %w", tokenSecret, err)
 	}
-	s.log.Info("k3s token rotated", "kind", user, "on", rot.Name)
+	s.log.Info("k3s token rotated", "kind", serverTokenLabel, "on", rot.Name)
 	return nil
 }
 
-// applyTokens: each surviving server (apply the server token, apply-agent
-// the agent token) one at a time, then each agent (apply the agent token),
-// each Ready again before the next; recorded per node.
-// applyTokens: final false applies the Ready survivors and leaves the
-// others for later; final true applies every survivor not applied yet,
-// waiting (the op retries) while one isn't Ready.
+// applyTokens: each surviving server gets the server token (apply: its
+// token file, one restart), one at a time, each Ready again before the
+// next; recorded per node. Agents get nothing: they hold no shared token
+// (their bootstrap token is deleted, they restart on their node identity).
+// final false applies the Ready servers and leaves the others for later;
+// final true applies every surviving server not applied yet, waiting (the
+// op retries) while one isn't Ready.
 func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool, applied *[]string) error {
-	servers, agents, err := s.survivors(ctx, op.Node)
+	servers, _, err := s.survivors(ctx, op.Node)
 	if err != nil {
 		return err
 	}
@@ -601,17 +585,7 @@ func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool, appl
 	if err != nil {
 		return err
 	}
-	agt, err := s.agentToken(ctx)
-	if err != nil {
-		return err
-	}
-	call := func(n clusterNode, tok, step string) error {
-		if err := s.agents.TokenRotate(ctx, n.Name, n.Mesh, tok, step); err != nil {
-			return fmt.Errorf("token %s on %s: %w", step, n.Name, redactErr(err, srv, agt))
-		}
-		return nil
-	}
-	for _, n := range append(servers, agents...) {
+	for _, n := range servers {
 		if slices.Contains(*applied, n.Name) {
 			continue
 		}
@@ -620,19 +594,21 @@ func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool, appl
 		}
 		if !n.Ready {
 			if final {
-				return fmt.Errorf("waiting for %s to be Ready to apply the rotated k3s tokens", n.Name)
+				return fmt.Errorf("waiting for %s to be Ready to apply the rotated k3s token", n.Name)
 			}
-			s.log.Info("k3s tokens deferred until the node is Ready", "node", n.Name)
+			s.log.Info("k3s token deferred until the node is Ready", "node", n.Name)
 			continue
 		}
-		if n.Role == "server" {
-			if err := call(n, srv, "apply"); err != nil {
-				return err
-			}
-			if err := call(n, agt, "apply-agent"); err != nil {
-				return err
-			}
-		} else if err := call(n, agt, "apply"); err != nil {
+		if err := s.agents.TokenRotate(ctx, n.Name, n.Mesh, srv, "apply"); err != nil {
+			return fmt.Errorf("token apply on %s: %w", n.Name, redactErr(err, srv, nodeCredential(srv)))
+		}
+		// Restarted before the next one (found live, agent-token fix): the
+		// nodeagent restarts k3s --no-block and the Node stays Ready for a
+		// while, so Ready alone let every server restart at once (the API
+		// and etcd's quorum gone for a minute). k3s's readyz answering the
+		// new token's node credential proves the restart is done (its old
+		// process accepts only the token it started with), then Ready.
+		if err := s.waitToken(ctx, n, srv); err != nil {
 			return err
 		}
 		if err := s.waitReady(ctx, n.Name); err != nil {
@@ -651,9 +627,31 @@ func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool, appl
 		}); err != nil {
 			return err
 		}
-		s.log.Info("k3s tokens applied", "node", n.Name)
+		s.log.Info("k3s token applied", "node", n.Name)
 	}
 	return nil
+}
+
+// waitToken waits (Timing.NodeReady) for n's k3s to run with tok and be
+// ready (its supervisor's readyz with the node credential derived from
+// tok: the supervisor alone answers seconds into a start, long before the
+// API server and etcd, found live).
+func (s *Server) waitToken(ctx context.Context, n clusterNode, tok string) error {
+	if s.bootstrap == nil {
+		return errors.New("no supervisor check")
+	}
+	deadline := time.Now().Add(s.timing.NodeReady)
+	for {
+		if st, err := s.bootstrap.Ready(ctx, n.Mesh, tok); err == nil && st == http.StatusOK {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s's k3s doesn't answer with the applied token: not restarted with it yet", n.Name)
+		}
+		if err := sleepCtx(ctx, s.timing.Poll); err != nil {
+			return err
+		}
+	}
 }
 
 // publishAddresses writes the cluster addresses now (a revoke's step).

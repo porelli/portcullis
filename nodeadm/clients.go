@@ -335,6 +335,10 @@ func (k3sBootstrap) AgentStatus(ctx context.Context, serverIP, token string) (in
 	return supervisorStatus(ctx, serverIP, token, "node", "/v1-k3s/client-kube-proxy.crt")
 }
 
+func (k3sBootstrap) Ready(ctx context.Context, serverIP, serverToken string) (int, error) {
+	return supervisorStatus(ctx, serverIP, nodeCredential(serverToken), "node", "/v1-k3s/readyz")
+}
+
 func supervisorStatus(ctx context.Context, serverIP, token, user, path string) (int, error) {
 	m := k10Re.FindStringSubmatch(token)
 	if m == nil || !meshAddrOK(serverIP) {
