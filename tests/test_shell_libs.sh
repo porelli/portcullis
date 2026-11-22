@@ -8393,7 +8393,10 @@ expect_eq "domains_image_ensure on kubernetes: nothing built, no refusal" "$OUT"
 # every app's egress policy is refused once a second node has a LAN address.
 NA_ROOT="$WORK/na-root"; rm -rf "$NA_ROOT"; mkdir -p "$NA_ROOT"; printf 'PORTCULLIS_DOMAIN=na.example\n' > "$NA_ROOT/.env"
 na_run() { ( export PORTCULLIS_ROOT="$NA_ROOT" CONTAINER_RUNTIME=kubernetes PORTCULLIS_POD_CIDR=10.42.0.0/16 PORTCULLIS_SERVICE_CIDR=10.43.0.0/16
-  for l in common network; do source "$HERE/../scripts/lib/$l.sh" >/dev/null 2>&1; done
+  # shellcheck source=/dev/null
+  source "$HERE/../scripts/lib/common.sh" >/dev/null 2>&1
+  # shellcheck source=/dev/null
+  source "$HERE/../scripts/lib/network.sh" >/dev/null 2>&1
   kube_node_addresses() { echo "10.215.0.1 10.215.0.2"; }; eval "$1"; env_load; hub_env_write 2>/dev/null
   grep '^PORTCULLIS_KUBE_NODE_ADDRESSES=' "$NA_ROOT/secrets/hub/core.env" ); }
 expect_eq "core.env node addresses: the cluster addresses document's (the params')" \
@@ -8422,7 +8425,7 @@ fi
 he_vols; printf LoadBalancer > "$HE/k/svc-traefik"; printf ClusterIP > "$HE/k/svc-traefik-vpn"; printf ExternalName > "$HE/k/svc-keycloak-internal"
 hacli "" "need_env; _ha_services_move; exit 0" status
 expect_eq "switch: the old traefik / traefik-vpn Services deleted, an ExternalName kept, a missing one skipped" \
-  "$RC:$(grep -c '^delete service' "$HE/order"):$(ls "$HE/k" | grep -c '^svc-keycloak-internal$')" "0:2:1"
+  "$RC:$(grep -c '^delete service' "$HE/order"):$([ -e "$HE/k/svc-keycloak-internal" ] && echo 1 || echo 0)" "0:2:1"
 # A writer already on its <pvc>-r (an earlier switch applied it): never
 # copied over again.
 he_vols; touch "$HE/k/onrep-hub"
