@@ -3429,13 +3429,26 @@ OUT="$(fliph true "export FINISH_RC=3" dns_tighten_main)"
 expect_eq "up: an unfinished HA flip keeps the mark and the old sentinel, warns, rc 0" \
   "$(grep -c relax-done "$STUB_DIR/dt/order" || true):$(cat "$FLH_ROOT/certs/.acme-staging-last"):$(cat "$FLH_ROOT/certs/.acme-ha-flip-pending"):${OUT##*rc=}" "0:false:true:0"
 case "$OUT" in *"isn't finished"*"Run ./portcullis up again"*) t_pass "up: the unfinished HA flip says rerun up" ;; *) t_fail "HA finish fail: $OUT" ;; esac
-# ACME_STAGING reverted mid-flip: the mark is dropped, no flip, no finish;
-# the front door goes back onto its old CA, whose account (its own key) renews.
+# ACME_STAGING reverted mid-flip (fix round 2, R-I1): a flip BACK — the
+# same settle first, then the mark for the old value; the next up finishes
+# for the old CA (its account, an order or a no-op, the re-pin).
+echo false > "$FLH_ROOT/certs/.acme-staging-last"; echo true > "$FLH_ROOT/certs/.acme-ha-flip-pending"
+OUT="$(fliph false "export SETTLE_RC=1")"
+expect_eq "revert of a pending HA flip, not settled: rc 1, the mark (true) kept, the CA and sentinel unchanged" \
+  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(fl_state):${OUT##*rc=}" "settle:https://acme-v02.api.letsencrypt.org/directory|false|true:1"
 OUT="$(fliph false ":")"
-expect_eq "ACME_STAGING reverted mid-flip in HA: no settle, no flip, the pending mark dropped, the old CA in .env" \
-  "$(cat "$STUB_DIR/dt/order" 2>/dev/null | grep -c -e settle -e finish -e kubectl || true):$(fl_state):${OUT##*rc=}" "0:https://acme-v02.api.letsencrypt.org/directory|false|:0"
+expect_eq "revert of a pending HA flip (after the order): settled → the mark now false, the old CA in .env" \
+  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(fl_state):${OUT##*rc=}" "settle:https://acme-v02.api.letsencrypt.org/directory|false|false:0"
+case "$OUT" in *"was reverted: flipping back"*"Finish with: ./portcullis up"*) t_pass "revert of a pending HA flip: says it flips back and up finishes" ;; *) t_fail "revert message: $OUT" ;; esac
 OUT="$(fliph false ":" dns_tighten_main)"
-expect_eq "ACME_STAGING reverted: up's finish does nothing" "$([ -s "$STUB_DIR/dt/order" ] && echo ran):${OUT##*rc=}" ":0"
+expect_eq "revert after the order: the next up orders with A and re-pins A (its account, the finish), the mark goes, the sentinel stays false" \
+  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(fl_state):${OUT##*rc=}" "account-uri|finish $FD_URI|relax-done:https://acme-v02.api.letsencrypt.org/directory|false|:0"
+# A mark that disagrees with ACME_STAGING without a config apply: up finishes nothing.
+echo true > "$FLH_ROOT/certs/.acme-ha-flip-pending"
+OUT="$(fliph false ":" dns_tighten_main)"
+expect_eq "up with a mark that disagrees with ACME_STAGING (no config apply since): no finish, the mark kept, warned" \
+  "$([ -s "$STUB_DIR/dt/order" ] && echo ran):$(cat "$FLH_ROOT/certs/.acme-ha-flip-pending"):$(printf '%s' "$OUT" | grep -c 'Run ./portcullis config apply'):${OUT##*rc=}" ":true:1:0"
+rm -f "$FLH_ROOT/certs/.acme-ha-flip-pending"
 expect_eq "config apply flip in HA: Traefik is never stopped and acme.json never cleared" "$(cat "$STUB_DIR/dt/order" 2>/dev/null | grep -c -e STOP -e CLEAR || true)" 0
 expect_eq "config apply runs under cli_lock (fix round 1, I1)" \
   "$(sed -n '/^cli_lock() {/,/^}/p' "$HERE/../scripts/lib/common.sh" | grep -c 'config) case "$sub" in apply) ;; \*) return 0 ;; esac ;;')" 1
@@ -3475,7 +3488,8 @@ kube_ctl() {
   echo "kubectl $*" >> "$FDB/calls"
   case "$*" in
     *"get secret frontdoor-acme frontdoor-cert -o json") echo '{"items":[{"metadata":{"name":"frontdoor-acme"},"data":{"frontdoor-x":"QUNDVC1LRVk="}},{"metadata":{"name":"frontdoor-cert"},"data":{"tls.key":"S0VZ"}}]}' ;;
-    *"get secret frontdoor-acme frontdoor-cert") return 0 ;;
+    *"get secret frontdoor-acme frontdoor-cert -o name --ignore-not-found") [ "${FDB_GET:-both}" != error ] || return 1
+      case "${FDB_GET:-both}" in both) printf 'secret/frontdoor-acme\nsecret/frontdoor-cert\n' ;; one) echo secret/frontdoor-acme ;; esac ;;
     *" exec -i "*"domains seal "*) cat > "$FDB/sealed-in"; echo '-----BEGIN AGE ENCRYPTED FILE-----'; echo 'Zm9v'; echo '-----END AGE ENCRYPTED FILE-----' ;;
     *" exec -i "*"domains unseal") cat > "$FDB/unseal-in"; echo '{"v":1,"secrets":[{"name":"frontdoor-acme","data":{"frontdoor-x":"QUNDVC1LRVk="}},{"name":"frontdoor-cert","data":{"tls.key":"S0VZ"}}]}' ;;
     *" patch secret "*) cat >> "$FDB/patches" ;;
@@ -3496,6 +3510,14 @@ expect_eq "restore: frontdoor.age unsealed with the domains key on stdin, each S
   '2:["frontdoor-x","tls.key"]:1:0:0'
 OUT="$(fdb "export PORTCULLIS_HA=; _kube_backup_frontdoor '$WORK/fdb/work2'")"
 expect_eq "backup outside HA: no front-door step" "$([ -s "$WORK/fdb/calls" ] && echo ran):${OUT##*rc=}" ":0"
+# R-M1: skipped only when neither Secret exists; an API error or one of the
+# two missing fails the backup.
+for g in none:0:skipped error:1:failed one:1:failed; do
+  OUT="$(fdb "export FDB_GET=${g%%:*}; _kube_backup_frontdoor '$WORK/fdb/work3'")"
+  rc_w="${g#*:}"; rc_w="${rc_w%%:*}"
+  expect_eq "backup: the front door's Secrets ${g%%:*} → ${g##*:} (rc $rc_w, no seal)" "$(grep -c 'domains seal' "$WORK/fdb/calls" || true):${OUT##*rc=}" "0:$rc_w"
+done
+expect_eq "restore: a newline between the identity file and frontdoor.age (k5)" "$(grep -cF "secrets/domains/age.key\"; printf '\\n'; cat \"\$dir/frontdoor.age\"" "$HERE/../scripts/lib/ha.sh")" 1
 expect_eq "the kube backup and restore run the front-door steps" \
   "$(grep -c 'kube_frontdoor_backup_step "$work"' "$HERE/../scripts/lib/kube.sh"):$(grep -c 'kube_frontdoor_restore_step "$dir"' "$HERE/../scripts/lib/kube.sh")" "1:1"
 

@@ -12,10 +12,12 @@ ingress only Prometheus on :9106. The label portcullis.io/net-frontdoor names
 a network of one (no generic net policy selects it).
 Task 29 (spec §11.2, contract §12.4 / §20.8): it also orders the main
 domain's certificate with its own ACME account (ACME_CA_SERVER /
-ACME_EMAIL, as the domains service), kept in the Secret frontdoor-acme (key
-frontdoor; read by it alone, through the API: never mounted), and writes the
-certificate into frontdoor-cert (tls.crt, tls.key, account-uri), which only
-the domains service mounts (read-only) and serves to every Traefik replica.
+ACME_EMAIL, as the domains service), kept in the Secret frontdoor-acme (one
+key per CA, frontdoor-<CA host>-<hash>; read by it alone, through the API:
+never mounted), and writes the certificate into frontdoor-cert (a slot per
+CA plus the served pair tls.crt, tls.key, account-uri), whose served pair
+only the domains service mounts (read-only) and serves to every Traefik
+replica.
 Both are created empty here and kept (helm.sh/resource-policy: keep: an
 uninstall must not lose the account the CAA pins). Its egress adds DNS
 (53) to public addresses: lego's propagation check asks the zone's

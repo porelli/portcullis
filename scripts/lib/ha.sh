@@ -2329,7 +2329,14 @@ _kube_backup_frontdoor() {
   local work="$1" ns pod rcpt rc=0
   kube_ha_on || return 0
   ns="$(kube_ns)"
-  kube_ctl -n "$ns" get secret frontdoor-acme frontdoor-cert >/dev/null 2>&1 || return 0
+  # Skipped only when neither exists (NotFound for both); any other
+  # answer (an API error, a timeout, one of the two missing) fails closed
+  # (fix round 2, R-M1).
+  local found
+  found="$(kube_ctl -n "$ns" get secret frontdoor-acme frontdoor-cert -o name --ignore-not-found)" \
+    || { echo "could not read the front door's Secrets (frontdoor-acme, frontdoor-cert)" >&2; return 1; }
+  [ -n "$found" ] || return 0
+  [ "$(printf '%s\n' "$found" | grep -c .)" = 2 ] || { echo "only one of the front door's Secrets exists ($found): refusing an incomplete backup" >&2; return 1; }
   rcpt="$(_kube_domains_recipient)"
   [ -n "$rcpt" ] || { echo "secrets/domains/age.key has no public key line: the front door's Secrets can't be sealed" >&2; return 1; }
   pod="$(_kube_helper_pod "" "$CT_UID_DOMAINS:$CT_UID_DOMAINS" ro "$(_kube_image_of domains)" frontdoor-seal)" || return 1
@@ -2350,7 +2357,7 @@ _kube_restore_frontdoor() {
   ns="$(kube_ns)"
   pod="$(_kube_helper_pod "" "$CT_UID_DOMAINS:$CT_UID_DOMAINS" ro "$(_kube_image_of domains)" frontdoor-seal)" || return 1
   for name in frontdoor-acme frontdoor-cert; do
-    cat "$PORTCULLIS_ROOT/secrets/domains/age.key" "$dir/frontdoor.age" \
+    { cat "$PORTCULLIS_ROOT/secrets/domains/age.key"; printf '\n'; cat "$dir/frontdoor.age"; } \
       | kube_ctl -n "$ns" exec -i "$pod" -- domains unseal \
       | N="$name" jq -c '{data: ([.secrets[] | select(.name == env.N)][0].data // error("no \(env.N) in frontdoor.age"))}' \
       | kube_ctl -n "$ns" patch secret "$name" --type=merge --patch-file=/dev/stdin >/dev/null || { rc=1; break; }
@@ -2369,5 +2376,5 @@ kube_frontdoor_backup_step() {
   printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
 }
 kube_frontdoor_restore_step() {
-  _kube_restore_frontdoor "$1" || fail "could not restore the front door's Secrets (frontdoor-acme, frontdoor-cert) from $1/frontdoor.age: the main domain has no certificate until they are (secrets/domains/age.key from another install?)"
+  _kube_restore_frontdoor "$1" || fail "could not restore the front door's Secrets (frontdoor-acme, frontdoor-cert) from $1/frontdoor.age: the main domain has no certificate until they are (secrets/domains/age.key from another install?). Everything else is restored; run the same ./portcullis restore again once the key matches (the front-door step is its last)"
 }

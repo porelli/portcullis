@@ -190,7 +190,7 @@ func NewMetrics() *Metrics {
 	m.snapOK = prometheus.NewGauge(prometheus.GaugeOpts{Name: "portcullis_frontdoor_snapshot_ok",
 		Help: "1 when the last round read nodeadm's snapshot; 0 = the site series are the last good round's (stale)."})
 	m.certExpiry = prometheus.NewGauge(prometheus.GaugeOpts{Name: "portcullis_frontdoor_certificate_expiry_timestamp_seconds",
-		Help: "When the main domain's certificate in frontdoor-cert expires (Unix seconds; 0 = none or unreadable)."})
+		Help: "When the main domain's served certificate in frontdoor-cert expires (Unix seconds; 0 = none, or the Secret unreadable this minute)."})
 	m.Registry.MustRegister(m.addresses, m.unhealthy, m.siteOK, m.blind, m.snapOK, m.certExpiry)
 	return m
 }

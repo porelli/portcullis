@@ -973,9 +973,8 @@ dns_frontdoor_cert_lines() {
   _st_line ok "front door: certificate of $PORTCULLIS_DOMAIN until $na, renewed on its own (account $(printf '%s' "$j" | jq -r '.account_uri'))"
 }
 
-# _dns_ha_flip_pending — the target ACME_STAGING value of an HA flip whose
-# settle passed in config apply (certs/.acme-ha-flip-pending), nothing
-# without one.
+# _dns_ha_flip_file — the mark of an HA flip whose settle passed in config
+# apply (certs/.acme-ha-flip-pending): the ACME_STAGING value it flips to.
 _dns_ha_flip_file() { printf '%s/certs/.acme-ha-flip-pending' "$PORTCULLIS_ROOT"; }
 
 # dns_ha_flip_finish — after `up` / `upgrade`'s helm release (HA): the
@@ -989,9 +988,10 @@ dns_ha_flip_finish() {
   target="$(cat "$f" 2>/dev/null)"
   cur="$(_bool "$(env_get ACME_STAGING)" false)"
   if [ "$target" != "$cur" ]; then
-    # ACME_STAGING reverted since: the flip is abandoned; the front door is
-    # back on its old CA and account (one key per CA, never overwritten).
-    rm -f "$f"
+    # ACME_STAGING changed since the mark without a config apply (it turns
+    # a revert into a flip back, with its own settle): nothing is finished
+    # without that settle.
+    warn "The ACME_STAGING flip in HA isn't finished: ACME_STAGING changed since its settle. Run ./portcullis config apply, then ./portcullis up."
     return 0
   fi
   uri="$(dns_frontdoor_account_uri)" || { warn "The ACME_STAGING flip in HA isn't finished: the front door's new account couldn't be read. Run ./portcullis up again."; return 0; }
@@ -1001,7 +1001,7 @@ dns_ha_flip_finish() {
     dns_relax_done
     ok "ACME_STAGING=$target in HA: the front door's account $uri holds the certificate and the CAA pin."
   else
-    warn "The ACME_STAGING flip in HA isn't finished (see above): the CAA stays CA-only and the current certificate stays served. Run ./portcullis up again."
+    warn "The ACME_STAGING flip in HA isn't finished (see above): the CAA isn't pinned to the front door's account yet (CA-only, or the write half done), and a valid certificate stays served. Run ./portcullis up again."
   fi
   return 0
 }

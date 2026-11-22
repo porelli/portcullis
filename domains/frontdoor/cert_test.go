@@ -93,7 +93,7 @@ func TestIssueRefusesUncheckedCert(t *testing.T) {
 	if err := c.IssueMain(ctx); err == nil || !strings.Contains(err.Error(), "nothing stored") {
 		t.Fatalf("IssueMain: %v", err)
 	}
-	if got, _ := st.LoadCert(ctx); got.ChainPEM != "" {
+	if got, _ := st.LoadCert(ctx, AccountKeyFor("https://ca.example/dir")); got.ChainPEM != "" {
 		t.Fatal("a refused chain was stored")
 	}
 	if a.regs != 1 {
@@ -101,7 +101,7 @@ func TestIssueRefusesUncheckedCert(t *testing.T) {
 	}
 	// A stored certificate of this account that doesn't parse is due;
 	// the failed renewal waits 10 min before the next try.
-	if err := st.SaveCert(ctx, Cert{ChainPEM: "garbage", KeyPEM: "k", AccountURI: a.uri}); err != nil {
+	if err := st.SaveCert(ctx, AccountKeyFor("https://ca.example/dir"), Cert{ChainPEM: "garbage", KeyPEM: "k", AccountURI: a.uri}, true); err != nil {
 		t.Fatal(err)
 	}
 	if ordered, err := c.Renew(ctx); !ordered || err == nil {
@@ -118,7 +118,7 @@ func TestIssueRefusesUncheckedCert(t *testing.T) {
 	if a.obtains != 3 {
 		t.Fatalf("%d orders", a.obtains)
 	}
-	if got, _ := st.LoadCert(ctx); got.ChainPEM != "garbage" {
+	if got, _ := st.LoadCert(ctx, AccountKeyFor("https://ca.example/dir")); got.ChainPEM != "garbage" {
 		t.Fatal("the stored certificate changed")
 	}
 }
@@ -138,7 +138,7 @@ func TestNotDueReasonLoggedOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := st.SaveCert(ctx, Cert{ChainPEM: "x", KeyPEM: "k", AccountURI: "https://old.example/acct/2"}); err != nil {
+	if err := st.SaveCert(ctx, AccountKeyFor("https://ca.example/dir"), Cert{ChainPEM: "x", KeyPEM: "k", AccountURI: "https://old.example/acct/2"}, true); err != nil {
 		t.Fatal(err)
 	}
 	for range 3 {
@@ -146,7 +146,7 @@ func TestNotDueReasonLoggedOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(logs) != 2 || !strings.Contains(logs[0], "no certificate yet") || !strings.Contains(logs[1], "old.example") {
+	if len(logs) != 2 || !strings.Contains(logs[0], "no certificate of this CA yet") || !strings.Contains(logs[1], "old.example") {
 		t.Fatalf("logs %q", logs)
 	}
 	if a.obtains != 0 {

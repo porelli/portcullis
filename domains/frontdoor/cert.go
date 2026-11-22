@@ -24,7 +24,9 @@ package frontdoor
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -47,21 +49,31 @@ const (
 	// only.
 	AccountSecret    = "frontdoor-acme"
 	AccountKeyPrefix = "frontdoor-"
-	// CertSecret holds the main domain's certificate: tls.crt (the full
-	// chain), tls.key and account-uri (the account that ordered it).
-	// Mounted read-only by the domains service, which serves it.
+	// CertSecret holds the main domain's certificates: one slot per CA
+	// (<AccountKeyFor>.tls.crt / .tls.key / .account-uri, like the
+	// accounts), and the SERVED pair tls.crt (the full chain), tls.key and
+	// account-uri — what the domains service mounts (read-only, those two
+	// keys only) and serves. The served pair is always a copy of the
+	// active CA's slot once that slot holds a servable certificate (Promote);
+	// until then the previous one stays served (no gap during a flip).
 	CertSecret     = "frontdoor-cert"
 	CertChainKey   = "tls.crt"
 	CertKeyKey     = "tls.key"
 	CertAccountKey = "account-uri"
 )
 
-// AccountKeyFor is the account's key in frontdoor-acme for the ACME
-// directory caServer: "frontdoor-<host>" (the host lowercased, a port as
-// "-<port>"; anything outside [a-z0-9.-] becomes "-"). Two directories on
-// one host share a key: the stored account names its CA, so the other
-// one's is registered over it (CurrentURI).
+// AccountKeyFor is the account's key in frontdoor-acme (and its
+// certificate slot's prefix in frontdoor-cert) for the ACME directory
+// caServer: "frontdoor-<host>-<8 hex of sha256(caServer)>" (the host
+// lowercased, anything outside [a-z0-9.-] as "-", at most 200 bytes):
+// injective in practice; a stored account of another CA under the same key
+// is refused, never overwritten (accountLocked).
 func AccountKeyFor(caServer string) string {
+	sum := sha256.Sum256([]byte(caServer))
+	return accountHostKey(caServer) + "-" + hex.EncodeToString(sum[:4])
+}
+
+func accountHostKey(caServer string) string {
 	u, err := url.Parse(caServer)
 	h := ""
 	if err == nil {
@@ -76,10 +88,14 @@ func AccountKeyFor(caServer string) string {
 			b.WriteByte('-')
 		}
 	}
-	if b.Len() == 0 {
-		return AccountKeyPrefix + "unknown"
+	h = b.String()
+	if h == "" {
+		h = "unknown"
 	}
-	return AccountKeyPrefix + b.String()
+	if len(h) > 200 {
+		h = h[:200]
+	}
+	return AccountKeyPrefix + h
 }
 
 // RenewBefore: a certificate with less than this left is renewed (as the
@@ -97,8 +113,12 @@ type Cert struct {
 type CertStore interface {
 	LoadAccount(ctx context.Context, key string) ([]byte, error)
 	SaveAccount(ctx context.Context, key string, acct []byte) error
-	LoadCert(ctx context.Context) (Cert, error)
-	SaveCert(ctx context.Context, c Cert) error
+	// LoadCert is a CA's slot; LoadServed the served pair.
+	LoadCert(ctx context.Context, slot string) (Cert, error)
+	LoadServed(ctx context.Context) (Cert, error)
+	// SaveCert writes a CA's slot and, with serve, the served pair, in one
+	// update.
+	SaveCert(ctx context.Context, slot string, c Cert, serve bool) error
 }
 
 // DNS01 writes and removes the challenge TXT record (fqdn with its
@@ -189,6 +209,11 @@ func (c *Certs) accountLocked(ctx context.Context) ([]byte, string, error) {
 	if uri := c.ACME.CurrentURI(stored); uri != "" {
 		return stored, uri, nil
 	}
+	if len(stored) > 0 {
+		// Fail closed: an account under this CA's key that isn't this
+		// CA's (or doesn't parse) is never registered over.
+		return nil, "", fmt.Errorf("%s holds an account under %s that isn't %s's: refusing to register over it", AccountSecret, c.key(), c.ACME.CAServer())
+	}
 	if !c.leading() {
 		return nil, "", ErrNoAccount
 	}
@@ -244,8 +269,12 @@ func (c *Certs) issue(ctx context.Context, want string) (bool, error) {
 		return false, fmt.Errorf("%w (asked %s, current %s)", ErrOtherAccount, want, uri)
 	}
 	if want != "" && c.Check != nil {
-		if cur, err := c.Store.LoadCert(ctx); err == nil && cur.AccountURI == uri && c.Check(cur.ChainPEM, cur.KeyPEM, c.now()) == nil {
+		if cur, err := c.Store.LoadCert(ctx, c.key()); err == nil && cur.AccountURI == uri && c.Check(cur.ChainPEM, cur.KeyPEM, c.now()) == nil {
 			if na, err := NotAfter(cur.ChainPEM); err == nil && na.Sub(c.now()) > c.renewBefore() {
+				// Current: nothing ordered; it is (made) the served pair.
+				if err := c.promoteLocked(ctx); err != nil {
+					return false, err
+				}
 				return false, nil
 			}
 		}
@@ -263,7 +292,7 @@ func (c *Certs) issue(ctx context.Context, want string) (bool, error) {
 	if !c.leading() {
 		return false, ErrStandingBy
 	}
-	if err := c.Store.SaveCert(ctx, Cert{ChainPEM: chain, KeyPEM: key, AccountURI: uri}); err != nil {
+	if err := c.Store.SaveCert(ctx, c.key(), Cert{ChainPEM: chain, KeyPEM: key, AccountURI: uri}, true); err != nil {
 		return false, fmt.Errorf("saving the certificate (%s): %w", CertSecret, err)
 	}
 	c.failures, c.retryAt = 0, time.Time{}
@@ -278,12 +307,12 @@ func (c *Certs) issue(ctx context.Context, want string) (bool, error) {
 // for IssueMain: the CAA may still pin another account) and has less than
 // RenewBefore left (or doesn't parse).
 func (c *Certs) RenewDue(ctx context.Context) (bool, string, error) {
-	cert, err := c.Store.LoadCert(ctx)
+	cert, err := c.Store.LoadCert(ctx, c.key())
 	if err != nil {
 		return false, "", fmt.Errorf("reading %s: %w", CertSecret, err)
 	}
 	if cert.ChainPEM == "" {
-		return false, "no certificate yet: the CAA flip orders the first one", nil
+		return false, "no certificate of this CA yet: the CAA flip orders the first one", nil
 	}
 	stored, err := c.Store.LoadAccount(ctx, c.key())
 	if err != nil {
@@ -303,6 +332,41 @@ func (c *Certs) RenewDue(ctx context.Context) (bool, string, error) {
 	return false, "", nil
 }
 
+// Promote makes the active CA's slot the served pair when it holds a
+// servable certificate and the served pair is another one (after a flip
+// back: the served certificate always belongs to the active CA once it
+// has one). Leader only; nothing when there is nothing to promote.
+func (c *Certs) Promote(ctx context.Context) error {
+	if !c.leading() {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.promoteLocked(ctx)
+}
+
+func (c *Certs) promoteLocked(ctx context.Context) error {
+	slot, err := c.Store.LoadCert(ctx, c.key())
+	if err != nil || slot.ChainPEM == "" || c.Check == nil || c.Check(slot.ChainPEM, slot.KeyPEM, c.now()) != nil {
+		return err
+	}
+	served, err := c.Store.LoadServed(ctx)
+	if err != nil {
+		return err
+	}
+	if served.ChainPEM == slot.ChainPEM && served.KeyPEM == slot.KeyPEM && served.AccountURI == slot.AccountURI {
+		return nil
+	}
+	if !c.leading() {
+		return ErrStandingBy
+	}
+	if err := c.Store.SaveCert(ctx, c.key(), slot, true); err != nil {
+		return err
+	}
+	c.logf("frontdoor: serving the certificate of %s from %s's slot (account %s)", c.Domain, c.ACME.CAServer(), slot.AccountURI)
+	return nil
+}
+
 // Renew renews the stored certificate when RenewDue (leader only, with a
 // backoff after a failure: 10 min doubling, at most 6 h). It reports
 // whether it ordered.
@@ -315,6 +379,9 @@ func (c *Certs) Renew(ctx context.Context) (bool, error) {
 	c.mu.Unlock()
 	if c.now().Before(wait) {
 		return false, nil
+	}
+	if err := c.Promote(ctx); err != nil {
+		return false, err
 	}
 	due, why, err := c.RenewDue(ctx)
 	if err != nil {
@@ -354,15 +421,18 @@ type CertStatus struct {
 	NotAfter          string `json:"not_after,omitempty"`
 	AccountURI        string `json:"account_uri,omitempty"`
 	CurrentAccountURI string `json:"current_account_uri"`
-	RenewsOnItsOwn    bool   `json:"renews_on_its_own"`
-	Due               bool   `json:"due"`
-	Why               string `json:"why,omitempty"`
+	// ServedAccountURI: the account of the served pair (another CA's while
+	// a flip hasn't ordered yet).
+	ServedAccountURI string `json:"served_account_uri,omitempty"`
+	RenewsOnItsOwn   bool   `json:"renews_on_its_own"`
+	Due              bool   `json:"due"`
+	Why              string `json:"why,omitempty"`
 }
 
 // Status is the stored certificate's state (no network; any replica).
 func (c *Certs) Status(ctx context.Context) (CertStatus, error) {
 	var st CertStatus
-	cert, err := c.Store.LoadCert(ctx)
+	cert, err := c.Store.LoadCert(ctx, c.key())
 	if err != nil {
 		return st, fmt.Errorf("reading %s: %w", CertSecret, err)
 	}
@@ -371,6 +441,9 @@ func (c *Certs) Status(ctx context.Context) (CertStatus, error) {
 		return st, fmt.Errorf("reading %s: %w", AccountSecret, err)
 	}
 	st.CurrentAccountURI = c.ACME.CurrentURI(stored)
+	if served, err := c.Store.LoadServed(ctx); err == nil {
+		st.ServedAccountURI = served.AccountURI
+	}
 	if cert.ChainPEM != "" {
 		st.Present, st.AccountURI = true, cert.AccountURI
 		if na, err := NotAfter(cert.ChainPEM); err == nil {
@@ -491,16 +564,29 @@ func (s SecretStore) SaveAccount(ctx context.Context, key string, acct []byte) e
 	return s.update(ctx, AccountSecret, map[string][]byte{key: acct})
 }
 
-func (s SecretStore) LoadCert(ctx context.Context) (Cert, error) {
+func (s SecretStore) load(ctx context.Context, prefix string) (Cert, error) {
 	sec, err := s.get(ctx, CertSecret)
 	if err != nil {
 		return Cert{}, err
 	}
-	return Cert{ChainPEM: string(sec.Data[CertChainKey]), KeyPEM: string(sec.Data[CertKeyKey]), AccountURI: string(sec.Data[CertAccountKey])}, nil
+	return Cert{ChainPEM: string(sec.Data[prefix+CertChainKey]), KeyPEM: string(sec.Data[prefix+CertKeyKey]), AccountURI: string(sec.Data[prefix+CertAccountKey])}, nil
 }
 
-// SaveCert writes the three keys in one update (a reader never pairs a
-// key with another chain: the kubelet swaps a Secret volume atomically).
-func (s SecretStore) SaveCert(ctx context.Context, c Cert) error {
-	return s.update(ctx, CertSecret, map[string][]byte{CertChainKey: []byte(c.ChainPEM), CertKeyKey: []byte(c.KeyPEM), CertAccountKey: []byte(c.AccountURI)})
+// LoadCert is the CA's slot (<slot>.tls.crt, …).
+func (s SecretStore) LoadCert(ctx context.Context, slot string) (Cert, error) {
+	return s.load(ctx, slot+".")
+}
+
+// LoadServed is the served pair (tls.crt, tls.key, account-uri).
+func (s SecretStore) LoadServed(ctx context.Context) (Cert, error) { return s.load(ctx, "") }
+
+// SaveCert writes the slot (and, with serve, the served pair) in one
+// update (a reader never pairs a key with another chain: the kubelet swaps
+// a Secret volume atomically).
+func (s SecretStore) SaveCert(ctx context.Context, slot string, c Cert, serve bool) error {
+	data := map[string][]byte{slot + "." + CertChainKey: []byte(c.ChainPEM), slot + "." + CertKeyKey: []byte(c.KeyPEM), slot + "." + CertAccountKey: []byte(c.AccountURI)}
+	if serve {
+		data[CertChainKey], data[CertKeyKey], data[CertAccountKey] = []byte(c.ChainPEM), []byte(c.KeyPEM), []byte(c.AccountURI)
+	}
+	return s.update(ctx, CertSecret, data)
 }

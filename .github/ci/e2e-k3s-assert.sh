@@ -299,10 +299,11 @@ jq '{images: (.images | with_entries(if (.value | type) == "string" then . else 
   charts/portcullis/images.json > "$T/images-values.json"
 helm template portcullis charts/portcullis -n "$NS" -f tests/k8s-ci-values.yaml -f tests/k8s-ci-values-ha.yaml -f "$T/images-values.json" \
     --show-only templates/frontdoor.yaml > "$T/frontdoor.yaml" || fail "the chart's front door doesn't render with the HA CI values"
+# (kubectl prints one JSON object per document: slurped into one List)
 K create --dry-run=client -o json -f "$T/frontdoor.yaml" \
-  | jq '{apiVersion: "v1", kind: "List", items: [(if .kind == "List" then .items[] else . end) | select(.kind == "ServiceAccount" or .kind == "Role" or .kind == "RoleBinding")]}' \
+  | jq -s '{apiVersion: "v1", kind: "List", items: [.[] | (if .kind == "List" then .items[] else . end) | select(.kind == "ServiceAccount" or .kind == "Role" or .kind == "RoleBinding")]}' \
   > "$T/frontdoor-rbac.json"
-[ "$(jq '.items | length' "$T/frontdoor-rbac.json")" = 3 ] || fail "the front door's ServiceAccount, Role and RoleBinding didn't render"
+[ "$(jq '.items | length' "$T/frontdoor-rbac.json")" = 3 ] || fail "the front door's ServiceAccount, Role and RoleBinding didn't render (HA values): $(jq -c '[.items[]?.kind]' "$T/frontdoor-rbac.json" 2>&1 | head -c 300)"
 K apply -f "$T/frontdoor-rbac.json" >/dev/null
 FD="system:serviceaccount:$NS:frontdoor"
 for s in frontdoor-acme frontdoor-cert; do

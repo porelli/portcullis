@@ -257,9 +257,12 @@ func runFrontdoor(args []string, stdout, stderr io.Writer) int {
 			} else if ordered {
 				logger.Print("frontdoor: certificate renewed")
 			}
-			if c, err := certs.Store.LoadCert(ctx); err == nil {
-				metrics.CertExpiry(c.ChainPEM)
+			// The served pair's expiry; unreadable = 0 (the help says so).
+			c, err := certs.Store.LoadServed(ctx)
+			if err != nil {
+				c = frontdoor.Cert{}
 			}
+			metrics.CertExpiry(c.ChainPEM)
 			select {
 			case <-ctx.Done():
 				return
@@ -339,7 +342,7 @@ func frontdoorControl(c *frontdoor.Certs, clean func(string) string) http.Handle
 			fail(rw, err)
 			return
 		}
-		cert, err := c.Store.LoadCert(ctx)
+		cert, err := c.Store.LoadServed(ctx)
 		if err != nil {
 			fail(rw, err)
 			return

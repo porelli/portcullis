@@ -27,6 +27,10 @@ func TestSealUnseal(t *testing.T) {
 		t.Fatalf("unseal: %d %q %s", code, out.String(), errb.String())
 	}
 	out.Reset()
+	if code := runUnseal(nil, strings.NewReader(id.String()+sealed.String()), &out, &errb); code != exitOK || out.String() != plain {
+		t.Fatalf("unseal with an identity file lacking its final newline: %d %s", code, errb.String())
+	}
+	out.Reset()
 	if code := runUnseal(nil, strings.NewReader(other.String()+"\n"+sealed.String()), &out, &errb); code != exitProblem || out.Len() != 0 {
 		t.Fatalf("unseal with another key: %d %q", code, out.String())
 	}

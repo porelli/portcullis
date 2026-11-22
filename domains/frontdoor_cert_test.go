@@ -78,12 +78,13 @@ func fdPebble(t *testing.T, dnsAddr string, validity time.Duration) (string, *ht
 }
 
 type fdEnv struct {
-	zone   *fakedns.Zone
-	cs     *fake.Clientset
-	ca     string
-	hc     *http.Client
-	mu     sync.Mutex
-	writes []string // "<op> <type> <abs name>" of every provider write
+	dnsAddr string
+	zone    *fakedns.Zone
+	cs      *fake.Clientset
+	ca      string
+	hc      *http.Client
+	mu      sync.Mutex
+	writes  []string // "<op> <type> <abs name>" of every provider write
 }
 
 func newFdEnv(t *testing.T, validity time.Duration) *fdEnv {
@@ -95,7 +96,7 @@ func newFdEnv(t *testing.T, validity time.Duration) *fdEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.Close() })
-	e := &fdEnv{zone: zone, cs: fdSecrets()}
+	e := &fdEnv{zone: zone, cs: fdSecrets(), dnsAddr: srv.Addr}
 	e.ca, e.hc = fdPebble(t, srv.Addr, validity)
 	return e
 }
@@ -125,7 +126,7 @@ func (e *fdEnv) certs(fence frontdoor.WriteFence, now func() time.Time) *frontdo
 
 func (e *fdEnv) stored(t *testing.T) frontdoor.Cert {
 	t.Helper()
-	c, err := frontdoor.SecretStore{Client: e.cs, Namespace: fdNS}.LoadCert(context.Background())
+	c, err := frontdoor.SecretStore{Client: e.cs, Namespace: fdNS}.LoadServed(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +252,7 @@ func TestRenewOnlySameAccount(t *testing.T) {
 		t.Fatalf("Renew without a certificate: %v %v", ordered, err)
 	}
 	chain, key := mkCert(t, []string{testMain, "*." + testMain}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
-	if err := (frontdoor.SecretStore{Client: e.cs, Namespace: fdNS}).SaveCert(ctx, frontdoor.Cert{ChainPEM: chain, KeyPEM: key, AccountURI: "https://old.example/acct/7"}); err != nil {
+	if err := (frontdoor.SecretStore{Client: e.cs, Namespace: fdNS}).SaveCert(ctx, frontdoor.AccountKeyFor(e.ca), frontdoor.Cert{ChainPEM: chain, KeyPEM: key, AccountURI: "https://old.example/acct/7"}, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.AccountURI(ctx); err != nil {
@@ -413,15 +414,107 @@ func TestCertStatus(t *testing.T) {
 	ctx := context.Background()
 	c := e.certs(&leadFence{lead: true}, nil)
 	st, err := c.Status(ctx)
-	if err != nil || st.Present || !strings.Contains(st.Why, "no certificate yet") {
+	if err != nil || st.Present || !strings.Contains(st.Why, "no certificate of this CA yet") {
 		t.Fatalf("no certificate: %+v %v", st, err)
 	}
 	chain, key := mkCert(t, []string{testMain, "*." + testMain}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
-	if err := (frontdoor.SecretStore{Client: e.cs, Namespace: fdNS}).SaveCert(ctx, frontdoor.Cert{ChainPEM: chain, KeyPEM: key, AccountURI: "https://old.example/acct/7"}); err != nil {
+	if err := (frontdoor.SecretStore{Client: e.cs, Namespace: fdNS}).SaveCert(ctx, frontdoor.AccountKeyFor(e.ca), frontdoor.Cert{ChainPEM: chain, KeyPEM: key, AccountURI: "https://old.example/acct/7"}, true); err != nil {
 		t.Fatal(err)
 	}
 	st, err = c.Status(ctx)
 	if err != nil || !st.Present || st.RenewsOnItsOwn || st.Due || !strings.Contains(st.Why, "old.example") || st.NotAfter == "" {
 		t.Fatalf("another account's certificate: %+v %v", st, err)
+	}
+}
+
+// TestRevertAfterOrder (fix round 2, R-I1): CA B ordered and its
+// certificate was served; ACME_STAGING reverted to A: the front door on A
+// serves A's own slot again (Promote) and tracks A's renewal; when A's slot
+// has no certificate, IssueMainFor(A) orders one.
+func TestRevertAfterOrder(t *testing.T) {
+	ctx := context.Background()
+	t.Run("A's certificate kept: served again, renewal tracked", func(t *testing.T) {
+		e := newFdEnv(t, 90*24*time.Hour)
+		lead := &leadFence{lead: true}
+		cA := e.certs(lead, nil)
+		uriA, _ := cA.AccountURI(ctx)
+		if _, err := cA.IssueMainFor(ctx, uriA); err != nil {
+			t.Fatal(err)
+		}
+		certA := e.stored(t)
+		caB, hcB := fdPebble(t, e.dnsAddr, 90*24*time.Hour)
+		cB := e.certs(lead, nil)
+		cB.ACME = &frontdoorACME{email: "ci@example.org", caServer: caB, hc: hcB, skipPropagation: true}
+		uriB, _ := cB.AccountURI(ctx)
+		if issued, err := cB.IssueMainFor(ctx, uriB); err != nil || !issued {
+			t.Fatalf("B's order: %v %v", issued, err)
+		}
+		if got := e.stored(t); got.AccountURI != uriB {
+			t.Fatalf("served %q after B's order", got.AccountURI)
+		}
+		// Reverted: back on A.
+		cA2 := e.certs(lead, nil)
+		if ordered, err := cA2.Renew(ctx); ordered || err != nil {
+			t.Fatalf("Renew on A: %v %v", ordered, err)
+		}
+		if got := e.stored(t); got.AccountURI != uriA || got.ChainPEM != certA.ChainPEM {
+			t.Fatalf("after the revert the served certificate is %q's, want A's own", got.AccountURI)
+		}
+		st, err := cA2.Status(ctx)
+		if err != nil || !st.RenewsOnItsOwn || st.ServedAccountURI != uriA || st.AccountURI != uriA {
+			t.Fatalf("status after the revert: %+v %v", st, err)
+		}
+		later := e.certs(lead, func() time.Time { return time.Now().Add(61 * 24 * time.Hour) })
+		if ordered, err := later.Renew(ctx); !ordered || err != nil {
+			t.Fatalf("A's renewal isn't tracked after the revert: %v %v", ordered, err)
+		}
+	})
+	t.Run("A has no certificate: IssueMainFor(A) orders", func(t *testing.T) {
+		e := newFdEnv(t, 90*24*time.Hour)
+		lead := &leadFence{lead: true}
+		cA := e.certs(lead, nil)
+		uriA, _ := cA.AccountURI(ctx)
+		caB, hcB := fdPebble(t, e.dnsAddr, 90*24*time.Hour)
+		cB := e.certs(lead, nil)
+		cB.ACME = &frontdoorACME{email: "ci@example.org", caServer: caB, hc: hcB, skipPropagation: true}
+		uriB, _ := cB.AccountURI(ctx)
+		if _, err := cB.IssueMainFor(ctx, uriB); err != nil {
+			t.Fatal(err)
+		}
+		cA2 := e.certs(lead, nil)
+		if ordered, _ := cA2.Renew(ctx); ordered {
+			t.Fatal("Renew ordered a first certificate on its own")
+		}
+		if issued, err := cA2.IssueMainFor(ctx, uriA); err != nil || !issued {
+			t.Fatalf("IssueMainFor(A): %v %v", issued, err)
+		}
+		if got := e.stored(t); got.AccountURI != uriA {
+			t.Fatalf("served %q, want A's", got.AccountURI)
+		}
+	})
+}
+
+// TestAccountKeyInjective (fix round 2, k1): the key separates hosts that
+// sanitise alike and directories on one host; another CA's account under
+// a CA's key is refused, never registered over.
+func TestAccountKeyInjective(t *testing.T) {
+	for _, pair := range [][2]string{{"https://a:1/dir", "https://a-1/dir"}, {"https://ca.example/dir", "https://ca.example/other"},
+		{"https://acme-v02.api.letsencrypt.org/directory", "https://acme-staging-v02.api.letsencrypt.org/directory"}} {
+		if frontdoor.AccountKeyFor(pair[0]) == frontdoor.AccountKeyFor(pair[1]) {
+			t.Errorf("%s and %s share a key", pair[0], pair[1])
+		}
+	}
+	e := newFdEnv(t, 90*24*time.Hour)
+	ctx := context.Background()
+	other, _ := json.Marshal(Account{Email: "x@example.org", CAServer: "https://elsewhere.example/dir", KeyPEM: "k", Registration: []byte(`{"uri":"https://elsewhere.example/acct/1"}`)})
+	st := frontdoor.SecretStore{Client: e.cs, Namespace: fdNS}
+	if err := st.SaveAccount(ctx, frontdoor.AccountKeyFor(e.ca), other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.certs(&leadFence{lead: true}, nil).AccountURI(ctx); err == nil || !strings.Contains(err.Error(), "refusing to register over it") {
+		t.Fatalf("another CA's account under the key: %v", err)
+	}
+	if got, _ := st.LoadAccount(ctx, frontdoor.AccountKeyFor(e.ca)); string(got) != string(other) {
+		t.Fatal("the other CA's account was overwritten")
 	}
 }

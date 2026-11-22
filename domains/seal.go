@@ -66,8 +66,11 @@ func runUnseal(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var rest bytes.Buffer
 	for {
 		line, err := in.ReadString('\n')
-		if strings.HasPrefix(line, armor.Header) {
-			rest.WriteString(line)
+		// (an identity file without a final newline puts the header on
+		// its last line: split there)
+		if i := strings.Index(line, armor.Header); i >= 0 {
+			idText.WriteString(line[:i] + "\n")
+			rest.WriteString(line[i:])
 			_, _ = io.Copy(&rest, in)
 			break
 		}
