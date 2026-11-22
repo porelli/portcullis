@@ -5971,6 +5971,9 @@ jobs:
       - name: The Hub on Kubernetes (e2e_k3s.py)
         timeout-minutes: 30
         run: bash .github/ci/e2e-k3s-phases.sh hub
+      - name: Sign out on Kubernetes (backend logout through kcinternal-logout, no id_token_hint logged)
+        timeout-minutes: 10
+        run: bash .github/ci/e2e-k3s-signout.sh
       - name: VPN on Kubernetes (vpn init, modes, break-glass)
         timeout-minutes: 20
         run: bash .github/ci/e2e-k3s-phases.sh vpn

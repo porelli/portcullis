@@ -329,7 +329,7 @@ def check_routers(comp):
                 F.add(f"router {rname}: service {gs} != compose {svc}")
             if ir["spec"].get("tls", {}).get("options", {}).get("name") != r.get("tls.options"):
                 F.add(f"router {rname}: tls options {ir['spec'].get('tls')} != compose {r.get('tls.options')}")
-        for extra in sorted(set(irs) - set(cr) - {"kcinternal"}):
+        for extra in sorted(set(irs) - set(cr) - {"kcinternal", "kcinternal-logout"}):
             F.add(f"IngressRoute {extra}: no compose router")
 
 

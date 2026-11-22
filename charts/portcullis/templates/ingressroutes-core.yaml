@@ -113,3 +113,32 @@ spec:
       services:
         - name: core-keycloak-8080@file
           kind: TraefikService
+---
+# kcinternal-logout (contract §5 "Sign out"): forward-auth's backend logout
+# (PORTCULLIS_BACKEND_LOGOUT_URL = keycloak-internal:8081/…/logout?
+# id_token_hint=…) on its own router, the same middleware and service as
+# kcinternal, with no access log: the query carries the session's ID token.
+# Keycloak's 8080 stays Traefik-only (it trusts proxy headers from the pod
+# CIDR), so the call can't skip Traefik. Exactly the path; above
+# kcinternal's PathPrefix(`/`).
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: kcinternal-logout
+  namespace: {{ .Values.edgeNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
+spec:
+  entryPoints: ["kcinternal"]
+  routes:
+    - match: Path(`/realms/portcullis/protocol/openid-connect/logout`)
+      kind: Rule
+      priority: 100
+      observability:
+        accessLogs: false
+      middlewares:
+        - name: strip-forwarded@file
+      services:
+        - name: core-keycloak-8080@file
+          kind: TraefikService
