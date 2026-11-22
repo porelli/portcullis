@@ -1795,7 +1795,7 @@ _rtk_pull() { kube_resolve_images; }
 _rtk_run() {
   local svc="$1" ep="" spec name img
   shift
-  kube_images_ready
+  kube_images_ready >&2  # its build lines never in the one-shot's stdout (found live: dns check)
   [ -s "$(kube_values_file)" ] || kube_render_values
   while [ "$1" != -- ]; do
     case "$1" in --entrypoint) ep="$2"; shift 2 ;; --user|--label) shift 2 ;; *) shift ;; esac

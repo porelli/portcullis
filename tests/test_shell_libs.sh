@@ -8440,6 +8440,10 @@ expect_eq "an HA release moves Traefik's Services right before helm (after the i
   "$(awk '/^_rtk_up\(\) \{/,/^}/' "$HERE/../scripts/lib/kube.sh" | grep -n 'kube_images_ready\|_ha_services_move\|kube_helm upgrade' | cut -d: -f2 | tr -s ' ' | sed 's/^ //' | cut -c1-30 | tr '\n' '|')" \
   "kube_images_ready|kube_vault_shrink_prepare; ! k|kube_helm upgrade --install \"$|"
 
+# Found live (Task 31): a one-shot's stdout is its own (the dns tool's
+# JSON): the image build's progress goes to stderr.
+expect_eq "_rtk_run: the images' build lines go to stderr" "$(awk '/^_rtk_run\(\) \{/,/^}/' "$HERE/../scripts/lib/kube.sh" | grep -c '^  kube_images_ready >&2')" 1
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
