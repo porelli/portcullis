@@ -90,15 +90,17 @@ for i in $(seq 1 30); do
       and (.methods | index("browser_cert") != null)
       and (.hosts | has("echo-std.\($d)") | not) and .default == "standard"
       and .core["hub.\($d)"] == "strong" and .core["people.\($d)"] == "strong"' >/dev/null 2>&1 \
-    && hub_file signin-keycloak.json | jq -e '.clients["oidc-strong"] == {template: "strong", name: "OIDC echo · OIDC Strong"}
+    && hub_file signin-keycloak.json | jq -e --arg d "$E2E_DOMAIN" '.clients["oidc-strong"] == {template: "strong", name: "OIDC echo · OIDC Strong"}
+      and (.app_hosts | index("echo-basic.\($d)") != null and index("hub.\($d)") != null and index($d) != null
+           and index("auth.\($d)") == null and . == (. | unique))
       and .clients["oidc-all"] == {template: "yubikey-and-certificate", name: "OIDC echo · OIDC All"}
       and .clients["oidc-cert"] == {template: "e2e-cert", name: "OIDC echo · OIDC Cert"}
       and (.authenticators | has("01020304-0506-0708-0102-030405060708"))
       and (.methods | index("password") == null) and (.methods | index("browser_cert") != null)' >/dev/null 2>&1 && break
-  [ "$i" -eq 30 ] && { echo "FAIL: published: $(hub_file group-gate-policy.json | jq -c '{hosts, core, default}') $(hub_file signin-keycloak.json | jq -c '{clients, methods, mds}')"; exit 1; }
+  [ "$i" -eq 30 ] && { echo "FAIL: published: $(hub_file group-gate-policy.json | jq -c '{hosts, core, default}') $(hub_file signin-keycloak.json | jq -c '{clients, methods, mds, app_hosts}')"; exit 1; }
   sleep 2
 done
-echo "PASS: policy v7 picks (Basic, e2e-cert, e2e-file, e2e-anycert, Strong core pages; browser_cert on) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate, oidc-cert e2e-cert)"
+echo "PASS: policy v7 picks (Basic, e2e-cert, e2e-file, e2e-anycert, Strong core pages; browser_cert on) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate, oidc-cert e2e-cert) and app_hosts (the apps' and core pages' hosts, sorted, never auth.<domain>)"
 
 # pat: a Hub-set password only (allowed while the method is off),
 # kept in a 0600 file, never printed.

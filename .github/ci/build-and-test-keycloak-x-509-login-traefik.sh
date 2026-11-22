@@ -7,7 +7,7 @@ set -e
 # The Hub isn't running yet: write a minimal signin-keycloak.json
 # (contract §8.1, the starting methods) into hub_data, or the sign-in
 # extension denies everything (DENY_ALL). The Hub's start replaces it.
-printf '%s' '{"version":1,"methods":["passkey_device","passkey_synced","security_key","yubikey_cert"],"add_stronger":false,"templates":{"standard":{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}},"clients":{},"authenticators":{},"mds":{"serial":0,"next_update":"0001-01-01T00:00:00Z"}}' \
+printf '%s' '{"version":1,"methods":["passkey_device","passkey_synced","security_key","yubikey_cert"],"add_stronger":false,"templates":{"standard":{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}},"clients":{},"authenticators":{},"mds":{"serial":0,"next_update":"0001-01-01T00:00:00Z"},"app_hosts":[]}' \
   | docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
       sh -c 'cat > /d/signin-keycloak.json.tmp && chmod 644 /d/signin-keycloak.json.tmp && mv /d/signin-keycloak.json.tmp /d/signin-keycloak.json'
 # pc_method=yubikey_cert = the YubiKey certificate only (the other
@@ -25,7 +25,9 @@ got_code() { grep -qiE '^location: .*[?&]code=' "$1"; }
 let_through() { grep -q 'id="portcullis-let-through-form"' "$1"; }
 # Keycloak usually gets there with a 302 to the required action's page.
 to_let_through() { grep -qiE '^location: [^ ]*/login-actions/required-action\?([^ ]*&)?execution=portcullis-let-through' "$1"; }
-authenticated() { got_code "$1" || let_through "$1" || to_let_through "$1"; }
+# Any required action at all comes only after the flow signed someone in.
+ra_redirect() { grep -qiE '^location: [^ ]*/login-actions/required-action\?' "$1"; }
+authenticated() { got_code "$1" || let_through "$1" || ra_redirect "$1"; }
 
 # 0) Without PKCE the forward-auth client issues no code (a stolen
 #    code for an extra-domain callback is useless without the verifier).
@@ -61,8 +63,10 @@ case "$ACTION" in
   https://auth.portcullis.local/realms/portcullis/login-actions/required-action\?*) ;;
   *) echo "FAIL: the Let through form posts to '$ACTION'"; exit 1 ;;
 esac
-grep -q 'Let through — opening auth.portcullis.local…' /tmp/kc-ok.h \
-  || { echo "FAIL: the Let through page doesn't name the callback's host (state 'ci' has no app URL)"; grep -o 'Let through[^<]*' /tmp/kc-ok.h; exit 1; }
+# The main forward-auth callback with state 'ci' (no app URL): no host
+# named, never auth.<domain> (contract §8.1 "Let through").
+grep -q 'Let through — opening your app…' /tmp/kc-ok.h && ! grep -q 'opening auth\.' /tmp/kc-ok.h \
+  || { echo "FAIL: the Let through page names a host for a state without one"; grep -o 'Let through[^<]*' /tmp/kc-ok.h; exit 1; }
 kc_tls -X POST --data-binary '' "$ACTION" > /tmp/kc-ok2.h
 rm -f "$JAR"
 got_code /tmp/kc-ok2.h || { echo "FAIL: X.509 login through Traefik did not authenticate after the Let through page"; head -c 3000 /tmp/kc-ok2.h; docker compose logs --tail=60 keycloak; exit 1; }
