@@ -1,9 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 68" width="32" height="68">
   <title>Portcullis: the gate (sign-in pages, behind the card)</title>
   <!-- Mockup gate-styles-v2 option A (A-bars): the logo's brass bars, three rails and five spikes,
-       in the top 34 units; the bottom 34 are empty on purpose: every offset the drop and rise use
+       in the top 34 units, sized to the arch's opening (x 4-28): the rails run into the stone, the
+       five bars are evenly spaced about the centre, and down (-4) the spikes touch the ground; the bottom 34 are empty on purpose: every offset the drop and rise use
        (down -4, up -38 units) then stays within one image height. Chromium paints a no-repeat SVG
        background whose offset is past one image height as if it wrapped: with a 34-unit image the
        "up" gate (-38) showed closed. -->
-  <path fill="#e3ac52" opacity=".6" d="M5 11h22v1.4H5z M5 17h22v1.4H5z M5 23h22v1.4H5z M8.6 2h1.4v28l-.7 2-.7-2z M12.6 2h1.4v28l-.7 2-.7-2z M16.6 2h1.4v28l-.7 2-.7-2z M20.6 2h1.4v28l-.7 2-.7-2z M24.6 2h1.4v28l-.7 2-.7-2z"/>
+  <path fill="#e3ac52" opacity=".6" d="M4 9h24v1.4H4z M4 17h24v1.4H4z M4 25h24v1.4H4z M5.7 0h1.4v32l-.7 2-.7-2z M10.5 0h1.4v32l-.7 2-.7-2z M15.3 0h1.4v32l-.7 2-.7-2z M20.1 0h1.4v32l-.7 2-.7-2z M24.9 0h1.4v32l-.7 2-.7-2z"/>
 </svg>
