@@ -5659,6 +5659,35 @@ case "$OUT" in *"not live with generation"*"portcullis-nodes-guard-removed"*"rc=
 expect_eq "cluster setup: the removed-nodes binding not live deletes nothing" "$(grep -c '^delete binding' "$KS/order" || true)" 0
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.12'; export STUB_REMOVED_READ_FAIL=1; kube_cluster_setup")"
 case "$OUT" in *"can't read the ConfigMap portcullis-removed-nodes"*"rc=1") t_pass "cluster setup: the removed-node params unreadable → refused" ;; *) t_fail "cluster setup removed unreadable: $OUT" ;; esac
+# Security review: the params are seeded only when absent, from nodeadm's
+# published removed names (never an empty list while one exists), and the
+# probe confirms them only while they cover every published name.
+RNDOC='{"v":1,"nodes":{},"api":[],"removed_names":["n3","a0","n3"]}'
+rn_gen() { printf 'removedNodes\t%s\n' "$1" | sha256sum | cut -c1-16; }
+jq -n --arg d "$RNDOC" '{data: {"addresses.json": $d}}' > "$KS/kube/cluster-addresses.json"
+rm -f "$KS/live/ConfigMap.portcullis-removed-nodes.json"
+OUT="$(kt 'kube_removed_params_seed')"
+expect_eq "kube_removed_params_seed: absent → created from nodeadm's removed_names (sorted unique) with their generation" \
+  "$(printf '%s\n' "$OUT" | tail -n1) $(jq -c '.data' "$KS/live/ConfigMap.portcullis-removed-nodes.json")" "rc=0 {\"removedNodes\":\"a0 n3\",\"generation\":\"$(rn_gen 'a0 n3')\"}"
+jq -n --arg g "$(rn_gen 'a0 b2 n3')" '{kind: "ConfigMap", metadata: {name: "portcullis-removed-nodes"}, data: {removedNodes: "a0 b2 n3", generation: $g}}' > "$KS/live/ConfigMap.portcullis-removed-nodes.json"
+OUT="$(kt 'kube_removed_params_seed')"
+expect_eq "kube_removed_params_seed: an existing list (nodeadm's) is never rewritten or reset (up / init / params-sync)" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(jq -r '.data.removedNodes' "$KS/live/ConfigMap.portcullis-removed-nodes.json")" "rc=0:a0 b2 n3"
+expect_eq "_kube_removed_generation: consistent and covering nodeadm's names → its generation" "$(kt '_kube_removed_generation' | head -n1)" "$(rn_gen 'a0 b2 n3')"
+jq -n --arg d "$(printf '%s' "$RNDOC" | jq -c '.removed_names += ["z9"]')" '{data: {"addresses.json": $d}}' > "$KS/kube/cluster-addresses.json"
+expect_eq "_kube_removed_generation: behind nodeadm (a published name missing) → none: no older binding goes" "$(kt '_kube_removed_generation' | head -n1)" "rc=0"
+jq -n --arg d "$RNDOC" '{data: {"addresses.json": $d}}' > "$KS/kube/cluster-addresses.json"
+jq '.data.generation = "0000000000000000"' "$KS/live/ConfigMap.portcullis-removed-nodes.json" > "$KS/rn.t" && mv "$KS/rn.t" "$KS/live/ConfigMap.portcullis-removed-nodes.json"
+expect_eq "_kube_removed_generation: a generation that isn't its list's → none" "$(kt '_kube_removed_generation' | head -n1)" "rc=0"
+rm -f "$KS/live/ConfigMap.portcullis-removed-nodes.json"
+jq -n '{data: {"addresses.json": "{\"removed_names\":[\"N3\"]}"}}' > "$KS/kube/cluster-addresses.json"
+OUT="$(kt 'kube_removed_params_seed')"
+case "$OUT" in *"hold no valid removed_names"*"isn't created"*"rc=1") t_pass "kube_removed_params_seed: nodeadm's names unreadable → nothing created (never an empty list)" ;; *) t_fail "seed bad doc: $OUT" ;; esac
+expect_eq "kube_removed_params_seed: nothing created on a bad document" "$(ls "$KS/live/ConfigMap.portcullis-removed-nodes.json" 2>/dev/null | wc -l | tr -d ' ')" 0
+rm -f "$KS/kube/cluster-addresses.json"
+OUT="$(kt 'kube_removed_params_seed')"
+expect_eq "kube_removed_params_seed: no document yet → the empty list" "$(printf '%s\n' "$OUT" | tail -n1):$(jq -r '.data.removedNodes' "$KS/live/ConfigMap.portcullis-removed-nodes.json")" "rc=0:"
+jq -n --arg g "$RNG" '{kind: "ConfigMap", metadata: {name: "portcullis-removed-nodes"}, data: {removedNodes: "a1 b2", generation: $g}}' > "$KS/live/ConfigMap.portcullis-removed-nodes.json"
 echo '{"items":[{"kind":"IngressRoute","metadata":{"name":"app-ok","labels":{"portcullis.io/instance":"a"}}},{"kind":"IngressRoute","metadata":{"name":"app-bad","labels":{"portcullis.io/instance":"b"}},"spec":{"x":"REFUSE-ME"}}]}' > "$KS/kube/edge-hub-ir.json"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"

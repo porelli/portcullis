@@ -637,30 +637,58 @@ kube_traefik_image() {
 KUBE_REMOVED_BINDING="portcullis-nodes-guard-removed"
 KUBE_REMOVED_PARAMS="portcullis-removed-nodes"
 
+# _kube_doc_removed — nodeadm's removed names as it publishes them (the
+# cluster addresses' removed_names; security review): sorted unique,
+# space-separated; "" with no document yet. Unreadable, or a document that
+# doesn't parse or holds a name that isn't a node id: 1 (fail closed).
+_kube_doc_removed() {
+  local out
+  if ! out="$(kube_ctl -n "$(kube_ns)" get configmap "$KUBE_CLUSTER_ADDRESSES" -o json 2>&1)"; then
+    case "$out" in *NotFound*) return 0 ;; esac
+    warn "can't read the cluster addresses ($KUBE_CLUSTER_ADDRESSES): ${out:0:200}"; return 1
+  fi
+  printf '%s' "$out" | jq -er '.data["addresses.json"] // "" | if . == "" then "" else fromjson
+      | .removed_names | select(type == "array" and all(type == "string" and test("^[a-z][a-z0-9-]{0,30}$"))) | unique | join(" ") end' 2>/dev/null \
+    || { warn "the cluster addresses ($KUBE_CLUSTER_ADDRESSES) hold no valid removed_names"; return 1; }
+}
+
 # kube_removed_params_seed — portcullis-removed-nodes' params
-# KUBE_REMOVED_PARAMS in the core namespace: created with no name listed
-# (removedNodes "", its generation by kube_params_generation, as nodeadm
-# computes it) when missing; an existing one is nodeadm's and never
-# rewritten (it updates it in place, and confirms each write on every API
-# server before a removed node's Node goes). Anything but NotFound fails.
+# KUBE_REMOVED_PARAMS in the core namespace, created only when absent
+# (init, up and params-sync alike), seeded with nodeadm's published removed
+# names (_kube_doc_removed; none before nodeadm writes) and their
+# generation (kube_params_generation, as nodeadm computes it); an existing
+# one is nodeadm's and never rewritten or reset (it updates it in place and
+# confirms each write on every API server before a removed node's Node
+# goes). Anything but NotFound, or names that can't be read, fails.
 kube_removed_params_seed() {
-  local pns out gen
+  local pns out gen names
   pns="$(kube_ns)"
   out="$(kube_ctl -n "$pns" get configmap "$KUBE_REMOVED_PARAMS" -o name 2>&1)" && return 0
   case "$out" in *NotFound*) ;; *) warn "can't read the ConfigMap $KUBE_REMOVED_PARAMS: ${out:0:200}"; return 1 ;; esac
-  gen="$(printf 'removedNodes\t\n' | kube_params_generation)"
-  G="$gen" NS="$pns" N="$KUBE_REMOVED_PARAMS" jq -n '{apiVersion: "v1", kind: "ConfigMap",
+  names="$(_kube_doc_removed)" || { warn "the ConfigMap $KUBE_REMOVED_PARAMS isn't created (nodeadm's removed names unknown)"; return 1; }
+  gen="$(printf 'removedNodes\t%s\n' "$names" | kube_params_generation)"
+  G="$gen" R="$names" NS="$pns" N="$KUBE_REMOVED_PARAMS" jq -n '{apiVersion: "v1", kind: "ConfigMap",
       metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
-      data: {removedNodes: "", generation: env.G}}' \
+      data: {removedNodes: env.R, generation: env.G}}' \
     | kube_ctl create --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \
     || { warn "could not create the ConfigMap $KUBE_REMOVED_PARAMS"; return 1; }
 }
 
-# _kube_removed_generation — the live KUBE_REMOVED_PARAMS' generation ("" if
-# unreadable).
+# _kube_removed_generation — the live KUBE_REMOVED_PARAMS' generation, only
+# when it is consistent (the generation of its own removedNodes) and lists
+# every name nodeadm publishes removed (security review: the probe then
+# confirms nodeadm's state, so no older binding is deleted before it is in
+# force); "" otherwise (unreadable, inconsistent, or behind nodeadm: the
+# probe retries, then refuses, the older bindings kept).
 _kube_removed_generation() {
-  kube_ctl -n "$(kube_ns)" get configmap "$KUBE_REMOVED_PARAMS" -o json 2>/dev/null \
-    | jq -r '.data.generation // empty | select(test("^[0-9a-f]{16}$"))' 2>/dev/null || true
+  local cm have gen doc n
+  cm="$(kube_ctl -n "$(kube_ns)" get configmap "$KUBE_REMOVED_PARAMS" -o json 2>/dev/null)" || return 0
+  have="$(printf '%s' "$cm" | jq -r '.data.removedNodes // empty' 2>/dev/null)"
+  gen="$(printf '%s' "$cm" | jq -r '.data.generation // empty | select(test("^[0-9a-f]{16}$"))' 2>/dev/null)"
+  [ -n "$gen" ] && [ "$gen" = "$(printf 'removedNodes\t%s\n' "$have" | kube_params_generation)" ] || return 0
+  doc="$(_kube_doc_removed 2>/dev/null)" || return 0
+  for n in $doc; do [[ " $have " == *" $n "* ]] || return 0; done
+  printf '%s\n' "$gen"
 }
 
 # _kube_probe_ha <binding> <gen> — the HA bindings' probes (contract §6
