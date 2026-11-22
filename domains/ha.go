@@ -230,7 +230,10 @@ func (s *Service) readFrontdoorStatus() haSets {
 	return h
 }
 
-// haRefresh reads the documents once. A good, current one becomes the
+// haRefresh reads the documents once. haSeen / haGood live in memory:
+// after a restart of the domains service an older document (at most 120 s
+// old) is accepted once — only the front door or the CLI can have written
+// it (portcullis-frontdoor-status). A good, current one becomes the
 // set to follow (and the last good one); anything else stops every change
 // and keeps the last good set (the records check and the plan still use
 // it). A change of the set or of the problem kicks the worker or is logged.
@@ -242,7 +245,10 @@ func (s *Service) haRefresh() {
 		switch {
 		case s.haSeen[h.Leader] > h.Generation:
 			h = haSets{Err: fmt.Sprintf("frontdoor-status refused: generation %d of %s is older than %d seen before (a rollback)", h.Generation, h.Leader, s.haSeen[h.Leader])}
-		case h.WrittenAt.Before(s.haGood.WrittenAt):
+		// Within one leader only: another leader's clock may be behind
+		// (a new front door on another node); its generation and the
+		// admission policy's identity check stand for it.
+		case h.Leader == s.haGood.Leader && h.WrittenAt.Before(s.haGood.WrittenAt):
 			h = haSets{Err: fmt.Sprintf("frontdoor-status refused: written %s, before the last document (%s)", h.WrittenAt.UTC().Format(time.RFC3339), s.haGood.WrittenAt.UTC().Format(time.RFC3339))}
 		case now.Sub(h.WrittenAt) > haStale:
 			h = haSets{Err: fmt.Sprintf("frontdoor-status is stale: written %s (%s ago); the front door isn't writing it", h.WrittenAt.UTC().Format(time.RFC3339), now.Sub(h.WrittenAt).Round(time.Second))}
@@ -386,7 +392,7 @@ func haResidual(name string, have, want, ours []string) []string {
 		case !slices.Contains(ours, a) && t == "AAAA" && !wantTypes["AAAA"]:
 			out = append(out, fmt.Sprintf("foreign AAAA %s at %s kept: the front door publishes IPv4 only (remove it by hand if it doesn't reach this cluster)", a, name))
 		case !slices.Contains(ours, a):
-			out = append(out, fmt.Sprintf("foreign %s %s at %s kept: Portcullis didn't write it, so it never removes it (remove it by hand if it doesn't reach this cluster)", t, a, name))
+			out = append(out, fmt.Sprintf("foreign %s %s at %s kept: it isn't provably Portcullis's (no live record of ours holds it), so it is never removed (remove it by hand if it doesn't reach this cluster)", t, a, name))
 		default:
 			out = append(out, fmt.Sprintf("%s %s at %s kept: it is the last %s address there and the front door publishes no other", t, a, name, t))
 		}
@@ -486,10 +492,19 @@ func (s *Service) haStep(ctx context.Context, p dnsProvider, d *Domain, zone str
 			// An attempt holds off the next one for 60 s too (the front
 			// door's rule: a failing provider isn't hammered).
 			res.changed[n] = now
-			// Never a delete that could take a record not ours: with IDs,
-			// exactly one live record holds the value, and it is ours.
-			if c.Op == "remove" && ids != nil && haLiveCount(live, zone, n, c.Type, c.Value) != 1 {
-				errs = append(errs, fmt.Errorf("not removing %s %s at %s: more than one live record holds it", c.Type, c.Value, n))
+			// Never a delete that could take a record not ours: on a
+			// provider with record IDs, only our own refs' IDs are deleted
+			// (a foreign copy of the value stays: a kept record afterwards).
+			if c.Op == "remove" && ids != nil {
+				gone, err := s.haDeleteOurs(ctx, w, ids, zone, n, c, d.Records[zone])
+				res.removed = append(res.removed, gone...)
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				res.addrs[n] = haLiveAfter(ctx, w, n, res.addrs[n], c.Value)
+				res.ours[n] = slices.DeleteFunc(res.ours[n], func(a string) bool { return a == c.Value })
+				s.logf("domain %s: high availability: %s %s %s (following the front door)", d.Name, c.Op, n, c.Value)
 				continue
 			}
 			if err := w.Apply(ctx, c); err != nil {
@@ -524,28 +539,114 @@ func (s *Service) haStep(ctx context.Context, p dnsProvider, d *Domain, zone str
 	return res, errors.Join(errs...)
 }
 
-// recordIDLister lists a zone's records with their provider IDs (the
-// by-ID delete path: porkbun, hetzner).
+// recordIDLister lists a zone's records with their provider IDs and
+// deletes one by ID (the by-ID path: porkbun, hetzner).
 type recordIDLister interface {
 	recordIDs(ctx context.Context, zone string) ([]idRecord, error)
+	deleteRecordID(ctx context.Context, zone, id string) error
 }
 
 func (p byIDDelete) recordIDs(ctx context.Context, zone string) ([]idRecord, error) {
 	return p.api.listIDs(ctx, zone)
 }
 
+func (p byIDDelete) deleteRecordID(ctx context.Context, zone, id string) error {
+	return p.api.deleteID(ctx, zone, id)
+}
+
 func (p porkbunProvider) recordIDs(ctx context.Context, zone string) ([]idRecord, error) {
 	return p.api.listIDs(ctx, zone)
+}
+
+func (p porkbunProvider) deleteRecordID(ctx context.Context, zone, id string) error {
+	return p.api.deleteID(ctx, zone, id)
+}
+
+// redactedIDs is a record-ID lister whose errors go through the provider's
+// redaction (the inner provider is reached past the redacting wrapper).
+type redactedIDs struct {
+	inner recordIDLister
+	clean func(error) error
+}
+
+func (r redactedIDs) recordIDs(ctx context.Context, zone string) ([]idRecord, error) {
+	out, err := r.inner.recordIDs(ctx, zone)
+	return out, r.clean(err)
+}
+
+func (r redactedIDs) deleteRecordID(ctx context.Context, zone, id string) error {
+	return r.clean(r.inner.deleteRecordID(ctx, zone, id))
 }
 
 // haIDLister is p's record-ID lister, nil when its provider has none
 // (then a ref is ours by its zone, name and live value alone).
 func haIDLister(p dnsProvider) recordIDLister {
-	inner, _ := unwrap(p)
+	inner, clean := unwrap(p)
 	if l, ok := inner.(recordIDLister); ok {
-		return l
+		return redactedIDs{inner: l, clean: clean}
 	}
 	return nil
+}
+
+// haDeleteOurs removes value c at name n by the IDs of our own refs only:
+// the Writer's checks first (the name, and never the last address of its
+// type, on a fresh read), then a fresh ID list; each ref of ours for the
+// value whose ID still carries it there is deleted by that ID, under the
+// write fence. A ref whose ID no longer does is returned as gone (pruned,
+// its record not touched). Never a delete by value.
+func (s *Service) haDeleteOurs(ctx context.Context, w *frontdoor.Writer, ids recordIDLister, zone, n string, c frontdoor.Change, refs []RecordRef) ([]RecordRef, error) {
+	if err := w.Allowed(n, c.Type); err != nil {
+		return nil, err
+	}
+	pub, err := w.Published(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s before the change: %w", n, err)
+	}
+	others := 0
+	for _, a := range pub[n] {
+		if a != c.Value && frontdoor.AddrType(a) == c.Type {
+			others++
+		}
+	}
+	if others == 0 {
+		return nil, fmt.Errorf("refusing to remove %s: it is the last %s address of %s", c.Value, c.Type, n)
+	}
+	rctx, cancel := context.WithTimeout(ctx, frontdoor.ReadTimeout)
+	live, err := ids.recordIDs(rctx, zone)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("reading the record IDs of %s: %w", n, err)
+	}
+	var gone []RecordRef
+	var errs []error
+	for _, r := range refs {
+		if r.Type != c.Type || haAbs(r.Name, zone) != n || r.Value != c.Value {
+			continue
+		}
+		gone = append(gone, r)
+		if !haLiveID(live, zone, n, r) {
+			continue // not ours any more: dropped, never deleted
+		}
+		wctx, done, err := haFence{}.WriteContext(ctx)
+		if err == nil {
+			err = ids.deleteRecordID(wctx, zone, r.ID)
+			done()
+		}
+		if err != nil {
+			gone = gone[:len(gone)-1] // still ours: kept for the retry
+			errs = append(errs, fmt.Errorf("remove %s at %s: %w", c.Value, n, err))
+		}
+	}
+	return gone, errors.Join(errs...)
+}
+
+// haLiveAfter is the name's live set after a removal: a fresh read (a
+// foreign copy of the value may still hold it), else the set without it.
+func haLiveAfter(ctx context.Context, w *frontdoor.Writer, n string, before []string, value string) []string {
+	if pub, err := w.Published(ctx); err == nil {
+		return pub[n]
+	}
+	return slices.DeleteFunc(slices.Clone(before), func(a string) bool { return a == value })
 }
 
 // haCaptureID is the ID of the record just appended for ref: a live record
@@ -586,17 +687,6 @@ func haLiveID(live []idRecord, zone, n string, r RecordRef) bool {
 		}
 	}
 	return false
-}
-
-// haLiveCount counts the live records of type at n holding value.
-func haLiveCount(live []idRecord, zone, n, typ, value string) int {
-	c := 0
-	for _, l := range live {
-		if v, ok := haIP(l.rr.Data); ok && l.rr.Type == typ && haAbs(l.rr.Name, zone) == n && v == value {
-			c++
-		}
-	}
-	return c
 }
 
 func haAbs(name, zone string) string {
@@ -768,4 +858,76 @@ func haOurs(d *Domain, n string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// haDeleteOwned removes a deleted domain's follower records by the same
+// ownership rule as haStep (review RI1): A / AAAA refs only of the zone in
+// use, whose value is live at their name and — on a provider with record
+// IDs — whose own ID still carries it, deleted by that ID; on a provider
+// without IDs, by the exact live value. Every other A / AAAA ref (another
+// zone's, a record gone or re-created by someone else) is dropped without
+// a delete. It returns the refs left for the plain removal (no A / AAAA).
+func (s *Service) haDeleteOwned(ctx context.Context, p dnsProvider, d *Domain) (map[string][]RecordRef, error) {
+	rest := map[string][]RecordRef{}
+	var addr []RecordRef
+	inUse := s.haZone(p, d.Name)
+	zone := dns.Fqdn(inUse)
+	for z, refs := range d.Records {
+		for _, r := range refs {
+			if r.Type == "A" || r.Type == "AAAA" {
+				if inUse != "" && dns.Fqdn(z) == zone {
+					addr = append(addr, r)
+				}
+				continue
+			}
+			rest[z] = append(rest[z], r)
+		}
+	}
+	if len(addr) == 0 {
+		return rest, nil
+	}
+	w := &frontdoor.Writer{Domain: d.Name, Zone: zone, P: p, Policy: s.cfg.AddrPolicy}
+	pub, err := w.Published(ctx)
+	if err != nil {
+		return rest, fmt.Errorf("reading the address set of %s (its address records are left): %w", d.Name, err)
+	}
+	ids := haIDLister(p)
+	var live []idRecord
+	if ids != nil {
+		rctx, cancel := context.WithTimeout(ctx, frontdoor.ReadTimeout)
+		live, err = ids.recordIDs(rctx, zone)
+		cancel()
+		if err != nil {
+			return rest, fmt.Errorf("reading the record IDs of %s (its address records are left): %w", d.Name, err)
+		}
+	}
+	var errs []error
+	for _, r := range addr {
+		n := haAbs(r.Name, zone)
+		v, ok := haIP(r.Value)
+		if !ok || !slices.Contains(haNames(d.Name), n) || !slices.Contains(pub[n], v) {
+			continue
+		}
+		if ids != nil {
+			if !haLiveID(live, zone, n, r) {
+				continue
+			}
+			if err := ids.deleteRecordID(ctx, zone, r.ID); err != nil {
+				errs = append(errs, fmt.Errorf("%s %s at %s: %w", r.Type, r.Value, n, err))
+			}
+			continue
+		}
+		rest[zone] = append(rest[zone], r)
+	}
+	return rest, errors.Join(errs...)
+}
+
+// haZone is the zone of name in use now ("" when it can't be found: then
+// no address ref is any zone's in use and none is deleted).
+func (s *Service) haZone(p dnsProvider, name string) string {
+	z, err := s.zoneOf(p, name)
+	if err != nil {
+		return ""
+	}
+	return z
 }

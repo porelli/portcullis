@@ -605,3 +605,91 @@ type idFake struct{ *fakedns.Provider }
 func (f idFake) recordIDs(ctx context.Context, zone string) ([]idRecord, error) {
 	return fakeIDs{f.Provider}.listIDs(ctx, zone)
 }
+
+func (f idFake) deleteRecordID(ctx context.Context, zone, id string) error {
+	return fakeIDs{f.Provider}.deleteID(ctx, zone, id)
+}
+
+// rrsAt are the A / AAAA records at name as "value ttl", sorted.
+func rrsAt(z *fakedns.Zone, name string) []string {
+	var out []string
+	for _, rr := range addrRecords(z, name) {
+		out = append(out, rr.Data+" "+rr.TTL.String())
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestHAForeignDuplicate (re-review RI1, RM1): a foreign copy of an
+// address the follower wrote. When the front door drops the address only
+// the follower's own record goes (deleted by its ID); the copy stays, is a
+// kept record (named, not due: no error loop, no provider reads).
+func TestHAForeignDuplicate(t *testing.T) {
+	const a1, a2 = "198.51.100.1", "198.51.100.2"
+	e, f := newHAEnv(t)
+	e.publish(f, []string{a1, a2}, []string{a1, a2})
+	const d = "team-q.example.org"
+	e.do("PUT", "/domains/"+d, creds(goodToken), true)
+	e.waitState(d, StateReady, 60*time.Second)
+	e.waitAddrs(d, a1, a2)
+	e.zone.Set(d, append(e.zone.Records(d), addrRR(d, a1, time.Hour))...) // the foreign copy
+	e.clock.advance(61 * time.Second)
+	e.publish(f, []string{a2}, []string{a2})
+	e.waitAddrs("*."+d, a2)
+	e.waitFor("our a1 gone", 20*time.Second, func() bool {
+		return slices.Equal(rrsAt(e.zone, d), []string{a1 + " 1h0m0s", a2 + " 1m0s"})
+	})
+	var gets atomic.Int32
+	e.setHook(func(op string, _ []libdns.Record, _ string) error {
+		if op == "get" {
+			gets.Add(1)
+		}
+		return nil
+	})
+	for range 3 {
+		e.clock.advance(61 * time.Second)
+		e.svc.haRefresh()
+		e.settle(d)
+	}
+	if v := e.list()[d]; v.State != StateReady || v.LastError != "" || gets.Load() != 0 {
+		t.Errorf("state %q %q, %d provider reads: the copy must be a kept record", v.State, v.LastError, gets.Load())
+	}
+	if p := e.planNotices(d); !strings.Contains(p, "foreign A "+a1+" at "+d+" kept: it isn't provably Portcullis") {
+		t.Errorf("the copy isn't named: %s", p)
+	}
+}
+
+// TestHADeleteOwnedOnly (re-review RI1): DELETE /domains/{d} in HA removes
+// the follower's own address records only: a foreign duplicate, an
+// address re-created by someone else and one an other zone's ref names
+// all survive.
+func TestHADeleteOwnedOnly(t *testing.T) {
+	const a1, a2, a3 = "198.51.100.1", "198.51.100.2", "198.51.100.3"
+	e, f := newHAEnv(t)
+	e.publish(f, []string{a1, a2}, []string{a1, a2})
+	const d = "team-w.example.org"
+	e.do("PUT", "/domains/"+d, creds(goodToken), true)
+	e.waitState(d, StateReady, 60*time.Second)
+	e.waitAddrs(d, a1, a2)
+	// a1: ours deleted by hand and re-created by someone else (another ID);
+	// a2: ours plus a foreign duplicate; a3: foreign, named by an old zone's ref.
+	var keep []libdns.RR
+	for _, rr := range e.zone.Records(d) {
+		if rr.Data != a1 {
+			keep = append(keep, rr)
+		}
+	}
+	e.zone.Set(d, append(keep, addrRR(d, a1, time.Hour), addrRR(d, a2, time.Hour), addrRR(d, a3, time.Hour))...)
+	e.svc.mu.Lock()
+	e.svc.doc.Domains[d].Records["example.org."] = append(e.svc.doc.Domains[d].Records["example.org."], RecordRef{Name: "team-w", Type: "A", Value: a3})
+	e.svc.mu.Unlock()
+	if code, body := e.do("DELETE", "/domains/"+d, "", true); code != 204 {
+		t.Fatalf("delete = %d %s", code, body)
+	}
+	if got := rrsAt(e.zone, d); !slices.Equal(got, []string{a1 + " 1h0m0s", a2 + " 1h0m0s", a3 + " 1h0m0s"}) {
+		t.Errorf("after delete %s = %v, want only the foreign records", d, got)
+	}
+	if got := addrs(e.zone, "*."+d); len(got) != 0 {
+		t.Errorf("after delete *.%s = %v (ours)", d, got)
+	}
+}

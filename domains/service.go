@@ -495,14 +495,21 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	p, perr := buildProvider(snap)
 	if perr == nil {
-		zones := make([]string, 0, len(snap.Records))
-		for z := range snap.Records {
+		// In HA the follower's address refs go only by its ownership rule
+		// (haDeleteOwned); every other ref as before.
+		recs := snap.Records
+		var haErr error
+		if s.cfg.HA {
+			recs, haErr = s.haDeleteOwned(ctx, p, snap)
+		}
+		zones := make([]string, 0, len(recs))
+		for z := range recs {
 			zones = append(zones, z)
 		}
 		sort.Strings(zones)
-		var errs []error
+		errs := []error{haErr}
 		for _, z := range zones {
-			if err := deleteRecords(ctx, p, z, snap.Records[z]); err != nil {
+			if err := deleteRecords(ctx, p, z, recs[z]); err != nil {
 				errs = append(errs, fmt.Errorf("zone %s: %w", z, err))
 			}
 		}

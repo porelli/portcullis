@@ -166,6 +166,9 @@ func (r *Runner) writeStatus(ctx context.Context, now time.Time, pub map[string]
 	}
 	st.WrittenAt = now.UTC()
 	st.Generation = max(now.UnixMilli(), r.generation+1)
+	// Compact JSON (json.Marshal): the admission policy finds
+	// "leader":"<pod>" as a substring of status.json, so an indented writer
+	// would be refused (tests/ha_admission_vectors.json pins the shape).
 	b, err := marshalStatus(st)
 	if err == nil {
 		sctx, cancel := context.WithTimeout(ctx, ReadTimeout)
