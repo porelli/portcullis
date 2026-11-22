@@ -857,7 +857,14 @@ hub_env_write() {
     content+="PORTCULLIS_TRAEFIK_SERVICE_IP=${PORTCULLIS_TRAEFIK_SERVICE_IP:-}"$'\n'
     content+="PORTCULLIS_RUNTIME_ROOTS=$KUBE_RUNTIME_ROOTS"$'\n'
     content+="PORTCULLIS_KUBE_CONTEXT=${PORTCULLIS_KUBE_CONTEXT:-}"$'\n'
-    content+="PORTCULLIS_KUBE_NODE_ADDRESSES=$(kube_node_addresses)"$'\n'
+    # The admission params' nodeAddresses exactly (the cluster addresses
+    # document once nodeadm writes it: every node's mesh, LAN and public
+    # addresses): the apps' egress policy must except every one of them,
+    # or portcullis-apps-netpol refuses it (found live, Task 31: a second
+    # node's LAN address in the params, the mesh ones only here).
+    local _na; _na="$(kube_node_addresses)"
+    if declare -F kube_doc_addresses >/dev/null && kube_doc_addresses 2>/dev/null; then _na="${_K_DOC_NODES//\/32/}"; fi
+    content+="PORTCULLIS_KUBE_NODE_ADDRESSES=$_na"$'\n'
   fi
   (umask 077 && mkdir -p "$(dirname "$f")")
   [ -e "$f" ] || (umask 077 && : > "$f")

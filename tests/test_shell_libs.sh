@@ -8367,6 +8367,20 @@ case "$RC:$ERR:$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" in "0:"*
 OUT="$(CONTAINER_RUNTIME=kubernetes bash -c 'for l in common domains; do source "'"$HERE"'/../scripts/lib/$l.sh" >/dev/null 2>&1; done; runtime_build_service() { echo BUILT; }; domains_image_ensure "for the dns tool"; echo "rc=$?"' 2>&1)"
 expect_eq "domains_image_ensure on kubernetes: nothing built, no refusal" "$OUT" "rc=0"
 
+# Found live (Task 31): the Hub's core.env node addresses are the admission
+# params' (the cluster addresses document's mesh, LAN and public ones), or
+# every app's egress policy is refused once a second node has a LAN address.
+NA_ROOT="$WORK/na-root"; rm -rf "$NA_ROOT"; mkdir -p "$NA_ROOT"; printf 'PORTCULLIS_DOMAIN=na.example\n' > "$NA_ROOT/.env"
+na_run() { ( export PORTCULLIS_ROOT="$NA_ROOT" CONTAINER_RUNTIME=kubernetes PORTCULLIS_POD_CIDR=10.42.0.0/16 PORTCULLIS_SERVICE_CIDR=10.43.0.0/16
+  for l in common network; do source "$HERE/../scripts/lib/$l.sh" >/dev/null 2>&1; done
+  kube_node_addresses() { echo "10.215.0.1 10.215.0.2"; }; eval "$1"; env_load; hub_env_write 2>/dev/null
+  grep '^PORTCULLIS_KUBE_NODE_ADDRESSES=' "$NA_ROOT/secrets/hub/core.env" ); }
+expect_eq "core.env node addresses: the cluster addresses document's (the params')" \
+  "$(na_run 'kube_doc_addresses() { _K_DOC_NODES="10.215.0.1/32 10.215.0.2/32 172.26.29.38/32 52.43.150.133/32"; return 0; }')" \
+  "PORTCULLIS_KUBE_NODE_ADDRESSES=10.215.0.1 10.215.0.2 172.26.29.38 52.43.150.133"
+expect_eq "core.env node addresses: no document yet → the nodes' (as the params then)" \
+  "$(na_run 'kube_doc_addresses() { return 2; }')" "PORTCULLIS_KUBE_NODE_ADDRESSES=10.215.0.1 10.215.0.2"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
