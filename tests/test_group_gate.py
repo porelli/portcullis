@@ -3203,11 +3203,12 @@ class ImpersonationTest(GateTest):
         code, hdrs, body = result
         self.assertEqual(code, 403, body)
         self.assertIn(f"Your session as {person} has ended.", body)
-        self.assertIn('<form class="pn-signout" method="post" action="https://auth.example.com/oauth2/sign_out" '
-                      'enctype="text/plain"><button type="submit" class="btn" id="pc-imp-sign-out">Sign out</button>'
-                      '</form>', body)
+        # A link to the confirmation page on auth.<d>: the ended page shows on
+        # app hosts, whose origin the sign-out guard never accepts.
+        self.assertIn('<a id="pc-imp-sign-out" class="btn" href="https://auth.example.com/oauth2/sign_out">Sign out</a>',
+                      body)
         self.assertNotIn("?rd=", body)
-        self.assertIn("form-action https://auth.example.com;", hdrs.get("Content-Security-Policy", ""))
+        self.assertNotIn("<form", body)
         for h in gg.IMPERSONATION_HEADERS:
             self.assertNotIn(h, hdrs)
         self.assertNotIn("X-Forwarded-User", hdrs)
@@ -3769,15 +3770,23 @@ class SignOutTest(GateTest):
             with e:
                 return e.code, dict(e.headers), e.read().decode()
 
-    def test_site_bar_post_allowed(self):
-        cases = [{}, {"Sec-Fetch-Site": "same-origin", "Origin": "https://auth.example.com"},
-                 {"Origin": "null"},  # the Hub's pages: Referrer-Policy no-referrer
-                 {"Origin": "https://hub.example.com"}, {"Origin": "https://people.example.com:443"},
-                 {"Content-Type": "text/plain;charset=UTF-8"}, {"Content-Type": None},
-                 {"Sec-Fetch-Site": None, "Origin": "https://people.example.com"},
-                 {"Origin": None}]
-        for c in cases:
-            with self.subTest(c=c):
+    def test_each_core_page_form_allowed(self):
+        # The real forms: the portal (Traefik's strict-origin-when-cross-origin
+        # sends its origin), the Hub and people.<d> (no-referrer pages switched
+        # to strict-origin before the submit), the confirmation page on
+        # auth.<d> (same-origin; its Origin may also be null).
+        cases = {
+            "portal": {"Origin": "https://example.com"},
+            "hub": {"Origin": "https://hub.example.com"},
+            "people / Sign-in page": {"Origin": "https://people.example.com"},
+            "confirmation page": {"Sec-Fetch-Site": "same-origin", "Origin": "https://auth.example.com"},
+            "confirmation page, Origin null": {"Sec-Fetch-Site": "same-origin", "Origin": "null"},
+            "an older browser (no fetch metadata)": {"Sec-Fetch-Site": None, "Origin": "https://people.example.com"},
+            "charset": {"Content-Type": "text/plain;charset=UTF-8"},
+            "no Content-Type": {"Content-Type": None},
+        }
+        for name, c in cases.items():
+            with self.subTest(name):
                 code, hdrs, body = self.guard(**c)
                 self.assertEqual(code, 200, body)
                 self.assertEqual(hdrs.get("X-Auth-Request-Redirect"), "https://example.com/signed-out")
@@ -3799,16 +3808,26 @@ class SignOutTest(GateTest):
 
     def test_refused(self):
         cases = {
+            # An app under the domain is same-site, never proof.
+            "an app (same-site)": {"Origin": "https://app.example.com"},
+            "an app, no Origin": {"Origin": None},
+            "Origin null, same-site": {"Origin": "null"},
+            "an app under hub": {"Origin": "https://x.hub.example.com"},
+            "an app claiming same-origin elsewhere": {"Sec-Fetch-Site": "same-site", "Origin": "https://grafana.example.com"},
             "cross-site": {"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"},
+            "cross-site with a core Origin": {"Sec-Fetch-Site": "cross-site", "Origin": "https://example.com"},
             "cross-site, no origin": {"Sec-Fetch-Site": "cross-site", "Origin": None},
             "user-typed": {"Sec-Fetch-Site": "none"},
             "foreign origin": {"Origin": "https://evil.example"},
             "look-alike": {"Origin": "https://evilexample.com"},
             "suffix trick": {"Origin": "https://example.com.evil.example"},
             "http origin": {"Origin": "http://example.com"},
+            "explicit port": {"Origin": "https://example.com:443"},
             "other port": {"Origin": "https://example.com:8443"},
+            "upper case": {"Origin": "https://HUB.example.com"},
             "no fetch metadata, null origin": {"Sec-Fetch-Site": None, "Origin": "null"},
             "no fetch metadata, no origin": {"Sec-Fetch-Site": None, "Origin": None},
+            "no fetch metadata, an app": {"Sec-Fetch-Site": None, "Origin": "https://app.example.com"},
             "query rd": {"X-Forwarded-Uri": "/oauth2/sign_out?rd=https%3A%2F%2Fhub.example.com%2F"},
             "bare query": {"X-Forwarded-Uri": "/oauth2/sign_out?"},
             "longer path": {"X-Forwarded-Uri": "/oauth2/sign_outx"},

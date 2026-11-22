@@ -159,17 +159,23 @@ refused() {
 refused "a cross-site POST" -H 'Sec-Fetch-Site: cross-site' -H 'Origin: https://evil.example' -H 'Content-Type: text/plain' \
   https://auth.portcullis.local/oauth2/sign_out
 refused "a POST with a foreign Origin" -H 'Origin: https://evil.example' -H 'Content-Type: text/plain' https://auth.portcullis.local/oauth2/sign_out
+# An app under the domain is same-site: never proof (its own origin, or none).
+refused "a POST from an app (same-site, Origin app.<d>)" -H 'Sec-Fetch-Site: same-site' -H 'Origin: https://app.portcullis.local' \
+  -H 'Content-Type: text/plain' https://auth.portcullis.local/oauth2/sign_out
+refused "a same-site POST with Origin null" -H 'Sec-Fetch-Site: same-site' -H 'Origin: null' -H 'Content-Type: text/plain' \
+  https://auth.portcullis.local/oauth2/sign_out
 refused "a same-site POST with ?rd=" -H 'Sec-Fetch-Site: same-site' -H 'Origin: https://portcullis.local' -H 'Content-Type: text/plain' \
   "https://auth.portcullis.local/oauth2/sign_out?rd=https%3A%2F%2Fhub.portcullis.local%2F"
 refused "a same-site form-encoded POST" -H 'Sec-Fetch-Site: same-site' -H 'Origin: https://portcullis.local' \
   --data 'rd=https%3A%2F%2Fhub.portcullis.local%2F' https://auth.portcullis.local/oauth2/sign_out
-echo "PASS: cross-site / foreign-origin / rd-carrying sign-out POSTs are refused (403) and end nothing"
-# 3. The site bar's POST (Sign out on hub.<d>: Referrer-Policy no-referrer,
-#    so Origin null): 302 to the fixed Signed out page; the ticket is gone
+echo "PASS: cross-site / foreign-origin / app-origin / Origin-null / rd-carrying sign-out POSTs are refused (403) and end nothing"
+# 3. The site bar's POST (Sign out on hub.<d>, whose page switches to
+#    strict-origin before the submit, so its Origin is sent): 302 to the
+#    fixed Signed out page; the ticket is gone
 #    from the store, the old cookie gets 401, Keycloak's session is gone and
 #    the next request to a forward-auth page goes to sign-in.
 cp "$J" /tmp/sess-before.jar
-HDRS="$("${C[@]}" -o /dev/null -D - -X POST -H 'Sec-Fetch-Site: same-site' -H 'Sec-Fetch-Mode: navigate' -H 'Origin: null' \
+HDRS="$("${C[@]}" -o /dev/null -D - -X POST -H 'Sec-Fetch-Site: same-site' -H 'Sec-Fetch-Mode: navigate' -H 'Origin: https://hub.portcullis.local' \
   -H 'Content-Type: text/plain' --data-binary '' https://auth.portcullis.local/oauth2/sign_out | tr -d '\r')"
 printf '%s\n' "$HDRS" | head -1 | grep -q ' 302' || { echo "FAIL: the sign-out POST: $(printf '%s\n' "$HDRS" | head -1)"; docker compose logs --tail=20 group-gate forward-auth; exit 1; }
 LOC="$(printf '%s\n' "$HDRS" | sed -n 's/^[Ll]ocation: //p')"

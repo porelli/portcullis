@@ -90,7 +90,7 @@ Request paths on group-gate itself (the forwardAuth `address`):
   /portal               the landing page at https://<domain>/
   /signout-guard        portcullis-signout-guard (router oauth2-signout on
                         auth.<domain>/oauth2/sign_out): a sign-out goes on
-                        only as the site bar's same-site POST; a GET gets a
+                        only as a Portcullis page's own POST; a GET gets a
                         confirmation page. See signout_refusal().
   /signed-out           the Signed out page at https://<domain>/signed-out
                         (router signed-out, no session)
@@ -792,9 +792,6 @@ PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"
 SIGNOUT_PATH = "/oauth2/sign_out"
 SIGNOUT_GUARD_PATH = "/signout-guard"
 SIGNED_OUT_PATH = "/signed-out"
-# Fetch metadata a sign-out may carry: a top-level navigation from a page
-# of this site (a sibling host under <domain> is same-site).
-SIGNOUT_FETCH_SITES = ("same-origin", "same-site")
 
 
 def sign_out_url(domain: str) -> str:
@@ -813,19 +810,12 @@ def _header_values(headers, name: str) -> List[str]:
     return [] if v is None else [v]
 
 
-def same_site_origin(origin: str, domain: str) -> bool:
-    """An Origin that is https://<domain> or https://<sub>.<domain> (port
-    443 or none, nothing else in it)."""
-    try:
-        p = urllib.parse.urlsplit(origin)
-        port = p.port
-    except ValueError:
-        return False
-    host = (p.hostname or "").lower()
-    if p.scheme != "https" or p.username is not None or p.password is not None or p.path or p.query \
-            or p.fragment or port not in (None, 443) or not valid_hostname(host):
-        return False
-    return host == domain or host.endswith("." + domain)
+def signout_origins(domain: str) -> FrozenSet[str]:
+    """The origins whose pages carry Sign out (the portal, the Hub,
+    people.<domain> with its Sign-in page) and auth.<domain> (the
+    confirmation page): exact strings, as browsers serialise them. Never
+    another host under the domain: those are apps, third-party code."""
+    return frozenset(f"https://{h}" for h in (domain, f"hub.{domain}", f"people.{domain}", f"auth.{domain}"))
 
 
 def signout_refusal(method: str, raw_uri: str, headers, domain: str) -> Optional[str]:
@@ -840,12 +830,14 @@ def signout_refusal(method: str, raw_uri: str, headers, domain: str) -> Optional
       form fields only from an application/x-www-form-urlencoded body, so
       no `rd` can come from the body either and the landing page stays the
       fixed one this guard names;
-    - Sec-Fetch-Site same-origin or same-site when sent (a cross-site POST
-      is refused; it would carry no Lax cookie anyway);
-    - an Origin, when sent and not "null" (the Hub's pages are
-      Referrer-Policy no-referrer, so their cross-origin POSTs say "null"),
-      that is https://<domain> or a host under it; without Sec-Fetch-Site
-      (older browsers) a same-site Origin is required.
+    - at most one Sec-Fetch-Site and one Origin, and then either
+      Sec-Fetch-Site same-origin (the confirmation page on auth.<domain>
+      itself), or an Origin that is exactly one of signout_origins() — and
+      a Sec-Fetch-Site, when sent, of same-site. "Same site" alone is never
+      proof: every app under the domain is same-site. An Origin "null"
+      counts only with same-origin (the Hub's pages are Referrer-Policy
+      no-referrer; their Sign out switches the page to strict-origin first,
+      so the browser sends their origin).
     """
     if not valid_hostname(domain):
         return "PORTCULLIS_DOMAIN is not a valid hostname"
@@ -864,12 +856,12 @@ def signout_refusal(method: str, raw_uri: str, headers, domain: str) -> Optional
         return "more than one Sec-Fetch-Site or Origin"
     site = sites[0] if sites else ""
     origin = origins[0] if origins else ""
-    if site and site not in SIGNOUT_FETCH_SITES:
+    if site == "same-origin":
+        return None
+    if site and site != "same-site":
         return f"Sec-Fetch-Site {site[:16]}"
-    if origin and origin != "null" and not same_site_origin(origin, domain):
-        return "an Origin outside the domain"
-    if not site and not same_site_origin(origin, domain):
-        return "neither Sec-Fetch-Site nor a same-site Origin"
+    if origin not in signout_origins(domain):
+        return "an Origin that isn't a Portcullis page's"
     return None
 
 
@@ -3253,8 +3245,8 @@ SIGNIN_CSS = PORTAL_CSS + (
 SIGNIN_CSP = ("default-src 'none'; style-src 'sha256-"
               + base64.b64encode(hashlib.sha256(SIGNIN_CSS.encode()).digest()).decode()
               + "'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-# The pages whose Sign out posts to oauth2-proxy (the ended page, the
-# sign-out confirmation): SIGNIN_CSP with form-action https://auth.<domain>.
+# The sign-out confirmation page (its Sign out posts to oauth2-proxy):
+# SIGNIN_CSP with form-action https://auth.<domain>.
 SIGNOUT_CSP = SIGNIN_CSP.replace("form-action 'none'", f"form-action {_form_action(DOMAIN)}")
 
 
@@ -3439,13 +3431,15 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
 
 def render_ended_page(person: str, domain: str) -> bytes:
     """The impersonation's ended page (contract §4, D41): "Your session as
-    <person> has ended." with a Sign out button (the site bar's POST to
-    oauth2-proxy's sign-out; served with SIGNOUT_CSP), which lands on the
+    <person> has ended." with Sign out: a link to the confirmation page on
+    auth.<domain> (it shows on any host, apps' included, whose origin the
+    sign-out guard never accepts), whose button signs out and lands on the
     Signed out page."""
+    sign_out = html.escape(sign_out_url(domain), quote=True)
     return _signin_page(
         "Signed in as someone else: ended",
         f"<div id=\"impersonation-ended\"><p>Your session as {html.escape(person)} has ended.</p>"
-        f"<div>{signout_form(domain, el_id='pc-imp-sign-out', cls='btn')}</div></div>")
+        f"<p><a id=\"pc-imp-sign-out\" class=\"btn\" href=\"{sign_out}\">Sign out</a></p></div>")
 
 
 def render_signout_page(domain: str, refused: bool = False) -> bytes:
@@ -3454,7 +3448,7 @@ def render_signout_page(domain: str, refused: bool = False) -> bytes:
     refused — 403): a confirmation with the same Sign out button. Served
     with SIGNOUT_CSP; the form posts to its own origin."""
     e = html.escape
-    note = ("<p class=\"portcullis-sub\">That sign-out request didn't come from a page of this site, so "
+    note = ("<p class=\"portcullis-sub\">That sign-out request didn't come from a Portcullis page, so "
             "nothing was changed.</p>" if refused else "")
     return _signin_page(
         "Sign out",
@@ -3685,7 +3679,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(403)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Security-Policy", SIGNOUT_CSP)
+            self.send_header("Content-Security-Policy", SIGNIN_CSP)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -3851,7 +3845,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Auth-Request-Redirect", signed_out_url(DOMAIN))
             self.send_header("Content-Length", "0")
             self.end_headers()
-            print(f"group-gate: SIGNOUT allowed site={self.headers.get('Sec-Fetch-Site', '-')!r}", flush=True)
+            print(f"group-gate: SIGNOUT allowed site={_log_field(self.headers.get('Sec-Fetch-Site', '') or '-', 16)!r} "
+                  f"origin={_log_field(self.headers.get('Origin', '') or '-', 80)!r}", flush=True)
             return
         METRICS.inc("group_gate_requests_total", endpoint="signout_guard", result="deny")
         if method in ("GET", "HEAD"):
