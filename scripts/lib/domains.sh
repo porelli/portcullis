@@ -114,11 +114,14 @@ domains_endpoint_certs() {
 # domains_image_ensure [why] — build the domains image if it is missing
 # (its age key, the one-shot dns tool and the Traefik account reader all
 # run from it, possibly before the first `up`).
+# Kubernetes: the one-shot (rt_run dns-tool) runs the release's domains
+# image by its digest (kube_images_ready); nothing to build here (found
+# live, Task 31: init's DNS step and the HA CAA switch failed on it).
 domains_image_ensure() {
-  # Kubernetes: the one-shot (rt_run dns-tool) runs the release's domains
-  # image by its digest (kube_images_ready); nothing to build here (found
-  # live, Task 31: init's DNS step and the HA CAA switch failed on it).
   ! _rt_is_kube || return 0
+  _domains_image_ensure_docker "$@"
+}
+_domains_image_ensure_docker() {
   _rt_docker_only
   docker image inspect "$DOMAINS_IMAGE_NAME" >/dev/null 2>&1 && return 0
   info "Building the domains service image${1:+ (needed $1)}..."
