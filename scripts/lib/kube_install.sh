@@ -737,6 +737,11 @@ _kube_probe_ha() {
       # identity's first rule refuses this generation's probe).
       M="$m" jq -n '{apiVersion: "v1", kind: "ConfigMap", metadata: (env.M | fromjson | .name = "frontdoor-status"), data: {}}' \
         | kube_ctl -n "$cns" --as="$(_kube_hub_sa)" --as-group=system:masters create --dry-run=server -f - ;;
+    portcullis-ingress-guard-default-cert)
+      # Task 31 fix round 2: a dry-run CREATE of traefik-default-cert (every
+      # identity's first rule refuses this generation's probe).
+      M="$m" jq -n '{apiVersion: "v1", kind: "Secret", type: "kubernetes.io/tls", metadata: (env.M | fromjson | .name = "traefik-default-cert"), data: {"tls.crt": "", "tls.key": ""}}' \
+        | kube_ctl -n "$KUBE_INGRESS_NS" --as="$(_kube_hub_sa)" --as-group=system:masters create --dry-run=server -f - ;;
     portcullis-ingress-guard-pods)
       M="$m" IMG="${KUBE_HUB_IMAGE:-$PORTCULLIS_HELPER_IMAGE}" jq -n '{apiVersion: "v1", kind: "Pod", metadata: (env.M | fromjson),
           spec: {automountServiceAccountToken: false, containers: [{name: "c", image: env.IMG, command: ["true"]}]}}' \

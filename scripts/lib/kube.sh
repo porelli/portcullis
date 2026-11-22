@@ -27,9 +27,9 @@ KUBE_PRIMARY_SITE="main"
 # Traefik's only watched namespace (the chart's edgeNamespace): the core
 # IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
 KUBE_EDGE_NS="portcullis-edge"
-# The twelve admission bindings (kube/admission/bindings.yaml; the last
-# six HA), live as <name>-<params generation> (kube_admission_params_apply; not KUBE_REMOVED_BINDING).
-KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods portcullis-nodes-guard-labels portcullis-core-guard-frontdoor-status portcullis-nodes-guard-removed"
+# The thirteen admission bindings (kube/admission/bindings.yaml; the last
+# seven HA), live as <name>-<params generation> (kube_admission_params_apply; not KUBE_REMOVED_BINDING).
+KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods portcullis-nodes-guard-labels portcullis-core-guard-frontdoor-status portcullis-ingress-guard-default-cert portcullis-nodes-guard-removed"
 KUBE_PROBE_NS="portcullis-netpol-probe"
 KUBE_MANAGED_LABEL="app.kubernetes.io/managed-by"
 KUBE_INSTALL_ANNOTATION="portcullis.io/install"
@@ -764,7 +764,7 @@ kube_vpn_reserved() {
 }
 
 # kube_status_extra — status --json's kubernetes fields: netpol (the CLI's
-# probe ConfigMap), admission (the twelve bindings), dns_shadows (an app
+# probe ConfigMap), admission (the thirteen bindings), dns_shadows (an app
 # Service named like a core one), kube_api_public (K8).
 # kube_crashing_json — the Deployments of the core, apps and cnpg-system (CloudNativePG + its barman-cloud plugin: review NM1) namespaces whose live pods
 # crash: a container waiting in CrashLoopBackOff / Error / an image pull
@@ -1149,7 +1149,7 @@ _kube_probe_object() {
   local b="$1" ns kind
   case "$b" in
     portcullis-edge-guard-routes) _kube_probe_route "portcullis-admission-probe.${PORTCULLIS_DOMAIN,,}" "$2"; return ;;
-    portcullis-core-guard-exec|portcullis-nodeadm-guard-tokens|portcullis-ingress-guard-pods|portcullis-nodes-guard-labels|portcullis-core-guard-frontdoor-status|portcullis-nodes-guard-removed) _kube_probe_ha "$b" "$2"; return ;;
+    portcullis-core-guard-exec|portcullis-nodeadm-guard-tokens|portcullis-ingress-guard-pods|portcullis-nodes-guard-labels|portcullis-core-guard-frontdoor-status|portcullis-ingress-guard-default-cert|portcullis-nodes-guard-removed) _kube_probe_ha "$b" "$2"; return ;;
     portcullis-apps-guard-pods) kind=Pod ;;
     portcullis-apps-guard-workloads) kind=Deployment ;;
     portcullis-apps-guard-services) kind=Service ;;
@@ -1214,7 +1214,7 @@ _kube_configmap_from() {
 #   storage     the provisioner portcullis.io/local-path (kube/storage),
 #               its ConfigMap, the StorageClasses, its deny policy + API egress;
 #   crds        the Traefik CRDs (K14: kubectl --server-side, never Helm);
-#   admission   the twelve VAPs and their twelve bindings (kube/admission);
+#   admission   the thirteen VAPs and their thirteen bindings (kube/admission);
 #   params      portcullis-admission-params: the Hub's resolved digest
 #               (KUBE_HUB_IMAGE, name@sha256:…), roots, ports, networks, peers.
 kube_cluster_setup() {
@@ -1720,7 +1720,7 @@ kube_health_report() {
 }
 
 # kube_cluster_check — the Hub's cluster check input (contract §6): the apps
-# namespace's PSA labels and the twelve bindings, written as the ConfigMap
+# namespace's PSA labels and the thirteen bindings, written as the ConfigMap
 # portcullis-cluster-check (checked_at RFC 3339 UTC, ok true|false, why).
 # The Hub refuses every runtime operation once it is 24 h old: `up` writes
 # it, and so does `kube check`, which the portcullis-kube-check.timer init
@@ -2290,7 +2290,7 @@ help_kube_check() {
 Usage: portcullis kube check
 
 Kubernetes only. Re-checks the apps namespace's Pod Security labels and the
-twelve admission bindings and writes the result into the ConfigMap
+thirteen admission bindings and writes the result into the ConfigMap
 portcullis-cluster-check (checked_at, ok, why), which the Hub reads: it
 refuses every runtime operation while the check failed or is more than 24 h
 old. `up` writes it too; init installs portcullis-kube-check.timer, which

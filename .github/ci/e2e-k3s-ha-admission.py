@@ -38,7 +38,7 @@ import urllib.parse
 CTX = sys.argv[1] if len(sys.argv) > 1 else "ci"
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 IDS = {"hub": "system:serviceaccount:portcullis:portcullis-hub", "intruder": "system:serviceaccount:portcullis:intruder",
-       "nodeadm": "system:serviceaccount:portcullis-nodeadm:nodeadm",
+       "nodeadm": "system:serviceaccount:portcullis-nodeadm:nodeadm", "frontdoor": "system:serviceaccount:portcullis:frontdoor",
        "daemonset-controller": "system:serviceaccount:kube-system:daemon-set-controller"}
 TEST_TRAEFIK = "docker.io/library/traefik:v3.7.0@sha256:" + "2" * 64
 TEST_GEN = "0123456789abcdef"

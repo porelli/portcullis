@@ -12632,7 +12632,7 @@
   "ha": true
  },
  {
-  "name": "ha: the HA Traefik pod projecting its default certificate (Secret traefik-default-cert, default-cert.yml as 00-default-cert.yml, 0440) into its dynamic directory is admitted (Task 31 fix round 2, M3)",
+  "name": "ha: the HA Traefik pod projecting its default certificate (Secret traefik-default-cert's tls.crt / tls.key as default-cert/*, 0440) into its dynamic directory is admitted (Task 31 fix round 2, M3)",
   "object": {
    "apiVersion": "v1",
    "kind": "Pod",
@@ -12711,8 +12711,13 @@
           "name": "traefik-default-cert",
           "items": [
            {
-            "key": "default-cert.yml",
-            "path": "00-default-cert.yml",
+            "key": "tls.crt",
+            "path": "default-cert/tls.crt",
+            "mode": 288
+           },
+           {
+            "key": "tls.key",
+            "path": "default-cert/tls.key",
             "mode": 288
            }
           ]
@@ -12727,6 +12732,240 @@
   "as": "cli",
   "want": "allow",
   "reason_contains": "",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door updates traefik-default-cert with exactly its new pair (Task 31 fix round 2, security review)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVDI=",
+    "tls.key": "S0VZMg=="
+   }
+  },
+  "as": "frontdoor",
+  "want": "allow",
+  "reason_contains": "",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVA==",
+    "tls.key": "S0VZ"
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door adding a key to traefik-default-cert (a file Traefik could read as configuration) is refused (Task 31 fix round 2, security review)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVDI=",
+    "tls.key": "S0VZMg==",
+    "00-evil.yml": "dGxzOiB7fQ=="
+   }
+  },
+  "as": "frontdoor",
+  "want": "deny",
+  "reason_contains": "traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels and annotations unchanged",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVA==",
+    "tls.key": "S0VZ"
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door changing traefik-default-cert's labels is refused (Task 31 fix round 2, security review)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVDI=",
+    "tls.key": "S0VZMg=="
+   }
+  },
+  "as": "frontdoor",
+  "want": "deny",
+  "reason_contains": "traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels and annotations unchanged",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVA==",
+    "tls.key": "S0VZ"
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door creating traefik-default-cert is refused (the CLI creates it) (Task 31 fix round 2, security review)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVA==",
+    "tls.key": "S0VZ"
+   }
+  },
+  "as": "frontdoor",
+  "want": "deny",
+  "reason_contains": "the front door only updates traefik-default-cert (the CLI creates it)",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door deleting traefik-default-cert is refused (Task 31 fix round 2, security review)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVA==",
+    "tls.key": "S0VZ"
+   }
+  },
+  "as": "frontdoor",
+  "want": "deny",
+  "reason_contains": "the front door only updates traefik-default-cert (the CLI creates it)",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVA==",
+    "tls.key": "S0VZ"
+   }
+  },
+  "op": "delete",
+  "ha": true
+ },
+ {
+  "name": "ha: another ServiceAccount updating traefik-default-cert is refused (Task 31 fix round 2, security review)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVDI=",
+    "tls.key": "S0VZMg=="
+   }
+  },
+  "as": "intruder",
+  "want": "deny",
+  "reason_contains": "only the front door (and the CLI) may write traefik-default-cert",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "Q0VSVA==",
+    "tls.key": "S0VZ"
+   }
+  },
+  "op": "update",
   "ha": true
  },
  {

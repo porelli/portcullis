@@ -1970,6 +1970,75 @@ spec:
         && 'status.json' in object.data && object.data['status.json'].contains('"leader":"' + variables.pod + '"'))
     message: the front door writes frontdoor-status only as its own pod (leader = its pod name)
 ---
+# portcullis-ingress-default-cert (NEW, HA; Task 31 fix round 2, security
+# review): traefik-default-cert in the ingress namespace is the HA
+# Traefik's default certificate, projected into its watched directory as
+# default-cert/tls.crt|tls.key beside the chart's own 00-default-cert.yml.
+# Only the CLI creates or deletes it; the front door's ServiceAccount
+# (system:serviceaccount:<core ns>:frontdoor, the core namespace of
+# params hubServiceAccount) may only update it, keeping it type
+# kubernetes.io/tls with exactly tls.crt and tls.key and its labels and
+# annotations: it can replace a certificate, never add a file Traefik
+# would read as configuration. Every other identity is refused. The
+# probe: a dry-run CREATE of traefik-default-cert annotated with the
+# generation; another generation's probe (a dry run with its 16 hex) is let by.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-ingress-default-cert
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ''
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      - DELETE
+      resources:
+      - secrets
+      # Only this Secret reaches the binding (a binding whose params are
+      # missing denies every request it matches).
+      resourceNames:
+      - traefik-default-cert
+  matchConditions:
+  - name: traefik-default-cert
+    expression: "request.name == 'traefik-default-cert'"
+  variables:
+  - name: cli
+    expression: "'cliUsername' in params.data && params.data.cliUsername != '' && request.userInfo.username == params.data.cliUsername"
+  - name: frontdoor
+    expression: >-
+      'hubServiceAccount' in params.data && params.data.hubServiceAccount.endsWith(':portcullis-hub')
+      && request.userInfo.username == params.data.hubServiceAccount.replace(':portcullis-hub', ':frontdoor')
+  - name: otherProbe
+    expression: >-
+      request.dryRun && request.operation != 'DELETE' && has(object.metadata.annotations) && 'portcullis.io/params-generation' in object.metadata.annotations
+      && object.metadata.annotations['portcullis.io/params-generation'].matches('^[0-9a-f]{16}$')
+      && object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+  validations:
+  - expression: >-
+      request.operation == 'DELETE' || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+  - expression: "variables.cli || variables.otherProbe || variables.frontdoor"
+    message: only the front door (and the CLI) may write traefik-default-cert
+  - expression: "variables.cli || variables.otherProbe || request.operation == 'UPDATE'"
+    message: the front door only updates traefik-default-cert (the CLI creates it)
+  - expression: >-
+      variables.cli || variables.otherProbe || request.operation != 'UPDATE'
+      || (has(object.type) && object.type == 'kubernetes.io/tls' && has(object.data) && size(object.data) == 2
+        && 'tls.crt' in object.data && 'tls.key' in object.data
+        && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})
+        && (has(object.metadata.annotations) ? object.metadata.annotations : {}) == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}))
+    message: traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels and annotations unchanged
+---
 # portcullis-removed-nodes (NEW, HA; Task 30 fix rounds 1 and 2): a removed
 # or revoked node's kubelet client certificate (system:node:<name>, k3s's
 # client CA, about a year) still authenticates after its removal, so with

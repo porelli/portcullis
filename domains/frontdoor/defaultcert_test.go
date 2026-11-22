@@ -3,6 +3,7 @@ package frontdoor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,8 @@ import (
 func TestDefaultCertMirror(t *testing.T) {
 	ctx := context.Background()
 	st := newStore()
-	ingress := fake.NewClientset(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: DefaultCertSecret, Namespace: "portcullis-ingress"}})
+	ingress := fake.NewClientset(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: DefaultCertSecret, Namespace: "portcullis-ingress"}, Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{"tls.crt": []byte("OLD"), "tls.key": []byte("OLD"), "extra.yml": []byte("tls: {}")}})
 	lead := true
 	var logs []string
 	servable := true
@@ -37,7 +39,10 @@ func TestDefaultCertMirror(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return string(s.Data[DefaultCertKey])
+		if s.Type != corev1.SecretTypeTLS {
+			t.Fatalf("type %s", s.Type)
+		}
+		return fmt.Sprintf("%d|%s|%s", len(s.Data), s.Data["tls.crt"], s.Data["tls.key"])
 	}
 	if err := st.SaveCert(ctx, "slot", Cert{ChainPEM: "CHAIN-1", KeyPEM: "KEY-SECRET-1"}, true); err != nil {
 		t.Fatal(err)
@@ -45,9 +50,9 @@ func TestDefaultCertMirror(t *testing.T) {
 	if w, err := m.Sync(ctx); !w || err != nil {
 		t.Fatalf("Sync: %v %v", w, err)
 	}
-	want := `{"tls":{"stores":{"default":{"defaultCertificate":{"certFile":"CHAIN-1","keyFile":"KEY-SECRET-1"}}}}}`
-	if got := doc(); got != want {
-		t.Fatalf("document %s, want %s", got, want)
+	// Exactly the pair: a stray key is dropped.
+	if got := doc(); got != "2|CHAIN-1|KEY-SECRET-1" {
+		t.Fatalf("Secret %s", got)
 	}
 	if w, _ := m.Sync(ctx); w {
 		t.Fatal("rewritten although equal")
@@ -95,19 +100,21 @@ func TestDefaultCertMirror(t *testing.T) {
 	}
 }
 
-// TestDefaultCertDocRoundTrip: the document's pair reads back; anything
-// else holds none.
-func TestDefaultCertDocRoundTrip(t *testing.T) {
-	d, err := DefaultCertDoc("C\n", "K\n")
-	if err != nil {
-		t.Fatal(err)
+// TestDefaultCertMirrorRefusesOtherType: a Secret that isn't
+// kubernetes.io/tls is never written (the CLI recreates it).
+func TestDefaultCertMirrorRefusesOtherType(t *testing.T) {
+	ctx := context.Background()
+	st := newStore()
+	_ = st.SaveCert(ctx, "slot", Cert{ChainPEM: "C", KeyPEM: "K"}, true)
+	ingress := fake.NewClientset(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: DefaultCertSecret, Namespace: "portcullis-ingress"}, Type: corev1.SecretTypeOpaque})
+	lead := true
+	m := &DefaultCertMirror{Client: ingress, Namespace: "portcullis-ingress", Store: st, Fence: testFence{&lead}, Now: func() time.Time { return t0 },
+		Check: func(string, string, time.Time) error { return nil }}
+	if w, err := m.Sync(ctx); w || err == nil || !strings.Contains(err.Error(), "not kubernetes.io/tls") {
+		t.Fatalf("Sync: %v %v", w, err)
 	}
-	if c, k := defaultCertOf(d); c != "C\n" || k != "K\n" {
-		t.Fatalf("%q %q", c, k)
-	}
-	for _, bad := range []string{"", "{", `{"tls":{}}`} {
-		if c, k := defaultCertOf([]byte(bad)); c != "" || k != "" {
-			t.Fatalf("%q: %q %q", bad, c, k)
-		}
+	s, _ := ingress.CoreV1().Secrets("portcullis-ingress").Get(ctx, DefaultCertSecret, metav1.GetOptions{})
+	if len(s.Data) != 0 {
+		t.Fatalf("written: %v", s.Data)
 	}
 }

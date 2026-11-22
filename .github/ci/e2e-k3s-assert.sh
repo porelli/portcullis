@@ -306,7 +306,8 @@ helm template portcullis charts/portcullis -n "$NS" -f tests/k8s-ci-values.yaml 
 K create --dry-run=client -o json -f "$T/frontdoor.yaml" \
   | jq -s '{apiVersion: "v1", kind: "List", items: [.[] | (if .kind == "List" then .items[] else . end) | select(.kind == "ServiceAccount" or .kind == "Role" or .kind == "RoleBinding")]}' \
   > "$T/frontdoor-rbac.json"
-[ "$(jq '.items | length' "$T/frontdoor-rbac.json")" = 3 ] || fail "the front door's ServiceAccount, Role and RoleBinding didn't render (HA values): $(jq -c '[.items[]?.kind]' "$T/frontdoor-rbac.json" 2>&1 | head -c 300)"
+# (Task 31 fix round 2: and its ingress Role / RoleBinding, traefik-default-cert.)
+[ "$(jq '.items | length' "$T/frontdoor-rbac.json")" = 5 ] || fail "the front door's ServiceAccount, Roles and RoleBindings didn't render (HA values): $(jq -c '[.items[]?.kind]' "$T/frontdoor-rbac.json" 2>&1 | head -c 300)"
 K apply -f "$T/frontdoor-rbac.json" >/dev/null
 FD="system:serviceaccount:$NS:frontdoor"
 for s in frontdoor-acme frontdoor-cert; do
@@ -321,8 +322,18 @@ for chk in "list secrets" "get secrets" "watch secrets" "get secret/portcullis-e
   # shellcheck disable=SC2086  # the verb and resource, split on purpose
   [ "$(K auth can-i $chk -n "$NS" --as="$FD" 2>/dev/null || true)" = no ] || { K delete -f "$T/frontdoor-rbac.json" >/dev/null 2>&1; fail "the front door can $chk"; }
 done
+# In the ingress namespace (Task 31 fix round 2, security review): get /
+# update of traefik-default-cert only; no other Secret, no ConfigMap (the
+# file provider's sources), no create, no list.
+for verb in get update; do
+  [ "$(K auth can-i "$verb" secret/traefik-default-cert -n portcullis-ingress --as="$FD" 2>/dev/null || true)" = yes ] || { K delete -f "$T/frontdoor-rbac.json" >/dev/null 2>&1; fail "the front door can't $verb secret/traefik-default-cert"; }
+done
+for chk in "create secrets" "list secrets" "delete secret/traefik-default-cert" "update secret/secrets-certs" "update configmap/traefik-dynamic" "update configmap/config-traefik-dynamic" "create configmaps"; do
+  # shellcheck disable=SC2086  # the verb and resource, split on purpose
+  [ "$(K auth can-i $chk -n portcullis-ingress --as="$FD" 2>/dev/null || true)" = no ] || { K delete -f "$T/frontdoor-rbac.json" >/dev/null 2>&1; fail "the front door can $chk in portcullis-ingress"; }
+done
 K delete -f "$T/frontdoor-rbac.json" >/dev/null
-pass "the front door: get / update of frontdoor-acme and frontdoor-cert only (no list, no other Secret); the Hub and Traefik read neither"
+pass "the front door: get / update of frontdoor-acme and frontdoor-cert only (no list, no other Secret); the Hub and Traefik read neither; in portcullis-ingress only get / update of traefik-default-cert (no Traefik configuration source)"
 
 # ── revocation within 10 s ──
 SER="$(cat "$T/../e2e-k3s-serial" 2>/dev/null || true)"

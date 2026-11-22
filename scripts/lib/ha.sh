@@ -2948,18 +2948,20 @@ _ha_frontdoor_cert_seed() {
 }
 
 # ha_default_cert_sync — before every HA release (_rtk_up; Task 31 fix
-# round 2, M3): the ingress namespace's Secret traefik-default-cert, key
-# default-cert.yml = Traefik's default TLS store holding frontdoor-cert's
-# served pair inline (the document domains/frontdoor/defaultcert.go
-# writes; the chart projects it into Traefik's watched directory, not
-# optional). So a (re)starting Traefik serves the main domain's
-# certificate from its first handshake, for no SNI and an unknown SNI too,
-# never its own self-signed one. Only a pair whose leaf names exactly <d>
-# and *.<d>, unexpired, with its key, is written; else an existing
-# document is kept (warned), and with none the release is refused (a
-# Traefik pod couldn't start). traefik/dynamic may not define a TLS store
-# in HA (the file provider keeps the first of a name). The key travels in
-# memory and on pipes only (kubectl → jq → kubectl; openssl reads stdin).
+# round 2, M3): the ingress namespace's Secret traefik-default-cert, type
+# kubernetes.io/tls, exactly tls.crt and tls.key = frontdoor-cert's served
+# pair. The chart projects it into Traefik's watched directory as
+# default-cert/*.crt|key (never read as configuration) beside its own
+# 00-default-cert.yml that makes it the default store (security review:
+# the pair's writers never write Traefik configuration). So a (re)starting
+# Traefik serves the main domain's certificate from its first handshake,
+# for no SNI and an unknown SNI too, never its own self-signed one. Only a
+# pair whose leaf names exactly <d> and *.<d>, unexpired, with its key, is
+# written; else an existing pair is kept (warned), and with none the
+# release is refused (a Traefik pod couldn't start). traefik/dynamic may
+# not define a TLS store in HA (the file provider keeps the first of a
+# name). The key travels in memory and on pipes only (kubectl → jq →
+# kubectl; openssl reads stdin).
 ha_default_cert_sync() {
   local ns ins="$KUBE_INGRESS_NS" src crt a b why="" have
   ns="$(kube_ns)"
@@ -2978,14 +2980,14 @@ ha_default_cert_sync() {
     [ -n "$a" ] && [ "$a" = "$b" ] || why="frontdoor-cert's served key isn't its certificate's"
   fi
   if [ -n "$why" ]; then
-    have="$(kube_ctl -n "$ins" get secret traefik-default-cert -o json 2>/dev/null | jq -r '.data["default-cert.yml"] // empty' 2>/dev/null)" || have=""
+    have="$(kube_ctl -n "$ins" get secret traefik-default-cert -o json 2>/dev/null | jq -r '.data["tls.crt"] // empty' 2>/dev/null)" || have=""
     [ -n "$have" ] || fail "Traefik would have no default certificate ($why; $ins/traefik-default-cert holds none either): nothing deployed. Check ./portcullis ha status and the front door's log (kubectl -n $ns logs deploy/frontdoor)"
     warn "Traefik's default certificate is kept as it is ($why)."
     return 0
   fi
-  printf '%s' "$src" | NS="$ins" jq -c '{apiVersion: "v1", kind: "Secret", type: "Opaque",
+  printf '%s' "$src" | NS="$ins" jq -c '{apiVersion: "v1", kind: "Secret", type: "kubernetes.io/tls",
       metadata: {name: "traefik-default-cert", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/owner": "core"}},
-      data: {"default-cert.yml": ({tls: {stores: {default: {defaultCertificate: {certFile: (.data["tls.crt"] | @base64d), keyFile: (.data["tls.key"] | @base64d)}}}}} | tojson | @base64)}}' \
+      data: {"tls.crt": .data["tls.crt"], "tls.key": .data["tls.key"]}}' \
     | _ha_apply || fail "could not write $ins/traefik-default-cert (Traefik's default certificate): nothing deployed"
 }
 

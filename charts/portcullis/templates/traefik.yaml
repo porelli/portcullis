@@ -133,19 +133,22 @@ search domain. */ -}}
 {{- $m := list }}{{- range $s.mounts }}{{- if ne .name "acme" }}{{- $m = append $m . }}{{- end }}{{- end }}
 {{- /* The default certificate (Task 31 fix round 2, M3; found live: a
 starting Traefik served its own self-signed default until the domains
-document arrived, and hostPort serves a pod that isn't Ready): the
-ingress namespace's Secret traefik-default-cert, key default-cert.yml (a
-dynamic document holding only tls.stores.default.defaultCertificate, the
-front door's served pair inline: domains/frontdoor/defaultcert.go), is
-one more file of the watched directory, 00-default-cert.yml (sorted
-first; the file provider keeps the first store of a name). So the main
-domain's certificate is served from the first handshake, for no SNI and
-an unknown SNI too, and a renewed pair reloads on its own. Not optional:
-without the key the pod doesn't start (Traefik v3.7.17 would otherwise
-keep a nil default certificate and dereference it). The CLI writes it
-before every HA release (ha.sh ha_default_cert_sync), the front door
-keeps it current. */}}
-{{- $v := list }}{{- range $s.volumes }}{{- if ne .name "acme" }}{{- if eq .name "dynamic" }}{{- $d := deepCopy . }}{{- $_ := set $d.projected "sources" (append $d.projected.sources (dict "secret" (dict "name" "traefik-default-cert" "items" (list (dict "key" "default-cert.yml" "path" "00-default-cert.yml" "mode" 288))))) }}{{- $v = append $v $d }}{{- else }}{{- $v = append $v . }}{{- end }}{{- end }}{{- end }}
+document arrived, and hostPort serves a pod that isn't Ready). Security
+review: the Secret holds only the pair — the ingress namespace's
+traefik-default-cert, type kubernetes.io/tls, tls.crt and tls.key (the
+front door may update just those, portcullis-ingress-default-cert) —
+projected into the watched directory's subdirectory default-cert/ as
+.crt / .key files, which the file provider never reads as configuration
+(Traefik v3.7.17 isFileSupported: .yml / .yaml / .toml only). The
+document that makes it the default store is the chart's own,
+traefik-dynamic's 00-default-cert.yml (traefik-file-middlewares.yaml,
+sorted first: the file provider keeps the first store of a name). A
+renewed pair swaps the projected volume (one atomic ..data swap at its
+root), so the watch reloads it. Not optional: without the pair the pod
+doesn't start (Traefik v3.7.17 would keep a nil default certificate and
+dereference it). The CLI writes it before every HA release
+(ha.sh ha_default_cert_sync), the front door keeps it current. */}}
+{{- $v := list }}{{- range $s.volumes }}{{- if ne .name "acme" }}{{- if eq .name "dynamic" }}{{- $d := deepCopy . }}{{- $_ := set $d.projected "sources" (append $d.projected.sources (dict "secret" (dict "name" "traefik-default-cert" "items" (list (dict "key" "tls.crt" "path" "default-cert/tls.crt" "mode" 288) (dict "key" "tls.key" "path" "default-cert/tls.key" "mode" 288))))) }}{{- $v = append $v $d }}{{- else }}{{- $v = append $v . }}{{- end }}{{- end }}{{- end }}
 {{- $_ := set $s "env" $env }}
 {{- $_ = set $s "ports" $ports }}
 {{- $_ = set $s "mounts" $m }}

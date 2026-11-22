@@ -2,13 +2,15 @@
 # e2e-k3s "Traefik's default certificate" (Task 31 fix round 2, M3; found
 # live: a starting HA Traefik served its own self-signed default until the
 # domains document arrived, and hostPort sends traffic to a pod that isn't
-# Ready). The HA Traefik's default TLS store is the ingress namespace's
-# Secret traefik-default-cert (default-cert.yml), projected into its
-# watched directory as 00-default-cert.yml. This runs the HA chart's own
-# Traefik shape — the image, the pod and container security contexts and
-# that projection exactly as rendered (the live DaemonSet's when the
-# cluster runs HA, else `helm template` with ha.enabled) — in a scratch
-# namespace, with the document written by the CLI's own
+# Ready). The HA Traefik's default TLS store is the chart's own document
+# (traefik-dynamic's 00-default-cert.yml) naming the ingress namespace's
+# kubernetes.io/tls Secret traefik-default-cert, projected into the watched
+# directory as default-cert/tls.crt|tls.key (security review: the pair's
+# writers never write configuration). This runs the HA chart's own
+# Traefik shape — the image, the pod and container security contexts,
+# that projection and that document exactly as rendered (the live objects
+# when the cluster runs HA, else `helm template` with ha.enabled) — in a
+# scratch namespace, with the pair written by the CLI's own
 # ha_default_cert_sync from a frontdoor-cert holding a test pair of the
 # main domain, and no domains provider at all (the worst case: its first
 # answer never comes). A test router (Host(e2e-router.<d>), the stand-in
@@ -19,9 +21,9 @@
 #     ever serves Traefik's self-signed default;
 #   - the same after a restart (the pod deleted and created again);
 #   - a renewed pair (frontdoor-cert changed, ha_default_cert_sync again)
-#     is served without a restart (the file provider's watch);
-#   - the control: the same pod without the projection serves Traefik's
-#     self-signed default (so the check can tell them apart).
+#     is served without a restart (the projection's swap fires the watch);
+#   - the control: the same pod without the document and the pair serves
+#     Traefik's self-signed default (so the check can tell them apart).
 #   bash .github/ci/e2e-k3s-default-cert.sh [<context>]   (default ci)
 set -euo pipefail
 CTX="${1:-ci}"
@@ -52,18 +54,26 @@ done
 serial() { openssl x509 -noout -serial -in "$1" | cut -d= -f2; }
 S1="$(serial "$T/p1.crt")" S2="$(serial "$T/p2.crt")"
 
-# The chart's HA Traefik pod template: the live DaemonSet's, else rendered.
+# The chart's HA Traefik pod template and traefik-dynamic: the live
+# objects, else rendered.
 if K -n portcullis-ingress get daemonset traefik -o json > "$T/ds.json" 2>/dev/null; then
-  src="the live HA DaemonSet"
+  K -n portcullis-ingress get configmap traefik-dynamic -o json > "$T/td.json"
+  src="the live HA DaemonSet and traefik-dynamic"
 else
   [ -s secrets/kube/values.yaml ] || fail "no secrets/kube/values.yaml to render the chart with"
-  helm template portcullis charts/portcullis -n portcullis -f secrets/kube/values.yaml --set ha.enabled=true --show-only templates/traefik.yaml \
-    | K create --dry-run=client -o json -f - | jq '(.items // [.])[] | select(.kind == "DaemonSet")' > "$T/ds.json"
+  helm template portcullis charts/portcullis -n portcullis -f secrets/kube/values.yaml --set ha.enabled=true \
+    --show-only templates/traefik.yaml --show-only templates/traefik-file-middlewares.yaml | K create --dry-run=client -o json -f - > "$T/r.json"
+  jq '(.items // [.])[] | select(.kind == "DaemonSet")' "$T/r.json" > "$T/ds.json"
+  jq '(.items // [.])[] | select(.kind == "ConfigMap" and .metadata.name == "traefik-dynamic")' "$T/r.json" > "$T/td.json"
   src="the HA chart (helm template, ha.enabled)"
 fi
 jq -e '.spec.template.spec.volumes[] | select(.name == "dynamic") | .projected.sources[] | select(.secret.name == "traefik-default-cert")' "$T/ds.json" > "$T/proj.json" \
   || fail "the HA Traefik ($src) doesn't project traefik-default-cert"
-pass "the HA Traefik's shape from $src: $(jq -c . "$T/proj.json")"
+jq -e '.secret.items == [{key: "tls.crt", path: "default-cert/tls.crt", mode: 288}, {key: "tls.key", path: "default-cert/tls.key", mode: 288}] and (.secret.optional | not)' "$T/proj.json" >/dev/null \
+  || fail "the HA Traefik ($src) projects traefik-default-cert as $(jq -c . "$T/proj.json"), not exactly its pair as default-cert/*"
+jq -r '.data["00-default-cert.yml"] // empty' "$T/td.json" > "$T/doc.yml"
+grep -q 'certFile: /etc/traefik/dynamic/default-cert/tls.crt' "$T/doc.yml" || fail "traefik-dynamic ($src) has no default store document"
+pass "the HA Traefik's shape from $src: $(jq -c . "$T/proj.json") + the chart's 00-default-cert.yml"
 
 K create namespace "$SNS" >/dev/null
 # The CLI writes the document from frontdoor-cert (its own function, the
@@ -76,9 +86,10 @@ put_pair() {
     || fail "ha_default_cert_sync refused pair $1"
 }
 put_pair 1
-K -n "$SNS" get secret traefik-default-cert -o json | jq -e '.data["default-cert.yml"] | @base64d | fromjson | .tls.stores.default.defaultCertificate | (.certFile | startswith("-----BEGIN CERTIFICATE")) and (.keyFile | test("PRIVATE KEY"))' >/dev/null \
-  || fail "traefik-default-cert's document isn't the default store holding the pair"
-pass "ha_default_cert_sync wrote the default store's document (the pair inline)"
+K -n "$SNS" get secret traefik-default-cert -o json | jq -e --rawfile c "$T/p1.crt" '.type == "kubernetes.io/tls" and (.data | keys) == ["tls.crt", "tls.key"] and (.data["tls.crt"] | @base64d) == $c' >/dev/null \
+  || fail "traefik-default-cert isn't a kubernetes.io/tls Secret of exactly the pair"
+pass "ha_default_cert_sync wrote traefik-default-cert: kubernetes.io/tls, exactly tls.crt and tls.key"
+K -n "$SNS" create configmap e2e-default-cert-doc --from-file=00-default-cert.yml="$T/doc.yml" >/dev/null
 K -n "$SNS" create configmap e2e-routes --from-literal=routes.yml="http:
   routers:
     e2e-router:
@@ -99,7 +110,7 @@ pod() { # pod <with projection: true|false>
          env: ([$c.env[] | select(.name | test("^TRAEFIK_(ENTRYPOINTS_(WEBSECURE|TRAEFIK)_ADDRESS|PING|LOG_LEVEL|PROVIDERS_FILE_(DIRECTORY|WATCH))$"))]),
          ports: [{containerPort: 8443}], resources: {limits: {memory: "256Mi"}, requests: {memory: "128Mi"}},
          volumeMounts: [{name: "dynamic", mountPath: "/etc/traefik/dynamic", readOnly: true}, {name: "tmp", mountPath: "/tmp"}]}],
-       volumes: [{name: "dynamic", projected: {sources: ([{configMap: {name: "e2e-routes"}}] + (if $with then $proj else [] end))}},
+       volumes: [{name: "dynamic", projected: {sources: ([{configMap: {name: "e2e-routes"}}] + (if $with then [{configMap: {name: "e2e-default-cert-doc"}}] + $proj else [] end))}},
          {name: "tmp", emptyDir: {medium: "Memory"}}]}}' "$T/ds.json"
 }
 # watch <label> <with: true|false> <want CN / serial> — create the pod,
@@ -129,7 +140,7 @@ watch() {
   [ "$ok" = "$seen" ] || { cat "$T/$label.log"; fail "$label: $((seen - ok)) of $seen handshakes didn't serve $want (first: $(head -1 "$T/$label.log"))"; }
   pass "$label: every one of $seen handshakes from the first ($(head -1 "$T/$label.log" | cut -d' ' -f1), no SNI and an unknown SNI) served $want"
 }
-watch "control (no projection)" false "TRAEFIK DEFAULT CERT"
+watch "control (no document, no pair)" false "TRAEFIK DEFAULT CERT"
 watch "first start" true "serial=$S1"
 watch "restart" true "serial=$S1"
 # A renewed pair: written by the CLI's function; the running Traefik serves
@@ -143,4 +154,4 @@ for _ in $(seq 1 90); do
 done
 kill "$PF" 2>/dev/null || true; wait "$PF" 2>/dev/null || true; PF=""
 [ "$got" = "$S2" ] || fail "renewal: the running Traefik still serves $got, not the renewed $S2"
-pass "renewal: the running Traefik serves the renewed pair without a restart (the file provider's watch)"
+pass "renewal: the running Traefik serves the renewed pair without a restart (the projection's swap fires the file provider's watch)"

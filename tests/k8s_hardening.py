@@ -293,15 +293,17 @@ def check_frontdoor():
             F.add(f"{name}: mounts frontdoor-acme (the front door's ACME account key)")
         if "frontdoor-cert" in secrets and name != "domains":
             F.add(f"{name}: mounts frontdoor-cert (only the domains service serves it)")
-        # The default certificate (M3): only the HA Traefik, projected into
-        # its watched directory as 00-default-cert.yml (sorted first), 0440,
-        # never optional (without it Traefik v3.7.17 keeps a nil default).
+        # The default certificate (M3): only the HA Traefik, its pair projected
+        # into its watched directory as default-cert/*.crt|key (never read as
+        # configuration), 0440, never optional (without it Traefik v3.7.17
+        # keeps a nil default); the chart's own traefik-dynamic carries the
+        # store document (checked below).
         if "traefik-default-cert" in secrets:
             srcs = [src for v in spec.get("volumes", []) if v["name"] == "dynamic" for src in v.get("projected", {}).get("sources", [])
                     if src.get("secret", {}).get("name") == "traefik-default-cert"]
             if name != "traefik" or ns != "portcullis-ingress" or srcs != [{"secret": {"name": "traefik-default-cert",
-                    "items": [{"key": "default-cert.yml", "path": "00-default-cert.yml", "mode": 288}]}}]:
-                F.add(f"{name} ({ns}): traefik-default-cert only as the HA Traefik's dynamic source default-cert.yml → 00-default-cert.yml, 0440, not optional")
+                    "items": [{"key": "tls.crt", "path": "default-cert/tls.crt", "mode": 288}, {"key": "tls.key", "path": "default-cert/tls.key", "mode": 288}]}}]:
+                F.add(f"{name} ({ns}): traefik-default-cert only as the HA Traefik's dynamic source tls.crt / tls.key → default-cert/*, 0440, not optional")
         if name == "traefik" and ns == "portcullis-ingress" and "traefik-default-cert" not in secrets:
             F.add("ha: the Traefik DaemonSet doesn't project traefik-default-cert (its default certificate)")
         if name == "domains":
@@ -312,6 +314,18 @@ def check_frontdoor():
             if vol and (not mnt.get(vol["name"], {}).get("readOnly")
                         or sorted(i["key"] for i in vol["secret"].get("items", [])) != ["tls.crt", "tls.key"]):
                 F.add("ha: domains must mount frontdoor-cert read-only, tls.crt and tls.key only")
+    # The default store's document: the chart's, in HA only, naming exactly
+    # the projected pair's files; the Secret is the CLI's, never rendered.
+    want_doc = {"tls": {"stores": {"default": {"defaultCertificate": {"certFile": "/etc/traefik/dynamic/default-cert/tls.crt",
+                                                                       "keyFile": "/etc/traefik/dynamic/default-cert/tls.key"}}}}}
+    td = [d for d in docs if d.get("kind") == "ConfigMap" and d["metadata"]["name"] == "traefik-dynamic"]
+    if len(td) != 1 or td[0]["metadata"].get("namespace") != "portcullis-ingress" \
+            or yaml.safe_load(td[0]["data"].get("00-default-cert.yml", "") or "null") != want_doc:
+        F.add(f"ha: traefik-dynamic's 00-default-cert.yml must be exactly {want_doc}")
+    if [d for d in K.render() if d.get("kind") == "ConfigMap" and "00-default-cert.yml" in (d.get("data") or {})]:
+        F.add("the default certificate document renders without ha.enabled")
+    if [d for d in docs if d.get("kind") == "Secret" and d["metadata"]["name"] == "traefik-default-cert"]:
+        F.add("ha: traefik-default-cert is rendered (the CLI creates it, the chart never)")
     for sec in ("frontdoor-acme", "frontdoor-cert"):
         objs = [d for d in docs if d.get("kind") == "Secret" and d["metadata"]["name"] == sec]
         if len(objs) != 1 or objs[0]["metadata"].get("annotations", {}).get("helm.sh/resource-policy") != "keep" or objs[0].get("data"):
@@ -1349,6 +1363,78 @@ def secret_access(docs):
     return out
 
 
+WRITE_VERBS = {"create", "update", "patch", "delete", "deletecollection", "*"}
+# Task 31 fix round 2 (security review): who may write a Traefik
+# configuration source — the ConfigMaps / Secrets of the ingress namespace
+# (the HA Traefik's file provider, its certificate files) or any traefik.io
+# object (its CRD provider). (subject, where, what) → the resourceNames it
+# may be limited to (None = any) and why. Everything else bound in the
+# chart, the storage manifests or the HA installs is a finding.
+TRAEFIK_CONFIG_WRITERS = {
+    (f"{K.NS}/frontdoor", "portcullis-ingress", "secrets"): (
+        {"traefik-default-cert"}, "the front door's served pair only; admission portcullis-ingress-default-cert holds it to a kubernetes.io/tls "
+        "update of exactly tls.crt / tls.key, projected as .crt / .key files the file provider never reads as configuration"),
+    (f"{K.NS}/portcullis-hub", K.EDGE_NS, "traefik.io"): (
+        None, "the apps' IngressRoutes / Middlewares in the edge namespace, judged by portcullis-edge-routes"),
+}
+
+
+def traefik_config_writers(docs):
+    """{(subject, where, what): resourceNames or None} — every write grant on
+    a Traefik configuration source (what: configmaps / secrets in the ingress
+    namespace, or traefik.io anywhere; where: the namespace or "*")."""
+    roles = {(d["kind"], d["metadata"].get("namespace", ""), d["metadata"]["name"]): d
+             for d in docs if d.get("kind") in ("Role", "ClusterRole")}
+    out = {}
+    for b in docs:
+        if b.get("kind") not in ("RoleBinding", "ClusterRoleBinding"):
+            continue
+        ref = b["roleRef"]
+        bns = b["metadata"].get("namespace", "")
+        role = roles.get((ref["kind"], bns if ref["kind"] == "Role" else "", ref["name"]))
+        if role is None:
+            continue
+        where = bns if b["kind"] == "RoleBinding" else "*"
+        for r in role.get("rules", []):
+            if not set(r.get("verbs", [])) & WRITE_VERBS:
+                continue
+            groups, res = set(r.get("apiGroups", [])), set(r.get("resources", []))
+            hits = []
+            if groups & {"", "*"} and where in ("*", "portcullis-ingress"):
+                hits += [x for x in ("configmaps", "secrets") if x in res or "*" in res]
+            if groups & {"traefik.io", "traefik.containo.us", "*"}:
+                hits.append("traefik.io")
+            for what in hits:
+                for sub in b.get("subjects", []):
+                    key = f"{sub.get('namespace', bns)}/{sub['name']}" if sub["kind"] == "ServiceAccount" else f"{sub['kind']}:{sub['name']}"
+                    names = set(r["resourceNames"]) if r.get("resourceNames") else None
+                    k = (key, where, what)
+                    if k in out and (out[k] is None or names is None):
+                        out[k] = None
+                    else:
+                        out[k] = (out.get(k) or set()) | names if names is not None else None
+    return out
+
+
+def check_traefik_config_writers(docs):
+    # Mutation test: a Role granting a ConfigMap update in the ingress
+    # namespace, and a ClusterRole granting traefik.io writes, are found.
+    probe = [{"kind": "Role", "metadata": {"name": "x", "namespace": "portcullis-ingress"},
+              "rules": [{"apiGroups": [""], "resources": ["configmaps"], "verbs": ["update"]}]},
+             {"kind": "RoleBinding", "metadata": {"name": "x", "namespace": "portcullis-ingress"}, "roleRef": {"kind": "Role", "name": "x"},
+              "subjects": [{"kind": "ServiceAccount", "name": "evil", "namespace": "y"}]},
+             {"kind": "ClusterRole", "metadata": {"name": "z"}, "rules": [{"apiGroups": ["traefik.io"], "resources": ["middlewares"], "verbs": ["patch"]}]},
+             {"kind": "ClusterRoleBinding", "metadata": {"name": "z"}, "roleRef": {"kind": "ClusterRole", "name": "z"},
+              "subjects": [{"kind": "ServiceAccount", "name": "evil", "namespace": "y"}]}]
+    if set(traefik_config_writers(probe)) != {("y/evil", "portcullis-ingress", "configmaps"), ("y/evil", "*", "traefik.io")}:
+        F.add("traefik_config_writers misses a grant (mutation test)")
+    for k, names in sorted(traefik_config_writers(docs).items(), key=lambda x: x[0]):
+        ok = TRAEFIK_CONFIG_WRITERS.get(k)
+        if ok is None or (ok[0] is not None and (names is None or not names <= ok[0])):
+            F.add(f"ha: {k[0]} may write the Traefik configuration source {k[2]} in {k[1]}"
+                  f"{'' if names is None else ' ' + str(sorted(names))} (only the CLI may: see TRAEFIK_CONFIG_WRITERS)")
+
+
 def check_secret_access(docs, ha=False):
     got = secret_access(docs)
     want = SECRET_READERS_HA if ha else SECRET_READERS
@@ -1557,6 +1643,11 @@ def check_ha_infra():
     renders = {c: ha_render(c) for c in ("longhorn", "snapshotter", "fencing", "certmanager")}
     renders["snapshotter-crds"] = [d for d in yaml.safe_load_all((K.ROOT / "kube/ha/snapshotter/upstream/crds.yaml").read_text()) if d]
     renders["barman"] = barman_render()
+    # Task 31 fix round 2 (security review): nobody but the CLI writes a
+    # Traefik configuration source, the two reviewed grants aside.
+    check_traefik_config_writers(K.render({"ha": {"enabled": True}, "nodeadm": {"enabled": True, "image": "ghcr.io/porelli/portcullis-nodeadm@sha256:" + "4" * 64}})
+                                 + storage_docs() + [d for x in renders.values() for d in x]
+                                 + [d for d in yaml.safe_load_all((K.ROOT / "kube" / "ha" / "cnpg" / "rbac.yaml").read_text()) if d])
     for c, docs in renders.items():
         for p in ha_image_problems(c, docs):
             F.add(p)

@@ -30,6 +30,20 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: portcullis
 data:
+  {{- if .Values.ha.enabled }}
+  # HA (Task 31 fix round 2, M3): the default TLS store is the main
+  # domain's served pair, the Secret traefik-default-cert projected beside
+  # this file as default-cert/ (traefik.yaml). Chart-owned: the pair's
+  # writers (the CLI, the front door) never write configuration.
+  00-default-cert.yml: |
+    # Rendered by charts/portcullis (traefik-file-middlewares.yaml): do not edit.
+    tls:
+      stores:
+        default:
+          defaultCertificate:
+            certFile: /etc/traefik/dynamic/default-cert/tls.crt
+            keyFile: /etc/traefik/dynamic/default-cert/tls.key
+  {{- end }}
   kubernetes.yml: |
     # Rendered by charts/portcullis (traefik-file-middlewares.yaml): do not edit.
     http:

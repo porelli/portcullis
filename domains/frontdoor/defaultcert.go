@@ -2,11 +2,11 @@ package frontdoor
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -15,62 +15,26 @@ import (
 // The HA Traefik's default certificate (Task 31 fix round 2, M3; found
 // live: a starting Traefik served its own self-signed default until the
 // domains HTTP provider's first answer, because hostPort sends traffic to
-// a pod that isn't Ready yet). Traefik's file provider loads one more file
-// from its watched directory, DefaultCertKey of the Secret
-// DefaultCertSecret in the ingress namespace (projected by the chart as
-// 00-default-cert.yml, sorted first). It is a dynamic document whose
-// only content is tls.stores.default.defaultCertificate: the front door's
-// served pair inline. So a Traefik serves the main domain's certificate
-// from its first handshake, for no SNI and an unknown SNI too, and a
-// renewed pair is reloaded on its own (FILE_WATCH). Traefik v3.7.17,
-// pinned source: one provider owns the default store (two drop it,
-// pkg/server/aggregator.go); a default certificate that fails to load
-// leaves the store's default nil (pkg/tls/tlsmanager.go), which
-// GetDefaultCertificate then dereferences (pkg/tls/certificate_store.go)
-// — so only a pair the domains service would serve is ever written, and
-// the chart's projection is not optional (no key = no pod).
-const (
-	DefaultCertSecret = "traefik-default-cert"
-	DefaultCertKey    = "default-cert.yml"
-)
+// a pod that isn't Ready yet). The ingress namespace's Secret
+// DefaultCertSecret, type kubernetes.io/tls, holds only the served pair
+// (tls.crt, tls.key): the chart projects it into Traefik's watched
+// directory as default-cert/*.crt|key, which the file provider never reads
+// as configuration, beside the chart's own 00-default-cert.yml that names
+// those files as the default store's certificate (security review: the
+// front door writes a certificate, never Traefik configuration; admission
+// portcullis-ingress-default-cert holds it to updates of exactly those two
+// keys). So a Traefik serves the main domain's certificate from its first
+// handshake, for no SNI and an unknown SNI too, and a renewed pair reloads
+// on its own (the projection's swap fires the watch). Traefik v3.7.17,
+// pinned source: a default certificate that fails to load leaves the
+// store's default nil (pkg/tls/tlsmanager.go), which GetDefaultCertificate
+// then dereferences (pkg/tls/certificate_store.go) — so only a pair the
+// domains service would serve is ever written.
+const DefaultCertSecret = "traefik-default-cert"
 
-type defaultCertDoc struct {
-	TLS struct {
-		Stores map[string]defaultCertStore `json:"stores"`
-	} `json:"tls"`
-}
-
-type defaultCertStore struct {
-	DefaultCertificate defaultCertPair `json:"defaultCertificate"`
-}
-
-type defaultCertPair struct {
-	CertFile string `json:"certFile"`
-	KeyFile  string `json:"keyFile"`
-}
-
-// DefaultCertDoc is the file-provider document for chainPEM / keyPEM
-// (JSON, which Traefik's .yml decoder reads as YAML).
-func DefaultCertDoc(chainPEM, keyPEM string) ([]byte, error) {
-	var d defaultCertDoc
-	d.TLS.Stores = map[string]defaultCertStore{"default": {DefaultCertificate: defaultCertPair{CertFile: chainPEM, KeyFile: keyPEM}}}
-	return json.Marshal(d)
-}
-
-// defaultCertOf is the pair a document holds ("", "" when it holds none
-// or doesn't decode).
-func defaultCertOf(doc []byte) (string, string) {
-	var d defaultCertDoc
-	if json.Unmarshal(doc, &d) != nil {
-		return "", ""
-	}
-	p := d.TLS.Stores["default"].DefaultCertificate
-	return p.CertFile, p.KeyFile
-}
-
-// DefaultCertMirror keeps DefaultCertSecret's document equal to the
-// served pair of frontdoor-cert (leader only; the CLI seeds it before an
-// HA release, ha.sh ha_default_cert_sync).
+// DefaultCertMirror keeps DefaultCertSecret's pair equal to the served
+// pair of frontdoor-cert (leader only; the CLI creates it before an HA
+// release, ha.sh ha_default_cert_sync).
 type DefaultCertMirror struct {
 	Client kubernetes.Interface
 	// Namespace is the ingress namespace (the Secret's).
@@ -91,7 +55,8 @@ var ErrNoDefaultCertSecret = errors.New("the Secret " + DefaultCertSecret + " do
 // Sync writes the served pair into the Secret when it differs and the
 // domains service would serve it; it reports whether it wrote. A pair
 // that isn't servable is never written (the Secret keeps the last good
-// one), said once per reason. No key material is ever logged.
+// one), said once per reason; a Secret of another type is refused (the
+// CLI recreates it). No key material is ever logged.
 func (m *DefaultCertMirror) Sync(ctx context.Context) (bool, error) {
 	if m.Fence == nil || !m.Fence.Leading() {
 		return false, nil
@@ -119,23 +84,21 @@ func (m *DefaultCertMirror) Sync(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("reading %s/%s: %w", m.Namespace, DefaultCertSecret, err)
 	}
-	if c, k := defaultCertOf(sec.Data[DefaultCertKey]); c == served.ChainPEM && k == served.KeyPEM {
-		return false, nil
+	if sec.Type != corev1.SecretTypeTLS {
+		return false, fmt.Errorf("%s/%s is of type %q, not %s (./portcullis up recreates it)", m.Namespace, DefaultCertSecret, sec.Type, corev1.SecretTypeTLS)
 	}
-	doc, err := DefaultCertDoc(served.ChainPEM, served.KeyPEM)
-	if err != nil {
-		return false, err
+	if len(sec.Data) == 2 && string(sec.Data[corev1.TLSCertKey]) == served.ChainPEM && string(sec.Data[corev1.TLSPrivateKeyKey]) == served.KeyPEM {
+		return false, nil
 	}
 	wctx, cancel, err := m.Fence.WriteContext(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer cancel()
-	if sec.Data == nil {
-		sec.Data = map[string][]byte{}
-	}
-	sec.Data[DefaultCertKey] = doc
-	// The read's resourceVersion: a concurrent writer makes it fail.
+	// Exactly the pair (anything else in the Secret is dropped). The read's
+	// resourceVersion: a concurrent writer makes it fail.
+	sec.Data = map[string][]byte{corev1.TLSCertKey: []byte(served.ChainPEM), corev1.TLSPrivateKeyKey: []byte(served.KeyPEM)}
+	sec.StringData = nil
 	if _, err := m.Client.CoreV1().Secrets(m.Namespace).Update(wctx, sec, metav1.UpdateOptions{}); err != nil {
 		return false, fmt.Errorf("writing %s/%s: %w", m.Namespace, DefaultCertSecret, err)
 	}
