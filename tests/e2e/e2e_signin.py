@@ -2907,8 +2907,10 @@ def main() -> int:
                     other.click("#x")
                 assert other.locator("#pc-sign-out-confirm").count() == 1, body(other)[:200]
                 other.close()
-                code, _ = raw_request(f"echo-std.{DOMAIN}", "/", f"_oauth2_proxy={old}")
-                assert code == 200 and mine <= session_ids("alice"), f"after the cross-site GET: HTTP {code}"
+                # (oauth2-proxy's own check: alice's certificate session meets
+                # the apps' templates only with her certificate presented.)
+                code, _ = raw_request(f"auth.{DOMAIN}", "/oauth2/auth", f"_oauth2_proxy={old}")
+                assert code == 202 and mine <= session_ids("alice"), f"after the cross-site GET: HTTP {code}"
                 goto(page, PEOPLE + "/signin")
                 page.wait_for_selector("#site-nav #pn-sign-out", timeout=TIMEOUT_MS)
                 until("the Sign-in page's bar names alice", lambda: "alice" in page.locator("#site-nav").inner_text(), 20, 1)
@@ -2917,9 +2919,11 @@ def main() -> int:
                 page.wait_for_url(PORTAL + "signed-out", timeout=TIMEOUT_MS)
                 assert page.locator("#pc-signed-out").count() == 1, body(page)[:200]
                 base.shot(page, "sign-out-signed-out")
+                code, _ = raw_request(f"auth.{DOMAIN}", "/oauth2/auth", f"_oauth2_proxy={old}")
+                print(f"    the old _oauth2_proxy cookie at /oauth2/auth after Sign out: HTTP {code}", flush=True)
+                assert code == 401, f"the old cookie after Sign out: HTTP {code}"
                 code, _ = raw_request(f"echo-std.{DOMAIN}", "/", f"_oauth2_proxy={old}")
-                print(f"    the old _oauth2_proxy cookie after Sign out: HTTP {code}", flush=True)
-                assert code in (302, 401, 403), f"the old cookie after Sign out: HTTP {code}"
+                assert code == 302, f"the next request to echo-std with the old cookie: HTTP {code} (want the sign-in redirect)"
                 until("alice's Keycloak session gone", lambda: not (mine & session_ids("alice")), 20, every=2)
                 assert not [c for c in ctx.cookies(AUTH) if c["name"] == "_oauth2_proxy" and c["value"]], "cookie kept"
                 page.click("#pc-sign-in-again")
@@ -2928,7 +2932,7 @@ def main() -> int:
                 ctx.close()
         check("site_bar_sign_out: the portal's and the Sign-in page's site bar show alice and a POST Sign out; a "
               "cross-site link to /oauth2/sign_out gets the confirmation and ends nothing; Sign out lands on the "
-              "Signed out page, the old ticket isn't 200, alice's Keycloak session is gone, Sign in again signs in",
+              "Signed out page, the old ticket gets 401 at /oauth2/auth and echo-std redirects to sign-in, alice's Keycloak session is gone, Sign in again signs in",
               site_bar_sign_out)
 
         def imp_stop_elsewhere():
