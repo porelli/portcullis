@@ -5524,6 +5524,14 @@ case "$OUT" in *"warn	port 6443 answers on the public address 198.51.100.1"*"war
 echo '{"items":[{"metadata":{"namespace":"kube-system","name":"x"},"spec":{"clusterIP":"10.43.0.21"}},{"metadata":{"namespace":"portcullis","name":"traefik"},"spec":{"clusterIP":"10.43.0.20"}}]}' > "$KS/kube/svcs.json"
 OUT="$(kt 'kube_host_checks')"
 case "$OUT" in *"ok	PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 is free"*"fail	PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 is already taken by Service kube-system/x"*) t_pass "kube_host_checks: a fixed ClusterIP held by another Service → refused (ours is fine)" ;; *) t_fail "kube svc ip taken: $OUT" ;; esac
+# HA (found live, Task 31): Traefik's Services live in portcullis-ingress
+# at the same fixed ClusterIPs: ours there too; without HA they aren't.
+echo '{"items":[{"metadata":{"namespace":"portcullis-ingress","name":"traefik"},"spec":{"clusterIP":"10.43.0.20"}}]}' > "$KS/kube/svcs.json"
+OUT="$(kt 'export PORTCULLIS_HA=on; kube_host_checks')"
+case "$OUT" in *"ok	PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 is free"*) t_pass "kube_host_checks: in HA the ingress namespace's traefik holds its fixed ClusterIP (ours)" ;; *) t_fail "kube svc ip HA: $OUT" ;; esac
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 is already taken by Service portcullis-ingress/traefik"*) t_pass "kube_host_checks: without HA the ingress namespace's holder is refused" ;; *) t_fail "kube svc ip non-HA: $OUT" ;; esac
+echo '{"items":[{"metadata":{"namespace":"kube-system","name":"x"},"spec":{"clusterIP":"10.43.0.21"}},{"metadata":{"namespace":"portcullis","name":"traefik"},"spec":{"clusterIP":"10.43.0.20"}}]}' > "$KS/kube/svcs.json"
 OUT="$(kt 'PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.9.1; kube_host_checks')"
 case "$OUT" in *"fail	PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.9.1 is outside the service CIDR's static band (the first 256 addresses"*) t_pass "kube_host_checks: a fixed ClusterIP outside the static band → refused" ;; *) t_fail "kube band: $OUT" ;; esac
 k_fixtures

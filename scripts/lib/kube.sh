@@ -194,9 +194,9 @@ _kube_svc_ip_check() {
   if [ $((n - first)) -lt 1 ] || [ $((n - first)) -ge "$band" ]; then
     _rt_chk fail "$name=$ip is outside the service CIDR's static band (the first $band addresses of $cidr): a dynamic Service could take it"; return 0
   fi
-  holder="$(printf '%s' "$svcs" | jq -r --arg ip "$ip" --arg ns "$(kube_ns)" '
+  holder="$(printf '%s' "$svcs" | jq -r --arg ip "$ip" --arg ns "$(kube_ns)" --arg ins "$(! kube_ha_on || echo "$KUBE_INGRESS_NS")" '
       [.items[] | select(.spec.clusterIP == $ip or ((.spec.clusterIPs // []) | index($ip)))
-       | select((.metadata.namespace == $ns) | not) | "\(.metadata.namespace)/\(.metadata.name)"] | join(", ")' 2>/dev/null)"
+       | select((.metadata.namespace == $ns or .metadata.namespace == $ins) | not) | "\(.metadata.namespace)/\(.metadata.name)"] | join(", ")' 2>/dev/null)"
   if [ -n "$holder" ]; then
     _rt_chk fail "$name=$ip is already taken by Service $holder"
   else
