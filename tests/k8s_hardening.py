@@ -1161,6 +1161,11 @@ def check_ingress_allowlists(docs):
                 ex = c.get(pr, {}).get("exec")
                 if ex is not None and ex.get("command") != ["traefik", "healthcheck", "--ping"]:
                     F.add(f"traefik: {pr} exec {ex} (only traefik healthcheck --ping)")
+            # Task 31 fix round 1, M3: the HA Traefik is Ready only once it
+            # serves the main certificate (the domains document's
+            # /portcullis-main-cert route on its :8080 entrypoint).
+            if in_ingress and c.get("readinessProbe", {}).get("httpGet") != {"path": "/portcullis-main-cert", "port": 8080}:
+                F.add(f"traefik in portcullis-ingress: readiness {c.get('readinessProbe')} (want httpGet /portcullis-main-cert :8080)")
             for hk, h in c.get("lifecycle", {}).items():
                 if set(h) - {"sleep"}:
                     F.add(f"traefik: lifecycle {hk} {h} (sleep only)")

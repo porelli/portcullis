@@ -21,7 +21,34 @@ import (
 
 type dynamicDoc struct {
 	TLS dynamicTLS `json:"tls"`
+	// HTTP carries, in HA only, the readiness route of the main
+	// certificate (MainCertReadyPath): present exactly when the main
+	// domain's certificate is in the same document.
+	HTTP *dynamicHTTP `json:"http,omitempty"`
 }
+
+type dynamicHTTP struct {
+	Routers map[string]dynamicRouter `json:"routers"`
+}
+
+type dynamicRouter struct {
+	EntryPoints []string `json:"entryPoints"`
+	Rule        string   `json:"rule"`
+	Service     string   `json:"service"`
+}
+
+// MainCertReadyPath is the HA Traefik's readiness route (Task 31 fix round
+// 1, M3): Traefik's own ping service on its internal entrypoint "traefik"
+// (:8080), routed only by a document that also carries the main domain's
+// certificate. Traefik loads one provider document at a time, so the route
+// answers 200 only once the main certificate is loaded: until then the pod
+// isn't Ready (no default certificate behind a Ready ingress, and the
+// front door publishes only Ready ingress nodes). The chart's HA readiness
+// probe asks this path.
+const MainCertReadyPath = "/portcullis-main-cert"
+
+// MainCertReadyRouter is that route's router name.
+const MainCertReadyRouter = "portcullis-main-cert-ready"
 
 type dynamicTLS struct {
 	Certificates []dynamicCert `json:"certificates"`
@@ -126,6 +153,8 @@ func buildDynamic(domains map[string]*Domain, mc *mainCert, main, mailHost strin
 			dropped = append(dropped, fmt.Sprintf("%s (the front door's): %v", main, err))
 		} else {
 			doc.TLS.Certificates = append(doc.TLS.Certificates, dynamicCert{CertFile: mc.CertPEM, KeyFile: mc.KeyPEM})
+			doc.HTTP = &dynamicHTTP{Routers: map[string]dynamicRouter{MainCertReadyRouter: {
+				EntryPoints: []string{"traefik"}, Rule: "Path(`" + MainCertReadyPath + "`)", Service: "ping@internal"}}}
 		}
 	}
 	names := make([]string, 0, len(domains))

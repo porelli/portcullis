@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -135,4 +137,36 @@ func pair(t *testing.T, sans []string, ips []net.IP, nb, na time.Time) [2]string
 	t.Helper()
 	c, k := mkCert(t, sans, ips, nb, na)
 	return [2]string{c, k}
+}
+
+// TestMainCertReadyRoute (Task 31 fix round 1, M3): the HA Traefik's
+// readiness route rides in the same document as the main certificate and
+// only with it: none without a front-door certificate, none when it isn't
+// servable, none without HA (no main certificate passed).
+func TestMainCertReadyRoute(t *testing.T) {
+	now := time.Now()
+	nb, na := now.Add(-time.Hour), now.Add(60*24*time.Hour)
+	good, gk := mkCert(t, []string{testMain, "*." + testMain}, nil, nb, na)
+	doc, _ := buildDynamic(nil, &mainCert{CertPEM: good, KeyPEM: gk}, testMain, "", now)
+	if doc.HTTP == nil || len(doc.HTTP.Routers) != 1 {
+		t.Fatalf("no readiness route with the main certificate: %+v", doc.HTTP)
+	}
+	r := doc.HTTP.Routers[MainCertReadyRouter]
+	if r.Rule != "Path(`/portcullis-main-cert`)" || r.Service != "ping@internal" || len(r.EntryPoints) != 1 || r.EntryPoints[0] != "traefik" {
+		t.Errorf("route %+v", r)
+	}
+	b, err := json.Marshal(doc)
+	if err != nil || !strings.Contains(string(b), `"http":{"routers":{"portcullis-main-cert-ready":{"entryPoints":["traefik"],"rule":"Path(`+"`/portcullis-main-cert`"+`)","service":"ping@internal"}}}`) {
+		t.Errorf("document %s (%v)", b, err)
+	}
+	expired := pair(t, []string{testMain, "*." + testMain}, nil, now.Add(-48*time.Hour), now.Add(-time.Hour))
+	for name, mc := range map[string]*mainCert{"none": nil, "expired": {CertPEM: expired[0], KeyPEM: expired[1]}} {
+		doc, _ := buildDynamic(nil, mc, testMain, "", now)
+		if doc.HTTP != nil {
+			t.Errorf("%s: a readiness route without a served main certificate", name)
+		}
+		if b, _ := json.Marshal(doc); strings.Contains(string(b), `"http"`) {
+			t.Errorf("%s: %s", name, b)
+		}
+	}
 }

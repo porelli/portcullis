@@ -44,9 +44,19 @@ initialDelaySeconds. A CMD-SHELL test runs as ["sh", "-c", <string>].
 {{- $cmd := $h.test -}}
 {{- $iv := int $h.interval -}}{{- $to := int $h.timeout -}}{{- $re := int $h.retries -}}
 readinessProbe:
+  {{- /* readyGet {path, port}: readiness is that httpGet instead of the
+  test (the HA Traefik: Task 31 fix round 1, M3); liveness and startup stay
+  the test. */}}
+  {{- if $h.readyGet }}
+  httpGet:
+    path: {{ $h.readyGet.path }}
+    port: {{ $h.readyGet.port }}
+  periodSeconds: 2
+  {{- else }}
   exec:
     command: {{ toJson $cmd }}
   periodSeconds: {{ $iv }}
+  {{- end }}
   timeoutSeconds: {{ $to }}
   failureThreshold: {{ $re }}
 livenessProbe:

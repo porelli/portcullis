@@ -12538,6 +12538,100 @@
   "ha": true
  },
  {
+  "name": "ha: the Traefik pod Ready only once it serves the main certificate (readiness httpGet /portcullis-main-cert :8080, Task 31 fix round 1)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "traefik-x7k2p",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/name": "traefik"
+    },
+    "ownerReferences": [
+     {
+      "apiVersion": "apps/v1",
+      "kind": "DaemonSet",
+      "name": "traefik",
+      "uid": "00000000-0000-4000-8000-000000000001",
+      "controller": true
+     }
+    ]
+   },
+   "spec": {
+    "serviceAccountName": "traefik",
+    "containers": [
+     {
+      "name": "traefik",
+      "image": "docker.io/library/traefik:v3.7.0@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "ports": [
+       {
+        "containerPort": 8443,
+        "hostPort": 443
+       },
+       {
+        "containerPort": 8000,
+        "hostPort": 80
+       }
+      ],
+      "securityContext": {
+       "runAsNonRoot": true,
+       "runAsUser": 65532,
+       "allowPrivilegeEscalation": false,
+       "readOnlyRootFilesystem": true,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "seccompProfile": {
+        "type": "RuntimeDefault"
+       }
+      },
+      "startupProbe": {
+       "exec": {
+        "command": [
+         "traefik",
+         "healthcheck",
+         "--ping"
+        ]
+       },
+       "periodSeconds": 10
+      },
+      "livenessProbe": {
+       "exec": {
+        "command": [
+         "traefik",
+         "healthcheck",
+         "--ping"
+        ]
+       },
+       "periodSeconds": 10
+      },
+      "readinessProbe": {
+       "httpGet": {
+        "path": "/portcullis-main-cert",
+        "port": 8080
+       },
+       "periodSeconds": 2
+      },
+      "lifecycle": {
+       "preStop": {
+        "sleep": {
+         "seconds": 5
+        }
+       }
+      }
+     }
+    ]
+   }
+  },
+  "as": "cli",
+  "want": "allow",
+  "reason_contains": "",
+  "ha": true
+ },
+ {
   "name": "ha: the Traefik DaemonSet with the chart's probes",
   "object": {
    "apiVersion": "apps/v1",

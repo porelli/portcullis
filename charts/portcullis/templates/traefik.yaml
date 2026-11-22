@@ -137,6 +137,15 @@ search domain. */ -}}
 {{- $_ = set $s "mounts" $m }}
 {{- $_ = set $s "volumes" $v }}
 {{- $_ = set $s "egress" false }}
+{{- /* Ready only once it serves the main domain's certificate (Task 31 fix
+round 1, M3; found live: a starting Traefik served its default certificate
+for 6-30 s): the domains service's document carries the route
+/portcullis-main-cert (Traefik's ping on its :8080 entrypoint) together with
+that certificate (domains/traefik.go MainCertReadyPath), so the probe
+passes only after the certificate is loaded. The DaemonSet's rollout waits
+for it, nodeadm reports the pod not Ready, and the front door publishes
+only Ready ingress nodes. */}}
+{{- $_ = set $s "health" (merge (dict "readyGet" (dict "path" "/portcullis-main-cert" "port" 8080)) $s.health) }}
 {{- $_ = set $s "namespace" .Values.ingressNamespace }}
 {{- $_ = set $s "daemonSet" (dict "nodeSelector" (dict "portcullis.io/ingress" "true")) }}
 {{- $_ = set $s "extraLabels" (dict "portcullis.io/ingress" "bound" "app.kubernetes.io/name" "traefik") }}
