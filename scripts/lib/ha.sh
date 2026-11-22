@@ -2617,11 +2617,16 @@ _ha_writers_stopped() {
 # portcullis.pvc renders it in HA) with Helm's ownership metadata, so the
 # release adopts it at the switch (helm v4.3.1 pkg/action/validate.go
 # checkOwnership: managed-by Helm, release name and namespace). Kept when
-# it exists.
+# it is bound; an unbound one (no data: a copy stopped before its volume
+# was provisioned, its WaitForFirstConsumer node maybe one without
+# Longhorn) is made again.
 _ha_replicated_pvc() {
-  local src ns
+  local src ns phase
   ns="$(kube_ns)"
-  kube_ctl -n "$ns" get pvc "$1-r" -o name >/dev/null 2>&1 && return 0
+  if phase="$(kube_ctl -n "$ns" get pvc "$1-r" -o jsonpath='{.status.phase}' 2>/dev/null)"; then
+    [ "$phase" != Bound ] || return 0
+    kube_ctl -n "$ns" delete pvc "$1-r" --wait=true --timeout=60s >/dev/null || { echo "can't remove the unbound PVC $1-r" >&2; return 1; }
+  fi
   src="$(kube_ctl -n "$ns" get pvc "$1" -o json 2>/dev/null)" || { echo "can't read the PVC $1" >&2; return 1; }
   printf '%s' "$src" | N="$1-r" NS="$ns" R="$KUBE_RELEASE" jq '{apiVersion: "v1", kind: "PersistentVolumeClaim",
       metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "Helm"},
@@ -2634,22 +2639,31 @@ _ha_replicated_pvc() {
 # _ha_copy_pod <pvc> <uid> <gid> <ro|rw> — a helper pod (the volume's
 # owner, the helper image, no network: _kube_helper_pod's shape) with
 # fsGroup <gid> (a fresh Longhorn volume's root is root's: the kubelet
-# gives it the group, as it does the chart's pods); its name.
+# gives it the group, as it does the chart's pods); its name. A <pvc>-r
+# (replicated) one runs where Longhorn does — the primary site's non-small
+# nodes, as the chart pins the core pods (found live: a fresh
+# WaitForFirstConsumer volume would be provisioned on whatever node the
+# pod lands on, a small node has no Longhorn); a local one goes where its
+# volume is (the small node too: a Vault voter's).
 _ha_copy_pod() {
   local name
   name="ha-copy-$(openssl rand -hex 4)"
-  N="$name" NS="$(kube_ns)" P="$1" U="$2" G="$3" RO="$4" IMG="$PORTCULLIS_HELPER_IMAGE" jq -n '
-    {apiVersion: "v1", kind: "Pod",
+  N="$name" NS="$(kube_ns)" P="$1" U="$2" G="$3" RO="$4" IMG="$PORTCULLIS_HELPER_IMAGE" SITE="$KUBE_PRIMARY_SITE" jq -n '
+    (env.P | endswith("-r")) as $rep
+    | {apiVersion: "v1", kind: "Pod",
      metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "volume-helper"}},
-     spec: {restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false,
+     spec: ({restartPolicy: "Never", priorityClassName: "portcullis-core", automountServiceAccountToken: false, enableServiceLinks: false,
        securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.G | tonumber), fsGroup: (env.G | tonumber),
-         fsGroupChangePolicy: "OnRootMismatch", seccompProfile: {type: "RuntimeDefault"}},
-       tolerations: [{key: "portcullis.io/small", operator: "Exists", effect: "NoSchedule"}],
+         fsGroupChangePolicy: "OnRootMismatch", seccompProfile: {type: "RuntimeDefault"}}}
+       + (if $rep then {affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions: [
+             {key: "portcullis.io/site", operator: "In", values: [env.SITE]}, {key: "portcullis.io/class", operator: "NotIn", values: ["small"]}]}]}}}}
+          else {tolerations: [{key: "portcullis.io/small", operator: "Exists", effect: "NoSchedule"}]} end)
+       + {
        containers: [{name: "helper", image: env.IMG, command: ["sleep", "3600"],
          resources: {limits: {memory: "256Mi"}, requests: {memory: "256Mi"}},
          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},
          volumeMounts: [{name: "tmp", mountPath: "/tmp"}, {name: "vol", mountPath: "/vol", readOnly: (env.RO == "ro")}]}],
-       volumes: [{name: "tmp", emptyDir: {medium: "Memory"}}, {name: "vol", persistentVolumeClaim: {claimName: env.P, readOnly: (env.RO == "ro")}}]}}' \
+       volumes: [{name: "tmp", emptyDir: {medium: "Memory"}}, {name: "vol", persistentVolumeClaim: {claimName: env.P, readOnly: (env.RO == "ro")}}]})}' \
     | kube_ctl create -f - >/dev/null || return 1
   if ! kube_ctl -n "$(kube_ns)" wait --for=condition=Ready "pod/$name" --timeout="${KUBE_POD_WAIT:-300}s" >/dev/null; then
     _kube_pod_diag "$name"; _kube_helper_done "$name"; return 1

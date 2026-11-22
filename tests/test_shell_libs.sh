@@ -8162,6 +8162,8 @@ case "$a" in
     [ -s "$HE/view.json" ] || { echo "the Hub isn't running" >&2; echo "command terminated with exit code 1" >&2; exit 1; }
     cat "$HE/view.json" ;;
   "get configmap portcullis-vault-shrink -o json") echo 'Error from server (NotFound): configmaps "portcullis-vault-shrink" not found' >&2; exit 1 ;;
+  "get pvc "*" -o jsonpath={.status.phase}") [ -e "$HE/k/pvc-$3" ] || { echo "Error from server (NotFound)" >&2; exit 1; }; [ -e "$HE/k/pending-$3" ] && echo Pending || echo Bound ;;
+  "delete pvc "*) rm -f "$HE/k/pvc-$3" "$HE/k/pending-$3"; echo "delete pvc $3" >> "$HE/order" ;;
   "get pvc "*" -o name") [ -e "$HE/k/pvc-$3" ] && echo "persistentvolumeclaim/$3" || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
   "get pvc "*" -o json") [ -e "$HE/k/pvc-$3" ] || exit 1
     echo '{"metadata":{"name":"'"$3"'","annotations":{"portcullis.io/uid":"10001","portcullis.io/gid":"10001","portcullis.io/mode":"0750","other":"x"}},"spec":{"resources":{"requests":{"storage":"1Gi"}}}}' ;;
@@ -8176,7 +8178,7 @@ case "$a" in
     case "$k" in
       Pod) c="$(printf '%s' "$j" | jq -r '.spec.volumes[] | select(.name == "vol") | .persistentVolumeClaim.claimName')"
         ro="$(printf '%s' "$j" | jq -r '.spec.volumes[] | select(.name == "vol") | .persistentVolumeClaim.readOnly')"
-        echo "$c" > "$HE/k/pod-$n"; echo "create pod $c ro=$ro" >> "$HE/order" ;;
+        echo "$c" > "$HE/k/pod-$n"; printf '%s' "$j" > "$HE/k/podjson-$c"; echo "create pod $c ro=$ro" >> "$HE/order" ;;
       PersistentVolumeClaim) printf '%s' "$j" > "$HE/k/pvc-$n"; echo "create pvc $n" >> "$HE/order" ;;
     esac ;;
   "wait --for=condition=Ready pod/"*) ;;
@@ -8320,6 +8322,14 @@ expect_eq "step 4: every helper pod removed" "$(grep -c '^create pod' "$HE/order
 expect_eq "step 4: the new PVCs: replicated class, the owner annotations, Helm's ownership" \
   "$(jq -c '[.spec.storageClassName, .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["meta.helm.sh/release-name"], .metadata.annotations["meta.helm.sh/release-namespace"], .metadata.annotations["portcullis.io/uid"], .metadata.annotations.other, .spec.resources.requests.storage]' "$HE/k/pvc-hub-state-r")" \
   '["portcullis-core-replicated","Helm","portcullis","portcullis","10001",null,"1Gi"]'
+expect_eq "step 4: the replicated side's helper runs where Longhorn does (main, not small), the local side's tolerates small" \
+  "$(jq -c '[.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions, .spec.tolerations]' "$HE/k/podjson-hub-state-r"):$(jq -c '[.spec.affinity, .spec.tolerations[0].key]' "$HE/k/podjson-hub-state")" \
+  '[[{"key":"portcullis.io/site","operator":"In","values":["main"]},{"key":"portcullis.io/class","operator":"NotIn","values":["small"]}],null]:[null,"portcullis.io/small"]'
+# A stopped copy left an unbound <pvc>-r (maybe on a node without Longhorn): made again; a bound one is kept.
+he_vols; echo '{}' > "$HE/k/pvc-hub-state-r"; touch "$HE/k/pending-hub-state-r" "$HE/k/pvc-wg-data-r"
+hacli "" "need_env; ha_enable_step_volumes; exit 0" status
+expect_eq "step 4: an unbound <pvc>-r is deleted and made again, a bound one kept" \
+  "$RC:$(grep -c '^delete pvc hub-state-r$' "$HE/order"):$(grep -c '^create pvc hub-state-r$' "$HE/order"):$(grep -c 'pvc wg-data-r$' "$HE/order")" "0:1:1:0"
 for fault in fault-tar fault-manifest; do
   he_vols; touch "$HE/$fault"
   hacli "" "need_env; ha_enable_step_volumes; exit 0" status
