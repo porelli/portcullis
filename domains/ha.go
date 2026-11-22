@@ -52,7 +52,10 @@ import (
 //   - a name followed for the first time gets the whole set in one step
 //     (ruling B); later, one change per name per 60 s: a removal first
 //     unless it would leave its type empty, then an addition;
-//   - only addresses this service wrote are ever removed (ruling M5): a
+//   - only addresses this service wrote are ever removed (ruling M5) —
+//     "ours" is derived from the authoritative record: the domain's
+//     RecordRefs, which every records step commits by EnrollID (haOurs;
+//     in HA the address set is written only by this follower) —: a
 //     foreign record at <d> stays, and so does the last address of a type;
 //     both are named once as a notice (the plan's address items, the log)
 //     and the set counts as converged with them (ruling I1: no records
@@ -293,7 +296,7 @@ func (s *Service) haDueLocked(d *Domain, now time.Time) bool {
 	for _, n := range haNames(d.Name) {
 		have, followed := d.HAAddrs[n]
 		if !followed || now.Sub(d.HAChanged[n]) >= frontdoor.ChangeEvery {
-			if len(haNext(n, have, s.ha.want(n, d.Name), d.HAOurs[n], !followed)) > 0 {
+			if len(haNext(n, have, s.ha.want(n, d.Name), haOurs(d, n), !followed)) > 0 {
 				return true
 			}
 		}
@@ -388,8 +391,9 @@ func (haFence) WriteContext(ctx context.Context) (context.Context, context.Cance
 }
 
 // haResult is one follower step: the records written and removed (for
-// DELETE's tracking) and each name's live set, last change and own
-// addresses afterwards. A result with nil maps (an early error: the set
+// DELETE's tracking; they are also what makes an address ours) and each
+// name's live set, last change and own addresses afterwards (ours: this
+// step's view only, never stored). A result with nil maps (an early error: the set
 // wasn't read) changes nothing that was stored.
 type haResult struct {
 	written, removed []RecordRef
@@ -415,7 +419,7 @@ func (s *Service) haStep(ctx context.Context, p dnsProvider, d *Domain, zone str
 	for _, n := range haNames(d.Name) {
 		res.addrs[n] = pub[n]
 		// Our own addresses still there (one removed by hand is no longer ours).
-		for _, a := range d.HAOurs[n] {
+		for _, a := range haOurs(d, n) {
 			if slices.Contains(pub[n], a) {
 				res.ours[n] = append(res.ours[n], a)
 			}
@@ -474,7 +478,7 @@ func (s *Service) haNoticesLocked(d *Domain) []string {
 	if s.haGood.OK {
 		for _, n := range haNames(d.Name) {
 			if have, ok := d.HAAddrs[n]; ok {
-				out = append(out, haResidual(n, have, s.haGood.want(n, d.Name), d.HAOurs[n])...)
+				out = append(out, haResidual(n, have, s.haGood.want(n, d.Name), haOurs(d, n))...)
 			}
 		}
 	}
@@ -489,7 +493,7 @@ func (s *Service) haLogNotices(name string) {
 	if d != nil && s.haGood.OK {
 		for _, n := range haNames(name) {
 			if have, ok := d.HAAddrs[n]; ok {
-				notes = append(notes, haResidual(n, have, s.haGood.want(n, name), d.HAOurs[n])...)
+				notes = append(notes, haResidual(n, have, s.haGood.want(n, name), haOurs(d, n))...)
 			}
 		}
 	}
@@ -586,5 +590,30 @@ func (s *Service) haAllowed(name string) map[string][]string {
 			out[n] = append(out[n], s.haGood.want(n, name)...)
 		}
 	}
+	return out
+}
+
+// haOurs are the A / AAAA values this service wrote at name n of d: the
+// domain's committed RecordRefs (every zone; a ref's name is relative to
+// its zone). In HA only the follower writes address records, so these are
+// its own (security review: never a separate cache that could miss one).
+func haOurs(d *Domain, n string) []string {
+	var out []string
+	want := strings.ToLower(strings.TrimSuffix(n, "."))
+	for zone, refs := range d.Records {
+		z := dns.Fqdn(zone)
+		for _, r := range refs {
+			if r.Type != "A" && r.Type != "AAAA" {
+				continue
+			}
+			if strings.ToLower(strings.TrimSuffix(libdns.AbsoluteName(r.Name, z), ".")) != want {
+				continue
+			}
+			if ip, err := netip.ParseAddr(r.Value); err == nil && !slices.Contains(out, ip.String()) {
+				out = append(out, ip.String())
+			}
+		}
+	}
+	sort.Strings(out)
 	return out
 }

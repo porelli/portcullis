@@ -512,10 +512,6 @@ func copyDomain(d *Domain) *Domain {
 		c.HAAddrs[n] = append([]string(nil), as...)
 	}
 	c.HAChanged = maps.Clone(d.HAChanged)
-	c.HAOurs = make(map[string][]string, len(d.HAOurs))
-	for n, as := range d.HAOurs {
-		c.HAOurs[n] = append([]string(nil), as...)
-	}
 	c.Records = make(map[string][]RecordRef, len(d.Records))
 	for z, refs := range d.Records {
 		c.Records[z] = append([]RecordRef(nil), refs...)
@@ -895,7 +891,7 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 				// An early follower error (nil maps) keeps what was stored
 				// (review M1): the 60 s clock and the published set.
 				if haStep && har.addrs != nil {
-					d.HAAddrs, d.HAChanged, d.HAOurs = har.addrs, har.changed, har.ours
+					d.HAAddrs, d.HAChanged = har.addrs, har.changed
 				}
 			})
 		}

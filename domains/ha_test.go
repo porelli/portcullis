@@ -330,7 +330,7 @@ func TestHAEarlyErrorKeepsState(t *testing.T) {
 	e.publish(f, []string{a1, a2}, []string{a1})
 	e.waitState(d, StateError, 20*time.Second)
 	after := e.domain(d)
-	if !slices.Equal(after.HAAddrs[d], before.HAAddrs[d]) || !after.HAChanged[d].Equal(before.HAChanged[d]) || !slices.Equal(after.HAOurs[d], before.HAOurs[d]) {
+	if !slices.Equal(after.HAAddrs[d], before.HAAddrs[d]) || !after.HAChanged[d].Equal(before.HAChanged[d]) {
 		t.Fatalf("a failed read wiped the follower's state: %v %v → %v %v", before.HAAddrs, before.HAChanged, after.HAAddrs, after.HAChanged)
 	}
 	e.setHook(nil)
@@ -445,4 +445,39 @@ func TestHANextNeverForeignNeverLast(t *testing.T) {
 	if len(r) != 3 || !strings.Contains(r[0], "foreign A 198.51.100.9") || !strings.Contains(r[1], "foreign AAAA 2001:db8::9") || !strings.Contains(r[2], "last A address") {
 		t.Errorf("residual %q", r)
 	}
+}
+
+// TestHAOursFromRecordRefs (security review): which addresses are the
+// follower's own comes from the domain's committed RecordRefs, nothing
+// else: after a restart (no in-memory state) an address the follower wrote
+// still goes when the front door drops it; refs in a parent zone count;
+// a value with no ref of ours (foreign) never does.
+func TestHAOursFromRecordRefs(t *testing.T) {
+	d := &Domain{Name: "team.example.org", Records: map[string][]RecordRef{
+		"example.org.": {{Name: "team", Type: "A", Value: "198.51.100.1"}, {Name: "*.team", Type: "AAAA", Value: "2001:db8::1"},
+			{Name: "team", Type: "CAA", Value: "0 issue \"x\""}, {Name: "other", Type: "A", Value: "198.51.100.7"}},
+		"team.example.org.": {{Name: "@", Type: "A", Value: "198.51.100.2"}},
+	}}
+	if got := haOurs(d, "team.example.org"); !slices.Equal(got, []string{"198.51.100.1", "198.51.100.2"}) {
+		t.Errorf("ours at the apex %v", got)
+	}
+	if got := haOurs(d, "*.team.example.org"); !slices.Equal(got, []string{"2001:db8::1"}) {
+		t.Errorf("ours at the wildcard %v", got)
+	}
+
+	const a1, a2 = "198.51.100.1", "198.51.100.2"
+	e, f := newHAEnv(t)
+	e.publish(f, []string{a1, a2}, []string{a1, a2})
+	const dn = "team-o.example.org"
+	e.do("PUT", "/domains/"+dn, creds(goodToken), true)
+	e.waitState(dn, StateReady, 60*time.Second)
+	e.waitAddrs(dn, a1, a2)
+	if dd := e.domain(dn); !slices.Equal(haOurs(&dd, dn), []string{a1, a2}) {
+		t.Fatalf("the follower's writes aren't recorded as refs: %v", haOurs(&dd, dn))
+	}
+	e.clock.advance(61 * time.Second)
+	e.restart(nil)
+	e.publish(f, []string{a2}, []string{a2})
+	e.waitAddrs(dn, a2)
+	e.waitAddrs("*."+dn, a2)
 }
