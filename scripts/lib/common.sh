@@ -863,7 +863,9 @@ hub_env_write() {
     # or portcullis-apps-netpol refuses it (found live, Task 31: a second
     # node's LAN address in the params, the mesh ones only here).
     local _na; _na="$(kube_node_addresses)"
-    if declare -F kube_doc_addresses >/dev/null && kube_doc_addresses 2>/dev/null; then _na="${_K_DOC_NODES//\/32/}"; fi
+    # (The document is IPv4-only today, kube_doc_addresses refuses anything
+    # else; /128 is stripped too should that ever change: fix round 1, M7.)
+    if declare -F kube_doc_addresses >/dev/null && kube_doc_addresses 2>/dev/null; then _na="${_K_DOC_NODES//\/32/}"; _na="${_na//\/128/}"; fi
     content+="PORTCULLIS_KUBE_NODE_ADDRESSES=$_na"$'\n'
   fi
   (umask 077 && mkdir -p "$(dirname "$f")")

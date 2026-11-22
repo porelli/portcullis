@@ -8181,6 +8181,7 @@ case "$a" in
   "scale deployment "*) d="$3" r="${4#--replicas=}"; echo "$r" > "$HE/k/deploy-$d"; echo "scale $d $r" >> "$HE/order" ;;
   "wait --for=delete pod -l portcullis.io/component="*) echo "gone ${5#portcullis.io/component=}" >> "$HE/order" ;;
   "get pods -l portcullis.io/component="*" -o json") echo '{"items":[]}' ;;
+  "get pods -o json") cat "$HE/k/pods.json" 2>/dev/null || echo '{"items":[]}' ;;
   "create -f -")
     j="$(cat)"; k="$(printf '%s' "$j" | jq -r .kind)" n="$(printf '%s' "$j" | jq -r .metadata.name)"
     case "$k" in
@@ -8360,7 +8361,6 @@ hacli "" "need_env; ha_frontdoor_env_sync; exit 0" status
 expect_eq "ha_frontdoor_env_sync: credentials.json = the provider and its dns-tool keys" \
   "$(cat "$HE"/k/applied.* | jq -r '.data["credentials.json"]' | base64 -d | jq -c .)" '{"provider":"cloudflare","credentials":{"api_token":"CF-SECRET-TOKEN-9"}}'
 expect_eq "ha_frontdoor_env_sync: the token never on kubectl's argv" "$(grep -c 'CF-SECRET' "$HE/calls")" 0
-expect_eq "up syncs frontdoor-env in HA" "$(grep -c 'kube_sync_secrets; ! kube_ha_on || ha_frontdoor_env_sync' "$HERE/../scripts/lib/kube.sh")" 1
 
 # Before Traefik moves (Task 29 carry; fix round 1, I2): the certificate
 # the HA ingress serves from the switch, valid for the account switch's
@@ -8430,6 +8430,9 @@ na_run() { ( export PORTCULLIS_ROOT="$NA_ROOT" CONTAINER_RUNTIME=kubernetes PORT
 expect_eq "core.env node addresses: the cluster addresses document's (the params')" \
   "$(na_run 'kube_doc_addresses() { _K_DOC_NODES="10.215.0.1/32 10.215.0.2/32 172.26.29.38/32 52.43.150.133/32"; return 0; }')" \
   "PORTCULLIS_KUBE_NODE_ADDRESSES=10.215.0.1 10.215.0.2 172.26.29.38 52.43.150.133"
+expect_eq "core.env node addresses: a /128 is stripped as /32 is (fix round 1, M7)" \
+  "$(na_run 'kube_doc_addresses() { _K_DOC_NODES="10.215.0.1/32 2001:db8::5/128"; return 0; }')" \
+  "PORTCULLIS_KUBE_NODE_ADDRESSES=10.215.0.1 2001:db8::5"
 expect_eq "core.env node addresses: no document yet → the nodes' (as the params then)" \
   "$(na_run 'kube_doc_addresses() { return 2; }')" "PORTCULLIS_KUBE_NODE_ADDRESSES=10.215.0.1 10.215.0.2"
 
@@ -8462,15 +8465,36 @@ expect_eq "switch: a writer on a <pvc>-r is seen (no copy over it)" "$RC:$OUT" "
 rm -f "$HE/k/onrep-hub"
 hacli "" "need_env; _ha_writers_on_replicated || echo LOCAL; exit 0" status
 expect_eq "switch: writers on their old volumes" "$RC:$OUT" "0:LOCAL"
-expect_eq "switch: the copy check skipped on replicated writers" \
-  "$(bash -c 'source "'"$HERE"'/../scripts/lib/common.sh" >/dev/null 2>&1; declare -f ha_enable_step_switch' | grep -c '_ha_writers_on_replicated')" 1
-expect_eq "an HA release moves Traefik's Services right before helm (after the images, sync and probes)" \
-  "$(awk '/^_rtk_up\(\) \{/,/^}/' "$HERE/../scripts/lib/kube.sh" | grep -n 'kube_images_ready\|_ha_services_move\|kube_helm upgrade' | cut -d: -f2 | tr -s ' ' | sed 's/^ //' | cut -c1-30 | tr '\n' '|')" \
-  "kube_images_ready|kube_vault_shrink_prepare; ! k|kube_helm upgrade --install \"$|"
+# Fix round 1, M5 (stubbed flows, no source grep): the release's order —
+# with HA on, the front door's credentials after the sync and Traefik's
+# old Services moved after the images, sync and probes, right before helm;
+# with HA off neither.
+HE_UP='for f in kube_images_ready hub_env_write kube_sync_secrets ha_frontdoor_env_sync kube_cluster_setup kube_pg_sync_secrets kube_lldap_schema_retry kube_netpol_probe kube_render_values kube_vault_shrink_prepare _ha_services_move kube_vault_shrink_finish kube_backup_after_release kube_cluster_check kube_first_nodeagent kube_forward_core; do eval "$f() { echo $f >> \"\$HE/ran\"; }"; done
+  kube_helm() { echo "helm $1" >> "$HE/ran"; }; export PORTCULLIS_HOME=/x; need_env'
+rm -f "$HE/ran"; hacli "" "$HE_UP; export PORTCULLIS_HA=on; _rtk_up; exit 0" status
+expect_eq "an HA release: the front door's credentials after the sync, Traefik's Services moved right before helm" \
+  "$RC:$(tr '\n' ' ' < "$HE/ran")" \
+  "0:kube_images_ready hub_env_write kube_sync_secrets ha_frontdoor_env_sync kube_cluster_setup kube_pg_sync_secrets kube_lldap_schema_retry kube_netpol_probe kube_render_values kube_vault_shrink_prepare _ha_services_move helm upgrade kube_vault_shrink_finish kube_backup_after_release kube_cluster_check kube_first_nodeagent kube_forward_core "
+rm -f "$HE/ran"; hacli "" "$HE_UP; unset PORTCULLIS_HA; _rtk_up; exit 0" status
+expect_eq "a non-HA release: no front-door credentials, no Services moved" "$RC:$(grep -c 'ha_frontdoor_env_sync\|_ha_services_move' "$HE/ran")" "0:0"
+# The switch on replicated writers copies nothing (never over a writer's new data).
+HE_SW='_ha_main_cert_plan() { echo plan >> "$HE/ran"; }; _ha_writers_on_replicated() { return 0; }; _ha_writers_stopped() { echo stopped >> "$HE/ran"; }
+  _ha_volumes_same() { echo same >> "$HE/ran"; }; ha_enable_step_volumes() { echo COPY >> "$HE/ran"; }; ha_frontdoor_env_sync() { echo env >> "$HE/ran"; }
+  _ha_frontdoor_cert_seed() { echo seed >> "$HE/ran"; }; env_set() { echo "env_set $1=$2" >> "$HE/ran"; }; stack_up() { echo up >> "$HE/ran"; }; need_env'
+rm -f "$HE/ran"; hacli "" "$HE_SW; ha_enable_step_switch; exit 0" status
+expect_eq "switch on writers already on <pvc>-r: the certificate plan first, no copy check, no copy" "$RC:$(tr '\n' ' ' < "$HE/ran")" "0:plan env seed env_set PORTCULLIS_HA=on up "
+rm -f "$HE/ran"; hacli "" "$HE_SW; _ha_writers_on_replicated() { return 1; }; _ha_volumes_same() { echo same >> \"\$HE/ran\"; return 1; }; ha_enable_step_switch; exit 0" status
+expect_eq "switch after a write since the copy: copied again before anything else changes" "$RC:$(tr '\n' ' ' < "$HE/ran")" "0:plan stopped same COPY env seed env_set PORTCULLIS_HA=on up "
 
 # Found live (Task 31): a one-shot's stdout is its own (the dns tool's
-# JSON): the image build's progress goes to stderr.
-expect_eq "_rtk_run: the images' build lines go to stderr" "$(awk '/^_rtk_run\(\) \{/,/^}/' "$HERE/../scripts/lib/kube.sh" | grep -c '^  kube_images_ready >&2')" 1
+# JSON): the local image build's progress goes to stderr.
+rm -f "$HE/ran"
+hacli "" 'need_env; kube_images_ready() { echo "==> Building portcullis-domains:kube-local..."; }; kube_render_values() { :; }
+  kube_helm() { printf "apiVersion: v1\nkind: Pod\nmetadata:\n  name: x\nspec:\n  containers:\n    - name: x\n      image: i\n"; }
+  kube_ctl() { case "$*" in *"create --dry-run=client -o json -f -"*) cat >/dev/null; echo "{\"spec\":{\"containers\":[{\"image\":\"i\",\"command\":[\"domains\",\"dns\"]}]}}" ;; *" run "*) echo "{\"tool\":\"json\"}" ;; esac; }
+  mkdir -p "$PORTCULLIS_ROOT/secrets/kube"; echo x > "$PORTCULLIS_ROOT/secrets/kube/values.yaml"
+  out="$(_rtk_run dns-tool -i -- check 2>/dev/null)"; echo "STDOUT=$out"; exit 0' status
+expect_eq "_rtk_run: the one-shot's stdout is its own, the image build's lines on stderr" "$RC:$(printf '%s' "$OUT" | grep '^STDOUT=')" '0:STDOUT={"tool":"json"}'
 
 # Fix round 1, I1: step 3 ends with the one-instance Cluster archiving
 # through the barman-cloud plugin — a release with HA still off after the
@@ -8502,6 +8526,28 @@ hacli "" "" enable --yes
 expect_eq "Stop mid-copy: exit 130, both helpers of the interrupted copy removed, the record whole, the writers at 0" \
   "$RC:$(grep -c '^create pod' "$HE/order"):$(grep -c '^delete pod' "$HE/order"):$(jq -r '.done | length' "$HE/root/secrets/kube/ha-enable.json"):$(cat "$HE/k/deploy-hub")" "130:2:2:3:0"
 rm -f "$HE/root/secrets/kube/ha-enable.json" "$HE/int-on-untar"
+
+# Fix round 1, M2: a component whose replicas all sit on one node is named
+# with its fix (a node-local per-replica volume named too); spread ones
+# and single-replica ones aren't.
+jq -n '{items: [
+  {metadata: {name: "group-gate-0", labels: {"portcullis.io/component": "group-gate"}}, spec: {nodeName: "vm2", volumes: [{persistentVolumeClaim: {claimName: "data-group-gate-0"}}]}, status: {phase: "Running"}},
+  {metadata: {name: "group-gate-1", labels: {"portcullis.io/component": "group-gate"}}, spec: {nodeName: "vm2", volumes: [{persistentVolumeClaim: {claimName: "data-group-gate-1"}}]}, status: {phase: "Running"}},
+  {metadata: {name: "sessions-0", labels: {"portcullis.io/component": "sessions"}}, spec: {nodeName: "vm2"}, status: {phase: "Running"}},
+  {metadata: {name: "sessions-1", labels: {"portcullis.io/component": "sessions"}}, spec: {nodeName: "vm2"}, status: {phase: "Running"}},
+  {metadata: {name: "keycloak-0", labels: {"portcullis.io/component": "keycloak"}}, spec: {nodeName: "vm2"}, status: {phase: "Running"}},
+  {metadata: {name: "keycloak-1", labels: {"portcullis.io/component": "keycloak"}}, spec: {nodeName: "node-1"}, status: {phase: "Running"}},
+  {metadata: {name: "hub-x", labels: {"portcullis.io/component": "hub"}}, spec: {nodeName: "vm2"}, status: {phase: "Running"}}]}' > "$HE/k/pods.json"
+hacli "" "need_env; _ha_spread_lines; exit 0" status
+expect_eq "spread: the packed components named with their fixes, the spread and single ones not" "$RC|$OUT" \
+  "0|group-gate: all 2 replicas on node vm2 (one node lost takes them all): kubectl -n portcullis delete pvc data-group-gate-1 --wait=false && kubectl -n portcullis delete pod group-gate-1 (its node-local volume goes too: a gate's own log)
+sessions: all 2 replicas on node vm2 (one node lost takes them all): kubectl -n portcullis delete pod sessions-1 (it starts again on another node)"
+printf '%s' "$he_green" | jq -c '.enabled = true' > "$HE/view.json"
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_status" status
+case "$OUT" in *"Not spread:"*"  group-gate: all 2 replicas on node vm2"*"  sessions: all 2"*) t_pass "ha status: names the components not spread" ;; *) t_fail "ha status spread: $OUT" ;; esac
+hacli "" "export PORTCULLIS_HA=on HA_STATUS_WAIT=0; need_env; _ha_green() { :; }; ha_enable_step_status" status
+case "$RC:$ERR" in "1:"*"group-gate: all 2 replicas on node vm2"*"ha status isn't all green"*) t_pass "step 10: not green while replicas aren't spread" ;; *) t_fail "step 10 spread: $RC $ERR" ;; esac
+rm -f "$HE/k/pods.json"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

@@ -3093,13 +3093,33 @@ _ha_green() {
       (.volumes[]? | select(.robustness != "healthy") | "volume \(.name): \(.robustness)")
     ] | .[]' <<<"$1"
 }
+# _ha_spread_lines — fix round 1, M2: each core component whose 2 or more
+# running replicas all sit on one node (found live: the switch's rollout,
+# short of memory on the other node, packed both gates, both Keycloaks and
+# both Valkeys onto one), one line each with its fix; nothing when spread.
+# A node-local per-replica volume (the gates' logs) pins the pod: its fix
+# names the PVC too. Unreadable pods print one line (fail closed).
+_ha_spread_lines() {
+  local pods
+  pods="$(kube_ctl -n "$(kube_ns)" get pods -o json 2>/dev/null)" || { echo "the core pods can't be read: their spread is unknown"; return 0; }
+  NS="$(kube_ns)" jq -r '
+    [.items[] | select(.status.phase == "Running" and .metadata.deletionTimestamp == null and (.metadata.labels["portcullis.io/component"] // "") != "")
+      | {c: .metadata.labels["portcullis.io/component"], n: .spec.nodeName, p: .metadata.name,
+         pvc: ([.spec.volumes[]? | .persistentVolumeClaim.claimName // empty | select(startswith("data-"))] | first // "")}]
+    | group_by(.c)[] | select(length >= 2 and ([.[].n] | unique | length) == 1)
+    | (sort_by(.p) | last) as $x
+    | "\(.[0].c): all \(length) replicas on node \(.[0].n) (one node lost takes them all): "
+      + (if $x.pvc != "" then "kubectl -n \(env.NS) delete pvc \($x.pvc) --wait=false && kubectl -n \(env.NS) delete pod \($x.p) (its node-local volume goes too: a gate'"'"'s own log)"
+         else "kubectl -n \(env.NS) delete pod \($x.p) (it starts again on another node)" end)' <<<"$pods" 2>/dev/null
+}
+
 ha_enable_step_status() {
   local t0 why
   t0="$(date +%s)"
   info "Waiting for ha status to be all green..."
   while :; do
     if _ha_hub_view; then
-      why="$(_ha_green "$_HA_VIEW")"
+      why="$(_ha_green "$_HA_VIEW"; _ha_spread_lines)"
       [ -n "$why" ] || break
     else
       why="the Hub's HA view: $_HA_ERR"
@@ -3195,6 +3215,10 @@ ha_status() {
     "  NODE                 ROLE    CLASS  SITE     READY  FENCING  N-1",
     (.nodes[]? | "  " + (.name + "                    ")[0:20] + " " + (.role + "        ")[0:7] + " " + ((.class // "-") + "       ")[0:6] + " " + ((.site // "-") + "         ")[0:8] + " " + (if .ready then "yes  " else "no   " end) + "  " + (if .fencing then "yes    " else "no     " end) + "  " + .n_minus_1),
     (if (.warnings // []) | length > 0 then "\nWarnings:", (.warnings[] | "  " + .) else empty end)' <<<"$view"
+  if kube_ha_on; then
+    local sp; sp="$(_ha_spread_lines)"
+    if [ -n "$sp" ]; then printf '\nNot spread:\n'; printf '%s\n' "$sp" | sed 's/^/  /'; fi
+  fi
 }
 
 help_ha() {
