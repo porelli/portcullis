@@ -5353,11 +5353,11 @@ rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.8' KUBE_ADMISSION_PROBE_WAIT=0; export STUB_PROBE_STALE_BINDING=portcullis-apps-guard-netpol; kube_cluster_setup")"
 case "$OUT" in *"not live with generation"*"portcullis-apps-guard-netpol"*"aren't live with their params"*"rc=1") t_pass "cluster setup: one binding of the six (netpol) not live → refused, the older bindings kept" ;; *) t_fail "cluster setup one stale binding: $OUT" ;; esac
 expect_eq "cluster setup: one stale binding deletes nothing" "$(grep -c '^delete binding' "$KS/order" || true)" 0
-expect_eq "cluster setup: a failed probe deletes no binding" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:10"
+expect_eq "cluster setup: a failed probe deletes no binding" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:11"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.9'; export STUB_BINDINGS_FAIL=1; kube_cluster_setup")"
 case "$OUT" in *"could not create the admission bindings of params generation"*"the older ones still judge"*"rc=1") t_pass "cluster setup: the new bindings can't be created → refused, nothing deleted" ;; *) t_fail "cluster setup bindings failure: $OUT" ;; esac
-expect_eq "cluster setup: failed bindings → the older bindings kept" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:10"
+expect_eq "cluster setup: failed bindings → the older bindings kept" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:11"
 echo '{"items":[{"kind":"IngressRoute","metadata":{"name":"app-ok","labels":{"portcullis.io/instance":"a"}}},{"kind":"IngressRoute","metadata":{"name":"app-bad","labels":{"portcullis.io/instance":"b"}},"spec":{"x":"REFUSE-ME"}}]}' > "$KS/kube/edge-hub-ir.json"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
@@ -5368,7 +5368,7 @@ k_fixtures
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_APPS_NAMESPACE=team-apps; export STUB_APPS_NS=team-apps; kube_cluster_setup")"
 expect_eq "cluster setup, PORTCULLIS_APPS_NAMESPACE=team-apps: the five apps bindings select team-apps, the edge one portcullis-edge (the HA ones unchanged)" \
   "$(printf '%s\n' "$OUT" | tail -n1) $(jq -s -r 'map(.spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"]) | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$KS"/live/Binding.*.json)" \
-  "rc=0 kube-system=1 portcullis=2 portcullis-edge=1 portcullis-ingress=1 team-apps=5"
+  "rc=0 kube-system=1 portcullis=3 portcullis-edge=1 portcullis-ingress=1 team-apps=5"
 expect_eq "no Hub scaling around the admission bindings (create-before-delete needs none)" "$(declare -f kube_admission_params_apply kube_cluster_setup | grep -c '_kube_scale\|deployment hub' || true)" 0
 k_fixtures
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_WHOAMI_FAIL=1; kube_cluster_setup")"
