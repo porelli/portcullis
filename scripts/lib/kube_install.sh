@@ -629,6 +629,40 @@ kube_traefik_image() {
   printf '%s\n' "$t"
 }
 
+# portcullis-removed-nodes (Task 30 fix round 2, nodeadm/removedparams.go):
+# one binding KUBE_REMOVED_BINDING of that fixed name (never a params
+# generation) on its own params KUBE_REMOVED_PARAMS, which the CLI creates
+# empty and nodeadm alone updates in place.
+# shellcheck disable=SC2034  # read by kube.sh and node.sh
+KUBE_REMOVED_BINDING="portcullis-nodes-guard-removed"
+KUBE_REMOVED_PARAMS="portcullis-removed-nodes"
+
+# kube_removed_params_seed — portcullis-removed-nodes' params
+# KUBE_REMOVED_PARAMS in the core namespace: created with no name listed
+# (removedNodes "", its generation by kube_params_generation, as nodeadm
+# computes it) when missing; an existing one is nodeadm's and never
+# rewritten (it updates it in place, and confirms each write on every API
+# server before a removed node's Node goes). Anything but NotFound fails.
+kube_removed_params_seed() {
+  local pns out gen
+  pns="$(kube_ns)"
+  out="$(kube_ctl -n "$pns" get configmap "$KUBE_REMOVED_PARAMS" -o name 2>&1)" && return 0
+  case "$out" in *NotFound*) ;; *) warn "can't read the ConfigMap $KUBE_REMOVED_PARAMS: ${out:0:200}"; return 1 ;; esac
+  gen="$(printf 'removedNodes\t\n' | kube_params_generation)"
+  G="$gen" NS="$pns" N="$KUBE_REMOVED_PARAMS" jq -n '{apiVersion: "v1", kind: "ConfigMap",
+      metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
+      data: {removedNodes: "", generation: env.G}}' \
+    | kube_ctl create --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \
+    || { warn "could not create the ConfigMap $KUBE_REMOVED_PARAMS"; return 1; }
+}
+
+# _kube_removed_generation — the live KUBE_REMOVED_PARAMS' generation ("" if
+# unreadable).
+_kube_removed_generation() {
+  kube_ctl -n "$(kube_ns)" get configmap "$KUBE_REMOVED_PARAMS" -o json 2>/dev/null \
+    | jq -r '.data.generation // empty | select(test("^[0-9a-f]{16}$"))' 2>/dev/null || true
+}
+
 # _kube_probe_ha <binding> <gen> — the HA bindings' probes (contract §6
 # "The probe"), each otherwise admissible by every generation's policy:
 #   exec      the Hub's exec of `hub rev /hub-data probe-<gen>` in the

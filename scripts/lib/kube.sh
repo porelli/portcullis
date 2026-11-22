@@ -28,7 +28,7 @@ KUBE_PRIMARY_SITE="main"
 # IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
 KUBE_EDGE_NS="portcullis-edge"
 # The twelve admission bindings (kube/admission/bindings.yaml; the last
-# six HA), live as <name>-<params generation> (kube_admission_params_apply).
+# six HA), live as <name>-<params generation> (kube_admission_params_apply; not KUBE_REMOVED_BINDING).
 KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods portcullis-nodes-guard-labels portcullis-core-guard-frontdoor-status portcullis-nodes-guard-removed"
 KUBE_PROBE_NS="portcullis-netpol-probe"
 KUBE_MANAGED_LABEL="app.kubernetes.io/managed-by"
@@ -960,7 +960,7 @@ kube_admission_params() {
     edgeCoreMiddlewares "$KUBE_EDGE_CORE_MIDDLEWARES" \
     reservedHosts "$reserved" \
     maxAppPriority "$maxprio" \
-    nodeadmServiceAccount "$KUBE_NODEADM_SA" removedNodes "$_K_PARAM_REMOVED" \
+    nodeadmServiceAccount "$KUBE_NODEADM_SA" \
     traefikImage "$traefik"
 }
 
@@ -978,9 +978,9 @@ kube_reserved_hosts() {
 # hex), create-before-delete so no object is ever unbound (contract K6):
 #   1. ConfigMap portcullis-admission-params-<gen> (kube_admission_params +
 #      generation; replaced whole);
-#   2. bindings.yaml's ten bindings as <name>-<gen> on those params (labels
+#   2. bindings.yaml's bindings as <name>-<gen> on those params (labels
 #      portcullis.io/binding = the base name, portcullis.io/params-generation);
-#      older generations' bindings stay and judge too (stricter, fail safe);
+#      older generations' bindings stay and judge too (stricter, fail safe; KUBE_REMOVED_BINDING in place);
 #   3. kube_admission_probe <gen>: the <gen> bindings are live with these
 #      params, within KUBE_ADMISSION_PROBE_WAIT (60) s — else refused, the
 #      older bindings kept;
@@ -1010,10 +1010,10 @@ kube_admission_params_apply() {
   kube_ctl create configmap "portcullis-admission-params-$gen" -n "$pns" --from-file="$tmp/data" --dry-run=client -o json \
     | G="$gen" jq '.metadata.labels = {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/params-generation": env.G}' > "$tmp/params.json" \
     && kube_ctl create -f "$adm/bindings.yaml" --dry-run=client -o json \
-    | G="$gen" NS="$pns" APPS="$(kube_apps_ns)" EDGE="$KUBE_EDGE_NS" INGRESS="$KUBE_INGRESS_NS" jq -s '{apiVersion: "v1", kind: "List", items: [.[] | (if .kind == "List" then .items[] else . end)
-        | .metadata.labels = {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/binding": .metadata.name, "portcullis.io/params-generation": env.G}
-        | .metadata.name += "-" + env.G
-        | .spec.paramRef.name = "portcullis-admission-params-" + env.G | .spec.paramRef.namespace = env.NS
+    | G="$gen" NS="$pns" RB="$KUBE_REMOVED_BINDING" RP="$KUBE_REMOVED_PARAMS" APPS="$(kube_apps_ns)" EDGE="$KUBE_EDGE_NS" INGRESS="$KUBE_INGRESS_NS" jq -s '{apiVersion: "v1", kind: "List", items: [.[] | (if .kind == "List" then .items[] else . end)
+        | (.metadata.name == env.RB) as $fixed | .metadata.labels = ({"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/binding": .metadata.name}
+            + (if $fixed then {} else {"portcullis.io/params-generation": env.G} end)) | .metadata.name += (if $fixed then "" else "-" + env.G end)
+        | .spec.paramRef.name = (if $fixed then env.RP else "portcullis-admission-params-" + env.G end) | .spec.paramRef.namespace = env.NS
         | .spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"] |=
             ({"portcullis-apps": env.APPS, "portcullis-edge": env.EDGE, "portcullis": env.NS, "kube-system": "kube-system", "portcullis-ingress": env.INGRESS}[.]
               // error("a binding selects namespace \(.), none of portcullis-apps, portcullis-edge, portcullis, kube-system, portcullis-ingress"))]}' > "$tmp/bindings.json" \
@@ -1021,14 +1021,15 @@ kube_admission_params_apply() {
   [ "$(jq '.items | length' "$tmp/bindings.json")" = "$(printf '%s\n' $KUBE_BINDINGS | wc -l | tr -d ' ')" ] \
     || { rm -rf "$tmp"; fail "kube/admission/bindings.yaml doesn't hold the $(printf '%s\n' $KUBE_BINDINGS | wc -l | tr -d ' ') bindings KUBE_BINDINGS names"; }
   _kube_put "$tmp/params.json" || { rm -rf "$tmp"; fail "could not write portcullis-admission-params-$gen"; }
+  kube_removed_params_seed || { rm -rf "$tmp"; exit 1; }
   _kube_apply_files "$tmp/bindings.json" || { rm -rf "$tmp"; fail "could not create the admission bindings of params generation $gen: the older ones still judge"; }
   _kube_applied_set cluster.params "$gen"
   rm -rf "$tmp"
   kube_admission_probe "$gen" || fail "the admission bindings of params generation $gen aren't live with their params (see above): the older bindings still judge; nothing deployed"
   kube_admission_active_put "$gen" "$params"
-  # Only now: the other generations.
+  # Only now: the other generations (KUBE_REMOVED_BINDING has none).
   local old
-  old="$(kube_ctl get validatingadmissionpolicybinding -l "portcullis.io/binding,portcullis.io/params-generation!=$gen" -o name 2>/dev/null)" \
+  old="$(kube_ctl get validatingadmissionpolicybinding -l "portcullis.io/binding,portcullis.io/params-generation,portcullis.io/params-generation!=$gen" -o name 2>/dev/null)" \
     || fail "can't list the older admission bindings"
   if [ -n "$old" ]; then
     info "Cluster setup: params generation $gen is live: removing the older bindings..."
@@ -1112,20 +1113,21 @@ _kube_hub_sa() { echo "system:serviceaccount:$(kube_ns):portcullis-hub"; }
 #     bootstrap token Secret, a node identity's Node, the Hub's exec `hub rev /hub-data probe-<gen>`
 #     in a reader pod name, refused before anything runs) by <binding>-<gen>
 #     naming <gen> (each policy refuses exactly its own params' generation
-#     first; older generations' bindings let it by);
+#     first; older generations' bindings let it by; KUBE_REMOVED_BINDING: its own);
 #   - a route on a reserved host is refused by an edge binding;
 #   - the same route on a free host, unannotated, is admitted.
 # Retried for KUBE_ADMISSION_PROBE_WAIT seconds (60).
 kube_admission_probe() {
-  local gen="${1:?}" d reserved i missing refused admitted out b
+  local gen="${1:?}" d reserved i missing refused admitted out b rg bn
   d="${PORTCULLIS_DOMAIN:?}"
   reserved="$(kube_reserved_hosts)" || return 1
   reserved="${reserved%% *}"
   for ((i = 0; ; i += 3)); do
     missing="" refused=false admitted=false
     for b in $KUBE_BINDINGS; do
-      if out="$(_kube_probe_object "$b" "$gen" 2>&1)"; then missing+=" $b (admitted)"; continue; fi
-      case "$out" in *"binding '$b-$gen'"*"admission probe: params generation $gen in effect"*) ;; *) missing+=" $b" ;; esac
+      rg="$gen" bn="$b-$gen"; [ "$b" != "$KUBE_REMOVED_BINDING" ] || { rg="$(_kube_removed_generation)" bn="$b"; }
+      if out="$(_kube_probe_object "$b" "$rg" 2>&1)"; then missing+=" $b (admitted)"; continue; fi
+      case "$out" in *"binding '$bn' denied request: admission probe: params generation $rg in effect"*) ;; *) missing+=" $b" ;; esac
     done
     if ! out="$(_kube_probe_route "$reserved" "" 2>&1)"; then
       case "$out" in *"binding 'portcullis-edge-guard-routes-"*"reserved core hostname"*) refused=true ;; esac

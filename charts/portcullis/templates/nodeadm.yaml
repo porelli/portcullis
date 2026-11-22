@@ -22,8 +22,16 @@ Its rights (the security delta of hardening.md):
     configmaps update on portcullis-cluster-addresses and get on
     portcullis-admission-active and portcullis-first-node (the CLI's
     record of the first node's certificate serials: a removal of that node
-    revokes them; Task 30 fix round 1); leases get / update on
+    revokes them; Task 30 fix round 1), get / update on
+    portcullis-removed-nodes (portcullis-removed-nodes' own params: the
+    removed names, confirmed on every API server before a removed node's
+    Node goes; Task 30 fix round 2); leases get / update on
     portcullis-nodeadm;
+  - ClusterRole: impersonate on exactly the user
+    system:node:portcullis-admission-probe (no group), whose only right
+    (ClusterRole portcullis-admission-probe) is nodes create, refused by
+    portcullis-removed-nodes unless a dry run; Role in default:
+    endpointslices get on kubernetes (the API servers it probes);
   - HA only, Role in longhorn-system: Longhorn's nodes get / patch (a
     cooperative removal asks Longhorn to evict the node's replicas);
   - HA only, Role in portcullis-fencing: SelfNodeRemediations create /
@@ -70,6 +78,12 @@ rules:
   - apiGroups: ["self-node-remediation.medik8s.io"]
     resources: ["selfnoderemediations"]
     verbs: ["get", "list"]
+  # The removed-node probe (Task 30 fix round 2): exactly this user, no
+  # group (nodeadm/removedparams.go).
+  - apiGroups: [""]
+    resources: ["users"]
+    resourceNames: ["system:node:portcullis-admission-probe"]
+    verbs: ["impersonate"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -80,6 +94,66 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  name: portcullis-nodeadm
+subjects:
+  - kind: ServiceAccount
+    name: nodeadm
+    namespace: {{ $nns }}
+---
+# The probe identity nodeadm impersonates (Task 30 fix round 2): without
+# the group system:nodes it is no node to the Node authorizer or
+# NodeRestriction; its only right is a Node create, which
+# portcullis-removed-nodes refuses unless it is a dry run.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-admission-probe
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-admission-probe
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: portcullis-admission-probe
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: system:node:portcullis-admission-probe
+---
+# The API servers nodeadm probes one by one (Task 30 fix round 2).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-nodeadm
+  namespace: default
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    resourceNames: ["kubernetes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-nodeadm
+  namespace: default
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
   name: portcullis-nodeadm
 subjects:
   - kind: ServiceAccount
@@ -134,6 +208,12 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["portcullis-admission-active", "portcullis-first-node"]
     verbs: ["get"]
+  # Its own params of portcullis-removed-nodes (Task 30 fix round 2; the
+  # CLI creates the ConfigMap).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["portcullis-removed-nodes"]
+    verbs: ["get", "update"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     resourceNames: ["portcullis-nodeadm"]

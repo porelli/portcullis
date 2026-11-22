@@ -1,0 +1,14 @@
+# portcullis-removed-nodes' params as the vectors use them (Task 30 fix
+# round 2): the ConfigMap the binding portcullis-nodes-guard-removed reads.
+# ./portcullis creates the real one empty (kube_removed_params_seed) and
+# nodeadm alone updates it (nodeadm/removedparams.go): removedNodes =
+# every removed node name, space-separated; generation = the first 16 hex
+# of the sha256 of "removedNodes<TAB><list>\n" (kube_params_generation).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portcullis-removed-nodes
+  namespace: portcullis
+data:
+  removedNodes: vector-removed vector-gone
+  generation: "0123456789abcdef"

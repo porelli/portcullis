@@ -11,7 +11,9 @@
 # Node (or its "target", @NODE2@ = the second) as a node identity or SNR's
 # manager under portcullis-node-labels
 # (round 3 I1: the storm guard's inputs); frontdoor-status writes under
-# portcullis-frontdoor-status (Task 28 fix round 1). Run by
+# portcullis-frontdoor-status (Task 28 fix round 1); removed node
+# identities' Node and CSR writes under portcullis-removed-nodes (Task 30
+# fix round 2; "subresource" = a status update). Run by
 # e2e-ha-vm (Task 33) after the HA installs; locally against k3d / k3s.
 # With HUB_DEV=1 + PORTCULLIS_DEV_SNR_IMAGE the vectors' SNR image is that
 # one (as ha_render's).
@@ -55,6 +57,41 @@ print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in docs 
     "portcullis-frontdoor-status", "portcullis-core-guard-frontdoor-status")]}))' \
   kube/admission/policies.yaml kube/admission/bindings.yaml \
   | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
+# portcullis-removed-nodes (Task 30 fix round 2) on its own params, under
+# e2e names (a real install's fixed binding portcullis-nodes-guard-removed
+# and its params portcullis-removed-nodes are nodeadm's: never touched):
+# kube/admission/removed-nodes.yaml's list, and a second binding on params
+# without removedNodes that judges only objects labelled
+# vector.example/nokey (R-M2). RBAC lets the identities without the Node
+# authorizer (a system:nodes member without a node name, a node name
+# without the group) write Nodes and CSRs, so the policy decides; the Node
+# vector-removed exists for the UPDATE vectors (removed at the end).
+python3 -c 'import sys, yaml, json
+docs = [d for f in sys.argv[1:] for d in yaml.safe_load_all(open(f)) if d]
+items = [d for d in docs if d["metadata"]["name"] in ("portcullis-removed-nodes", "portcullis-nodes-guard-removed")]
+for d in list(items):
+    if d["kind"] == "ConfigMap":
+        d["metadata"]["name"] = "portcullis-removed-nodes-e2e"; d["data"]["generation"] = "e2e0ha0000000000"
+    elif d["kind"] == "ValidatingAdmissionPolicyBinding":
+        nokey = json.loads(json.dumps(d))
+        d["metadata"]["name"] += "-e2e"; d["spec"]["paramRef"]["name"] = "portcullis-removed-nodes-e2e"
+        nokey["metadata"]["name"] += "-e2e-nokey"; nokey["spec"]["paramRef"]["name"] = "portcullis-removed-nodes-e2e-nokey"
+        nokey["spec"]["matchResources"]["objectSelector"] = {"matchLabels": {"vector.example/nokey": "true"}}
+        items.append(nokey)
+items.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "portcullis-removed-nodes-e2e-nokey", "namespace": "portcullis"},
+              "data": {"generation": "e2e0nokey0000000"}})
+items += [{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "vector-node-writer"},
+           "rules": [{"apiGroups": [""], "resources": ["nodes", "nodes/status"], "verbs": ["create", "update"]},
+                     {"apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["create"]}]},
+          {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": "vector-node-writer"},
+           "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "vector-node-writer"},
+           "subjects": [{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": n} for n in ("vector-nodes-member", "system:node:vector-removed")]}]
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))' \
+  kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/removed-nodes.yaml \
+  | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
+trap 'kubectl --context "$ctx" delete node vector-removed --ignore-not-found >/dev/null 2>&1 || true' EXIT
+jq -c '[.[] | select(.policy == "portcullis-removed-nodes" and (.update // false) and .object.kind == "Node")][0].object' tests/ha_admission_vectors.json \
+  | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
 # portcullis-barman-rbac (Task 26 review M4) with the plugin's Role (its
 # create right), in cnpg-system, confirmed in force.
 kubectl --context "$ctx" create namespace cnpg-system --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
@@ -95,8 +132,17 @@ while IFS= read -r v; do
     while IFS= read -r g; do as+=(--as-group "$g"); done < <(jq -r '.as.groups[]' <<<"$v")
     # A bound token's extra (the frontdoor-status vectors: its pod name).
     while IFS= read -r x; do as+=(--as-user-extra "$x"); done < <(jq -r '(.as.extra // {}) | to_entries[] | "\(.key)=\(.value)"' <<<"$v")
-    verb=create; [ "$(jq -r '.update // false' <<<"$v")" != true ] || verb=replace
-    out="$(jq -c .object <<<"$v" | kubectl --context "$ctx" "${as[@]}" "$verb" --dry-run=server -f - 2>&1)" && got=true || got=false
+    verb=(create); [ "$(jq -r '.update // false' <<<"$v")" != true ] || verb=(replace)
+    # A subresource update (Task 30 fix round 2: nodes/status).
+    sub="$(jq -r '.subresource // empty' <<<"$v")"; [ -z "$sub" ] || verb+=(--subresource="$sub")
+    obj="$(jq -c .object <<<"$v")"
+    # A Node update is the live Node (its podCIDRs, set once by the node
+    # IPAM, and the taints the node lifecycle controller adds: a change to
+    # either is refused before this policy) with the vector's metadata.
+    if [ "${verb[0]}" = replace ] && [ "$(jq -r .kind <<<"$obj")" = Node ]; then
+      obj="$(kubectl --context "$ctx" get node "$(jq -r .metadata.name <<<"$obj")" -o json | jq -c --argjson o "$obj" 'del(.metadata.resourceVersion) * ($o | del(.spec))')"
+    fi
+    out="$(printf '%s' "$obj" | kubectl --context "$ctx" "${as[@]}" "${verb[@]}" --dry-run=server -f - 2>&1)" && got=true || got=false
   else
     out="$(jq -c .pod <<<"$v" | sed "s|$pinned|$img|g" | kubectl --context "$ctx" create --dry-run=server -f - 2>&1)" && got=true || got=false
   fi

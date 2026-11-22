@@ -6,12 +6,16 @@
 # portcullis-ingress-guard-pods on portcullis-ingress and
 # portcullis-nodes-guard-labels on Nodes (cluster-scoped) and
 # portcullis-core-guard-frontdoor-status on the core namespace and
-# portcullis-nodes-guard-removed on Nodes (twelve); the params
+# portcullis-nodes-guard-removed on Nodes and CSRs (twelve); the params
 # ConfigMap portcullis-admission-params in the core namespace (written only
 # by the CLI identity, ruling R-ADM: no Role of the Hub or nodeadm there;
 # missing = deny), Deny. The CLI applies each as
 # <name>-<params generation> on portcullis-admission-params-<generation>,
-# create-before-delete (scripts/lib/kube.sh kube_admission_params_apply).
+# create-before-delete (scripts/lib/kube.sh kube_admission_params_apply),
+# but portcullis-nodes-guard-removed: one binding of that fixed name on
+# its own params portcullis-removed-nodes, which nodeadm updates in place
+# and confirms on every API server before a removed node's Node goes
+# (Task 30 fix round 2).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
@@ -191,8 +195,9 @@ spec:
       matchLabels:
         kubernetes.io/metadata.name: portcullis
 ---
-# Task 30 fix round 1: Nodes (cluster-scoped: the namespaceSelector has no
-# effect on them) as removed node identities.
+# Task 30 fix rounds 1 and 2: Nodes and CSRs (cluster-scoped: the
+# namespaceSelector has no effect on them) as removed node identities, on
+# their own params (nodeadm's, never a params generation).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
@@ -201,7 +206,7 @@ spec:
   policyName: portcullis-removed-nodes
   validationActions: ["Deny"]
   paramRef:
-    name: portcullis-admission-params
+    name: portcullis-removed-nodes
     namespace: portcullis
     parameterNotFoundAction: Deny
   matchResources:

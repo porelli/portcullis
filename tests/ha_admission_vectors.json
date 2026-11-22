@@ -19294,5 +19294,413 @@
    }
   },
   "policy": "portcullis-removed-nodes"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-removed"
+  },
+  "name": "removed nodes: a removed node's kubelet updates its Node",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "was removed from the cluster",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-removed"
+  },
+  "name": "removed nodes: a removed node's kubelet updates its Node's status",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "was removed from the cluster",
+  "subresource": "status",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "vector-nodes-member"
+  },
+  "name": "removed nodes: a system:nodes member without a node name registers a removed Node",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "was removed from the cluster"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "vector-nodes-member"
+  },
+  "name": "removed nodes: a system:nodes member without a node name updates a removed Node",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "was removed from the cluster",
+  "update": true
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "vector-nodes-member"
+  },
+  "name": "removed nodes: a system:nodes member without a node name registers a fresh Node",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-fresh"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-removed"
+  },
+  "name": "removed nodes: a removed name without the group registers its Node",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "was removed from the cluster"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-removed"
+  },
+  "name": "removed nodes: a removed name without the group registers a Node of another name",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-fresh"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "node vector-removed was removed from the cluster"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-removed"
+  },
+  "name": "removed nodes: a removed node's kubelet files a client CSR",
+  "object": {
+   "apiVersion": "certificates.k8s.io/v1",
+   "kind": "CertificateSigningRequest",
+   "metadata": {
+    "name": "vector-csr-a"
+   },
+   "spec": {
+    "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIM01JR2VBZ0VBTUR3eEZUQVRCZ05WQkFvTURITjVjM1JsYlRwdWIyUmxjekVqTUNFR0ExVUVBd3dhYzNsegpkR1Z0T201dlpHVTZkbVZqZEc5eUxYSmxiVzkyWldRd1dUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DCkFBUUs5L3NZRkY4TmZoMWJ2ZWRhWjdMaGo2RW9RdHRtMXI3aXNva25ZK0EwakgwcE1OcEQzRkNvVlp2TERJYk8KcDBmcE5vOVQ0VkNEcC9zdHlZUmxiVmlHb0FBd0NnWUlLb1pJemowRUF3SURTQUF3UlFJaEFKUjErUEovbTcvVApxQUdEc2lDMlhHREZOUUlnWG5keGc4aFJ4aW4xejFQV0FpQnRWTis4SWZhaVVuMEJVU1Q3ckw4U0ZzenArTEc3CkpqUUR0d2cxT252VlpBPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUgUkVRVUVTVC0tLS0tCg==",
+    "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+    "usages": [
+     "digital signature",
+     "client auth"
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "node vector-removed was removed from the cluster: its kubelet identity can file no certificate signing request"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-removed"
+  },
+  "name": "removed nodes: a removed name without the group files a CSR",
+  "object": {
+   "apiVersion": "certificates.k8s.io/v1",
+   "kind": "CertificateSigningRequest",
+   "metadata": {
+    "name": "vector-csr-b"
+   },
+   "spec": {
+    "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIM01JR2VBZ0VBTUR3eEZUQVRCZ05WQkFvTURITjVjM1JsYlRwdWIyUmxjekVqTUNFR0ExVUVBd3dhYzNsegpkR1Z0T201dlpHVTZkbVZqZEc5eUxYSmxiVzkyWldRd1dUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DCkFBUUs5L3NZRkY4TmZoMWJ2ZWRhWjdMaGo2RW9RdHRtMXI3aXNva25ZK0EwakgwcE1OcEQzRkNvVlp2TERJYk8KcDBmcE5vOVQ0VkNEcC9zdHlZUmxiVmlHb0FBd0NnWUlLb1pJemowRUF3SURTQUF3UlFJaEFKUjErUEovbTcvVApxQUdEc2lDMlhHREZOUUlnWG5keGc4aFJ4aW4xejFQV0FpQnRWTis4SWZhaVVuMEJVU1Q3ckw4U0ZzenArTEc3CkpqUUR0d2cxT252VlpBPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUgUkVRVUVTVC0tLS0tCg==",
+    "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+    "usages": [
+     "digital signature",
+     "client auth"
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "can file no certificate signing request"
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-fresh"
+  },
+  "name": "removed nodes: a node that was never removed files its client CSR",
+  "object": {
+   "apiVersion": "certificates.k8s.io/v1",
+   "kind": "CertificateSigningRequest",
+   "metadata": {
+    "name": "vector-csr-c"
+   },
+   "spec": {
+    "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIMk1JR2NBZ0VBTURveEZUQVRCZ05WQkFvTURITjVjM1JsYlRwdWIyUmxjekVoTUI4R0ExVUVBd3dZYzNsegpkR1Z0T201dlpHVTZkbVZqZEc5eUxXWnlaWE5vTUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFCmxxNXBaclY2WEpyYUhOS2kvS1dvWno2N2RsRzQzSWZMeEZyZmtVdjlkNWV4YjgveFZNdlhsSmJVc0JMSW5EdU0Kd1FIRTdwb3owYUhrdUF4UjUrUW5PYUFBTUFvR0NDcUdTTTQ5QkFNQ0Ewa0FNRVlDSVFEVTVRekpiN0JVdzlvdwplVkgzbDRGZXVQa2QzRFl3VitOc09HdWpPSUNTakFJaEFQN0gveXhZNDlRS0ZsMVMwbHlsL2xxcmt6UnVjZjJSClpYTTlDanorMTBUTwotLS0tLUVORCBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K",
+    "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+    "usages": [
+     "digital signature",
+     "client auth"
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes"
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "vector-nodes-member"
+  },
+  "name": "removed nodes: a system:nodes member without a node name files a CSR",
+  "object": {
+   "apiVersion": "certificates.k8s.io/v1",
+   "kind": "CertificateSigningRequest",
+   "metadata": {
+    "name": "vector-csr-d"
+   },
+   "spec": {
+    "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIMk1JR2NBZ0VBTURveEZUQVRCZ05WQkFvTURITjVjM1JsYlRwdWIyUmxjekVoTUI4R0ExVUVBd3dZYzNsegpkR1Z0T201dlpHVTZkbVZqZEc5eUxXWnlaWE5vTUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFCmxxNXBaclY2WEpyYUhOS2kvS1dvWno2N2RsRzQzSWZMeEZyZmtVdjlkNWV4YjgveFZNdlhsSmJVc0JMSW5EdU0Kd1FIRTdwb3owYUhrdUF4UjUrUW5PYUFBTUFvR0NDcUdTTTQ5QkFNQ0Ewa0FNRVlDSVFEVTVRekpiN0JVdzlvdwplVkgzbDRGZXVQa2QzRFl3VitOc09HdWpPSUNTakFJaEFQN0gveXhZNDlRS0ZsMVMwbHlsL2xxcmt6UnVjZjJSClpYTTlDanorMTBUTwotLS0tLUVORCBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K",
+    "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+    "usages": [
+     "digital signature",
+     "client auth"
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes"
+ },
+ {
+  "allowed": true,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:portcullis-admission-probe"
+  },
+  "name": "removed nodes: the probe identity's dry run of a Node is let by",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "portcullis-admission-probe"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-fresh"
+  },
+  "name": "removed nodes: params without removedNodes refuse a fresh node's registration",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "labels": {
+     "vector.example/nokey": "true"
+    },
+    "name": "vector-fresh"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "lack removedNodes"
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:nodes",
+    "system:authenticated"
+   ],
+   "user": "system:node:vector-fresh"
+  },
+  "name": "removed nodes: params without removedNodes refuse that generation's probe",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "annotations": {
+     "portcullis.io/removed-nodes-generation": "e2e0nokey0000000"
+    },
+    "labels": {
+     "vector.example/nokey": "true"
+    },
+    "name": "vector-fresh"
+   },
+   "spec": {
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  "policy": "portcullis-removed-nodes",
+  "reason_contains": "lack removedNodes"
  }
 ]

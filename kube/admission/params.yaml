@@ -27,6 +27,5 @@ data:
   reservedHosts: portcullis.local traefik.portcullis.local hub.portcullis.local directory.portcullis.local metrics.portcullis.local people.portcullis.local mcp.portcullis.local auth.portcullis.local enroll.portcullis.local
   maxAppPriority: "1000"
   nodeadmServiceAccount: system:serviceaccount:portcullis-nodeadm:nodeadm
-  removedNodes: vector-removed
   traefikImage: docker.io/library/traefik:v3.7.0@sha256:2222222222222222222222222222222222222222222222222222222222222222
   generation: "0123456789abcdef"

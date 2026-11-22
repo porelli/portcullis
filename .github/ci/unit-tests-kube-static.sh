@@ -215,7 +215,7 @@ copies="$copies nodeadm/testdata/site_roles_vectors.json=internal/servers/testda
 copies="$copies tests/admission_vectors.json=internal/runtime/kube/testdata/admission_vectors.json"
 copies="$copies kube/priorityclasses.yaml=internal/runtime/kube/testdata/priorityclasses.yaml"
 if [ -d kube/admission ]; then
-  for f in kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/params.yaml kube/admission/nodeadm-tokens.yaml; do
+  for f in kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/params.yaml kube/admission/removed-nodes.yaml kube/admission/nodeadm-tokens.yaml; do
     copies="$copies $f=internal/runtime/kube/testdata/admission/${f##*/}"
   done
 fi

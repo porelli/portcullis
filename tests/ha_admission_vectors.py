@@ -384,30 +384,53 @@ def vectors():
     out.append({"policy": FS, "name": "frontdoor-status: this params generation's probe is refused", "allowed": False, "as": intruder, "object": probe("e2e0ha0000000000"),
                 "update": True, "reason_contains": "admission probe: params generation e2e0ha0000000000 in effect"})
     fsv("another params generation's probe (a dry run) is let by", probe("fedcba9876543210"), intruder, True)
-    # portcullis-removed-nodes (Task 30 fix round 1): a removed node's
-    # kubelet identity (its client certificate still authenticates) can't
-    # register its Node again. The e2e params list vector-removed and
-    # vector-gone (e2e-ha-admission.sh); the Node is otherwise admissible
-    # (portcullis-node-labels: exactly the unlabelled taint).
+    # portcullis-removed-nodes (Task 30 fix rounds 1 and 2): a removed
+    # node's kubelet identity (its client certificate still authenticates)
+    # can't register or update its Node, nor file a CSR. Its own params
+    # (e2e-ha-admission.sh: portcullis-removed-nodes-e2e, kube/admission/
+    # removed-nodes.yaml) list vector-removed and vector-gone; the Node
+    # vector-removed exists (made by the CLI identity) for the UPDATE
+    # vectors; the Node is otherwise admissible (portcullis-node-labels:
+    # exactly the unlabelled taint). A second binding on params without
+    # removedNodes judges only objects labelled vector.example/nokey (R-M2).
     RN = "portcullis-removed-nodes"
 
     def kubelet(name):
         return {"user": "system:node:" + name, "groups": ["system:nodes", "system:authenticated"]}
+    # In system:nodes without a node name, and a node name without the group
+    # (e2e RBAC lets both write Nodes and CSRs, so the policy decides).
+    member = {"user": "vector-nodes-member", "groups": ["system:nodes", "system:authenticated"]}
+    nogroup = {"user": "system:node:vector-removed", "groups": ["system:authenticated"]}
 
-    def node(name, ann=None):
+    def node(name, ann=None, labels=None):
         md = {"name": name}
         if ann:
             md["annotations"] = ann
+        if labels:
+            md["labels"] = labels
         return {"apiVersion": "v1", "kind": "Node", "metadata": md,
                 "spec": {"taints": [{"key": "nodeadm.portcullis/unlabelled", "value": "true", "effect": "NoSchedule"}]}}
 
-    def rnv(name, o, who, allowed, also=None, reason=None):
+    # Throwaway CSRs (the keys discarded): CN system:node:<name>, O system:nodes.
+    csrs = {"vector-removed": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIM01JR2VBZ0VBTUR3eEZUQVRCZ05WQkFvTURITjVjM1JsYlRwdWIyUmxjekVqTUNFR0ExVUVBd3dhYzNsegpkR1Z0T201dlpHVTZkbVZqZEc5eUxYSmxiVzkyWldRd1dUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DCkFBUUs5L3NZRkY4TmZoMWJ2ZWRhWjdMaGo2RW9RdHRtMXI3aXNva25ZK0EwakgwcE1OcEQzRkNvVlp2TERJYk8KcDBmcE5vOVQ0VkNEcC9zdHlZUmxiVmlHb0FBd0NnWUlLb1pJemowRUF3SURTQUF3UlFJaEFKUjErUEovbTcvVApxQUdEc2lDMlhHREZOUUlnWG5keGc4aFJ4aW4xejFQV0FpQnRWTis4SWZhaVVuMEJVU1Q3ckw4U0ZzenArTEc3CkpqUUR0d2cxT252VlpBPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUgUkVRVUVTVC0tLS0tCg==",
+            "vector-fresh": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIMk1JR2NBZ0VBTURveEZUQVRCZ05WQkFvTURITjVjM1JsYlRwdWIyUmxjekVoTUI4R0ExVUVBd3dZYzNsegpkR1Z0T201dlpHVTZkbVZqZEc5eUxXWnlaWE5vTUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFCmxxNXBaclY2WEpyYUhOS2kvS1dvWno2N2RsRzQzSWZMeEZyZmtVdjlkNWV4YjgveFZNdlhsSmJVc0JMSW5EdU0Kd1FIRTdwb3owYUhrdUF4UjUrUW5PYUFBTUFvR0NDcUdTTTQ5QkFNQ0Ewa0FNRVlDSVFEVTVRekpiN0JVdzlvdwplVkgzbDRGZXVQa2QzRFl3VitOc09HdWpPSUNTakFJaEFQN0gveXhZNDlRS0ZsMVMwbHlsL2xxcmt6UnVjZjJSClpYTTlDanorMTBUTwotLS0tLUVORCBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K"}
+
+    def csr(name, cn):
+        return {"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest", "metadata": {"name": name},
+                "spec": {"request": csrs[cn], "signerName": "kubernetes.io/kube-apiserver-client-kubelet", "usages": ["digital signature", "client auth"]}}
+
+    def rnv(name, o, who, allowed, also=None, reason=None, update=False, sub=None):
         v = {"policy": RN, "name": f"removed nodes: {name}", "allowed": allowed, "as": who, "object": o}
         if also:
             v["also_refused_by"] = also
         if reason:
             v["reason_contains"] = reason
+        if update:
+            v["update"] = True
+        if sub:
+            v["subresource"] = sub
         out.append(v)
+    gone = "was removed from the cluster"
     rnv("a removed node's kubelet registers its Node again", node("vector-removed"), kubelet("vector-removed"), False,
         reason="node vector-removed was removed from the cluster")
     rnv("another removed node's kubelet registers its Node again", node("vector-gone"), kubelet("vector-gone"), False)
@@ -417,6 +440,36 @@ def vectors():
     rnv("its generation probe is refused", node("vector-fresh", {"portcullis.io/removed-nodes-generation": "e2e0ha0000000000"}), kubelet("vector-fresh"), False,
         reason="admission probe: params generation e2e0ha0000000000 in effect")
     rnv("another generation's probe is let by", node("vector-fresh", {"portcullis.io/removed-nodes-generation": "0123456789abcdef"}), kubelet("vector-fresh"), True)
+    # R-M1: an UPDATE and a status update of the removed (existing) Node.
+    rnv("a removed node's kubelet updates its Node", node("vector-removed"), kubelet("vector-removed"), False, reason=gone, update=True)
+    rnv("a removed node's kubelet updates its Node's status", node("vector-removed"), kubelet("vector-removed"), False, reason=gone,
+        update=True, sub="status")
+    # R-M1: a group-only identity (no node name: self is "") and a node name
+    # without the group.
+    rnv("a system:nodes member without a node name registers a removed Node", node("vector-removed"), member, False, reason=gone)
+    rnv("a system:nodes member without a node name updates a removed Node", node("vector-removed"), member, False, reason=gone, update=True)
+    rnv("a system:nodes member without a node name registers a fresh Node", node("vector-fresh"), member, True)
+    rnv("a removed name without the group registers its Node", node("vector-removed"), nogroup, False, reason=gone)
+    rnv("a removed name without the group registers a Node of another name", node("vector-fresh"), nogroup, False,
+        reason="node vector-removed was removed from the cluster")
+    # R-I1: CSR creates by (and for) a removed name.
+    rnv("a removed node's kubelet files a client CSR", csr("vector-csr-a", "vector-removed"), kubelet("vector-removed"), False,
+        reason="node vector-removed was removed from the cluster: its kubelet identity can file no certificate signing request")
+    rnv("a removed name without the group files a CSR", csr("vector-csr-b", "vector-removed"), nogroup, False,
+        reason="can file no certificate signing request")
+    rnv("a node that was never removed files its client CSR", csr("vector-csr-c", "vector-fresh"), kubelet("vector-fresh"), True)
+    rnv("a system:nodes member without a node name files a CSR", csr("vector-csr-d", "vector-fresh"), member, True)
+    # The probe identity writes only in a dry run (every e2e vector is one:
+    # its generation probe above is refused by the probe rule, so a probe
+    # identity's dry run of a fresh Node is admitted).
+    rnv("the probe identity's dry run of a Node is let by", node("portcullis-admission-probe"), kubelet("portcullis-admission-probe"), True)
+    # R-M2: params without removedNodes refuse every node identity's write,
+    # the fresh one's and the probe's included (a probe never confirms them).
+    nk = {"vector.example/nokey": "true"}
+    lack = "lack removedNodes"
+    rnv("params without removedNodes refuse a fresh node's registration", node("vector-fresh", labels=nk), kubelet("vector-fresh"), False, reason=lack)
+    rnv("params without removedNodes refuse that generation's probe", node("vector-fresh", {"portcullis.io/removed-nodes-generation": "e2e0nokey0000000"}, nk),
+        kubelet("vector-fresh"), False, reason=lack)
     return out
 
 

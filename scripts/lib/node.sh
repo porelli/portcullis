@@ -188,15 +188,15 @@ kube_params_generation() {
 # whose Node object still exists, and every InternalIP / ExternalIP of every
 # live Node (the union: the document is nodeadm's, the Node objects the API
 # server's); _K_DOC_API = api; each a /32, sorted unique, space-separated;
-# _K_DOC_REMOVED = removed_names (every node name nodeadm removed, sorted
-# unique, each a node id; params removedNodes, portcullis-removed-nodes).
+# removed_names must be node ids (nodeadm's own params
+# portcullis-removed-nodes carry them, not these: Task 30 fix round 2).
 # Strict IPv4 only (an IPv4 single-stack cluster: octets 0–255, no leading
 # zero; any IPv6 or malformed entry refuses the whole document). 0 = used;
 # 2 = no document yet; 1 = refused (_K_ERR): it doesn't parse, a live Node
 # is missing from it, or kube_cluster_addresses refuses it (fail closed).
 kube_doc_addresses() {
   local out doc vals live
-  _K_DOC_NODES="" _K_DOC_API="" _K_DOC_REMOVED=""
+  _K_DOC_NODES="" _K_DOC_API=""
   if ! out="$(kube_ctl -n "$(kube_ns)" get configmap "$KUBE_CLUSTER_ADDRESSES" -o json 2>&1)"; then
     case "$out" in *NotFound*) return 2 ;; esac
     _K_ERR="the cluster addresses (ConfigMap $KUBE_CLUSTER_ADDRESSES) can't be read"; return 1
@@ -220,26 +220,25 @@ kube_doc_addresses() {
       | if ($missing | length) > 0 then "MISSING\t" + ($missing | join(" "))
         else [([(.nodes | to_entries[] | select(.value.state != "removed" or (.key as $k | $names | index($k)))
                  | .value | .mesh, .lan[], .public[]), ($laddr[] | select(ip4))] | map(. + "/32") | unique | join(" ")),
-              (.api | map(. + "/32") | unique | join(" ")), (.removed_names | unique | join(" "))] | @tsv end' 2>/dev/null)"
+              (.api | map(. + "/32") | unique | join(" "))] | @tsv end' 2>/dev/null)"
   case "$vals" in
     "") _K_ERR="the cluster addresses (ConfigMap $KUBE_CLUSTER_ADDRESSES) don't parse: nothing is changed"; return 1 ;;
     MISSING*) _K_ERR="the cluster addresses don't list the node(s) ${vals#MISSING$'\t'}: nothing is changed"; return 1 ;;
   esac
-  IFS=$'\t' read -r _K_DOC_NODES _K_DOC_API _K_DOC_REMOVED <<< "$vals"
+  IFS=$'\t' read -r _K_DOC_NODES _K_DOC_API <<< "$vals"
   [ -n "$_K_DOC_NODES" ] && [ -n "$_K_DOC_API" ] || { _K_ERR="the cluster addresses list no node or no API server: nothing is changed"; return 1; }
 }
 
 # kube_params_addresses — the nodeAddresses / apiAddresses kube_admission_params
 # writes: the cluster addresses document's once it exists (refused while it
 # doesn't validate), else PORTCULLIS_KUBE_NODE_ADDRESSES (or the nodes') and
-# PORTCULLIS_KUBE_API_ENDPOINTS. Sets _K_PARAM_NODES / _K_PARAM_API, and
-# _K_PARAM_REMOVED (the document's removed names; none without one).
+# PORTCULLIS_KUBE_API_ENDPOINTS. Sets _K_PARAM_NODES / _K_PARAM_API.
 kube_params_addresses() {
   local a ep rc=0
-  _K_PARAM_NODES="" _K_PARAM_API="" _K_PARAM_REMOVED=""
+  _K_PARAM_NODES="" _K_PARAM_API=""
   kube_doc_addresses || rc=$?
   case "$rc" in
-    0) _K_PARAM_NODES="$_K_DOC_NODES" _K_PARAM_API="$_K_DOC_API" _K_PARAM_REMOVED="$_K_DOC_REMOVED"; return 0 ;;
+    0) _K_PARAM_NODES="$_K_DOC_NODES" _K_PARAM_API="$_K_DOC_API"; return 0 ;;
     1) fail "$_K_ERR (admission params)" ;;
   esac
   for a in ${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}; do _K_PARAM_NODES+="${_K_PARAM_NODES:+ }$a/32"; done
@@ -283,11 +282,8 @@ kube_params_sync() {
     | jq -r '.data // {} | del(.generation) | to_entries[] | "\(.key)\t\(.value)"' 2>/dev/null || true)"
   [ -n "$base" ] || fail "params-sync: the active params portcullis-admission-params-$cur can't be read"
   hub="$(printf '%s\n' "$base" | awk -F'\t' '$1 == "hubImage" { print $2 }')"
-  # removedNodes (Task 30 fix round 1): the document's removed names,
-  # written even when the active params lack the key (never left out).
-  params="$(printf '%s\n' "$base" | awk -F'\t' -v n="$_K_DOC_NODES" -v a="$_K_DOC_API" -v p="$_K_POD_CIDR" -v s="$_K_SVC_CIDR" -v r="$_K_DOC_REMOVED" 'BEGIN { OFS = "\t" }
-    $1 == "nodeAddresses" { $2 = n } $1 == "apiAddresses" { $2 = a } $1 == "podCIDR" { $2 = p } $1 == "serviceCIDR" { $2 = s }
-    $1 == "removedNodes" { $2 = r; seen = 1 } { print } END { if (!seen) print "removedNodes", r }')"
+  params="$(printf '%s\n' "$base" | awk -F'\t' -v n="$_K_DOC_NODES" -v a="$_K_DOC_API" -v p="$_K_POD_CIDR" -v s="$_K_SVC_CIDR" 'BEGIN { OFS = "\t" }
+    $1 == "nodeAddresses" { $2 = n } $1 == "apiAddresses" { $2 = a } $1 == "podCIDR" { $2 = p } $1 == "serviceCIDR" { $2 = s } { print }')"
   gen="$(printf '%s\n' "$params" | kube_params_generation)"
   if [ "$gen" = "$cur" ]; then
     # Unchanged only when it still judges (review I3): every binding of the
@@ -305,13 +301,21 @@ kube_params_sync() {
 # kube_params_intact <gen> <params lines> — prints why generation <gen>
 # doesn't judge as recorded (nothing = intact): each of the KUBE_BINDINGS
 # <binding>-<gen> exists, labelled with <gen> and naming
-# portcullis-admission-params-<gen>; that ConfigMap exists; the record
+# portcullis-admission-params-<gen> (KUBE_REMOVED_BINDING: by its own name,
+# on KUBE_REMOVED_PARAMS, which exists); that ConfigMap exists; the record
 # portcullis-admission-active names <gen> with the params' addresses.
 kube_params_intact() {
   local gen="$1" params="$2" live b rec nodes api
   live="$(kube_ctl get validatingadmissionpolicybinding -l "portcullis.io/params-generation=$gen" -o json 2>/dev/null)" \
     || { echo "its bindings can't be listed"; return 0; }
   for b in $KUBE_BINDINGS; do
+    if [ "$b" = "$KUBE_REMOVED_BINDING" ]; then
+      kube_ctl get validatingadmissionpolicybinding "$b" -o json 2>/dev/null | P="$KUBE_REMOVED_PARAMS" jq -e '.spec.paramRef.name == env.P' >/dev/null 2>&1 \
+        || { echo "the binding $b is missing"; return 0; }
+      kube_ctl -n "$(kube_ns)" get configmap "$KUBE_REMOVED_PARAMS" -o name >/dev/null 2>&1 \
+        || { echo "its params $KUBE_REMOVED_PARAMS are missing"; return 0; }
+      continue
+    fi
     printf '%s' "$live" | N="$b-$gen" P="portcullis-admission-params-$gen" jq -e \
       '[.items[] | select(.metadata.name == env.N and .spec.paramRef.name == env.P)] | length == 1' >/dev/null 2>&1 \
       || { echo "the binding $b-$gen is missing"; return 0; }
@@ -949,6 +953,8 @@ _node_kube() {
 
 _node_id() {
   [[ "$2" =~ $NODE_ID_RE ]] || usage_error "node $1" "invalid node id: $2 (^[a-z][a-z0-9-]{0,30}\$)"
+  # The admission probes' node identity (fix round 2, nit 2; nodeadm refuses it too).
+  [[ "$1" != add || "$2" != portcullis-admission-* ]] || usage_error "node add" "node id $2 is reserved (portcullis-admission-… names the admission probes)"
 }
 
 _node_add() {
@@ -1145,14 +1151,21 @@ _node_revoke_outcome() {
           ok "$id revoked (parked: the Hub finishes the removal once etcd has quorum)" >&2; return 0 ;;
         revoked\|true\|*) ok "$id revoked" >&2; return 0 ;;
         revoked\|*) [ $((i % 20)) != 0 ] || info "  the revocation of $id goes on in nodeadm..." >&2 ;;
-        # Not marked: asked again (the Hub records it once nodeadm answers).
-        *)
+        # Mid-operation (fix round 2, nit 3): a revoke now is refused
+        # (the Hub's 409) or would turn a removal into a revoke: wait.
+        removing\|*|enrolling\|*)
+          [ $((i % 20)) != 0 ] || info "  the Hub lists $id as $(printf '%s' "$s" | jq -r .state): waiting for that operation to end..." >&2 ;;
+        # Not marked, nothing running (ready, offline): asked again (the
+        # Hub records it once nodeadm answers; a revoke asked again is
+        # idempotent). Any other state is waited for, never resent.
+        ready\|*|offline\|*)
           if [ $((i - last)) -ge 20 ]; then
             last=$i rc=0
             info "  the Hub lists $id as $(printf '%s' "$s" | jq -r .state): asking it to revoke $id again..." >&2
             _node_revoke_send "$id" || rc=$?
             [ "$rc" != 1 ] || return 1
           fi ;;
+        *) [ $((i % 20)) != 0 ] || info "  the Hub lists $id as $(printf '%s' "$s" | jq -r .state): waiting..." >&2 ;;
       esac
     fi
     sleep "${NODE_POLL:-3}"

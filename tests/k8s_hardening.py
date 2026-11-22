@@ -923,11 +923,17 @@ NODEADM_CLUSTER_RULES = [
     {"apiGroups": ["postgresql.cnpg.io"], "resources": ["clusters"], "verbs": ["get", "list"]},
     {"apiGroups": ["longhorn.io"], "resources": ["volumes", "nodes", "replicas"], "verbs": ["get", "list"]},
     {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["get", "list"]},
+    # Task 30 fix round 2: the removed-node probe identity, exactly (no group).
+    {"apiGroups": [""], "resources": ["users"], "resourceNames": ["system:node:portcullis-admission-probe"], "verbs": ["impersonate"]},
 ]
+# The probe identity's only right (portcullis-removed-nodes refuses it but a dry run).
+PROBE_CLUSTER_RULES = [{"apiGroups": [""], "resources": ["nodes"], "verbs": ["create"]}]
+NODEADM_DEFAULT_RULES = [{"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "resourceNames": ["kubernetes"], "verbs": ["get"]}]
 NODEADM_CORE_RULES = [
     {"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["nodeadm-k3s-token", "frontdoor-control-tls", "nodeadm-state"], "verbs": ["get", "update"]},
     {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-cluster-addresses"], "verbs": ["update"]},
     {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-admission-active", "portcullis-first-node"], "verbs": ["get"]},
+    {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-removed-nodes"], "verbs": ["get", "update"]},
     {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["portcullis-nodeadm"], "verbs": ["get", "update"]},
 ]
 NODEADM_KUBE_SYSTEM_RULES = [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "delete"]}]
@@ -996,19 +1002,32 @@ def check_nodeadm():
                  if any(s.get("name") == "nodeadm" for b in K.by_kind(docs, "RoleBinding")
                         if b["roleRef"]["name"] == r["metadata"]["name"] and b["metadata"]["namespace"] == r["metadata"]["namespace"]
                         for s in b.get("subjects", []))}
-        want = {(K.NS, "portcullis-nodeadm"): NODEADM_CORE_RULES, ("kube-system", "portcullis-nodeadm"): NODEADM_KUBE_SYSTEM_RULES}
+        want = {(K.NS, "portcullis-nodeadm"): NODEADM_CORE_RULES, ("kube-system", "portcullis-nodeadm"): NODEADM_KUBE_SYSTEM_RULES,
+                ("default", "portcullis-nodeadm"): NODEADM_DEFAULT_RULES}
         if ha:
             want[("longhorn-system", "portcullis-nodeadm")] = NODEADM_LONGHORN_RULES
             want[("portcullis-fencing", "portcullis-nodeadm")] = NODEADM_FENCING_RULES
         if roles != want:
             F.add(f"nodeadm's Roles {roles} != {want}")
+        # The probe identity (Task 30 fix round 2): exactly one binding, to
+        # exactly that user, of exactly nodes create; nothing else grants it.
+        pr = [d for d in K.by_kind(docs, "ClusterRole") if d["metadata"]["name"] == "portcullis-admission-probe"]
+        prb = [b for b in K.by_kind(docs, "ClusterRoleBinding") + K.by_kind(docs, "RoleBinding")
+               if any(x.get("name") == "system:node:portcullis-admission-probe" for x in b.get("subjects", []))]
+        if len(pr) != 1 or pr[0]["rules"] != PROBE_CLUSTER_RULES or len(prb) != 1 or prb[0]["roleRef"]["name"] != "portcullis-admission-probe" \
+                or prb[0]["subjects"] != [{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": "system:node:portcullis-admission-probe"}]:
+            F.add("the probe identity system:node:portcullis-admission-probe must hold exactly nodes create (ClusterRole portcullis-admission-probe)")
+        for d in K.by_kind(docs, "ClusterRole") + K.by_kind(docs, "Role"):
+            for r in d["rules"]:
+                if "impersonate" in r.get("verbs", []) and not (d["metadata"]["name"] == "portcullis-nodeadm" and r == NODEADM_CLUSTER_RULES[-1]):
+                    F.add(f"{d['kind']} {d['metadata']['name']}: impersonate (only nodeadm, only the probe user)")
         for d in K.by_kind(docs, "ClusterRole") + K.by_kind(docs, "Role"):
             if "nodeadm" in d["metadata"]["name"]:
                 for r in d["rules"]:
                     if set(r.get("resources", [])) & ADMISSION_RESOURCES or "*" in r.get("resources", []) + r.get("verbs", []):
                         F.add(f"{d['kind']} {d['metadata']['name']}: an admission object or a wildcard (ruling R-ADM)")
                     if "configmaps" in r.get("resources", []) and {"create", "delete", "patch"} & set(r["verbs"]):
-                        F.add(f"{d['kind']} {d['metadata']['name']}: configmaps {r['verbs']} (update the addresses, get the active record only)")
+                        F.add(f"{d['kind']} {d['metadata']['name']}: configmaps {r['verbs']} (update the addresses and the removed-node params, get the records only)")
         got = secret_access(docs).get(f"{NODEADM_NS}/nodeadm", set())
         if got != {K.NS}:
             F.add(f"nodeadm reads Secrets in {sorted(got)} (the core namespace's three, by name)")
