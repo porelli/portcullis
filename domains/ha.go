@@ -76,6 +76,9 @@ const haPoll = 10 * time.Second
 // 10 s rounds; it writes at least every 30 s) is stale.
 const haStale = 12 * frontdoor.Round
 
+// haCantFollow starts a records step's error while no document counts.
+const haCantFollow = "the front door's address set can't be followed"
+
 // haWrite bounds one provider write of the follower.
 const haWrite = 30 * time.Second
 
@@ -254,11 +257,24 @@ func (s *Service) haRefresh() {
 		s.mainGen++
 	}
 	s.ha = h
+	kick := false
 	if h.OK {
 		s.haGood = h
 		s.haSeen[h.Leader] = h.Generation
+		for _, d := range s.doc.Domains {
+			// A domain that waited for a good document retries now, not at
+			// the end of its backoff; one whose 60 s just ran out is due now,
+			// not at the worker's next tick.
+			if changed && d.State == StateError && strings.Contains(d.LastError, haCantFollow) {
+				d.NextAttempt = time.Time{}
+			}
+			kick = kick || (!d.Deleting && !now.Before(d.NextAttempt) && s.haDueLocked(d, now))
+		}
 	}
 	s.mu.Unlock()
+	if kick && !changed {
+		s.Kick()
+	}
 	if !h.OK && (old.OK || old.Err != h.Err) {
 		s.logf("high availability: %s: the added domains' address sets stay as they are", h.Err)
 	}
@@ -410,7 +426,7 @@ type haResult struct {
 // time, else at most one change per name per 60 s).
 func (s *Service) haStep(ctx context.Context, p dnsProvider, d *Domain, zone string, h haSets, now time.Time) (haResult, error) {
 	if !h.OK {
-		return haResult{}, fmt.Errorf("the front door's address set can't be followed (%s): high availability publishes the added domains' addresses from it", h.Err)
+		return haResult{}, fmt.Errorf("%s (%s): high availability publishes the added domains' addresses from it", haCantFollow, h.Err)
 	}
 	zone = dns.Fqdn(zone)
 	w := &frontdoor.Writer{Domain: d.Name, Zone: zone, P: p, TTL: frontdoor.TTL(providerMinTTL(d.Provider)), Fence: haFence{}, Policy: s.cfg.AddrPolicy}

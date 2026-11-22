@@ -389,9 +389,8 @@ func TestHAStatusUnknownNoAddresses(t *testing.T) {
 	if got := addrs(e.zone, d); len(got) != 0 {
 		t.Fatalf("%s = %v without a front door status", d, got)
 	}
+	// A good document makes it retry at once (not at the end of its backoff).
 	e.publish(f, []string{"198.51.100.5"}, []string{"198.51.100.5"})
-	e.clock.advance(2 * time.Minute) // past the backoff
-	e.svc.Kick()
 	e.waitAddrs(d, "198.51.100.5")
 	e.waitAddrs("*."+d, "198.51.100.5")
 }
