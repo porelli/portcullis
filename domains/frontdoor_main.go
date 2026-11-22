@@ -179,8 +179,11 @@ func runFrontdoor(args []string, stdout, stderr io.Writer) int {
 		logger.Printf("refusing to start: FRONTDOOR_CONTROL_ADDR=%q is not a loopback address", ctlAddr)
 		return exitFailure
 	}
-	inner, _ := unwrap(w.P.(dnsProvider))
-	_, skip := inner.(propagationSkipper)
+	skip := false
+	if dp, ok := w.P.(dnsProvider); ok {
+		inner, _ := unwrap(dp)
+		_, skip = inner.(propagationSkipper)
+	}
 	certs := &frontdoor.Certs{
 		Domain: domain, Store: frontdoor.SecretStore{Client: kc, Namespace: ns}, DNS: w, Fence: fence,
 		ACME: &frontdoorACME{email: env("ACME_EMAIL", "admin@"+domain), caServer: env("ACME_CA_SERVER", "https://acme-v02.api.letsencrypt.org/directory"),
