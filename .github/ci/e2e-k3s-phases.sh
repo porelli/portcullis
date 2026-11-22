@@ -43,6 +43,11 @@ redact() { sed -E 's#(https?://[^ ]*/invite/)[A-Za-z0-9_-]+#\1<redacted>#g'; }
 fail() { echo "FAIL: $*"; exit 1; }
 ALPINE="docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
 
+# CLI_LIBS — every library the entrypoint sources, in its order (read from
+# ./portcullis): the HA installs call into backup.sh / network.sh too (found
+# on the GitHub runner: ha_longhorn_backup_target needs backup_dest_parts).
+# shellcheck disable=SC2016  # expanded by the inner bash
+CLI_LIBS='for _lib in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" portcullis); do source "scripts/lib/$_lib.sh"; done'
 # lh_prereqs — Longhorn's node prerequisites for the dest step (sets
 # lh_skip; see there). lh_diag — what they look like on this node, printed
 # when they are still missing on a GitHub-hosted runner (nothing secret).
@@ -451,7 +456,7 @@ dest)
   ! HUB_DEV=1 ./portcullis backup destination show | grep -qF "$(sed -n 's/^AWS_SECRET_ACCESS_KEY=//p' "$t/creds" | cut -c1-12)" || fail "backup destination show printed the secret"
   K -n cnpg-system get secret backup-destination -o json | jq -e '.data | keys == ["AWS_ACCESS_KEY_ID","AWS_DEFAULT_REGION","AWS_ENDPOINTS","AWS_SECRET_ACCESS_KEY"]' >/dev/null || fail "the Secret backup-destination in cnpg-system"
   # The HA-only installs the archive needs (Task 31 runs them in ha enable).
-  HUB_DEV=1 bash -c 'source scripts/lib/common.sh; env_load; runtime_export >/dev/null 2>&1 || true; ha_install_certmanager && ha_install_barman' 2>&1 | tail -n 3
+  HUB_DEV=1 bash -c "$CLI_LIBS"'; env_load; runtime_export >/dev/null 2>&1 || true; ha_install_certmanager && ha_install_barman' 2>&1 | tail -n 3
   HUB_DEV=1 ./portcullis up 2>&1 | redact | tail -n 5
   K -n cnpg-system get networkpolicy portcullis-pg-backup -o json | jq -e --arg c 198.51.100.2/32 '.spec.podSelector.matchLabels == {"cnpg.io/cluster": "portcullis-pg", "cnpg.io/podRole": "instance"} and .spec.egress == [{"ports": [{"port": 9000, "protocol": "TCP"}], "to": [{"ipBlock": {"cidr": $c}}]}]' >/dev/null \
     || fail "portcullis-pg-backup isn't the instance pods to the destination's /32 on 9000"
@@ -498,7 +503,7 @@ dest)
     [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "- **Longhorn backup to the destination: SKIPPED** ($lh_skip). Proven on the HA VMs (task 26); the CNPG archive and the core offsite ran and passed." >> "$GITHUB_STEP_SUMMARY"
     echo "SKIPPED: Longhorn and a Longhorn backup ($lh_skip)"
   else
-    HUB_DEV=1 bash -c 'source scripts/lib/common.sh; env_load; runtime_export >/dev/null 2>&1 || true; ha_install_snapshotter && ha_install_longhorn' 2>&1 | tail -n 3
+    HUB_DEV=1 bash -c "$CLI_LIBS"'; env_load; runtime_export >/dev/null 2>&1 || true; ha_install_snapshotter && ha_install_longhorn' 2>&1 | tail -n 3
     for _ in $(seq 1 60); do [ "$(K -n longhorn-system get backuptargets.longhorn.io default -o jsonpath='{.status.available}')" = true ] && break; sleep 5; done
     [ "$(K -n longhorn-system get backuptargets.longhorn.io default -o jsonpath='{.status.available}')" = true ] || fail "Longhorn's backup target isn't available"
     K create namespace e2e-lh >/dev/null
