@@ -55,8 +55,11 @@ SECRET_READERS_HA = {
 # Any rule, from any Role, granting it more Secrets there counts in full.
 # The front door (Task 29): its own ACME account and the main domain's
 # certificate, by name (contract §20.8).
+# Task 31 fix round 2 (M3): in the ingress namespace, Traefik's default
+# certificate document traefik-default-cert, by name.
 SECRET_BY_NAME = {(K.NS, f"{K.NS}/portcullis-hub"): {"pub-mcp-credentials"},
-                  (K.NS, f"{K.NS}/frontdoor"): {"frontdoor-acme", "frontdoor-cert"}}
+                  (K.NS, f"{K.NS}/frontdoor"): {"frontdoor-acme", "frontdoor-cert"},
+                  ("portcullis-ingress", f"{K.NS}/frontdoor"): {"traefik-default-cert"}}
 SECRET_READ_VERBS = {"get", "list", "watch", "*"}
 RESTRICTED_VOLUMES = {"configMap", "csi", "downwardAPI", "emptyDir", "ephemeral", "persistentVolumeClaim", "projected", "secret"}
 
@@ -144,6 +147,9 @@ FRONTDOOR_RULES = [
     {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["portcullis-frontdoor"], "verbs": ["get", "update"]},
     {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["frontdoor-status"], "verbs": ["get", "update"]},
     {"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["frontdoor-acme", "frontdoor-cert"], "verbs": ["get", "update"]},
+]
+FRONTDOOR_DEFAULT_CERT_RULES = [
+    {"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["traefik-default-cert"], "verbs": ["get", "update"]},
 ]
 
 
@@ -264,6 +270,15 @@ def check_frontdoor():
     roles = [r for r in K.by_kind(docs, "Role") if r["metadata"]["name"] == "frontdoor"]
     if len(roles) != 1 or roles[0]["rules"] != FRONTDOOR_RULES:
         F.add(f"the front door's Role must be exactly {FRONTDOOR_RULES}")
+    # Task 31 fix round 2 (M3): in the ingress namespace only get / update
+    # of traefik-default-cert, bound to the front door's ServiceAccount.
+    dc = [r for r in K.by_kind(docs, "Role") if r["metadata"]["name"] == "frontdoor-default-cert"]
+    if len(dc) != 1 or dc[0]["metadata"].get("namespace") != "portcullis-ingress" or dc[0]["rules"] != FRONTDOOR_DEFAULT_CERT_RULES:
+        F.add(f"the front door's ingress Role must be exactly {FRONTDOOR_DEFAULT_CERT_RULES} in portcullis-ingress")
+    dcb = [b for b in K.by_kind(docs, "RoleBinding") if b["metadata"]["name"] == "frontdoor-default-cert"]
+    if len(dcb) != 1 or dcb[0]["subjects"] != [{"kind": "ServiceAccount", "name": "frontdoor", "namespace": K.NS}] \
+            or dcb[0]["roleRef"].get("name") != "frontdoor-default-cert":
+        F.add("the front door's ingress RoleBinding must bind exactly frontdoor-default-cert to the frontdoor ServiceAccount")
     for name, ns, labels, spec, ann in K.pod_specs(docs):
         secrets = {v["secret"]["secretName"] for v in spec.get("volumes", []) if "secret" in v}
         for p in spec.get("volumes", []):
@@ -278,6 +293,17 @@ def check_frontdoor():
             F.add(f"{name}: mounts frontdoor-acme (the front door's ACME account key)")
         if "frontdoor-cert" in secrets and name != "domains":
             F.add(f"{name}: mounts frontdoor-cert (only the domains service serves it)")
+        # The default certificate (M3): only the HA Traefik, projected into
+        # its watched directory as 00-default-cert.yml (sorted first), 0440,
+        # never optional (without it Traefik v3.7.17 keeps a nil default).
+        if "traefik-default-cert" in secrets:
+            srcs = [src for v in spec.get("volumes", []) if v["name"] == "dynamic" for src in v.get("projected", {}).get("sources", [])
+                    if src.get("secret", {}).get("name") == "traefik-default-cert"]
+            if name != "traefik" or ns != "portcullis-ingress" or srcs != [{"secret": {"name": "traefik-default-cert",
+                    "items": [{"key": "default-cert.yml", "path": "00-default-cert.yml", "mode": 288}]}}]:
+                F.add(f"{name} ({ns}): traefik-default-cert only as the HA Traefik's dynamic source default-cert.yml → 00-default-cert.yml, 0440, not optional")
+        if name == "traefik" and ns == "portcullis-ingress" and "traefik-default-cert" not in secrets:
+            F.add("ha: the Traefik DaemonSet doesn't project traefik-default-cert (its default certificate)")
         if name == "domains":
             if "frontdoor-cert" not in secrets:
                 F.add("ha: domains doesn't mount frontdoor-cert (the main domain's certificate)")

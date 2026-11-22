@@ -8208,11 +8208,17 @@ case "$a" in
   "get deployment "*" -o json") [ -e "$HE/k/deploy-$3" ] || exit 1; c=hub-state; [ ! -e "$HE/k/onrep-$3" ] || c=hub-state-r; echo '{"spec":{"template":{"spec":{"volumes":[{"persistentVolumeClaim":{"claimName":"'"$c"'"}}]}}}}' ;;
   "-n cnpg-system get cluster.postgresql.cnpg.io portcullis-pg -o json") cat "$HE/k/cluster.json" 2>/dev/null || exit 1 ;;
   "get secret frontdoor-cert -o json") cat "$HE/k/frontdoor-cert.json" 2>/dev/null || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
+  "-n portcullis-ingress get secret traefik-default-cert -o json") cat "$HE/k/tdc.json" 2>/dev/null || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
   "exec "*" -- cat /vol/acme.json") cat "$HE/acme.json" ;;
+  "get statefulset vault -o jsonpath={.spec.replicas}") printf 3 ;;
+  "--request-timeout=5s exec vault-"*" -c vault -- vault status -format=json")
+    if [ -e "$HE/k/vault-active-$3" ]; then echo '{"ha_enabled":true,"is_self":true}'; else echo '{"ha_enabled":true,"is_self":false}'; fi ;;
   *) echo "unexpected kubectl $*" >&2; exit 98 ;;
 esac
 KSTUB
 chmod +x "$HE/bin/kubectl"
+# Vault: vault-0 is the active voter unless a test says otherwise.
+touch "$HE/k/vault-active-vault-0"
 he_green='{"experimental":true,"enabled":false,"checklist":[{"id":"nodes","ok":true,"text":""},{"id":"watchdog","ok":true,"text":""}],"guarantee":"Degraded: one more failure may lose the last writes","nodes":[{"name":"n1","role":"server","class":"cloud","site":"main","ready":true,"fencing":false,"n_minus_1":"green"}],"quorum":{"etcd":{"voters":1,"healthy":1},"vault":{"voters":1,"healthy":1},"sentinel":{"voters":0,"healthy":0}},"frontdoor":{"state":"","error":""},"warnings":[]}'
 # hacli <stdin> <setup code> <args…> — cmd_ha in the CLI's libraries.
 hacli() {
@@ -8321,7 +8327,7 @@ rm -f "$HE/root/secrets/kube/ha-enable.json"
 # mounted read-only; a fault in the copy (the stream, or the manifests
 # differing) → refused, the writers stay at 0 on their old volumes (never
 # scaled up, never pointed at the new one), both helpers removed.
-he_vols() { rm -rf "$HE/k"; mkdir -p "$HE/k"; for v in hub-state hub-secrets hub-backups domains-data wg-data; do touch "$HE/k/pvc-$v"; done; for d in hub domains wg; do echo 1 > "$HE/k/deploy-$d"; done; }
+he_vols() { rm -rf "$HE/k"; mkdir -p "$HE/k"; for v in hub-state hub-secrets hub-backups domains-data wg-data; do touch "$HE/k/pvc-$v"; done; for d in hub domains wg; do echo 1 > "$HE/k/deploy-$d"; done; touch "$HE/k/vault-active-vault-0"; }
 he_vols
 hacli "" "" status >/dev/null
 hacli "" "need_env; ha_enable_step_volumes; exit 0" status
@@ -8412,6 +8418,40 @@ hacli "" "$HE_SEED" status
 case "$RC:$ERR" in "1:"*"under the 47 days"*) t_pass "switch's certificate: a saved settle point further out raises the floor" ;; *) t_fail "seed floor: $RC $ERR" ;; esac
 rm -rf "$HE/root/secrets/domains" "$HE/home/traefik/dynamic/ci-certs.yml" "$HE/root/certs"
 
+# Fix round 2, M3: Traefik's default certificate. Before every HA release
+# the served pair of frontdoor-cert becomes the ingress namespace's
+# traefik-default-cert (default-cert.yml: the default TLS store, the pair
+# inline); the key only on pipes; a pair that doesn't hold together is
+# never written (an existing document kept, none = refused); traefik/dynamic
+# may not define a store.
+he_fdc() { jq -n --arg c "$(he_b64 "$1.crt")" --arg k "$(he_b64 "$2.key")" '{data: {"tls.crt": $c, "tls.key": $k}}' > "$HE/k/frontdoor-cert.json"; }
+HE_DC="export PORTCULLIS_HOME='$HE/home'; need_env; ha_default_cert_sync; echo DC-DONE; exit 0"
+rm -f "$HE"/k/applied.* "$HE/k/tdc.json"; he_fdc "$HE/le" "$HE/le"
+hacli "" "$HE_DC" status
+expect_eq "default certificate: the served pair as the default store's, in the ingress namespace, owner core" \
+  "$RC|$(cat "$HE"/k/applied.* | jq -c --rawfile c "$HE/le.crt" --rawfile k "$HE/le.key" '[.metadata.namespace, .metadata.name, .metadata.labels["portcullis.io/owner"], (.data | keys), (.data["default-cert.yml"] | @base64d | fromjson | .tls.stores.default.defaultCertificate | [.certFile == $c, .keyFile == $k]), (.data["default-cert.yml"] | @base64d | fromjson | .tls | keys)]')" \
+  '0|["portcullis-ingress","traefik-default-cert","core",["default-cert.yml"],[true,true],["stores"]]'
+expect_eq "default certificate: no key or certificate on argv" "$(grep -c 'PRIVATE\|BEGIN' "$HE/calls")" 0
+# The Go side's document (domains/frontdoor/defaultcert.go) is the same JSON shape.
+expect_eq "default certificate: the document is exactly the front door's shape" \
+  "$(cat "$HE"/k/applied.* | jq -r '.data["default-cert.yml"] | @base64d' | sed -E 's/"certFile":"[^"]*"/"certFile":"C"/; s/"keyFile":"[^"]*"/"keyFile":"K"/')" \
+  '{"tls":{"stores":{"default":{"defaultCertificate":{"certFile":"C","keyFile":"K"}}}}}'
+rm -f "$HE"/k/applied.*; he_fdc "$HE/le" "$HE/near"
+hacli "" "$HE_DC" status
+case "$RC:$ERR" in "1:"*"Traefik would have no default certificate (frontdoor-cert's served key isn't its certificate's; portcullis-ingress/traefik-default-cert holds none either): nothing deployed"*) t_pass "default certificate: a key of another certificate, no document yet → refused" ;; *) t_fail "default cert mismatch: $RC $ERR" ;; esac
+expect_eq "default certificate: a refusal writes nothing" "$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" 0
+jq -n '{data: {"default-cert.yml": "e30="}}' > "$HE/k/tdc.json"
+hacli "" "$HE_DC" status
+case "$RC:$OUT:$ERR" in "0:"*"DC-DONE"*"default certificate is kept as it is (frontdoor-cert's served key isn't its certificate's)"*) t_pass "default certificate: a bad pair keeps the existing document (warned)" ;; *) t_fail "default cert kept: $RC $ERR" ;; esac
+expect_eq "default certificate: kept means nothing written" "$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" 0
+rm -f "$HE/k/tdc.json" "$HE/k/frontdoor-cert.json"
+hacli "" "$HE_DC" status
+case "$RC:$ERR" in "1:"*"frontdoor-cert holds no served certificate"*) t_pass "default certificate: no served pair and no document → refused" ;; *) t_fail "default cert none: $RC $ERR" ;; esac
+he_fdc "$HE/le" "$HE/le"; printf 'tls:\n  stores:\n    default:\n      defaultCertificate: {}\n' > "$HE/home/traefik/dynamic/mine.yml"
+hacli "" "$HE_DC" status
+case "$RC:$ERR" in "1:"*"traefik/dynamic defines a TLS store"*) t_pass "default certificate: a traefik/dynamic TLS store is refused in HA" ;; *) t_fail "default cert store: $RC $ERR" ;; esac
+rm -f "$HE/home/traefik/dynamic/mine.yml" "$HE/k/frontdoor-cert.json" "$HE"/k/applied.*
+
 # Found live (Task 31): on Kubernetes the dns tool's one-shot runs the
 # release's image: domains_image_ensure builds nothing and never refuses.
 OUT="$(CONTAINER_RUNTIME=kubernetes bash -c 'for l in common domains; do source "'"$HERE"'/../scripts/lib/$l.sh" >/dev/null 2>&1; done; runtime_build_service() { echo BUILT; }; domains_image_ensure "for the dns tool"; echo "rc=$?"' 2>&1)"
@@ -8470,14 +8510,14 @@ expect_eq "switch: writers on their old volumes" "$RC:$OUT" "0:LOCAL"
 # with HA on, the front door's credentials after the sync and Traefik's
 # old Services moved after the images, sync and probes, right before helm;
 # with HA off neither.
-HE_UP='for f in kube_images_ready hub_env_write kube_sync_secrets ha_frontdoor_env_sync kube_cluster_setup kube_pg_sync_secrets kube_lldap_schema_retry kube_netpol_probe kube_render_values kube_vault_shrink_prepare _ha_services_move kube_vault_shrink_finish kube_backup_after_release kube_cluster_check kube_first_nodeagent kube_forward_core; do eval "$f() { echo $f >> \"\$HE/ran\"; }"; done
+HE_UP='for f in kube_images_ready hub_env_write kube_sync_secrets ha_frontdoor_env_sync ha_default_cert_sync kube_cluster_setup kube_pg_sync_secrets kube_lldap_schema_retry kube_netpol_probe kube_render_values kube_vault_shrink_prepare _ha_services_move kube_vault_shrink_finish kube_backup_after_release kube_cluster_check kube_first_nodeagent kube_forward_core; do eval "$f() { echo $f >> \"\$HE/ran\"; }"; done
   kube_helm() { echo "helm $1" >> "$HE/ran"; }; export PORTCULLIS_HOME=/x; need_env'
 rm -f "$HE/ran"; hacli "" "$HE_UP; export PORTCULLIS_HA=on; _rtk_up; exit 0" status
 expect_eq "an HA release: the front door's credentials after the sync, Traefik's Services moved right before helm" \
   "$RC:$(tr '\n' ' ' < "$HE/ran")" \
-  "0:kube_images_ready hub_env_write kube_sync_secrets ha_frontdoor_env_sync kube_cluster_setup kube_pg_sync_secrets kube_lldap_schema_retry kube_netpol_probe kube_render_values kube_vault_shrink_prepare _ha_services_move helm upgrade kube_vault_shrink_finish kube_backup_after_release kube_cluster_check kube_first_nodeagent kube_forward_core "
+  "0:kube_images_ready hub_env_write kube_sync_secrets ha_frontdoor_env_sync ha_default_cert_sync kube_cluster_setup kube_pg_sync_secrets kube_lldap_schema_retry kube_netpol_probe kube_render_values kube_vault_shrink_prepare _ha_services_move helm upgrade kube_vault_shrink_finish kube_backup_after_release kube_cluster_check kube_first_nodeagent kube_forward_core "
 rm -f "$HE/ran"; hacli "" "$HE_UP; unset PORTCULLIS_HA; _rtk_up; exit 0" status
-expect_eq "a non-HA release: no front-door credentials, no Services moved" "$RC:$(grep -c 'ha_frontdoor_env_sync\|_ha_services_move' "$HE/ran")" "0:0"
+expect_eq "a non-HA release: no front-door credentials, no default certificate, no Services moved" "$RC:$(grep -c 'ha_frontdoor_env_sync\|ha_default_cert_sync\|_ha_services_move' "$HE/ran")" "0:0"
 # The switch on replicated writers copies nothing (never over a writer's new data).
 HE_SW='_ha_main_cert_plan() { echo plan >> "$HE/ran"; }; _ha_writers_on_replicated() { return 0; }; _ha_writers_stopped() { echo stopped >> "$HE/ran"; }
   _ha_volumes_same() { echo same >> "$HE/ran"; }; ha_enable_step_volumes() { echo COPY >> "$HE/ran"; }; ha_frontdoor_env_sync() { echo env >> "$HE/ran"; }
@@ -8549,6 +8589,80 @@ case "$OUT" in *"Not spread:"*"  group-gate: all 2 replicas on node vm2"*"  sess
 hacli "" "export PORTCULLIS_HA=on HA_STATUS_WAIT=0; need_env; _ha_green() { :; }; ha_enable_step_status" status
 case "$RC:$ERR" in "1:"*"group-gate: all 2 replicas on node vm2"*"ha status isn't all green"*) t_pass "step 10: not green while replicas aren't spread" ;; *) t_fail "step 10 spread: $RC $ERR" ;; esac
 rm -f "$HE/k/pods.json"
+
+# Fix round 2 (Vault, found live: no active node for ~50 min, nodeadm down
+# with it): ha status asks the voters itself and says it plainly; step 10
+# isn't green; --json carries vault_active. With a leader: nothing.
+printf '%s' "$he_green" | jq -c '.enabled = true' > "$HE/view.json"
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_status" status
+case "$OUT" in *"no active Vault"*) t_fail "ha status: no-active-Vault line with vault-0 leading: $OUT" ;; *) t_pass "ha status: no Vault line while a voter leads" ;; esac
+rm -f "$HE/k/vault-active-vault-0"
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_status" status
+case "$OUT" in *"Vault: no active Vault: no voter leads"*"get pods -l portcullis.io/component=vault"*"Quorum:"*) t_pass "ha status: no active Vault said plainly (the voters asked)" ;; *) t_fail "ha status no active Vault: $OUT" ;; esac
+hacli "" "export PORTCULLIS_HA=on" status
+expect_eq "ha status: every voter asked, once" "$RC:$(grep -c 'exec vault-[0-2] -c vault -- vault status' "$HE/calls")" 0:3
+rm -f "$HE/view.json"
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_status" status
+case "$OUT" in *"Vault: no active Vault"*"The Hub's HA view: unreadable"*) t_pass "ha status: no active Vault also while the Hub's view is unreadable" ;; *) t_fail "ha status no Vault, no view: $OUT" ;; esac
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_status true" status
+expect_eq "ha status --json: vault_active false" "$(jq -r .vault_active <<<"$OUT")" false
+printf '%s' "$he_green" | jq -c '.enabled = true' > "$HE/view.json"
+hacli "" "export PORTCULLIS_HA=on HA_STATUS_WAIT=0; need_env; _ha_green() { :; }; _ha_spread_lines() { :; }; ha_enable_step_status" status
+case "$RC:$ERR" in "1:"*"no active Vault"*"ha status isn't all green"*) t_pass "step 10: not green without an active Vault" ;; *) t_fail "step 10 no Vault: $RC $ERR" ;; esac
+touch "$HE/k/vault-active-vault-1"
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_status true" status
+expect_eq "ha status --json: vault_active true (vault-1 leads)" "$(jq -r .vault_active <<<"$OUT")" true
+hacli "" "need_env; ha_status true" status
+expect_eq "ha status --json: vault_active null without HA" "$(jq -r .vault_active <<<"$OUT")" null
+rm -f "$HE/k/vault-active-vault-1" "$HE/view.json"; touch "$HE/k/vault-active-vault-0"
+
+# Fix round 2 (Vault, found live): vault/serving.sh, the HA voter's
+# readiness and liveness — 0 only when this voter is active or its
+# advertised leader (one of our voters) confirms it is; wget stubbed by URL
+# (each answer a file, a missing one = unreachable). The calls are logged.
+VS="$WORK/vserving"; mkdir -p "$VS/bin" "$VS/r"
+cat > "$VS/bin/wget" <<EOF
+#!/bin/sh
+for u; do :; done
+echo "\$u" >> "$VS/calls"
+f="$VS/r/\$(printf '%s' "\$u" | tr -c 'a-z0-9' '_')"
+[ -f "\$f" ] || exit 1
+cat "\$f"
+EOF
+chmod +x "$VS/bin/wget"
+vs_answer() { printf '%s' "$2" > "$VS/r/$(printf '%s' "$1" | tr -c 'a-z0-9' '_')"; }
+vs_run() { rm -f "$VS/calls"; PATH="$VS/bin:$PATH" VAULT_SERVING_ADDR=http://127.0.0.1:8200 sh "$HERE/../vault/serving.sh"; echo "$?:$(tr '\n' ' ' < "$VS/calls" 2>/dev/null)"; }
+LOC=http://127.0.0.1:8200/v1/sys/leader V0=http://vault-0.vault-internal:8200/v1/sys/leader
+vs_answer "$LOC" '{"ha_enabled":true,"is_self":true,"leader_address":"http://vault-1.vault-internal:8200"}'
+expect_eq "vault serving: the active node passes on its own answer (never asks another)" "$(vs_run)" "0:$LOC "
+vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":"http://vault-0.vault-internal:8200"}'
+vs_answer "$V0" '{"ha_enabled":true,"is_self":true,"leader_address":"http://vault-0.vault-internal:8200"}'
+expect_eq "vault serving: a standby whose leader confirms it is active passes" "$(vs_run)" "0:$LOC $V0 "
+vs_answer "$V0" '{"ha_enabled":true,"is_self":false,"active_time":"0001-01-01T00:00:00Z","leader_address":""}'
+expect_eq "vault serving: the advertised leader isn't active (found live: a dead active node's advertisement) → not serving" "$(vs_run)" "1:$LOC $V0 "
+vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":""}'
+expect_eq "vault serving: no leader advertised → not serving" "$(vs_run)" "1:$LOC "
+vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":"http://evil.example:8200"}'
+expect_eq "vault serving: a leader address that isn't one of our voters is never asked → not serving" "$(vs_run)" "1:$LOC "
+vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":"http://vault-2.vault-internal:8200"}'
+expect_eq "vault serving: the advertised leader unreachable → not serving" "$(vs_run)" "1:$LOC http://vault-2.vault-internal:8200/v1/sys/leader "
+rm -f "$VS/r/"*
+expect_eq "vault serving: the local API not answering (sealed, starting) → not serving" "$(vs_run)" "1:$LOC "
+# The chart: only the HA voters use it, liveness with a 3-minute grace,
+# startup still vault status; one voter (no HA) unchanged.
+vprobes() { helm template portcullis "$HERE/../charts/portcullis" -n portcullis -f "$HERE/k8s-ci-values.yaml" -f "$VS/img.yaml" "$@" 2>/dev/null \
+  | python3 -c 'import sys, yaml, json
+for d in yaml.safe_load_all(sys.stdin):
+    if d and d.get("kind") == "StatefulSet" and d["metadata"]["name"] == "vault":
+        c = d["spec"]["template"]["spec"]["containers"][0]
+        print(json.dumps([c["readinessProbe"]["exec"]["command"], c["livenessProbe"]["exec"]["command"], c["livenessProbe"]["periodSeconds"] * c["livenessProbe"]["failureThreshold"], c["startupProbe"]["exec"]["command"]]))'; }
+if command -v helm >/dev/null && python3 -c 'import sys; sys.path.insert(0, "'"$HERE"'"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))' > "$VS/img.yaml" 2>/dev/null; then
+  expect_eq "vault chart: HA readiness and liveness = serving.sh, liveness grace 180 s, startup vault status" "$(vprobes -f "$HERE/k8s-ci-values-ha.yaml")" \
+    '[["/bin/sh", "/vault/portcullis/serving.sh"], ["/bin/sh", "/vault/portcullis/serving.sh"], 180, ["vault", "status"]]'
+  expect_eq "vault chart: one voter (no HA) keeps vault status everywhere" "$(vprobes)" '[["vault", "status"], ["vault", "status"], 50, ["vault", "status"]]'
+else
+  t_fail "vault chart probes: helm or the images values not available"
+fi
 
 echo ""
 echo "$PASS passed, $FAIL failed"

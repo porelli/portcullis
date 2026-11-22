@@ -155,7 +155,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
-        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh tests/e2e/*.sh vault/entrypoint.sh .github/automerge/*.sh .github/ci/*.sh .github/ci/local/*.sh .github/ci/local/runner/*.sh
+        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh tests/e2e/*.sh vault/entrypoint.sh vault/serving.sh .github/automerge/*.sh .github/ci/*.sh .github/ci/local/*.sh .github/ci/local/runner/*.sh
       - name: ci.yml stays under GitHub's workflow size limit (lint at 450,000 bytes; GitHub refuses 500 KB)
         run: tests/lint_ci_size.sh
       - name: No compiled program is tracked (tests/lint_no_binaries.sh)

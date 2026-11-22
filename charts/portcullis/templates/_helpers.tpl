@@ -54,17 +54,26 @@ readinessProbe:
   periodSeconds: 2
   {{- else }}
   exec:
-    command: {{ toJson $cmd }}
+    command: {{ toJson ($h.serving | default $cmd) }}
   periodSeconds: {{ $iv }}
   {{- end }}
   timeoutSeconds: {{ $to }}
   failureThreshold: {{ $re }}
+{{- /* serving [argv] + liveGrace (seconds): readiness and liveness are that
+exec instead of the test, liveness every 10 s for liveGrace (the HA Vault
+voter's vault/serving.sh: Task 31 fix round 2); startup stays the test. */}}
 livenessProbe:
   exec:
-    command: {{ toJson $cmd }}
+    command: {{ toJson ($h.serving | default $cmd) }}
+  {{- if $h.serving }}
+  periodSeconds: 10
+  timeoutSeconds: {{ $to }}
+  failureThreshold: {{ div (int (required "health.liveGrace is required with health.serving" $h.liveGrace)) 10 }}
+  {{- else }}
   periodSeconds: {{ $iv }}
   timeoutSeconds: {{ $to }}
   failureThreshold: {{ mul $re 2 }}
+  {{- end }}
 {{- if $h.startPeriod }}
 startupProbe:
   exec:

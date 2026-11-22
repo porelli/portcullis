@@ -12632,6 +12632,104 @@
   "ha": true
  },
  {
+  "name": "ha: the HA Traefik pod projecting its default certificate (Secret traefik-default-cert, default-cert.yml as 00-default-cert.yml, 0440) into its dynamic directory is admitted (Task 31 fix round 2, M3)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Pod",
+   "metadata": {
+    "name": "traefik-x7k2p",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/name": "traefik"
+    },
+    "ownerReferences": [
+     {
+      "apiVersion": "apps/v1",
+      "kind": "DaemonSet",
+      "name": "traefik",
+      "uid": "00000000-0000-4000-8000-000000000001",
+      "controller": true
+     }
+    ]
+   },
+   "spec": {
+    "serviceAccountName": "traefik",
+    "containers": [
+     {
+      "name": "traefik",
+      "image": "docker.io/library/traefik:v3.7.0@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "ports": [
+       {
+        "containerPort": 8443,
+        "hostPort": 443
+       },
+       {
+        "containerPort": 8000,
+        "hostPort": 80
+       }
+      ],
+      "securityContext": {
+       "runAsNonRoot": true,
+       "runAsUser": 65532,
+       "allowPrivilegeEscalation": false,
+       "readOnlyRootFilesystem": true,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "seccompProfile": {
+        "type": "RuntimeDefault"
+       }
+      },
+      "volumeMounts": [
+       {
+        "name": "dynamic",
+        "mountPath": "/etc/traefik/dynamic",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "volumes": [
+     {
+      "name": "dynamic",
+      "projected": {
+       "sources": [
+        {
+         "configMap": {
+          "name": "config-traefik-dynamic"
+         }
+        },
+        {
+         "configMap": {
+          "name": "traefik-dynamic"
+         }
+        },
+        {
+         "secret": {
+          "name": "traefik-default-cert",
+          "items": [
+           {
+            "key": "default-cert.yml",
+            "path": "00-default-cert.yml",
+            "mode": 288
+           }
+          ]
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "as": "cli",
+  "want": "allow",
+  "reason_contains": "",
+  "ha": true
+ },
+ {
   "name": "ha: the Traefik DaemonSet with the chart's probes",
   "object": {
    "apiVersion": "apps/v1",

@@ -1590,11 +1590,12 @@ spec:
   # Traefik's only ConfigMaps, Secrets and environment variable names
   # (charts/portcullis/templates/traefik.yaml; tests/k8s_hardening.py holds
   # the rendered pod to these lists). kube-root-ca.crt: the API access volume
-  # the ServiceAccount admission plugin adds.
+  # the ServiceAccount admission plugin adds. traefik-default-cert: the HA
+  # Traefik's default certificate document (Task 31 fix round 2, M3).
   - name: traefikConfigMaps
     expression: "['config-traefik-dynamic', 'traefik-dynamic', 'certs', 'kube-root-ca.crt']"
   - name: traefikSecrets
-    expression: "['secrets-certs', 'secrets-domains-certs-endpoint', 'portcullis-env']"
+    expression: "['secrets-certs', 'secrets-domains-certs-endpoint', 'portcullis-env', 'traefik-default-cert']"
   - name: traefikEnv
     expression: >-
       ['TRAEFIK_API_DASHBOARD', 'TRAEFIK_API_INSECURE', 'TRAEFIK_LOG_LEVEL', 'TRAEFIK_ACCESSLOG',

@@ -264,6 +264,9 @@ bash .github/ci/e2e-k3s-apps-admission.sh ci
 bash .github/ci/e2e-k3s-chart-admission.sh ci
 # A params change never leaves an object unbound.
 bash .github/ci/e2e-k3s-rebind.sh
+# The HA Traefik's default certificate: the main domain's from the first
+# handshake (no SNI, unknown SNI), after a restart and a renewal.
+bash .github/ci/e2e-k3s-default-cert.sh ci
 
 # ── Secret access of every ServiceAccount (least privilege) ──
 # Traefik reads Secrets only in the edge namespace (it holds none), the Hub

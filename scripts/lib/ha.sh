@@ -2947,6 +2947,48 @@ _ha_frontdoor_cert_seed() {
   ok "The certificate of $d Traefik serves now ($_HA_CERT_SRC) is the front door's served one until the account switch."
 }
 
+# ha_default_cert_sync — before every HA release (_rtk_up; Task 31 fix
+# round 2, M3): the ingress namespace's Secret traefik-default-cert, key
+# default-cert.yml = Traefik's default TLS store holding frontdoor-cert's
+# served pair inline (the document domains/frontdoor/defaultcert.go
+# writes; the chart projects it into Traefik's watched directory, not
+# optional). So a (re)starting Traefik serves the main domain's
+# certificate from its first handshake, for no SNI and an unknown SNI too,
+# never its own self-signed one. Only a pair whose leaf names exactly <d>
+# and *.<d>, unexpired, with its key, is written; else an existing
+# document is kept (warned), and with none the release is refused (a
+# Traefik pod couldn't start). traefik/dynamic may not define a TLS store
+# in HA (the file provider keeps the first of a name). The key travels in
+# memory and on pipes only (kubectl → jq → kubectl; openssl reads stdin).
+ha_default_cert_sync() {
+  local ns ins="$KUBE_INGRESS_NS" src crt a b why="" have
+  ns="$(kube_ns)"
+  if grep -lsE '^[[:space:]]*stores:' "$PORTCULLIS_HOME"/traefik/dynamic/*.yml >/dev/null 2>&1; then
+    fail "traefik/dynamic defines a TLS store: in HA the default store is Portcullis' own (the main domain's certificate, traefik-default-cert); remove the stores: block"
+  fi
+  src="$(kube_ctl -n "$ns" get secret frontdoor-cert -o json 2>/dev/null)" || src=""
+  crt="$(printf '%s' "$src" | jq -r '.data["tls.crt"] // empty' 2>/dev/null | base64 -d 2>/dev/null)" || crt=""
+  if [ -z "$crt" ]; then
+    why="frontdoor-cert holds no served certificate"
+  elif ! _ha_cert_ok "$crt" 0; then
+    why="frontdoor-cert's served certificate: $_HA_CERT_WHY"
+  else
+    a="$(printf '%s\n' "$crt" | openssl x509 -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null)"
+    b="$(printf '%s' "$src" | jq -r '.data["tls.key"] // empty' | base64 -d 2>/dev/null | openssl pkey -pubout 2>/dev/null | openssl sha256 2>/dev/null)"
+    [ -n "$a" ] && [ "$a" = "$b" ] || why="frontdoor-cert's served key isn't its certificate's"
+  fi
+  if [ -n "$why" ]; then
+    have="$(kube_ctl -n "$ins" get secret traefik-default-cert -o json 2>/dev/null | jq -r '.data["default-cert.yml"] // empty' 2>/dev/null)" || have=""
+    [ -n "$have" ] || fail "Traefik would have no default certificate ($why; $ins/traefik-default-cert holds none either): nothing deployed. Check ./portcullis ha status and the front door's log (kubectl -n $ns logs deploy/frontdoor)"
+    warn "Traefik's default certificate is kept as it is ($why)."
+    return 0
+  fi
+  printf '%s' "$src" | NS="$ins" jq -c '{apiVersion: "v1", kind: "Secret", type: "Opaque",
+      metadata: {name: "traefik-default-cert", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/owner": "core"}},
+      data: {"default-cert.yml": ({tls: {stores: {default: {defaultCertificate: {certFile: (.data["tls.crt"] | @base64d), keyFile: (.data["tls.key"] | @base64d)}}}}} | tojson | @base64)}}' \
+    | _ha_apply || fail "could not write $ins/traefik-default-cert (Traefik's default certificate): nothing deployed"
+}
+
 # _ha_writers_on_replicated — a writer's Deployment already mounts a
 # <pvc>-r (an earlier switch applied it): its data is the replicated
 # copy's now, which must never be copied over again.
@@ -3119,7 +3161,7 @@ ha_enable_step_status() {
   info "Waiting for ha status to be all green..."
   while :; do
     if _ha_hub_view; then
-      why="$(_ha_green "$_HA_VIEW"; _ha_spread_lines)"
+      why="$(_ha_green "$_HA_VIEW"; _ha_spread_lines; _ha_no_active_vault_line)"
       [ -n "$why" ] || break
     else
       why="the Hub's HA view: $_HA_ERR"
@@ -3180,8 +3222,10 @@ ha_status() {
   _ha_hub_view || true
   view="$_HA_VIEW"
   if [ "$json" = true ]; then
-    jq -n --argjson r "$rec" --arg v "$view" --arg e "${_HA_ERR:-}" --arg ha "${PORTCULLIS_HA:-off}" \
-      '{ha: ($ha == "on"), enable: $r, hub: (if $v == "" then null else ($v | fromjson) end), hub_error: (if $v == "" then $e else null end)}'
+    local va=null
+    if kube_ha_on; then if kube_vault_leader >/dev/null 2>&1; then va=true; else va=false; fi; fi
+    jq -n --argjson r "$rec" --arg v "$view" --arg e "${_HA_ERR:-}" --arg ha "${PORTCULLIS_HA:-off}" --argjson va "$va" \
+      '{ha: ($ha == "on"), enable: $r, vault_active: $va, hub: (if $v == "" then null else ($v | fromjson) end), hub_error: (if $v == "" then $e else null end)}'
     return 0
   fi
   next="$(_ha_enable_next)"
@@ -3198,6 +3242,7 @@ ha_status() {
       printf 'ha enable: done (%s)\n' "$(jq -r '.done[-1].at' <<<"$rec")"
     fi
   fi
+  _ha_no_active_vault_line
   if [ -z "$view" ]; then
     if [ -n "$next" ] && _ha_enable_done volumes && ! _ha_enable_done switch; then
       printf 'The Hub is stopped by ha enable (its volumes are copied: step 4 done) until the switch (step 5).\n'
@@ -3221,6 +3266,17 @@ ha_status() {
   fi
 }
 
+# _ha_no_active_vault_line — HA (Task 31 fix round 2; found live: ~50 min
+# with no active Vault while nodeadm, whose certificate Vault signs, was
+# down and the quorum said nothing): the CLI asks the voters itself
+# (kube_vault_leader: vault status on each, is_self) and says it plainly
+# when none is active. Nothing without HA or when one leads.
+_ha_no_active_vault_line() {
+  kube_ha_on || return 0
+  ! kube_vault_leader >/dev/null 2>&1 || return 0
+  printf 'Vault: no active Vault: no voter leads (sealed, unreachable, or stuck unable to become active), so Vault answers no request (certificates, sign-in setup, nodeadm). Each voter'"'"'s liveness restarts it after 3 minutes without an active node; check: kubectl -n %s get pods -l portcullis.io/component=vault\n' "$(kube_ns)"
+}
+
 help_ha() {
   cat <<'HELP'
 Usage: portcullis ha <subcommand>
@@ -3242,8 +3298,10 @@ view (`hub ha checklist`, as Settings → High availability shows it): the
 checklist ha enable needs all green, the Postgres guarantee, the etcd,
 Vault and Sentinel quorums, each node (role, class, site, ready, fencing,
 N−1) and the warnings. While ha enable has the Hub stopped (its volumes
-copied, before the switch) it says so. --json prints
-{ha, enable, hub, hub_error}.
+copied, before the switch) it says so. In HA it asks the Vault voters
+itself and says "no active Vault" when none leads (also while the Hub's
+view is unreadable). --json prints {ha, enable, vault_active, hub,
+hub_error} (vault_active null without HA).
 HELP
 }
 

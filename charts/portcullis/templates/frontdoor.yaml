@@ -5,7 +5,8 @@ main domain's DNS credentials, the file credentials.json; written by the CLI,
 never Helm) and frontdoor-control-tls (its frontdoor.control client
 certificate, written and renewed by nodeadm; empty until then, so the front
 door reaches no prober and changes nothing). Its Role: get / update of its
-Lease and of frontdoor-status only. Its network: egress to the DNS provider's
+Lease and of frontdoor-status only (and, in the ingress namespace, of
+traefik-default-cert: Task 31 fix round 2). Its network: egress to the DNS provider's
 API (any public address on 443: a NetworkPolicy can't name a host), the
 nodeagents' :7443 on the node mesh, nodeadm's :8443 and the API server;
 ingress only Prometheus on :9106. The label portcullis.io/net-frontdoor names
@@ -41,6 +42,7 @@ authoritative nameservers; the CA is public 443. */ -}}
     (dict "name" "FRONTDOOR_NODEADM_URL" "value" (printf "https://nodeadm.%s.svc:8443" .Values.ha.nodeadmNamespace))
     (dict "name" "FRONTDOOR_CREDENTIALS_FILE" "value" "/run/portcullis/frontdoor/credentials.json")
     (dict "name" "FRONTDOOR_TLS_DIR" "value" "/run/portcullis/frontdoor-tls")
+    (dict "name" "FRONTDOOR_INGRESS_NAMESPACE" "value" .Values.ingressNamespace)
     (dict "name" "FRONTDOOR_EXCLUDED_CIDRS" "value" (printf "%s %s %s" .Values.ha.meshCIDR (required "podCIDR is required" .Values.podCIDR) (required "serviceCIDR is required" .Values.serviceCIDR))))
   "mounts" (list
     (dict "name" "credentials" "mountPath" "/run/portcullis/frontdoor" "readOnly" true)
@@ -109,6 +111,39 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: frontdoor
+subjects:
+  - kind: ServiceAccount
+    name: frontdoor
+    namespace: {{ $ns }}
+---
+# Traefik's default certificate (Task 31 fix round 2, M3): the front door
+# mirrors its served pair into the ingress namespace's
+# traefik-default-cert (created by the CLI, ha.sh ha_default_cert_sync;
+# domains/frontdoor/defaultcert.go): get / update of that one Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: frontdoor-default-cert
+  namespace: {{ .Values.ingressNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["traefik-default-cert"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: frontdoor-default-cert
+  namespace: {{ .Values.ingressNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: frontdoor-default-cert
 subjects:
   - kind: ServiceAccount
     name: frontdoor

@@ -193,6 +193,16 @@ func runFrontdoor(args []string, stdout, stderr io.Writer) int {
 		Check: func(chain, key string, now time.Time) error { return servableHA(chain, key, domain, mailHost, now) },
 		Log:   func(m string) { logger.Print(clean(m)) },
 	}
+	// The HA Traefik's default certificate (Task 31 fix round 2, M3): the
+	// served pair mirrored into the ingress namespace's
+	// traefik-default-cert (FRONTDOOR_INGRESS_NAMESPACE, the chart's).
+	var mirror *frontdoor.DefaultCertMirror
+	if ins := strings.TrimSpace(os.Getenv("FRONTDOOR_INGRESS_NAMESPACE")); ins != "" {
+		mirror = &frontdoor.DefaultCertMirror{Client: kc, Namespace: ins, Store: certs.Store, Check: certs.Check, Fence: fence,
+			Log: func(m string) { logger.Print(clean(m)) }}
+	} else {
+		logger.Print("frontdoor: FRONTDOOR_INGRESS_NAMESPACE is empty: Traefik's default certificate isn't kept up to date")
+	}
 	metrics := frontdoor.NewMetrics()
 	sink := frontdoor.ConfigMapSink{Client: kc, Namespace: ns, Leader: pod}
 	r := &frontdoor.Runner{
@@ -247,7 +257,8 @@ func runFrontdoor(args []string, stdout, stderr io.Writer) int {
 	}()
 	// The certificate: renewed by the leader when less than 30 days are
 	// left (a certificate of the current account only; the first one is
-	// ordered by the CAA flip). Checked every minute (the Secret).
+	// ordered by the CAA flip). Checked every minute (the Secret), and
+	// the served pair mirrored as Traefik's default.
 	go func() {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
@@ -256,6 +267,11 @@ func runFrontdoor(args []string, stdout, stderr io.Writer) int {
 				logger.Printf("frontdoor: renewing the certificate: %s", clean(err.Error()))
 			} else if ordered {
 				logger.Print("frontdoor: certificate renewed")
+			}
+			if mirror != nil {
+				if _, err := mirror.Sync(ctx); err != nil {
+					logger.Printf("frontdoor: Traefik's default certificate: %s", clean(err.Error()))
+				}
 			}
 			// The served pair's expiry; unreadable = 0 (the help says so).
 			c, err := certs.Store.LoadServed(ctx)
