@@ -59,8 +59,10 @@ func joinFlags(rec *nodeRecord, id, serverURL, clusterCIDR string) []string {
 		"--token-file=" + k3sTokenFile,
 		"--node-name=" + id,
 		"--node-ip=" + ip,
-		// The kubelet (and kube-proxy's health / metrics) on the mesh
-		// address only, through k3s's own listener setting: k3s v1.37.2's
+		// The kubelet on the mesh address only, through k3s's own listener
+		// setting (kube-proxy's health / metrics stay on 127.0.0.1, and
+		// nodeagent's PORTCULLIS-MESH-IN keeps the mesh address's ports
+		// off every other interface): k3s v1.37.2's
 		// agent tunnel dials the kubelet at that same address
 		// (pkg/agent/config/config.go:583-591 sets ListenAddress from
 		// --bind-address, pkg/daemons/agent/agent.go:226-227 makes it the

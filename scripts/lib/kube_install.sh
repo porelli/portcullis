@@ -387,6 +387,7 @@ Address = $KUBE_MESH_IP/24
 ListenPort = $KUBE_MESH_PORT
 MTU = $KUBE_MESH_MTU
 PostUp = wg set %i private-key $KUBE_MESH_KEY
+$(_ki_mesh_input_postup)
 EOF
   fi
   # `enable --now` can answer 0 although the start failed (systemd 255):
@@ -397,6 +398,31 @@ EOF
     fail "wg-quick@$KUBE_MESH_IF didn't start (its last journal lines are above)"
   fi
   info "Node mesh $KUBE_MESH_IF up: $KUBE_MESH_IP/24, UDP $KUBE_MESH_PORT."
+}
+
+# _ki_mesh_input_rules — PORTCULLIS-MESH-IN's rules on this first node (a
+# server; Task 28 fix round 2): the kubelet, the API server / supervisor
+# and etcd listen on the mesh address only, and only pcmesh, loopback and
+# the node's pod networks may reach that address on their ports (a LAN /
+# VPC neighbour could route to it through the uplink: Linux's weak host
+# model). The list is tests/fixtures/mesh-input-rules.txt, the one the
+# nodeagent keeps on every node (Hub internal/nodeagent/host/mesh.go
+# meshInRules), so it takes the chain over unchanged.
+_ki_mesh_input_rules() {
+  local i
+  for i in pcmesh lo cni0 flannel+; do printf -- '-A PORTCULLIS-MESH-IN -i %s -j RETURN\n' "$i"; done
+  printf -- '-A PORTCULLIS-MESH-IN -d %s/32 -p tcp -m multiport --dports 10250,6443,2379,2380 -j DROP\n' "$KUBE_MESH_IP"
+}
+
+# _ki_mesh_input_postup — the PostUp lines that (re)build the chain and
+# put INPUT's jump to it first, at every wg-quick up (before k3s, which
+# starts after wg-quick@pcmesh).
+_ki_mesh_input_postup() {
+  local r
+  printf 'PostUp = iptables -w 5 -N PORTCULLIS-MESH-IN 2>/dev/null || true\n'
+  printf 'PostUp = iptables -w 5 -F PORTCULLIS-MESH-IN\n'
+  while IFS= read -r r; do printf 'PostUp = iptables -w 5 %s\n' "$r"; done < <(_ki_mesh_input_rules)
+  printf 'PostUp = iptables -w 5 -C INPUT -j PORTCULLIS-MESH-IN 2>/dev/null || iptables -w 5 -I INPUT 1 -j PORTCULLIS-MESH-IN\n'
 }
 
 # _ki_journal_tail <unit> <lines> — the unit's last journal lines on stderr
