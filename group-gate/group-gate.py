@@ -769,8 +769,10 @@ PORTAL_CSS = (
 
 def _form_action(domain: str) -> str:
     """CSP form-action: the sign-out endpoint's origin, https://auth.<domain>
-    (the site bar's Sign out posts there), else 'none'."""
-    return f"https://auth.{domain}" if valid_hostname(domain) else "'none'"
+    (the site bar's Sign out posts there), and https://<domain>, where its
+    302 lands (the Signed out page: browsers check form-action on a form's
+    redirects too), else 'none'."""
+    return f"https://auth.{domain} https://{domain}" if valid_hostname(domain) else "'none'"
 
 
 PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"

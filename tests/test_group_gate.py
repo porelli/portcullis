@@ -3802,7 +3802,7 @@ class SignOutTest(GateTest):
                     self.assertEqual(hdrs.get("Allow"), "POST")
                     self.assertNotIn("X-Auth-Request-Redirect", hdrs)
                     self.assertIn('action="https://auth.example.com/oauth2/sign_out" enctype="text/plain"', body)
-                    self.assertIn("form-action https://auth.example.com;", hdrs["Content-Security-Policy"])
+                    self.assertIn("form-action https://auth.example.com https://example.com;", hdrs["Content-Security-Policy"])
                     self.assertIn("frame-ancestors 'none'", hdrs["Content-Security-Policy"])
                     self.assertNotIn("evil", body)
 
@@ -3905,7 +3905,7 @@ class SignOutTest(GateTest):
         self.assertIn('<a class="pn-signout-btn" id="pn-sign-out" href="https://people.example.com/impersonation/stop">'
                       'Sign out</a>', imp)
         self.assertNotIn("<form", imp)
-        self.assertIn("form-action https://auth.example.com;", gg.PORTAL_CSP)
+        self.assertIn("form-action https://auth.example.com https://example.com;", gg.PORTAL_CSP)
         hostile = gg.render_portal('<b>"x', set(), [], "example.com").decode()
         self.assertIn("Signed in as <strong>&lt;b&gt;&quot;x</strong>", hostile)
 

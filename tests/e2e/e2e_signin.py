@@ -2883,7 +2883,15 @@ def main() -> int:
                 page = ctx.new_page()
                 before = session_ids("alice")
                 goto(page, PORTAL)
-                until("the portal as alice", lambda: page.url == PORTAL and "Signed in as" in body(page), 60, every=1)
+
+                def at_portal():
+                    # The impersonation notice, when an earlier case left it
+                    # owed (imp_notice_next_signin normally takes it).
+                    if page.locator("#portcullis-notice-continue").count():
+                        page.click("#portcullis-notice-continue")
+                        return False
+                    return page.url == PORTAL and "Signed in as" in body(page)
+                until("the portal as alice", at_portal, 60, every=1)
                 bar = page.locator(".pn-bar")
                 assert "Signed in as alice" in bar.inner_text(), bar.inner_text()
                 assert page.locator("form.pn-signout[method=post][enctype='text/plain'] #pn-sign-out").count() == 1
