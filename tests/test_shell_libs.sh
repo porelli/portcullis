@@ -8423,8 +8423,11 @@ expect_eq "switch: a writer on a <pvc>-r is seen (no copy over it)" "$RC:$OUT" "
 rm -f "$HE/k/onrep-hub"
 hacli "" "need_env; _ha_writers_on_replicated || echo LOCAL; exit 0" status
 expect_eq "switch: writers on their old volumes" "$RC:$OUT" "0:LOCAL"
-expect_eq "switch: the services move before the release, the copy check skipped on replicated writers" \
-  "$(declare -f ha_enable_step_switch >/dev/null 2>&1; bash -c 'source "'"$HERE"'/../scripts/lib/common.sh" >/dev/null 2>&1; declare -f ha_enable_step_switch' | grep -c '_ha_writers_on_replicated\|_ha_services_move')" 2
+expect_eq "switch: the copy check skipped on replicated writers" \
+  "$(bash -c 'source "'"$HERE"'/../scripts/lib/common.sh" >/dev/null 2>&1; declare -f ha_enable_step_switch' | grep -c '_ha_writers_on_replicated')" 1
+expect_eq "an HA release moves Traefik's Services right before helm (after the images, sync and probes)" \
+  "$(awk '/^_rtk_up\(\) \{/,/^}/' "$HERE/../scripts/lib/kube.sh" | grep -n 'kube_images_ready\|_ha_services_move\|kube_helm upgrade' | cut -d: -f2 | tr -s ' ' | sed 's/^ //' | cut -c1-30 | tr '\n' '|')" \
+  "kube_images_ready|kube_vault_shrink_prepare; ! k|kube_helm upgrade --install \"$|"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

@@ -2840,7 +2840,9 @@ _ha_writers_on_replicated() {
 # traefik-metrics stay in the core namespace as ExternalName names.
 HA_MOVED_SERVICES="traefik traefik-vpn keycloak-internal traefik-metrics"
 
-# _ha_services_move — before the switch's release: the core namespace's
+# _ha_services_move — right before an HA release (_rtk_up, after the
+# images, the sync and the probes, so sign-in stops as late as possible):
+# the core namespace's
 # old Services of HA_MOVED_SERVICES deleted (found live: the release
 # creates traefik in portcullis-ingress at the same fixed ClusterIP, which
 # the old one still held — "provided IP is already allocated" — and a
@@ -2869,7 +2871,6 @@ ha_enable_step_switch() {
   _ha_frontdoor_cert_seed
   env_set PORTCULLIS_HA on
   export PORTCULLIS_HA=on
-  _ha_services_move
   info "HA on (PORTCULLIS_HA=on in .env): deploying the HA shape (./portcullis up)..."
   stack_up
 }

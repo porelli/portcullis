@@ -1768,7 +1768,7 @@ _rtk_up() {
   fi
   kube_render_values
   vf="$(kube_values_file)"
-  kube_vault_shrink_prepare  # fewer voters: their raft peers removed first (ha.sh)
+  kube_vault_shrink_prepare; ! kube_ha_on || _ha_services_move  # fewer voters first; HA's Traefik Services (ha.sh)
   info "helm upgrade --install $KUBE_RELEASE${wait[*]:+ (waits up to 10 minutes)}..."
   kube_helm upgrade --install "$KUBE_RELEASE" "$PORTCULLIS_HOME/charts/portcullis" -n "$(kube_ns)" \
     --skip-crds ${wait[@]+"${wait[@]}"} -f "$vf" >&2 || rc=$?
