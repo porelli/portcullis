@@ -752,7 +752,15 @@ services:
       # router oauth2-signout and its guard (group-gate /signout-guard).
       # Into alpha.yaml's backendLogoutURL (a provider option: the
       # OAUTH2_PROXY_BACKEND_LOGOUT_URL env var is ignored with --alpha-config).
-      PORTCULLIS_BACKEND_LOGOUT_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/logout?id_token_hint={id_token}
+      # Straight to Keycloak on the portcullis network (like the Hub's
+      # KEYCLOAK_URL), never through Traefik: its access log would record the
+      # id_token_hint, and the keycloak router's rate-limit-auth (shared by
+      # every refresh from this gateway) could refuse it with a 429 — the
+      # sign-out would then land on /signed-out with the SSO session alive.
+      # Keycloak trusts proxy headers only from Traefik's pinned address, so
+      # nothing forwarded here counts; sslRequired=external admits the
+      # private address.
+      PORTCULLIS_BACKEND_LOGOUT_URL: http://keycloak:8080/realms/portcullis/protocol/openid-connect/logout?id_token_hint={id_token}
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_SSL_UPSTREAM_INSECURE_SKIP_VERIFY: "true"
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt

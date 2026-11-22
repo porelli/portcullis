@@ -275,7 +275,7 @@ echo "$CFG" | jq -e '.services["forward-auth"] as $m | .services["forward-auth-e
     and $g["traefik.http.routers.signed-out.rule"] == "Host(`portcullis.local`) && Path(`/signed-out`)"
     and $g["traefik.http.routers.signed-out.middlewares"] == "rate-limit@file,security-headers@file"
     and $g["traefik.http.routers.signed-out.service"] == "group-gate"
-    and ($m.environment.PORTCULLIS_BACKEND_LOGOUT_URL | startswith("https://auth.portcullis.local/realms/portcullis/protocol/openid-connect/logout?id_token_hint="))
+    and $m.environment.PORTCULLIS_BACKEND_LOGOUT_URL == "http://keycloak:8080/realms/portcullis/protocol/openid-connect/logout?id_token_hint={id_token}"
     and ($x.environment.PORTCULLIS_BACKEND_LOGOUT_URL // null) == null
     and (([$m, $x] | map(.environment | has("OAUTH2_PROXY_BACKEND_LOGOUT_URL")) | any) | not)' >/dev/null \
   || { echo "FAIL: sign-out wiring (oauth2-signout + portcullis-signout-guard, signed-out, backend logout on forward-auth only; contract §5)"; exit 1; }

@@ -175,6 +175,10 @@ echo "PASS: cross-site / foreign-origin / app-origin / Origin-null / rd-carrying
 #    from the store, the old cookie gets 401, Keycloak's session is gone and
 #    the next request to a forward-auth page goes to sign-in.
 cp "$J" /tmp/sess-before.jar
+# The backend logout goes straight to Keycloak (http://keycloak:8080), never
+# through Traefik: its access log must not gain an id_token_hint.
+tk_hints() { docker compose logs --no-color traefik 2>&1 | grep -c 'id_token_hint' || true; }
+HINTS_BEFORE="$(tk_hints)"
 HDRS="$("${C[@]}" -o /dev/null -D - -X POST -H 'Sec-Fetch-Site: same-site' -H 'Sec-Fetch-Mode: navigate' -H 'Origin: https://hub.portcullis.local' \
   -H 'Content-Type: text/plain' --data-binary '' https://auth.portcullis.local/oauth2/sign_out | tr -d '\r')"
 printf '%s\n' "$HDRS" | head -1 | grep -q ' 302' || { echo "FAIL: the sign-out POST: $(printf '%s\n' "$HDRS" | head -1)"; docker compose logs --tail=20 group-gate forward-auth; exit 1; }
@@ -184,6 +188,14 @@ LOC="$(printf '%s\n' "$HDRS" | sed -n 's/^[Ll]ocation: //p')"
 code="$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt --resolve "auth.portcullis.local:443:127.0.0.1" -b /tmp/sess-before.jar https://auth.portcullis.local/oauth2/auth)"
 [ "$code" = 401 ] || { echo "FAIL: the signed-out ticket still answers $code"; exit 1; }
 for i in $(seq 1 10); do [ "$(kc_sessions)" = 0 ] && break; [ "$i" = 10 ] && { echo "FAIL: testuser's Keycloak session $SID_KC survived the sign-out"; docker compose logs --tail=20 forward-auth; exit 1; }; sleep 1; done
+sleep 2  # Traefik's access log is buffered
+HINTS_AFTER="$(tk_hints)"
+[ "$HINTS_AFTER" = "$HINTS_BEFORE" ] || { echo "FAIL: the sign-out put an id_token_hint into Traefik's access log ($HINTS_BEFORE → $HINTS_AFTER lines)"; exit 1; }
+[ "$HINTS_AFTER" = 0 ] || echo "NOTE: Traefik's access log has $HINTS_AFTER id_token_hint line(s) from before this sign-out"
+if docker compose logs --no-color forward-auth 2>&1 | grep -q 'backend logout'; then
+  echo "FAIL: oauth2-proxy's backend logout reported an error:"; docker compose logs --no-color forward-auth 2>&1 | grep 'backend logout' | sed -E 's/id_token_hint=[^ "&]*/id_token_hint=…/g' | tail -3; exit 1
+fi
+echo "PASS: the backend logout bypasses Traefik (no id_token_hint in its access log) and reported no error"
 PORTAL="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' --cacert certs/ca-chain.crt "${A[@]}" --resolve "auth.portcullis.local:443:127.0.0.1" \
   -b /tmp/sess-before.jar https://portcullis.local/)"
 case "$PORTAL" in "302 https://auth.portcullis.local/"*) ;; *) echo "FAIL: the portal after the sign-out: $PORTAL (want a redirect to sign-in)"; exit 1 ;; esac
