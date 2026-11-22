@@ -4,7 +4,8 @@
 # (real creates, `kubectl --as`), the params change twice through
 # `./portcullis up` (HUB_OVERRIDE_BIND_ROOTS → bindRoots → a new params
 # generation, then back). Not one create may be admitted; every refusal comes
-# from an edge binding; afterwards exactly one generation's ten bindings.
+# from an edge binding; afterwards exactly one generation's swapped bindings
+# and the fixed portcullis-nodes-guard-removed once.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 K() { kubectl --context ci "$@"; }
@@ -33,6 +34,14 @@ r="$(grep -c '^refused' "$T/log" || true)" a="$(grep -c '^ADMITTED' "$T/log" || 
 [ "$a" = 0 ] || fail "a reserved-host route was admitted during a params change ($a times)"
 [ "$r" -gt 10 ] || fail "only $r refusals recorded (the loop didn't run through the changes)"
 [ "$o" = 0 ] || { grep -m3 '^OTHER' "$T/log"; fail "$o creates failed for another reason than the edge binding"; }
-n="$(K get validatingadmissionpolicybinding -l portcullis.io/binding -o json | jq '[.items[].metadata.labels["portcullis.io/params-generation"]] | unique | length')"
+b="$(K get validatingadmissionpolicybinding -l portcullis.io/binding -o json)"
+# The generation-swapped bindings: exactly one generation, every one of them
+# labelled; portcullis-nodes-guard-removed (Task 30 fix round 2) is no
+# generation's: its fixed name on its own params, exactly once.
+n="$(printf '%s' "$b" | jq '[.items[] | select(.metadata.name != "portcullis-nodes-guard-removed") | .metadata.labels["portcullis.io/params-generation"]] | unique | length')"
 [ "$n" = 1 ] || fail "$n params generations bound after the changes (want 1)"
-echo "PASS: two params changes under a looped Hub create of hub.$D: $r refused, 0 admitted; one generation bound"
+printf '%s' "$b" | jq -e '[.items[] | select(.metadata.name != "portcullis-nodes-guard-removed") | .metadata.labels["portcullis.io/params-generation"] | select(. == null)] | length == 0' >/dev/null \
+  || fail "a swapped binding has no params generation"
+rb="$(printf '%s' "$b" | jq -c '[.items[] | select(.metadata.labels["portcullis.io/binding"] == "portcullis-nodes-guard-removed")] | map([.metadata.name, .spec.paramRef.name, (.metadata.labels["portcullis.io/params-generation"] // "-")] | join(" "))')"
+[ "$rb" = '["portcullis-nodes-guard-removed portcullis-removed-nodes -"]' ] || fail "the removed-nodes binding isn't exactly once, fixed, on portcullis-removed-nodes: $rb"
+echo "PASS: two params changes under a looped Hub create of hub.$D: $r refused, 0 admitted; one generation bound; portcullis-nodes-guard-removed once on its own params"
