@@ -48,6 +48,12 @@ class GateTest(unittest.TestCase):
         self.assertIn("scripts=js/portcullis-gate.js", read("theme.properties").splitlines())
         self.assertTrue(os.path.isfile(os.path.join(LOGIN, "resources", "js", "portcullis-gate.js")))
 
+    def test_reload_replays_the_drop(self):
+        js = read(os.path.join("resources", "js", "portcullis-gate.js"))
+        self.assertIn('getEntriesByType("navigation")', js)
+        self.assertIn('nav.type === "reload"', js)
+        self.assertIn("if (!reload && now - last >= 0 && now - last < WINDOW_MS)", js)
+
     def test_art_reuses_the_logo(self):
         mark = read(os.path.join("resources", "img", "portcullis-mark.svg"))
         arch = read(os.path.join("resources", "img", "portcullis-arch.svg"))
@@ -57,8 +63,12 @@ class GateTest(unittest.TestCase):
         self.assertIn('fill="#e3ac52"', mark)
         self.assertIn('fill="#e8edf5"', arch)
         self.assertIn('fill="#e3ac52" opacity=".6"', gate)
+        self.assertIn('viewBox="0 0 32 34"', arch)
+        # The gate's bars in the top 34 units, 34 empty below: every offset
+        # (-4 down, -38 up) stays within one image height (Chromium paints a
+        # no-repeat SVG background past it as if it wrapped).
+        self.assertIn('viewBox="0 0 32 68"', gate)
         for svg in (arch, gate):
-            self.assertIn('viewBox="0 0 32 34"', svg)
             self.assertNotIn("<script", svg)
         # The logo's arch (a 14-radius outer, 12 inner here) run to the foot.
         self.assertIn("a14 14 0 0 1 28 0", arch)
@@ -69,10 +79,17 @@ class GateTest(unittest.TestCase):
         for want in ('url("../img/portcullis-arch.svg")', 'url("../img/portcullis-gate.svg")',
                      "@keyframes pc-gate-drop", "@keyframes pc-gate-rise", "animation:pc-gate-drop 460ms",
                      'data-page-id="login-portcullis-let-through"', "animation:pc-gate-rise 560ms cubic-bezier(.2,.7,.3,1)",
-                     ".pc-gate-still #keycloak-bg::before", ".pf-v5-c-alert.pf-m-danger",
+                     ".pf-v5-c-alert.pf-m-danger",
                      "@media (prefers-reduced-motion:reduce)", "#keycloak-bg>.pf-v5-c-login{position:relative;z-index:1}"):
             with self.subTest(rule=want):
                 self.assertIn(want, css)
+        self.assertIn("background-size:calc(32 * var(--pc-u)) calc(68 * var(--pc-u))", css)
+        # The Let through page rests UP (not only the animation's fill) and
+        # the still / error rules never apply to it; reduced motion: down.
+        self.assertIn('#keycloak-bg[data-page-id="login-portcullis-let-through"]::before{background-position-y:calc(-38 * var(--pc-u));animation:pc-gate-rise', css)
+        self.assertIn('.pc-gate-still #keycloak-bg:not([data-page-id="login-portcullis-let-through"])::before', css)
+        self.assertIn('#keycloak-bg:not([data-page-id="login-portcullis-let-through"]):has(', css)
+        self.assertIn('#keycloak-bg[data-page-id="login-portcullis-let-through"]::before{animation:none;background-position-y:calc(-4 * var(--pc-u))}', css)
         # The drop's overshoot: 0.8 units past down (-4) at 82% of its progress.
         self.assertIn("96.09%{background-position-y:calc(-3.2 * var(--pc-u))", css)
 
