@@ -12,6 +12,8 @@ import (
 	"maps"
 	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -81,6 +83,10 @@ type Config struct {
 	// FrontdoorStatusFile; only addresses AddrPolicy admits are written.
 	HA                  bool
 	FrontdoorStatusFile string
+	// FrontdoorCertDir: the Secret frontdoor-cert mounted read-only
+	// (tls.crt, tls.key; HA only): the main domain's certificate, served
+	// when servableHA admits it (contract §12.4 "Only Portcullis names").
+	FrontdoorCertDir string
 	// ClusterAddressesFile: portcullis-cluster-addresses' addresses.json
 	// (nodeadm's, mounted read-only): every followed address must be an
 	// active node's public address.
@@ -127,6 +133,10 @@ type Service struct {
 	haGood  haSets
 	haSeen  map[string]int64
 	haNoted map[string]string
+	// certMu guards mainLast: the last servable main-domain certificate
+	// read from the front door's Secret (frontdoorCert).
+	certMu   sync.Mutex
+	mainLast *mainCert
 
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
@@ -550,8 +560,12 @@ func copyDomain(d *Domain) *Domain {
 func (s *Service) CertsHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /traefik/dynamic", func(w http.ResponseWriter, _ *http.Request) {
+		var mc *mainCert
+		if s.cfg.HA {
+			mc = s.frontdoorCert()
+		}
 		s.mu.Lock()
-		doc, dropped := buildDynamic(s.doc.Domains, s.cfg.MainDomain, s.cfg.MailHostname, s.cfg.Now())
+		doc, dropped := buildDynamic(s.doc.Domains, mc, s.cfg.MainDomain, s.cfg.MailHostname, s.cfg.Now())
 		if d := strings.Join(dropped, "; "); d != s.lastDropped {
 			s.lastDropped = d
 			if d != "" {
@@ -562,6 +576,36 @@ func (s *Service) CertsHandler() http.Handler {
 		writeJSON(w, http.StatusOK, doc)
 	})
 	return mux
+}
+
+// frontdoorCert reads the main domain's certificate from the front door's
+// Secret (HA). A read that doesn't pass servableHA (the kubelet swapping
+// the volume between the two reads, a Secret still empty) keeps the last
+// good pair while it is still valid, so Traefik never loses the main
+// certificate for a poll; with none, the fresh read is returned (and
+// dropped, logged, by buildDynamic) or nil when there is nothing.
+func (s *Service) frontdoorCert() *mainCert {
+	dir := s.cfg.FrontdoorCertDir
+	c, cerr := os.ReadFile(filepath.Join(dir, frontdoor.CertChainKey))
+	k, kerr := os.ReadFile(filepath.Join(dir, frontdoor.CertKeyKey))
+	now := s.cfg.Now()
+	s.certMu.Lock()
+	defer s.certMu.Unlock()
+	if cerr == nil && kerr == nil && len(c) > 0 && len(k) > 0 {
+		fresh := &mainCert{CertPEM: string(c), KeyPEM: string(k)}
+		if servableHA(fresh.CertPEM, fresh.KeyPEM, s.cfg.MainDomain, s.cfg.MailHostname, now) == nil {
+			s.mainLast = fresh
+			return fresh
+		}
+		if s.mainLast != nil && servableHA(s.mainLast.CertPEM, s.mainLast.KeyPEM, s.cfg.MainDomain, s.cfg.MailHostname, now) == nil {
+			return s.mainLast
+		}
+		return fresh
+	}
+	if s.mainLast != nil && servableHA(s.mainLast.CertPEM, s.mainLast.KeyPEM, s.cfg.MainDomain, s.cfg.MailHostname, now) == nil {
+		return s.mainLast
+	}
+	return nil
 }
 
 // ── worker ───────────────────────────────────────────────

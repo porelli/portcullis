@@ -53,7 +53,10 @@ SECRET_READERS_HA = {
 # namespace: (namespace, ServiceAccount) → the names its rules may list.
 # The Hub's portcullis-hub-core: the published Secret only (contract §6).
 # Any rule, from any Role, granting it more Secrets there counts in full.
-SECRET_BY_NAME = {(K.NS, f"{K.NS}/portcullis-hub"): {"pub-mcp-credentials"}}
+# The front door (Task 29): its own ACME account and the main domain's
+# certificate, by name (contract §20.8).
+SECRET_BY_NAME = {(K.NS, f"{K.NS}/portcullis-hub"): {"pub-mcp-credentials"},
+                  (K.NS, f"{K.NS}/frontdoor"): {"frontdoor-acme", "frontdoor-cert"}}
 SECRET_READ_VERBS = {"get", "list", "watch", "*"}
 RESTRICTED_VOLUMES = {"configMap", "csi", "downwardAPI", "emptyDir", "ephemeral", "persistentVolumeClaim", "projected", "secret"}
 
@@ -140,6 +143,7 @@ def check_pod(name, ns, labels, spec, ann):
 FRONTDOOR_RULES = [
     {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["portcullis-frontdoor"], "verbs": ["get", "update"]},
     {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["frontdoor-status"], "verbs": ["get", "update"]},
+    {"apiGroups": [""], "resources": ["secrets"], "resourceNames": ["frontdoor-acme", "frontdoor-cert"], "verbs": ["get", "update"]},
 ]
 
 
@@ -242,9 +246,11 @@ def check_coredns_small():
 
 def check_frontdoor():
     """HA only (contract §20.8): the front door's pod has the baseline, its
-    Role is exactly its Lease and frontdoor-status (get / update, by name),
-    it reads no Secret through the API (its credentials are a file mount)
-    and only it mounts frontdoor-env and frontdoor-control-tls."""
+    Role is exactly its Lease, frontdoor-status and (Task 29) its two
+    Secrets frontdoor-acme / frontdoor-cert (get / update, by name; its
+    credentials are a file mount), only it mounts frontdoor-env and
+    frontdoor-control-tls, nobody mounts frontdoor-acme (the ACME account
+    key) and only the domains service mounts frontdoor-cert, read-only."""
     docs = K.render({"ha": {"enabled": True}})
     if [x for x in K.by_kind(K.render(), "Lease") if x["metadata"]["name"] == "portcullis-frontdoor"]:
         F.add("the front door's objects render without ha.enabled")
@@ -268,6 +274,22 @@ def check_frontdoor():
             F.add(f"{name}: mounts the front door's Secrets")
         if name == "frontdoor" and secrets != {"frontdoor-env", "frontdoor-control-tls"}:
             F.add(f"frontdoor: mounts {sorted(secrets)}")
+        if "frontdoor-acme" in secrets:
+            F.add(f"{name}: mounts frontdoor-acme (the front door's ACME account key)")
+        if "frontdoor-cert" in secrets and name != "domains":
+            F.add(f"{name}: mounts frontdoor-cert (only the domains service serves it)")
+        if name == "domains":
+            if "frontdoor-cert" not in secrets:
+                F.add("ha: domains doesn't mount frontdoor-cert (the main domain's certificate)")
+            mnt = {m["name"]: m for c in spec["containers"] for m in c.get("volumeMounts", [])}
+            vol = next((v for v in spec.get("volumes", []) if v.get("secret", {}).get("secretName") == "frontdoor-cert"), None)
+            if vol and (not mnt.get(vol["name"], {}).get("readOnly")
+                        or sorted(i["key"] for i in vol["secret"].get("items", [])) != ["tls.crt", "tls.key"]):
+                F.add("ha: domains must mount frontdoor-cert read-only, tls.crt and tls.key only")
+    for sec in ("frontdoor-acme", "frontdoor-cert"):
+        objs = [d for d in docs if d.get("kind") == "Secret" and d["metadata"]["name"] == sec]
+        if len(objs) != 1 or objs[0]["metadata"].get("annotations", {}).get("helm.sh/resource-policy") != "keep" or objs[0].get("data"):
+            F.add(f"ha: {sec} must be rendered once, empty, with helm.sh/resource-policy: keep")
     check_secret_access(docs + storage_docs(), ha=True)
 
 

@@ -1,0 +1,138 @@
+package main
+
+import (
+	"net"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// TestServableHAIncludesMain: in HA the main domain's certificate from
+// the front door's store is served, exactly {<main>, *.<main>}; anything
+// else under that name is dropped.
+func TestServableHAIncludesMain(t *testing.T) {
+	now := time.Now()
+	nb, na := now.Add(-time.Hour), now.Add(60*24*time.Hour)
+	good, gk := mkCert(t, []string{testMain, "*." + testMain}, nil, nb, na)
+	if err := servableHA(good, gk, testMain, "", now); err != nil {
+		t.Fatalf("main certificate refused: %v", err)
+	}
+	added, ak := mkCert(t, []string{"good.example.org", "*.good.example.org"}, nil, nb, na)
+	domains := map[string]*Domain{"good.example.org": {Name: "good.example.org", CertPEM: added, KeyPEM: ak, CertNotAfter: &na}}
+	doc, dropped := buildDynamic(domains, &mainCert{CertPEM: good, KeyPEM: gk}, testMain, "", now)
+	if len(doc.TLS.Certificates) != 2 || len(dropped) != 0 {
+		t.Fatalf("served %d (want main + the added domain), dropped %v", len(doc.TLS.Certificates), dropped)
+	}
+	if doc.TLS.Certificates[0].CertFile != good {
+		t.Error("the main certificate isn't served first")
+	}
+	_, otherKey := mkCert(t, []string{testMain, "*." + testMain}, nil, nb, na)
+	for name, c := range map[string][2]string{
+		"auth host added": pair(t, []string{testMain, "*." + testMain, "auth." + testMain}, nil, nb, na),
+		"core host only":  pair(t, []string{"auth." + testMain, "*.auth." + testMain}, nil, nb, na),
+		"apex only":       pair(t, []string{testMain}, nil, nb, na),
+		"an IP SAN":       pair(t, []string{testMain, "*." + testMain}, []net.IP{net.ParseIP("203.0.113.1")}, nb, na),
+		"expired":         pair(t, []string{testMain, "*." + testMain}, nil, now.Add(-48*time.Hour), now.Add(-time.Hour)),
+		"another key":     {good, otherKey},
+		"no key":          {good, ""},
+	} {
+		if err := servableHA(c[0], c[1], testMain, "", now); err == nil {
+			t.Errorf("%s: served", name)
+		}
+		doc, dropped := buildDynamic(nil, &mainCert{CertPEM: c[0], KeyPEM: c[1]}, testMain, "", now)
+		if len(doc.TLS.Certificates) != 0 || len(dropped) != 1 {
+			t.Errorf("%s: served %d, dropped %v", name, len(doc.TLS.Certificates), dropped)
+		}
+	}
+}
+
+// TestServableHAExcludesMailHost: never the mail provider's name.
+func TestServableHAExcludesMailHost(t *testing.T) {
+	now := time.Now()
+	c := pair(t, []string{testMain, "*." + testMain}, nil, now.Add(-time.Hour), now.Add(time.Hour))
+	if err := servableHA(c[0], c[1], testMain, testMain+".", now); err == nil {
+		t.Fatal("served with MAIL_HOSTNAME = the main domain")
+	}
+	if err := servableHA(c[0], c[1], testMain, "mail."+testMain, now); err != nil {
+		t.Fatalf("a mail host under the main domain refused the main certificate: %v", err)
+	}
+	m := pair(t, []string{"mail." + testMain, "*.mail." + testMain}, nil, now.Add(-time.Hour), now.Add(time.Hour))
+	if err := servableHA(m[0], m[1], testMain, "mail."+testMain, now); err == nil {
+		t.Fatal("served the mail host's certificate as the main domain's")
+	}
+}
+
+// TestServableNonHAUnchanged: without HA (no front-door certificate) the
+// rule is "only added-domain names": the main domain is never served,
+// even stored as an added domain.
+func TestServableNonHAUnchanged(t *testing.T) {
+	now := time.Now()
+	nb, na := now.Add(-time.Hour), now.Add(60*24*time.Hour)
+	c := pair(t, []string{testMain, "*." + testMain}, nil, nb, na)
+	if err := servable(&Domain{Name: testMain, CertPEM: c[0], KeyPEM: c[1]}, testMain, "", now); err == nil {
+		t.Fatal("servable admitted the main domain")
+	}
+	doc, dropped := buildDynamic(map[string]*Domain{testMain: {Name: testMain, CertPEM: c[0], KeyPEM: c[1], CertNotAfter: &na}}, nil, testMain, "", now)
+	if len(doc.TLS.Certificates) != 0 || len(dropped) != 1 {
+		t.Fatalf("served %d, dropped %v", len(doc.TLS.Certificates), dropped)
+	}
+	// A Service without HA never reads the front door's certificate.
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "tls.crt"), c[0])
+	writeFile(t, filepath.Join(dir, "tls.key"), c[1])
+	e := newEnvWith(t, false, func(c *Config) { c.FrontdoorCertDir = dir })
+	if e.svc.cfg.HA {
+		t.Fatal("HA on")
+	}
+	_, served := e.dynamic()
+	if len(served.TLS.Certificates) != 0 {
+		t.Fatalf("served %d", len(served.TLS.Certificates))
+	}
+}
+
+// TestHAServesFrontdoorCert: the domains service in HA serves the mounted
+// frontdoor-cert, picks up a replaced one, and keeps the last good pair
+// while a read is broken (the kubelet's swap between the two files, an
+// emptied Secret), so Traefik never loses the main certificate.
+func TestHAServesFrontdoorCert(t *testing.T) {
+	e, _ := newHAEnv(t)
+	dir := t.TempDir()
+	e.svc.cfg.FrontdoorCertDir = dir
+	now := time.Now()
+	served := func() []string {
+		_, doc := e.dynamic()
+		var out []string
+		for _, c := range doc.TLS.Certificates {
+			out = append(out, c.CertFile)
+		}
+		return out
+	}
+	if got := served(); len(got) != 0 {
+		t.Fatalf("served %d with no certificate mounted", len(got))
+	}
+	a := pair(t, []string{testMain, "*." + testMain}, nil, now.Add(-time.Hour), now.Add(48*time.Hour))
+	writeFile(t, filepath.Join(dir, "tls.crt"), a[0])
+	writeFile(t, filepath.Join(dir, "tls.key"), a[1])
+	if got := served(); len(got) != 1 || got[0] != a[0] {
+		t.Fatalf("served %d, want the mounted one", len(got))
+	}
+	b := pair(t, []string{testMain, "*." + testMain}, nil, now.Add(-time.Hour), now.Add(72*time.Hour))
+	writeFile(t, filepath.Join(dir, "tls.crt"), b[0]) // the key still a's: a torn read
+	if got := served(); len(got) != 1 || got[0] != a[0] {
+		t.Fatal("a torn read didn't keep the last good pair")
+	}
+	writeFile(t, filepath.Join(dir, "tls.key"), b[1])
+	if got := served(); len(got) != 1 || got[0] != b[0] {
+		t.Fatal("the replaced certificate isn't served")
+	}
+	writeFile(t, filepath.Join(dir, "tls.crt"), "")
+	if got := served(); len(got) != 1 || got[0] != b[0] {
+		t.Fatal("an emptied Secret dropped the last good pair")
+	}
+}
+
+func pair(t *testing.T, sans []string, ips []net.IP, nb, na time.Time) [2]string {
+	t.Helper()
+	c, k := mkCert(t, sans, ips, nb, na)
+	return [2]string{c, k}
+}

@@ -39,18 +39,26 @@ lag; no Role; the whole ConfigMap, which the chart creates empty: status.json
 and leader appear once the front door writes them), nodeadm's
 portcullis-cluster-addresses likewise (optional: the CLI creates it; while
 it is missing nothing is followed: every address must be a node's), and only public addresses outside the mesh, pod and
-service CIDRs are written (the front door's own FRONTDOOR_EXCLUDED_CIDRS). */ -}}
+service CIDRs are written (the front door's own FRONTDOOR_EXCLUDED_CIDRS).
+The main domain's certificate (Task 29, §12.4 "Only Portcullis names"): the
+front door's Secret frontdoor-cert, only tls.crt and tls.key, mounted
+read-only (optional: empty until the first order) and served when
+servableHA admits it. */ -}}
 {{- $_ := set $s "env" (concat $s.env (list
   (dict "name" "PORTCULLIS_HA" "value" "on")
   (dict "name" "DOMAINS_FRONTDOOR_STATUS" "value" "/run/portcullis/frontdoor-status/status.json")
   (dict "name" "DOMAINS_CLUSTER_ADDRESSES" "value" "/run/portcullis/cluster-addresses/addresses.json")
+  (dict "name" "DOMAINS_FRONTDOOR_CERT_DIR" "value" "/run/portcullis/frontdoor-cert")
   (dict "name" "FRONTDOOR_EXCLUDED_CIDRS" "value" (printf "%s %s %s" .Values.ha.meshCIDR (required "podCIDR is required" .Values.podCIDR) (required "serviceCIDR is required" .Values.serviceCIDR))))) }}
 {{- $_ := set $s "mounts" (concat $s.mounts (list
   (dict "name" "frontdoor-status" "mountPath" "/run/portcullis/frontdoor-status" "readOnly" true)
-  (dict "name" "cluster-addresses" "mountPath" "/run/portcullis/cluster-addresses" "readOnly" true))) }}
+  (dict "name" "cluster-addresses" "mountPath" "/run/portcullis/cluster-addresses" "readOnly" true)
+  (dict "name" "frontdoor-cert" "mountPath" "/run/portcullis/frontdoor-cert" "readOnly" true))) }}
 {{- $_ := set $s "volumes" (concat $s.volumes (list
   (dict "name" "frontdoor-status" "configMap" (dict "name" "frontdoor-status" "defaultMode" 292))
-  (dict "name" "cluster-addresses" "configMap" (dict "name" "portcullis-cluster-addresses" "defaultMode" 292 "optional" true)))) }}
+  (dict "name" "cluster-addresses" "configMap" (dict "name" "portcullis-cluster-addresses" "defaultMode" 292 "optional" true))
+  (dict "name" "frontdoor-cert" "secret" (dict "secretName" "frontdoor-cert" "defaultMode" 288 "optional" true "items" (list
+    (dict "key" "tls.crt" "path" "tls.crt") (dict "key" "tls.key" "path" "tls.key")))))) }}
 {{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---

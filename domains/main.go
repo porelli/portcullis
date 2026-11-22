@@ -107,7 +107,7 @@ func main() {
 		case "mail-tlsa":
 			os.Exit(runMailTLSA(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr}))
 		case "frontdoor":
-			os.Exit(runFrontdoor(os.Stderr))
+			os.Exit(runFrontdoor(os.Args[2:], os.Stdout, os.Stderr))
 		case "traefik-account-uri":
 			os.Exit(runTraefikAccountURI(os.Args[2:], os.Stdout, os.Stderr))
 		case "report":
@@ -330,6 +330,7 @@ func run() error {
 		cfg.HA, cfg.AddrPolicy = true, pol
 		cfg.FrontdoorStatusFile = env("DOMAINS_FRONTDOOR_STATUS", "/run/portcullis/frontdoor-status/status.json")
 		cfg.ClusterAddressesFile = env("DOMAINS_CLUSTER_ADDRESSES", "/run/portcullis/cluster-addresses/addresses.json")
+		cfg.FrontdoorCertDir = env("DOMAINS_FRONTDOOR_CERT_DIR", "/run/portcullis/frontdoor-cert")
 	case "", "off":
 	default:
 		return fmt.Errorf("PORTCULLIS_HA=%q: on or off", v)

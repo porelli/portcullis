@@ -621,7 +621,7 @@ func TestServesOnlyOwnCertificates(t *testing.T) {
 	add("leaving.example.org", []string{"leaving.example.org", "*.leaving.example.org"}, nil, nb, na)
 	domains["leaving.example.org"].Deleting = true
 
-	doc, dropped := buildDynamic(domains, testMain, "", now)
+	doc, dropped := buildDynamic(domains, nil, testMain, "", now)
 	b, _ := json.Marshal(doc)
 	var raw map[string]any
 	json.Unmarshal(b, &raw)
@@ -643,7 +643,7 @@ func TestServesOnlyOwnCertificates(t *testing.T) {
 		}
 	}
 	// Nothing at all: still the bare shape.
-	empty, _ := buildDynamic(map[string]*Domain{}, testMain, "", now)
+	empty, _ := buildDynamic(map[string]*Domain{}, nil, testMain, "", now)
 	if b, _ := json.Marshal(empty); string(b) != `{"tls":{"certificates":[]}}` {
 		t.Fatalf("empty document %s", b)
 	}

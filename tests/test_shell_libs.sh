@@ -3298,6 +3298,122 @@ SJ="$( (require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_log
 expect_eq "status --json: dns.main / dns.domains" "$(printf '%s' "$SJ" | jq -c '[.dns.main.name, (.dns.domains | keys), .ok]')" '["ci.example.org",["team-b.test"],false]'
 expect_eq "status --json has runtime{}" "$(printf '%s' "$SJ" | jq -c '[.runtime.name, .runtime.version, .runtime.rootless, .runtime.checks, (.problems | type)]')" '["docker","29.0.0",false,[],"number"]'
 
+# ══ HA: the CAA account flip to the front door (Task 29, spec §11.2) ═══
+# dns_flip_main_account <uri>: relax → settle → issue → re-pin, with the
+# Docker flip's settle point and waits; the front door's order through a
+# recorded `domains frontdoor` (the leader's pod over kubectl exec).
+FD_URI="https://acme-staging-v02.api.letsencrypt.org/acme/acct/4242"
+FDF="export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123
+_dns_frontdoor() { echo \"frontdoor \$*\" >> \"\$STUB_DIR/dt/order\"; [ ! -f \"\$STUB_DIR/dt/fd-rc\" ] || return \"\$(cat \"\$STUB_DIR/dt/fd-rc\")\"; echo '{\"issued\":true,\"account_uri\":\"$FD_URI\",\"not_after\":\"2027-02-01T00:00:00Z\"}'; }"
+rm -f "$STUB_DIR/dt/out-check" "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/fd-rc" "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
+echo '{"ttl": 300, "caa_relaxed": false}' > "$STUB_DIR/dt/out-ttl"
+wait_out true true 0
+OUT="$(dt "$FDF; dns_flip_main_account '$FD_URI'")"
+expect_eq "dns_flip_main_account: order relax, settle, issue, re-pin (ttl read, CA-only apply with --settle, public check, the front door's order, the pin)" \
+  "$(paste -sd' ' "$STUB_DIR/dt/order"):${OUT##*rc=}" "ttl apply refresh check frontdoor issue --account-uri $FD_URI apply refresh:0"
+expect_eq "dns_flip_main_account: the relax settles past the saved point, the re-pin waits by the stored TTL" \
+  "$(grep -c 'dns-tool apply --wait auto --settle --settle-after [0-9][0-9]*$' "$STUB_DIR/dt/argv"):$(grep -c 'dns-tool apply --wait auto$' "$STUB_DIR/dt/argv")" "1:1"
+expect_eq "dns_flip_main_account: the last apply pins the front door's account; main-domain.env records it" \
+  "$(dtin apply '[.sets, .caa.account_uri] | @json'):$(cat "$PORTCULLIS_ROOT/secrets/domains/main-domain.env")" \
+  "[[\"caa\"],\"$FD_URI\"]:DOMAINS_MAIN_ACME_ACCOUNT_URI=$FD_URI"
+expect_eq "dns_flip_main_account: the settle point stays saved after the re-pin (only a finished ACME_STAGING flip removes it)" \
+  "$([ -e "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" ] && echo kept)" kept
+case "$OUT" in *"Relaxing the CAA of ci.example.org to CA-only (the front door registers a new ACME account)"*"pinned to $FD_URI"*) t_pass "dns_flip_main_account: the messages name the front door" ;; *) t_fail "flip messages: $OUT" ;; esac
+case "$OUT" in *tok-SECRET-123*) t_fail "dns_flip_main_account printed a credential" ;; *) t_pass "dns_flip_main_account: no credential in its output" ;; esac
+# Not settled: written, but caches may still hold the old pin → stops
+# before the order, exit 1, the settle point saved for the rerun.
+rm -f "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env"
+wait_out false false 540 8.8.8.8:53
+echo 1 > "$STUB_DIR/dt/rc-apply"
+OUT="$(dt "$FDF; dns_flip_main_account '$FD_URI'")"
+expect_eq "dns_flip_main_account: settle not reached → stops before issue (no order, no pin), exit 1, settle point saved" \
+  "$(paste -sd' ' "$STUB_DIR/dt/order"):${OUT##*rc=}:$([ -e "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" ] && echo saved)" "ttl apply refresh:1:saved"
+case "$OUT" in *"stops before the order"*"orders nothing against the old pin"*) t_pass "dns_flip_main_account: unsettled → says it stops before the order" ;; *) t_fail "flip unsettled: $OUT" ;; esac
+# A saved settle point still in the future: no write at all, nothing ordered.
+rm -f "$STUB_DIR/dt/rc-apply"
+wait_out true true 0
+printf 'RELAX_WRITTEN_AT=%s\nRELAX_OLD_TTL=600\nRELAX_NOT_BEFORE=%s\n' "$(date +%s)" "$(( $(date +%s) + 3600 ))" > "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env"
+jq '.wait.settled = false | .wait.beyond_cap = true | .wait.settle_cause = "saved"' "$STUB_DIR/dt/out-apply" > "$STUB_DIR/dt/out-apply2" && mv "$STUB_DIR/dt/out-apply2" "$STUB_DIR/dt/out-apply"
+echo 1 > "$STUB_DIR/dt/rc-apply"
+OUT="$(dt "$FDF; dns_flip_main_account '$FD_URI'")"
+expect_eq "dns_flip_main_account: a saved settle point ahead → no order" "$(grep -c frontdoor "$STUB_DIR/dt/order" || true):${OUT##*rc=}" "0:1"
+rm -f "$STUB_DIR/dt/rc-apply" "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env"
+wait_out true true 0
+# The public check refuses (a pin still live elsewhere) → no order.
+jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: ["x"], live: ["0 issue \"letsencrypt.org; accounturi=https://x/acct/5\""], status: "wrong", severity: "problem", fix: "auto", steps: []}] | .caa.would_issue = false' \
+  "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
+OUT="$(dt "$FDF; dns_flip_main_account '$FD_URI'")"
+expect_eq "dns_flip_main_account: the public check refuses → no order, no pin, exit 1" \
+  "$(grep -c frontdoor "$STUB_DIR/dt/order" || true):$(grep -c 'dns-tool apply' "$STUB_DIR/dt/argv"):${OUT##*rc=}" "0:1:1"
+rm -f "$STUB_DIR/dt/out-check" "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env"
+# The front door refuses (standing by / another account) or fails → the
+# CAA stays CA-only (no pin), exit 1 / 3.
+for fr in 1:1 3:3; do
+  echo "${fr%%:*}" > "$STUB_DIR/dt/fd-rc"
+  rm -f "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env"
+  OUT="$(dt "$FDF; dns_flip_main_account '$FD_URI'")"
+  expect_eq "dns_flip_main_account: the front door's order exits ${fr%%:*} → no re-pin, exit ${fr##*:}" \
+    "$(grep -c 'dns-tool apply' "$STUB_DIR/dt/argv"):$(dtin apply '.caa.account_uri'):${OUT##*rc=}" "1::${fr##*:}"
+done
+rm -f "$STUB_DIR/dt/fd-rc" "$PORTCULLIS_ROOT/secrets/domains/acme-relax.env"
+# CAA not managed (manual provider): no relax, no pin; the public check,
+# then the order.
+OUT="$(dt "$FDF; export DNS_PROVIDER=gcloud; dns_flip_main_account '$FD_URI'")"
+expect_eq "dns_flip_main_account: CAA not managed → check, order, no CAA write" \
+  "$(paste -sd' ' "$STUB_DIR/dt/order"):${OUT##*rc=}" "check frontdoor issue --account-uri $FD_URI:0"
+OUT="$(dt "$FDF; dns_flip_main_account 'http://evil/acct/1'")"
+expect_eq "dns_flip_main_account: a non-https URI is refused before anything" "$([ -s "$STUB_DIR/dt/order" ] && echo ran):${OUT##*rc=}" ":3"
+# HA: the tighten never pins (Traefik has no account there), and the plan
+# judges against the pin the last flip recorded.
+OUT="$(dt "$FDF; export CONTAINER_RUNTIME=kubernetes PORTCULLIS_HA=on; _rt_is_kube() { true; }; dns_traefik_account_uri() { echo TRAEFIK >> \"\$STUB_DIR/dt/order\"; }; dns_tighten_main")"
+expect_eq "HA: dns_tighten_main does nothing (no Traefik account read, no CAA write)" "$([ -s "$STUB_DIR/dt/order" ] && echo ran):${OUT##*rc=}" ":0"
+echo "DOMAINS_MAIN_ACME_ACCOUNT_URI=$FD_URI" > "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
+OUT="$(dt "$FDF; export PORTCULLIS_HA=on; _rt_is_kube() { true; }; dns_traefik_account_uri() { echo https://traefik/acct/1; }; _dns_ips() { :; }; _dns_prepare; echo \"URI=\$DNS_ACCOUNT_URI\"")"
+case "$OUT" in *"URI=$FD_URI"*) t_pass "HA: _dns_prepare pins the front door's account (main-domain.env), never Traefik's" ;; *) t_fail "HA prepare: $OUT" ;; esac
+# _dns_frontdoor: the Lease holder's pod, the frontdoor container; no
+# holder → exit 3 without an exec.
+mkdir -p "$WORK/fdk"
+cat > "$WORK/fdk/kubectl" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/dt/kubectl"
+case "$*" in
+  *"get lease portcullis-frontdoor"*) cat "$STUB_DIR/dt/holder" 2>/dev/null; exit 0 ;;
+  *" exec "*) echo "https://ca.example/acct/1"; exit 0 ;;
+esac
+STUB
+chmod +x "$WORK/fdk/kubectl"
+fdk() { rm -f "$STUB_DIR/dt/kubectl"; (PATH="$WORK/fdk:$PATH" bash -c ". '$WORK/dtenv.sh'; export CONTAINER_RUNTIME=kubernetes PORTCULLIS_HA=on PORTCULLIS_KUBE_CONTEXT=ci; _rt_is_kube() { true; }; $1" 2>&1; echo "rc=$?"); }
+echo "frontdoor-7d9c-x2k4p" > "$STUB_DIR/dt/holder"
+OUT="$(fdk "_dns_frontdoor account-uri")"
+expect_eq "_dns_frontdoor: kubectl exec into the Lease holder's pod, container frontdoor" \
+  "$(grep -c -- '--context ci -n portcullis exec pod/frontdoor-7d9c-x2k4p -c frontdoor -- domains frontdoor account-uri$' "$STUB_DIR/dt/kubectl"):${OUT##*rc=}" "1:0"
+echo 'x; rm -rf /' > "$STUB_DIR/dt/holder"
+OUT="$(fdk "_dns_frontdoor account-uri")"
+expect_eq "_dns_frontdoor: no (or a malformed) Lease holder → exit 3, no exec" "$(grep -c ' exec ' "$STUB_DIR/dt/kubectl" || true):${OUT##*rc=}" "0:3"
+OUT="$(fdk "export PORTCULLIS_HA=off; _dns_frontdoor account-uri")"
+expect_eq "_dns_frontdoor: outside HA → exit 3, no kubectl" "$([ -s "$STUB_DIR/dt/kubectl" ] && echo ran):${OUT##*rc=}" ":3"
+rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env" "$STUB_DIR/dt/holder"
+# config apply in HA: an ACME_STAGING flip moves the front door onto the
+# new CA, reads its account, then flips; never touches Traefik or acme.json.
+FLH_ROOT="$WORK/fliph"; mkdir -p "$FLH_ROOT/certs"
+printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=true\n' > "$FLH_ROOT/.env"
+echo false > "$FLH_ROOT/certs/.acme-staging-last"
+fliph() {
+  rm -f "$STUB_DIR/dt/argv" "$STUB_DIR/dt/order"
+  echo false > "$FLH_ROOT/certs/.acme-staging-last"
+  (PATH="$WORK/dtbin:$PATH" PORTCULLIS_ROOT="$FLH_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FLH_ROOT' PORTCULLIS_HA=on; _rt_is_kube() { true; }
+    config_build_ca_bundle() { :; }; kube_ctl() { echo \"kubectl \$*\" >> \"\$STUB_DIR/dt/order\"; }
+    dns_frontdoor_account_uri() { echo '$FD_URI'; }; dns_flip_main_account() { echo \"flip \$1 CA=\$ACME_CA_SERVER\" >> \"\$STUB_DIR/dt/order\"; return \"\${FLIP_RC:-0}\"; }
+    rt_stop() { echo STOP >> \"\$STUB_DIR/dt/order\"; }; _cfg_acme_clear() { echo CLEAR >> \"\$STUB_DIR/dt/order\"; }; $1; config_apply" 2>&1; echo "rc=$?")
+}
+OUT="$(fliph ":")"
+expect_eq "config apply flip in HA: the front door onto the new CA, rolled out, then the flip to its account; sentinel written" \
+  "$(paste -sd'|' "$STUB_DIR/dt/order"):$(cat "$FLH_ROOT/certs/.acme-staging-last"):${OUT##*rc=}" \
+  "kubectl -n portcullis set env deployment/frontdoor ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory|kubectl -n portcullis rollout status deployment/frontdoor --timeout=180s|flip $FD_URI CA=https://acme-staging-v02.api.letsencrypt.org/directory:true:0"
+OUT="$(fliph "export FLIP_RC=1")"
+expect_eq "config apply flip in HA: an unfinished flip → rc 1, sentinel unchanged (the rerun redoes it), Traefik never stopped" \
+  "$(cat "$FLH_ROOT/certs/.acme-staging-last"):$(grep -c -e STOP -e CLEAR "$STUB_DIR/dt/order" || true):${OUT##*rc=}" "false:0:1"
+
 # ══ runtime: CONTAINER_RUNTIME (scripts/lib/runtime.sh) ═════
 # docker stub: the engine's components by DOCKER_HOST — the rootless Podman
 # socket answers STUB_PODMAN_SOCK_ENGINE, anything else

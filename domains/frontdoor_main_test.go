@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -233,7 +234,7 @@ func TestFrontDoorCredentialsNeverLogged(t *testing.T) {
 	tr, to := http.DefaultTransport, http.DefaultClient.Timeout
 	t.Cleanup(func() { http.DefaultTransport, http.DefaultClient.Timeout = tr, to })
 	var stderr bytes.Buffer
-	if code := runFrontdoor(&stderr); code == 0 {
+	if code := runFrontdoor(nil, io.Discard, &stderr); code == 0 {
 		t.Error("runFrontdoor started with a failing zone lookup")
 	}
 	if !strings.Contains(stderr.String(), "finding the DNS zone") {

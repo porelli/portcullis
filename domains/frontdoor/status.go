@@ -167,7 +167,9 @@ type Metrics struct {
 	unhealthy *prometheus.GaugeVec
 	siteOK    *prometheus.GaugeVec
 	blind     *prometheus.GaugeVec
-	snapOK    prometheus.Gauge
+	// certExpiry: the main domain's certificate (cert.go).
+	certExpiry prometheus.Gauge
+	snapOK     prometheus.Gauge
 }
 
 // NewMetrics registers portcullis_frontdoor_addresses{name},
@@ -187,8 +189,21 @@ func NewMetrics() *Metrics {
 	}
 	m.snapOK = prometheus.NewGauge(prometheus.GaugeOpts{Name: "portcullis_frontdoor_snapshot_ok",
 		Help: "1 when the last round read nodeadm's snapshot; 0 = the site series are the last good round's (stale)."})
-	m.Registry.MustRegister(m.addresses, m.unhealthy, m.siteOK, m.blind, m.snapOK)
+	m.certExpiry = prometheus.NewGauge(prometheus.GaugeOpts{Name: "portcullis_frontdoor_certificate_expiry_timestamp_seconds",
+		Help: "When the main domain's certificate in frontdoor-cert expires (Unix seconds; 0 = none or unreadable)."})
+	m.Registry.MustRegister(m.addresses, m.unhealthy, m.siteOK, m.blind, m.snapOK, m.certExpiry)
 	return m
+}
+
+// CertExpiry sets the certificate's expiry from its chain ("" or
+// unreadable: 0).
+func (m *Metrics) CertExpiry(chainPEM string) {
+	na, err := NotAfter(chainPEM)
+	if err != nil {
+		m.certExpiry.Set(0)
+		return
+	}
+	m.certExpiry.Set(float64(na.Unix()))
 }
 
 // SnapshotFailed marks a round without nodeadm's snapshot: the other

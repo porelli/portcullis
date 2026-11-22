@@ -15,8 +15,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,6 +31,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/portcullis/domains/frontdoor"
+	"github.com/portcullis/domains/internal/dnsplan"
 )
 
 // frontdoorCreds is credentials.json: the main domain's provider and its
@@ -112,8 +115,22 @@ func newFrontdoorWriter(domain string, c frontdoorCreds, policy frontdoor.AddrPo
 	return &frontdoor.Writer{Domain: domain, Zone: dns.Fqdn(zone), P: p, TTL: frontdoor.TTL(providerMinTTL(c.Provider)), Policy: policy}, clean, nil
 }
 
-// runFrontdoor is `domains frontdoor`.
-func runFrontdoor(stderr io.Writer) int {
+// The front door's control listener (loopback only: reached by
+// `domains frontdoor account-uri | issue` run inside its own pod with
+// `kubectl exec`; the NetworkPolicy and the pod's network namespace keep
+// everyone else out). Not an API to the cluster: §20.8's "no API besides
+// health" holds for every other address.
+const frontdoorControlAddr = "127.0.0.1:8091"
+
+// issueTimeout bounds one requested order (lego's propagation wait is
+// 10 min at most).
+const issueTimeout = 15 * time.Minute
+
+// runFrontdoor is `domains frontdoor [account-uri | issue --account-uri <uri>]`.
+func runFrontdoor(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		return runFrontdoorClient(args, env("FRONTDOOR_CONTROL_ADDR", frontdoorControlAddr), stdout, stderr)
+	}
 	logger := log.New(stderr, "", log.LstdFlags)
 	if err := startTestProvider(logger); err != nil {
 		logger.Print(err)
@@ -157,6 +174,20 @@ func runFrontdoor(stderr io.Writer) int {
 	}
 	fence := frontdoor.NewFence(kc, ns, pod)
 	w.Fence = fence
+	ctlAddr := env("FRONTDOOR_CONTROL_ADDR", frontdoorControlAddr)
+	if !loopbackAddr(ctlAddr) {
+		logger.Printf("refusing to start: FRONTDOOR_CONTROL_ADDR=%q is not a loopback address", ctlAddr)
+		return exitFailure
+	}
+	inner, _ := unwrap(w.P.(dnsProvider))
+	_, skip := inner.(propagationSkipper)
+	certs := &frontdoor.Certs{
+		Domain: domain, Store: frontdoor.SecretStore{Client: kc, Namespace: ns}, DNS: w, Fence: fence,
+		ACME: &frontdoorACME{email: env("ACME_EMAIL", "admin@"+domain), caServer: env("ACME_CA_SERVER", "https://acme-v02.api.letsencrypt.org/directory"),
+			skipPropagation: skip},
+		Check: func(chain, key string, now time.Time) error { return servableHA(chain, key, domain, "", now) },
+		Log:   func(m string) { logger.Print(clean(m)) },
+	}
 	metrics := frontdoor.NewMetrics()
 	sink := frontdoor.ConfigMapSink{Client: kc, Namespace: ns, Leader: pod}
 	r := &frontdoor.Runner{
@@ -202,6 +233,35 @@ func runFrontdoor(stderr io.Writer) int {
 			logger.Printf("frontdoor: the Lease: %v", err)
 		}
 	}()
+	ctl := &http.Server{Addr: ctlAddr, Handler: frontdoorControl(certs, clean), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := ctl.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Printf("frontdoor: %s: %v", ctlAddr, err)
+			stop()
+		}
+	}()
+	// The certificate: renewed by the leader when less than 30 days are
+	// left (a certificate of the current account only; the first one is
+	// ordered by the CAA flip). Checked every minute (the Secret).
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			if ordered, err := certs.Renew(ctx); err != nil {
+				logger.Printf("frontdoor: renewing the certificate: %s", clean(err.Error()))
+			} else if ordered {
+				logger.Print("frontdoor: certificate renewed")
+			}
+			if c, err := certs.Store.LoadCert(ctx); err == nil {
+				metrics.CertExpiry(c.ChainPEM)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
 	logger.Printf("frontdoor: %s (zone %s, TTL %s), Lease %s/%s as %s", domain, w.Zone, w.TTL, ns, frontdoor.LeaseName, pod)
 	rctx, rcancel := context.WithCancel(ctx)
 	ran := make(chan struct{})
@@ -221,4 +281,120 @@ func runFrontdoor(stderr io.Writer) int {
 		logger.Print("frontdoor: standing by (the Lease was lost): exiting")
 		return exitFailure
 	}
+}
+
+// loopbackAddr: host:port with a loopback IP host.
+func loopbackAddr(a string) bool {
+	h, _, err := net.SplitHostPort(a)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(h)
+	return err == nil && ip.IsLoopback()
+}
+
+// frontdoorControl is the loopback control API:
+//
+//	GET  /v1/account                  {"account_uri"} (the leader registers one when there is none)
+//	POST /v1/issue?account_uri=<uri>  order <d> and *.<d> now with that (the current) account
+//
+// Errors: 409 standing by / no account / another account, 502 the CA or
+// the provider (the message redacted).
+func frontdoorControl(c *frontdoor.Certs, clean func(string) string) http.Handler {
+	mux := http.NewServeMux()
+	fail := func(rw http.ResponseWriter, err error) {
+		code := http.StatusBadGateway
+		if errors.Is(err, frontdoor.ErrStandingBy) || errors.Is(err, frontdoor.ErrNoAccount) || errors.Is(err, frontdoor.ErrOtherAccount) {
+			code = http.StatusConflict
+		}
+		writeJSON(rw, code, map[string]string{"error": clean(err.Error())})
+	}
+	mux.HandleFunc("GET /v1/account", func(rw http.ResponseWriter, r *http.Request) {
+		uri, err := c.AccountURI(r.Context())
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, http.StatusOK, map[string]string{"account_uri": uri})
+	})
+	mux.HandleFunc("POST /v1/issue", func(rw http.ResponseWriter, r *http.Request) {
+		want := r.URL.Query().Get("account_uri")
+		if !dnsplan.ValidAccountURI(want) {
+			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "account_uri: an ACME account URI is required"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), issueTimeout)
+		defer cancel()
+		if err := c.IssueMainFor(ctx, want); err != nil {
+			fail(rw, err)
+			return
+		}
+		cert, err := c.Store.LoadCert(ctx)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		na, _ := frontdoor.NotAfter(cert.ChainPEM)
+		writeJSON(rw, http.StatusOK, map[string]any{"issued": true, "account_uri": cert.AccountURI, "not_after": na.UTC().Format(time.RFC3339)})
+	})
+	return mux
+}
+
+// runFrontdoorClient is `domains frontdoor account-uri` (prints the
+// front door's account URI) and `domains frontdoor issue --account-uri
+// <uri>` (prints {"issued", "account_uri", "not_after"}), run in the front
+// door's pod. Exit 0 ok, 1 refused (standing by, no account, another
+// account), 2 usage, 3 a failure (the CA, the provider, the front door
+// unreachable).
+func runFrontdoorClient(args []string, addr string, stdout, stderr io.Writer) int {
+	usage := func(msg string) int {
+		fmt.Fprintf(stderr, "domains frontdoor: %s\nusage: domains frontdoor [account-uri | issue --account-uri <uri>]\n", msg)
+		return exitUsage
+	}
+	if !loopbackAddr(addr) {
+		return usage("FRONTDOOR_CONTROL_ADDR is not a loopback address")
+	}
+	var req *http.Request
+	switch {
+	case len(args) == 1 && args[0] == "account-uri":
+		req, _ = http.NewRequest(http.MethodGet, "http://"+addr+"/v1/account", nil)
+	case len(args) == 3 && args[0] == "issue" && args[1] == "--account-uri":
+		if !dnsplan.ValidAccountURI(args[2]) {
+			return usage(fmt.Sprintf("%q is not an ACME account URI", args[2]))
+		}
+		req, _ = http.NewRequest(http.MethodPost, "http://"+addr+"/v1/issue?account_uri="+url.QueryEscape(args[2]), nil)
+	default:
+		return usage("unexpected arguments")
+	}
+	resp, err := (&http.Client{Timeout: issueTimeout + time.Minute}).Do(req)
+	if err != nil {
+		fmt.Fprintf(stderr, "domains frontdoor: the running front door doesn't answer on %s: %v\n", addr, err)
+		return exitFailure
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body); err != nil {
+		fmt.Fprintf(stderr, "domains frontdoor: unreadable answer (HTTP %d)\n", resp.StatusCode)
+		return exitFailure
+	}
+	switch {
+	case resp.StatusCode == http.StatusOK && args[0] == "account-uri":
+		u, _ := body["account_uri"].(string)
+		if !dnsplan.ValidAccountURI(u) {
+			fmt.Fprintln(stderr, "domains frontdoor: the answer holds no account URI")
+			return exitFailure
+		}
+		fmt.Fprintln(stdout, u)
+		return exitOK
+	case resp.StatusCode == http.StatusOK:
+		b, _ := json.Marshal(body)
+		fmt.Fprintln(stdout, string(b))
+		return exitOK
+	}
+	msg, _ := body["error"].(string)
+	fmt.Fprintf(stderr, "domains frontdoor: %s\n", msg)
+	if resp.StatusCode == http.StatusConflict {
+		return exitProblem
+	}
+	return exitFailure
 }

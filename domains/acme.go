@@ -20,6 +20,9 @@ import (
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
 	"github.com/libdns/libdns"
+
+	"github.com/portcullis/domains/frontdoor"
+	"github.com/portcullis/domains/internal/dnsplan"
 )
 
 // ACME DNS-01 with lego as a library (contract §12.4 "Certificates"): one
@@ -268,4 +271,105 @@ func parseLeaf(chain string) (*x509.Certificate, error) {
 		return nil, errors.New("no certificate PEM block")
 	}
 	return x509.ParseCertificate(b.Bytes)
+}
+
+// ── the front door's account (HA, contract §20.8) ──
+
+// frontdoorACME is the front door's ACME side: its OWN account, never the
+// added-domains one (one account per name, CAA accounturi; spec §11.2),
+// kept in the front door's store under the key "frontdoor" (the Secret
+// frontdoor-acme, frontdoor.AccountKey; the same Account shape as the
+// domains service's store). Only the CA decides whether the stored account
+// is current: an ACME_EMAIL change keeps it (a new account would need the
+// CAA flip).
+type frontdoorACME struct {
+	email, caServer string
+	hc              *http.Client
+	// skipPropagation: the provider has no authoritative nameservers for
+	// lego's check (the test provider).
+	skipPropagation   bool
+	timeout, interval time.Duration
+}
+
+func (a *frontdoorACME) parse(stored []byte) (*Account, *acmeUser, error) {
+	if len(stored) == 0 {
+		return nil, nil, errors.New("no account")
+	}
+	var acct Account
+	if err := json.Unmarshal(stored, &acct); err != nil {
+		return nil, nil, fmt.Errorf("the stored front-door account: %w", err)
+	}
+	u, err := accountUser(&acct)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &acct, u, nil
+}
+
+// CurrentURI: the stored account's URI when it belongs to this CA.
+func (a *frontdoorACME) CurrentURI(stored []byte) string {
+	acct, u, err := a.parse(stored)
+	if err != nil || acct.CAServer != a.caServer || u.reg == nil || !dnsplan.ValidAccountURI(u.reg.URI) {
+		return ""
+	}
+	return u.reg.URI
+}
+
+// Register registers a new account (fresh EC P-256 key) at the CA.
+func (a *frontdoorACME) Register(context.Context) ([]byte, string, error) {
+	u, acct, err := registerAccount(a.email, a.caServer, a.hc)
+	if err != nil {
+		return nil, "", err
+	}
+	b, err := json.Marshal(acct)
+	if err != nil {
+		return nil, "", err
+	}
+	return b, u.reg.URI, nil
+}
+
+// Obtain orders domain and *.domain (fresh EC P-256 key) with the stored
+// account, the challenge records through dns (the front door's Writer).
+func (a *frontdoorACME) Obtain(ctx context.Context, stored []byte, domain string, dns frontdoor.DNS01) (string, string, error) {
+	_, u, err := a.parse(stored)
+	if err != nil {
+		return "", "", err
+	}
+	client, err := lego.NewClient(legoConfigFor(u, a.caServer, a.hc))
+	if err != nil {
+		return "", "", fmt.Errorf("ACME directory %s: %w", a.caServer, err)
+	}
+	p := &frontdoorChallenge{ctx: ctx, dns: dns, timeout: a.timeout, interval: a.interval}
+	if err := client.Challenge.SetDNS01Provider(p, dns01.CondOption(a.skipPropagation,
+		dns01.WrapPreCheck(func(_, _, _ string, _ dns01.PreCheckFunc) (bool, error) { return true, nil }))); err != nil {
+		return "", "", err
+	}
+	res, err := client.Certificate.Obtain(certificate.ObtainRequest{Domains: []string{domain, "*." + domain}, Bundle: true})
+	if err != nil {
+		return "", "", err
+	}
+	return string(res.Certificate), string(res.PrivateKey), nil
+}
+
+// frontdoorChallenge is lego's DNS-01 provider over the front door's
+// Writer (which refuses any name but _acme-challenge.<d> and writes only
+// while leading).
+type frontdoorChallenge struct {
+	ctx               context.Context
+	dns               frontdoor.DNS01
+	timeout, interval time.Duration
+}
+
+func (c *frontdoorChallenge) Present(domain, _, keyAuth string) error {
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+	return c.dns.PresentTXT(c.ctx, info.EffectiveFQDN, info.Value)
+}
+
+func (c *frontdoorChallenge) CleanUp(domain, _, keyAuth string) error {
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+	return c.dns.CleanUpTXT(c.ctx, info.EffectiveFQDN, info.Value)
+}
+
+func (c *frontdoorChallenge) Timeout() (time.Duration, time.Duration) {
+	return orDur(c.timeout, 10*time.Minute), orDur(c.interval, 5*time.Second)
 }

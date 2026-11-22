@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -40,10 +41,34 @@ func servable(d *Domain, main, mailHost string, now time.Time) error {
 	if err := checkName(d.Name, main, mailHost); err != nil {
 		return err
 	}
-	if d.CertPEM == "" || d.KeyPEM == "" {
+	return checkCertFor(d.Name, d.CertPEM, d.KeyPEM, now)
+}
+
+// servableHA checks the main domain's certificate from the front door's
+// store (HA, contract §12.4 "Only Portcullis names"): exactly {<main>,
+// *.<main>} (DNS names only), the subject common name "" / <main> /
+// *.<main>, valid now, the key its own, every PEM block a certificate — and
+// never when MAIL_HOSTNAME is the main domain itself (the mail provider
+// owns that name's certificate and TLSA, §19.3: servable's mail-host
+// exclusion kept). Nothing else is ever served as the main domain's.
+func servableHA(certPEM, keyPEM, main, mailHost string, now time.Time) error {
+	if main == "" || !validHostname(main) {
+		return fmt.Errorf("the main domain %q is not a hostname", main)
+	}
+	if mailHost != "" && strings.EqualFold(strings.TrimSuffix(mailHost, "."), main) {
+		return fmt.Errorf("the main domain %s is MAIL_HOSTNAME: the mail provider owns its certificate", main)
+	}
+	return checkCertFor(main, certPEM, keyPEM, now)
+}
+
+// checkCertFor: certPEM / keyPEM are a pair whose leaf names exactly
+// {name, *.name} (DNS names only; CN "", name or *.name), valid now, and
+// the chain holds only CERTIFICATE blocks.
+func checkCertFor(name, certPEM, keyPEM string, now time.Time) error {
+	if certPEM == "" || keyPEM == "" {
 		return errors.New("no certificate")
 	}
-	pair, err := tls.X509KeyPair([]byte(d.CertPEM), []byte(d.KeyPEM))
+	pair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 	if err != nil {
 		return fmt.Errorf("certificate and key: %w", err)
 	}
@@ -51,15 +76,15 @@ func servable(d *Domain, main, mailHost string, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if cn := leaf.Subject.CommonName; cn != "" && cn != d.Name && cn != "*."+d.Name {
-		return fmt.Errorf("certificate common name %q is not %s or *.%s", cn, d.Name, d.Name)
+	if cn := leaf.Subject.CommonName; cn != "" && cn != name && cn != "*."+name {
+		return fmt.Errorf("certificate common name %q is not %s or *.%s", cn, name, name)
 	}
 	if len(leaf.IPAddresses)+len(leaf.EmailAddresses)+len(leaf.URIs) > 0 {
 		return errors.New("certificate has non-DNS names")
 	}
 	sans := append([]string(nil), leaf.DNSNames...)
 	sort.Strings(sans)
-	want := []string{"*." + d.Name, d.Name}
+	want := []string{"*." + name, name}
 	if len(sans) != 2 || sans[0] != want[0] || sans[1] != want[1] {
 		return fmt.Errorf("certificate names %v, want exactly %v", leaf.DNSNames, want)
 	}
@@ -68,7 +93,7 @@ func servable(d *Domain, main, mailHost string, now time.Time) error {
 	}
 	// Every PEM block of the chain must be a certificate (the inline
 	// certFile is passed to Traefik as-is).
-	rest := []byte(d.CertPEM)
+	rest := []byte(certPEM)
 	for {
 		var b *pem.Block
 		b, rest = pem.Decode(rest)
@@ -82,17 +107,32 @@ func servable(d *Domain, main, mailHost string, now time.Time) error {
 	return nil
 }
 
+// mainCert is the main domain's certificate as the domains service read it
+// from the front door's Secret (HA only; nil otherwise).
+type mainCert struct {
+	CertPEM, KeyPEM string
+}
+
 // buildDynamic returns the document for every enrolled domain whose
-// certificate is servable, sorted by name; dropped lists (name, reason)
-// of the others that have a certificate (logged without key material).
-func buildDynamic(domains map[string]*Domain, main, mailHost string, now time.Time) (dynamicDoc, []string) {
+// certificate is servable, sorted by name, after the main domain's from
+// the front door (HA only: mc non-nil, servableHA); dropped lists (name,
+// reason) of the others that have a certificate (logged without key
+// material).
+func buildDynamic(domains map[string]*Domain, mc *mainCert, main, mailHost string, now time.Time) (dynamicDoc, []string) {
 	doc := dynamicDoc{TLS: dynamicTLS{Certificates: []dynamicCert{}}}
+	var dropped []string
+	if mc != nil {
+		if err := servableHA(mc.CertPEM, mc.KeyPEM, main, mailHost, now); err != nil {
+			dropped = append(dropped, fmt.Sprintf("%s (the front door's): %v", main, err))
+		} else {
+			doc.TLS.Certificates = append(doc.TLS.Certificates, dynamicCert{CertFile: mc.CertPEM, KeyFile: mc.KeyPEM})
+		}
+	}
 	names := make([]string, 0, len(domains))
 	for n := range domains {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	var dropped []string
 	for _, n := range names {
 		d := domains[n]
 		if d.CertPEM == "" || d.Deleting {

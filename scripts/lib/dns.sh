@@ -198,7 +198,11 @@ _dns_prepare() {
   require_cmd docker jq
   _dns_ips
   DNS_TRAEFIK_UNREADABLE=""
-  if [ -z "${DNS_ACCOUNT_URI+x}" ]; then
+  if [ -z "${DNS_ACCOUNT_URI+x}" ] && _rt_is_kube && kube_ha_on; then
+    # HA: the pin is the front door's account the last flip pinned
+    # (main-domain.env; CA-only before the first one).
+    DNS_ACCOUNT_URI="$(dns_main_env_uri)"
+  elif [ -z "${DNS_ACCOUNT_URI+x}" ]; then
     if ! DNS_ACCOUNT_URI="$(dns_traefik_account_uri)"; then
       DNS_ACCOUNT_URI=""
       DNS_TRAEFIK_UNREADABLE=1
@@ -457,6 +461,9 @@ _dns_caa_live_ok() {
 # `up` never fails because of it.
 dns_tighten_main() {
   local caa poll=false uri="" deadline every
+  # HA: Traefik has no ACME account; the pin follows the front door's,
+  # written only by dns_flip_main_account (relax → settle → issue → re-pin).
+  if _rt_is_kube && kube_ha_on; then return 0; fi
   caa="$(_dns_flag DNS_CAA true 2>/dev/null)" || { warn "DNS_CAA must be true or false: the CAA pin is left alone"; return 0; }
   [ "$caa" != true ] || ! _dns_automated "${DNS_PROVIDER:-none}" || poll=true
   if [ "$poll" = true ]; then
@@ -730,7 +737,7 @@ dns_relax_main() {
       _dns_relax_put "$now" "$ttl" "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
     fi
   fi
-  info "Relaxing the CAA of $d to CA-only (Traefik registers a new ACME account), then waiting until no cache can hold the old pin (the TTL caches got + 1 min, at most 15 min; Traefik keeps running meanwhile)..."
+  info "Relaxing the CAA of $d to CA-only (${DNS_RELAX_WHO:-Traefik} registers a new ACME account), then waiting until no cache can hold the old pin (the TTL caches got + 1 min, at most 15 min; ${DNS_RELAX_WHO:-Traefik} keeps serving the current certificate meanwhile)..."
   rc=0
   # The tool's settle point is saved the moment it prints it, right after
   # the write (I8); a failed save fails.
@@ -776,6 +783,106 @@ dns_relax_main() {
     2) warn "could not relax the CAA of $d: the dns tool refused the arguments, the domains image is older than this CLI (docker compose build domains)."; return 2 ;;
     3) warn "could not relax the CAA of $d to CA-only: the write failed (the message is above; check the provider access: ./portcullis dns plan)."; return 3 ;;
     *) warn "the relax of the CAA of $d was interrupted (exit $rc): its settle point is saved; run it again."; return 3 ;;
+  esac
+}
+
+# ── HA: the main domain's certificate comes from the front door ──
+# (spec §11.2, contract §12.4 / §20.8): its own ACME account, so the CAA
+# pin follows that account. Turning HA on and an ACME_STAGING flip in HA
+# are account switches: dns_flip_main_account runs the DNS spec's
+# fail-safe sequence (relax → settle → issue → re-pin) with the same
+# settle point (_dns_relax_file) and waits as the Docker flip.
+
+# _dns_frontdoor <args> — `domains frontdoor <args>` in the LEADING front
+# door's pod (the Lease portcullis-frontdoor's holder: a standby would
+# only refuse), over kubectl exec (the CLI's identity; the exec policy
+# lets it). Its stdout; exit 1 refused (standing by, no / another
+# account), 2 usage, 3 a failure or no leader.
+_dns_frontdoor() {
+  local ns pod
+  _rt_is_kube && kube_ha_on || { warn "the front door runs only in HA mode (PORTCULLIS_HA=on on kubernetes)"; return 3; }
+  ns="$(kube_ns)"
+  pod="$(kube_ctl -n "$ns" get lease portcullis-frontdoor -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)" || pod=""
+  if ! [[ "$pod" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    warn "no front door holds the Lease portcullis-frontdoor (is it running? ./portcullis status)"
+    return 3
+  fi
+  kube_ctl -n "$ns" exec "pod/$pod" -c frontdoor -- domains frontdoor "$@" \
+    2> >(awk '!/^command terminated with exit code [0-9]+$/ { print; fflush() }' >&2)
+}
+
+# dns_frontdoor_account_uri — the front door's ACME account URI (the
+# leader registers it with ACME_CA_SERVER on first ask). Polled up to
+# DNS_TIGHTEN_TIMEOUT (180 s; a rolled-out front door takes the Lease
+# within ~15 s). Nothing printed and exit 1 when none came.
+dns_frontdoor_account_uri() {
+  local deadline every uri rc
+  deadline=$((SECONDS + ${DNS_TIGHTEN_TIMEOUT:-180}))
+  every="${DNS_TIGHTEN_POLL:-5}"
+  while :; do
+    rc=0
+    uri="$(_dns_frontdoor account-uri 2>/dev/null | head -n1)" || rc=$?
+    if [ "$rc" -eq 0 ] && _dns_uri_ok "$uri"; then printf '%s\n' "$uri"; return 0; fi
+    [ "$SECONDS" -lt "$deadline" ] || break
+    sleep "$every"
+  done
+  warn "the front door didn't tell its ACME account within ${DNS_TIGHTEN_TIMEOUT:-180} s (./portcullis status; its log: kubectl logs deploy/frontdoor)"
+  return 1
+}
+
+# dns_flip_main_account <uri> — switch the main domain's CAA pin to the
+# front door's account <uri>, fail-safe: (1) relax the CAA to CA-only and
+# (2) wait until no cache can hold the old pin (dns_relax_main: the old
+# pin's TTL read first, the settle point saved in _dns_relax_file and only
+# ever moved later); only once settled (3) the front door orders the main
+# domain's certificate with <uri> (`domains frontdoor issue`), then (4) the
+# CAA is pinned to <uri> and main-domain.env records it. Anything short of
+# settled stops before the order: nothing is ordered against the old pin,
+# and a rerun goes on from the saved settle point. Where Portcullis
+# doesn't manage the CAA (DNS_CAA=false, a manual provider, no
+# credentials) there is no pin to relax or write: the public check alone
+# decides (dns_flip_guard), then the order.
+# Exit 0 done (also: re-pin written, not yet visible everywhere); 1 not
+# settled yet / refused (run it again later); 2 an older domains image;
+# 3 a failure.
+dns_flip_main_account() {
+  local uri="$1" d="${PORTCULLIS_DOMAIN:-the domain}" caa managed=false relaxed="" rc out
+  _dns_uri_ok "$uri" || { warn "not an ACME account URI: '$uri'"; return 3; }
+  caa="$(_dns_flag DNS_CAA true)" || return 3
+  if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}" && _dns_creds_present "${DNS_PROVIDER:-none}"; then
+    managed=true
+  fi
+  # (1) relax + (2) settle.
+  if [ "$managed" = true ]; then
+    rc=0
+    DNS_RELAX_WHO="the front door" dns_relax_main || rc=$?
+    [ "$rc" -eq 0 ] || { warn "The CAA account switch of $d stops before the order (see above): the front door orders nothing against the old pin."; return "$rc"; }
+    relaxed=1
+  fi
+  # The public check the Docker flip runs too (N2): a pin still live or
+  # cached where Portcullis can't see it refuses.
+  dns_flip_guard "$(_dns_ca_server)" "$relaxed" || { warn "The CAA account switch of $d stops before the order: nothing was ordered."; return 1; }
+  # (3) issue.
+  info "The front door orders the certificate of $d and *.$d with its ACME account $uri..."
+  rc=0
+  out="$(_dns_frontdoor issue --account-uri "$uri")" || rc=$?
+  case "$rc" in
+    0) ok "The front door holds a certificate of $d from $uri (until $(printf '%s' "$out" | jq -r '.not_after // "?"' 2>/dev/null))." ;;
+    1) warn "The front door refused the order (see above): the CAA of $d stays CA-only; run it again."; return 1 ;;
+    *) warn "The front door's order failed (see above): the CAA of $d stays CA-only; run it again."; return 3 ;;
+  esac
+  # (4) re-pin.
+  dns_main_env_write "$uri" if-running || true
+  [ "$managed" = true ] || return 0
+  info "Pinning the CAA of $d to the front door's ACME account..."
+  rc=0
+  out="$(_dns_caa_apply "$uri")" || rc=$?
+  dns_main_refresh
+  case "$rc" in
+    0) ok "CAA of $d pinned to $uri"; _dns_relax_repin; return 0 ;;
+    1) warn "$(_dns_wait_text "$out" "The CAA pin of $d"). Nothing to do: ./portcullis status shows it as planned once those caches have cleared."; _dns_relax_repin; return 0 ;;
+    2) warn "could not pin the CAA of $d: the dns tool refused the arguments, the domains image is older than this CLI"; return 2 ;;
+    *) warn "could not pin the CAA of $d to the front door's account: the write failed (the message is above). The certificate is ordered and the CAA is CA-only (still one CA, DNS-01 only): run it again."; return 3 ;;
   esac
 }
 

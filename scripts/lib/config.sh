@@ -132,6 +132,10 @@ config_apply() {
   if [ -z "$last" ] && _cfg_acme_exists; then
     last=false
   fi
+  if [ -n "$last" ] && [ "$last" != "$staging" ] && _rt_is_kube && kube_ha_on; then
+    _cfg_flip_ha "$last" "$staging" "$ca_server" "$acme_dns" "$sentinel"
+    return
+  fi
   if [ -n "$last" ] && [ "$last" != "$staging" ]; then
     warn "ACME_STAGING flipped ($last → $staging): Traefik needs a new ACME account and new certificates."
     flipping=true
@@ -202,6 +206,38 @@ config_apply() {
   # TLS options are static (traefik/dynamic/tls.yml, tracked): the Hub
   # picks one per app router, core routers use authaware.
   ok "Updated ACME_CA_SERVER. Apply with: ./portcullis up"
+}
+
+# _cfg_flip_ha <last> <staging> <ca_server> <acme_dns> <sentinel> — an
+# ACME_STAGING flip in HA (spec §11.2): Traefik has no ACME resolver
+# there; the main domain's certificate is the front door's, so the flip is
+# the front door's account switch. The front door is rolled onto the new
+# CA (its stored certificate stays served meanwhile: domains serves it
+# while it is valid; nothing is ordered with the new account before the
+# settle), its new account URI read, and dns_flip_main_account runs relax
+# → settle → issue → re-pin. Anything short of done stops with the
+# sentinel unwritten, so the next run redoes the flip from the saved
+# settle point.
+_cfg_flip_ha() {
+  local last="$1" staging="$2" ca="$3" acme_dns="$4" sentinel="$5" ns uri
+  warn "ACME_STAGING flipped ($last → $staging) in HA: the front door needs a new ACME account and a new certificate of $PORTCULLIS_DOMAIN."
+  env_set ACME_CA_SERVER "$ca"
+  export ACME_CA_SERVER="$ca"
+  env_set ACME_DNS_PROVIDER "$acme_dns"
+  export ACME_DNS_PROVIDER="$acme_dns"
+  ns="$(kube_ns)"
+  info "Moving the front door onto $ca..."
+  # The same value the chart renders from .env at the next up.
+  kube_ctl -n "$ns" set env deployment/frontdoor "ACME_CA_SERVER=$ca" >/dev/null \
+    || fail "could not move the front door onto $ca: the ACME_STAGING flip is not finished; run the same command again"
+  kube_ctl -n "$ns" rollout status deployment/frontdoor --timeout="${KUBE_POD_WAIT:-180}s" >/dev/null \
+    || fail "the front door didn't roll out on $ca: the ACME_STAGING flip is not finished; run the same command again"
+  uri="$(dns_frontdoor_account_uri)" || fail "The ACME_STAGING flip is not finished (see above): the CAA and the current certificate are unchanged; run the same command again."
+  dns_flip_main_account "$uri" || fail "The ACME_STAGING flip is not finished (see above): the current certificate stays served, nothing was ordered against the old CAA pin, and the settle point is saved: running it again early just waits or stops again."
+  mkdir -p "$(dirname "$sentinel")"
+  echo "$staging" > "$sentinel"
+  dns_relax_done
+  ok "ACME_STAGING=$staging in HA: the front door's account $uri holds the certificate and the CAA pin. The added domains switch at: ./portcullis up"
 }
 
 # config_init <remote> <clone-url> — config/ as a separate git repo holding
