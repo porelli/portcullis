@@ -403,14 +403,14 @@ EOF
 # _ki_mesh_input_rules — PORTCULLIS-MESH-IN's rules on this first node (a
 # server; Task 28 fix round 2): the kubelet, the API server / supervisor
 # and etcd listen on the mesh address only, and only pcmesh, loopback and
-# the node's pod networks may reach that address on their ports (a LAN /
+# the node's pods (cni0) may reach that address on their ports (a LAN /
 # VPC neighbour could route to it through the uplink: Linux's weak host
 # model). The list is tests/fixtures/mesh-input-rules.txt, the one the
 # nodeagent keeps on every node (Hub internal/nodeagent/host/mesh.go
 # meshInRules), so it takes the chain over unchanged.
 _ki_mesh_input_rules() {
   local i
-  for i in pcmesh lo cni0 flannel+; do printf -- '-A PORTCULLIS-MESH-IN -i %s -j RETURN\n' "$i"; done
+  for i in pcmesh lo cni0; do printf -- '-A PORTCULLIS-MESH-IN -i %s -j RETURN\n' "$i"; done
   printf -- '-A PORTCULLIS-MESH-IN -d %s/32 -p tcp -m multiport --dports 10250,6443,2379,2380 -j DROP\n' "$KUBE_MESH_IP"
 }
 
