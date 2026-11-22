@@ -663,6 +663,9 @@ func (s *Server) removeCooperative(ctx context.Context, id string) error {
 	if err := s.forget(ctx, id, &cn.Addresses); err != nil {
 		return err
 	}
+	if err := s.clearRemediation(ctx, id); err != nil {
+		return err
+	}
 	if err := s.kube.CoreV1().Nodes().Delete(ctx, id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("deleting node %s: %w", id, err)
 	}

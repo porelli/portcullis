@@ -360,6 +360,9 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 			s.log.Info("bootstrap token deleted", "node", id, "token_id", t)
 		}
 	case "node_deleted":
+		if err := s.clearRemediation(ctx, id); err != nil {
+			return err
+		}
 		if err := s.kube.CoreV1().Nodes().Delete(ctx, id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("deleting node %s: %w", id, err)
 		}

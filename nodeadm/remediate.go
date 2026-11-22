@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -392,4 +393,41 @@ func (s *Server) remediationErrors() []string {
 		out = append(out, "unknown node registered: "+x+" (not enrolled and labelled by nodeadm: never counted or fenced; remove it, or finish its labelling)")
 	}
 	return out
+}
+
+// clearRemediation is a removal's remediation clean-up (plan Task 30
+// carry), run once the node is marked removed (no new remediation from
+// here: Excluded) and before its Node is deleted: its SelfNodeRemediation
+// goes at once — never left the 15 min planRemediation gives a gone
+// node, where SNR would fence a node rejoining under the same name — and
+// its back-off and maintenance records with it (a rejoin starts clean).
+// Fail closed: an error other than NotFound stops the removal before the
+// Node goes, so a retry runs it again — except where no request of ours
+// can exist: without HA nodeadm has no rights in the fencing namespace
+// (Forbidden) and SNR may not be installed (no kind), and nodeadm creates
+// every SelfNodeRemediation itself, recording it in Remediations; with no
+// record for the node, those two answers mean nothing to remove (found
+// live, Task 30: a non-HA revoke stopped at Forbidden).
+func (s *Server) clearRemediation(ctx context.Context, id string) error {
+	if s.dyn != nil && s.cfg.FencingNS != "" {
+		st, err := s.load(ctx)
+		if err != nil {
+			return err
+		}
+		recorded := !st.Remediations[id].IsZero()
+		err = s.dyn.Resource(gvrSNR).Namespace(s.cfg.FencingNS).Delete(ctx, id, metav1.DeleteOptions{})
+		switch {
+		case err == nil:
+			s.log.Info("removal: the node's SelfNodeRemediation removed", "node", id)
+		case apierrors.IsNotFound(err):
+		case !recorded && (apierrors.IsForbidden(err) || isNoKind(err)):
+		default:
+			return fmt.Errorf("removing %s's SelfNodeRemediation: %s", id, redact(err.Error()))
+		}
+	}
+	return s.mutate(ctx, func(st *nodeadmState) error {
+		delete(st.Remediations, id)
+		delete(st.Maintenance, id)
+		return nil
+	})
 }

@@ -1,0 +1,108 @@
+{
+  "vectors": [
+    {
+      "name": "a server at main",
+      "id": "n4",
+      "role": "server",
+      "mesh_ip": "10.215.0.4",
+      "server_url": "https://10.215.0.1:6443",
+      "cluster_cidr": "10.42.0.0/16",
+      "flags": [
+        "--advertise-address=10.215.0.4",
+        "--agent-token-file=/etc/rancher/k3s/agent-token",
+        "--bind-address=10.215.0.4",
+        "--cluster-cidr=10.42.0.0/16",
+        "--disable=traefik",
+        "--etcd-arg=election-timeout=2000",
+        "--etcd-arg=heartbeat-interval=200",
+        "--etcd-arg=listen-client-urls=https://10.215.0.4:2379,https://127.0.0.1:2379",
+        "--flannel-backend=wireguard-native",
+        "--flannel-conf=/etc/rancher/k3s/flannel-net-conf.json",
+        "--flannel-iface=pcmesh",
+        "--kube-controller-manager-arg=disable-force-detach-on-timeout=true",
+        "--kubelet-arg=address=10.215.0.4",
+        "--kubelet-arg=pod-max-pids=1024",
+        "--kubelet-arg=sync-frequency=10s",
+        "--node-ip=10.215.0.4",
+        "--node-name=n4",
+        "--node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule",
+        "--secrets-encryption",
+        "--server=https://10.215.0.1:6443",
+        "--token-file=/etc/rancher/k3s/token",
+        "--write-kubeconfig-mode=0600"
+      ]
+    },
+    {
+      "name": "an agent at main",
+      "id": "n5",
+      "role": "agent",
+      "mesh_ip": "10.215.0.5",
+      "server_url": "https://10.215.0.1:6443",
+      "cluster_cidr": "10.42.0.0/16",
+      "flags": [
+        "--bind-address=10.215.0.5",
+        "--flannel-conf=/etc/rancher/k3s/flannel-net-conf.json",
+        "--flannel-iface=pcmesh",
+        "--kubelet-arg=pod-max-pids=1024",
+        "--kubelet-arg=sync-frequency=10s",
+        "--node-ip=10.215.0.5",
+        "--node-name=n5",
+        "--node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule",
+        "--server=https://10.215.0.1:6443",
+        "--token-file=/etc/rancher/k3s/token"
+      ]
+    },
+    {
+      "name": "an agent at another site, another server, another cluster network",
+      "id": "edge-1",
+      "role": "agent",
+      "mesh_ip": "10.215.0.17",
+      "server_url": "https://10.215.0.2:6443",
+      "cluster_cidr": "10.60.0.0/16",
+      "flags": [
+        "--bind-address=10.215.0.17",
+        "--flannel-conf=/etc/rancher/k3s/flannel-net-conf.json",
+        "--flannel-iface=pcmesh",
+        "--kubelet-arg=pod-max-pids=1024",
+        "--kubelet-arg=sync-frequency=10s",
+        "--node-ip=10.215.0.17",
+        "--node-name=edge-1",
+        "--node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule",
+        "--server=https://10.215.0.2:6443",
+        "--token-file=/etc/rancher/k3s/token"
+      ]
+    },
+    {
+      "name": "a server, another cluster network",
+      "id": "srv-3",
+      "role": "server",
+      "mesh_ip": "10.215.0.33",
+      "server_url": "https://10.215.0.2:6443",
+      "cluster_cidr": "10.60.0.0/16",
+      "flags": [
+        "--advertise-address=10.215.0.33",
+        "--agent-token-file=/etc/rancher/k3s/agent-token",
+        "--bind-address=10.215.0.33",
+        "--cluster-cidr=10.60.0.0/16",
+        "--disable=traefik",
+        "--etcd-arg=election-timeout=2000",
+        "--etcd-arg=heartbeat-interval=200",
+        "--etcd-arg=listen-client-urls=https://10.215.0.33:2379,https://127.0.0.1:2379",
+        "--flannel-backend=wireguard-native",
+        "--flannel-conf=/etc/rancher/k3s/flannel-net-conf.json",
+        "--flannel-iface=pcmesh",
+        "--kube-controller-manager-arg=disable-force-detach-on-timeout=true",
+        "--kubelet-arg=address=10.215.0.33",
+        "--kubelet-arg=pod-max-pids=1024",
+        "--kubelet-arg=sync-frequency=10s",
+        "--node-ip=10.215.0.33",
+        "--node-name=srv-3",
+        "--node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule",
+        "--secrets-encryption",
+        "--server=https://10.215.0.2:6443",
+        "--token-file=/etc/rancher/k3s/token",
+        "--write-kubeconfig-mode=0600"
+      ]
+    }
+  ]
+}

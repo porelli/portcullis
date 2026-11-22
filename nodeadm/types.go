@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"time"
@@ -224,6 +225,11 @@ type AgentHealth struct {
 	MeshPub string `json:"mesh_pub"`
 	K3s     string `json:"k3s"`
 	Time    string `json:"time"`
+	// Peers: each plan peer's WireGuard state, for the Hub (contract
+	// §20.4, Hub Task 10); nodeadm never reads it. Without the field the
+	// strict decode refused every real answer, so every join stayed
+	// mesh_pending (found live, Task 30).
+	Peers json.RawMessage `json:"peers,omitempty"`
 }
 
 func rfc3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }

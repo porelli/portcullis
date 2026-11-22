@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -511,5 +512,101 @@ func TestSecretStoreFreshStateMaps(t *testing.T) {
 	st.Maintenance["n1"] = true
 	if st.Codes == nil || st.Nodes == nil || st.Ops == nil || st.PendingRevokes == nil {
 		t.Fatalf("a nil map in a fresh state: %+v", st)
+	}
+}
+
+// TestRemovalClearsRemediation (plan Task 30 carry): a removal through
+// nodeadm — cooperative or revoke — deletes the node's
+// SelfNodeRemediation before its Node, and drops its back-off and
+// maintenance records, so a node rejoining under the same name is never
+// fenced by a leftover request and starts clean. A CR that can't be
+// removed stops the removal before the Node goes (fail closed).
+func TestRemovalClearsRemediation(t *testing.T) {
+	ctx := context.Background()
+	snr := func(name string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{"apiVersion": "self-node-remediation.medik8s.io/v1alpha1", "kind": "SelfNodeRemediation",
+			"metadata": map[string]any{"name": name, "namespace": "portcullis-fencing"}}}
+	}
+	for _, mode := range []string{"cooperative", "revoke"} {
+		agent := nodeSpec{"n4", "agent", "cloud", "main", "10.215.0.4", nil, nil, true, false}
+		h := newHarness(t, append(append([]nodeSpec{}, baseNodes...), agent)...)
+		h.agents.onRotate = h.bootFollows
+		d := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+			map[schema.GroupVersionResource]string{gvrSNR: "SelfNodeRemediationList", gvrLonghornVolume: "VolumeList"}, snr("n4"), snr("n3"))
+		h.s.dyn = d
+		h.putState(t, func(st *nodeadmState) {
+			st.Nodes["n4"] = &nodeRecord{Role: "agent", Serial: "ab:cd", MeshIP: "10.215.0.4", Labelled: true}
+			st.Remediations["n4"], st.Remediations["n3"] = vecNow, vecNow
+			st.Maintenance["n4"] = true
+		})
+		// Fail closed first: the CR delete refused → the Node stays.
+		d.PrependReactor("delete", "selfnoderemediations", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("refused")
+		})
+		if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode="+mode, nil); w.Code < 400 && mode == "cooperative" {
+			t.Fatalf("%s: a refused CR delete answered %d", mode, w.Code)
+		}
+		if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n4", metav1.GetOptions{}); err != nil {
+			t.Fatalf("%s: the Node went although its remediation stayed: %v", mode, err)
+		}
+		d.ReactionChain = d.ReactionChain[1:]
+		if mode == "revoke" {
+			// The op is resumable: driven again (the leader's loop).
+			h.s.resumeOps(ctx)
+			<-h.s.driveOp("n4")
+		} else if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=cooperative", nil); w.Code != 204 {
+			t.Fatalf("remove: %d %s", w.Code, w.Body)
+		}
+		if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n4", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("%s: n4 still there: %v", mode, err)
+		}
+		if _, err := d.Resource(gvrSNR).Namespace("portcullis-fencing").Get(ctx, "n4", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("%s: n4's SelfNodeRemediation stayed: %v", mode, err)
+		}
+		if _, err := d.Resource(gvrSNR).Namespace("portcullis-fencing").Get(ctx, "n3", metav1.GetOptions{}); err != nil {
+			t.Fatalf("%s: another node's remediation went: %v", mode, err)
+		}
+		st := h.state(t)
+		if !st.Remediations["n4"].IsZero() || st.Maintenance["n4"] || st.Remediations["n3"].IsZero() {
+			t.Fatalf("%s: remediations %v, maintenance %v", mode, st.Remediations, st.Maintenance)
+		}
+	}
+}
+
+// TestRemovalWithoutFencingRights (found live, Task 30): without HA
+// nodeadm may not touch the fencing namespace (Forbidden) and SNR may not
+// be installed; a node nodeadm never remediated is removed all the same.
+// A node it did remediate keeps the removal stopped (fail closed).
+func TestRemovalWithoutFencingRights(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		err      error
+		recorded bool
+		removed  bool
+	}{
+		{"forbidden, never remediated", apierrors.NewForbidden(gvrSNR.GroupResource(), "n4", fmt.Errorf("no rights")), false, true},
+		{"no kind, never remediated", fmt.Errorf("the server could not find the requested resource"), false, true},
+		{"forbidden, remediated before", apierrors.NewForbidden(gvrSNR.GroupResource(), "n4", fmt.Errorf("no rights")), true, false},
+		{"another error, never remediated", fmt.Errorf("etcdserver: timeout"), false, false},
+	} {
+		agent := nodeSpec{"n4", "agent", "cloud", "main", "10.215.0.4", nil, nil, true, false}
+		h := newHarness(t, append(append([]nodeSpec{}, baseNodes...), agent)...)
+		d := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+			map[schema.GroupVersionResource]string{gvrSNR: "SelfNodeRemediationList", gvrLonghornVolume: "VolumeList"})
+		h.s.dyn = d
+		err := tc.err
+		d.PrependReactor("delete", "selfnoderemediations", func(k8stesting.Action) (bool, runtime.Object, error) { return true, nil, err })
+		h.putState(t, func(st *nodeadmState) {
+			st.Nodes["n4"] = &nodeRecord{Role: "agent", Serial: "ab:cd", MeshIP: "10.215.0.4", Labelled: true}
+			if tc.recorded {
+				st.Remediations["n4"] = vecNow
+			}
+		})
+		h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=cooperative", nil)
+		_, gerr := h.kube.CoreV1().Nodes().Get(ctx, "n4", metav1.GetOptions{})
+		if gone := apierrors.IsNotFound(gerr); gone != tc.removed {
+			t.Errorf("%s: removed %v, want %v", tc.name, gone, tc.removed)
+		}
 	}
 }
