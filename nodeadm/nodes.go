@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -541,9 +542,16 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) error {
 
 // forget revokes a node's certificate (if any), voids its code, and marks
 // it removed with addrs (its document entry, state removed, until the
-// active admission generation drops it; ruling R-ADM). A code that never
-// enrolled leaves nothing behind.
-func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses) error {
+// active admission generation drops it; ruling R-ADM), its name listed
+// removed (revoked: for good). A code that never enrolled leaves nothing
+// behind. The first node (init's, which nodeadm never enrolled) has no
+// record: its serials come from the CLI's ConfigMap portcullis-first-node
+// (review I2), read first; an unreadable one stops the removal.
+func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses, revoked bool) error {
+	first, err := s.firstNodeSerials(ctx, id)
+	if err != nil {
+		return err
+	}
 	// Marked removed first (verifySigned refuses from here on, whether or
 	// not enroll is up), the serial queued in PendingRevokes; then every
 	// pending serial revoked; a failed one stays queued and is retried by
@@ -553,12 +561,21 @@ func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses) er
 			c.KeySHA256, c.Used = "", true
 		}
 		rec := st.Nodes[id]
+		for _, sr := range first {
+			st.queueRevoke(id, sr, s.now())
+		}
 		if rec == nil && addrs == nil {
 			return nil
 		}
 		if rec == nil {
 			rec = &nodeRecord{}
 			st.Nodes[id] = rec
+		}
+		if st.RemovedNames == nil {
+			st.RemovedNames = map[string]*removedName{}
+		}
+		if rn := st.RemovedNames[id]; rn == nil || (revoked && !rn.Revoked) {
+			st.RemovedNames[id] = &removedName{At: s.now(), Revoked: revoked || (rn != nil && rn.Revoked)}
 		}
 		if addrs != nil {
 			a := *addrs
@@ -576,6 +593,59 @@ func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses) er
 	}
 	return s.revokePending(ctx, id)
 }
+
+// firstNodeCM is the CLI's record of the first node's certificates
+// (scripts/lib/node.sh kube_first_node_record): {"v":1,"id","serials":
+// [{"serial","not_after"}]}, in the core namespace, written by the CLI's
+// identity only (nodeadm may get it, nothing else).
+const (
+	firstNodeCM  = "portcullis-first-node"
+	firstNodeKey = "first-node.json"
+)
+
+// firstNodeSerials: when id is the first node the CLI adopted, every
+// serial of its record not yet expired (Vault's form). No ConfigMap, or
+// another id: none. Unreadable or malformed: an error (fail closed: the
+// removal stops, and is retried, before anything is marked).
+func (s *Server) firstNodeSerials(ctx context.Context, id string) ([]string, error) {
+	cm, err := s.kube.CoreV1().ConfigMaps(s.cfg.CoreNS).Get(ctx, firstNodeCM, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading the ConfigMap %s: %w", firstNodeCM, err)
+	}
+	var doc struct {
+		V       int    `json:"v"`
+		ID      string `json:"id"`
+		Serials []struct {
+			Serial   string    `json:"serial"`
+			NotAfter time.Time `json:"not_after"`
+		} `json:"serials"`
+	}
+	dec := json.NewDecoder(strings.NewReader(cm.Data[firstNodeKey]))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&doc); err != nil || doc.V != 1 || !serverIDRe.MatchString(doc.ID) {
+		return nil, fmt.Errorf("the ConfigMap %s doesn't parse", firstNodeCM)
+	}
+	if doc.ID != id {
+		return nil, nil
+	}
+	var out []string
+	for _, c := range doc.Serials {
+		sr := normSerial(c.Serial)
+		if !serialRe.MatchString(sr) {
+			return nil, fmt.Errorf("the ConfigMap %s holds a malformed serial", firstNodeCM)
+		}
+		if c.NotAfter.After(s.now()) {
+			out = append(out, sr)
+		}
+	}
+	return out, nil
+}
+
+// serialRe: Vault's serial form, lowercase colon-separated hex bytes.
+var serialRe = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){0,31}$`)
 
 // revokePending revokes the queued serials (of node id; every node's
 // with id ""), dropping each one enroll revoked; an error while one of
@@ -636,6 +706,11 @@ func (s *Server) removeCooperative(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	// A removal stopped after its Node delete (review M1): only the etcd
+	// step is left, whether the Node is gone or still terminating.
+	if rec := st.Nodes[id]; rec != nil && rec.Removed && rec.EtcdPending != "" {
+		return s.finishEtcd(ctx, id, rec.EtcdPending)
+	}
 	n, err := s.getNode(ctx, id)
 	var ae *apiError
 	if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
@@ -643,7 +718,7 @@ func (s *Server) removeCooperative(ctx context.Context, id string) error {
 			return err
 		}
 		s.log.Info("enrolment voided", "node", id)
-		return s.forget(ctx, id, nil)
+		return s.forget(ctx, id, nil, false)
 	}
 	if err != nil {
 		return err
@@ -660,25 +735,76 @@ func (s *Server) removeCooperative(ctx context.Context, id string) error {
 	// The node marked removed (cert revoked) first, then its Node gone, then
 	// the document says so, then (a server) its etcd member removed.
 	cn := toClusterNode(n)
-	if err := s.forget(ctx, id, &cn.Addresses); err != nil {
+	if err := s.forget(ctx, id, &cn.Addresses, false); err != nil {
 		return err
 	}
 	if err := s.clearRemediation(ctx, id); err != nil {
 		return err
 	}
+	if isServer(n) {
+		// Recorded before the Node goes: a retry after the delete resumes
+		// at the etcd step (review M1).
+		if err := s.mutate(ctx, func(st *nodeadmState) error {
+			if r := st.Nodes[id]; r != nil && r.Removed {
+				r.EtcdPending = cn.Mesh
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	if err := s.kube.CoreV1().Nodes().Delete(ctx, id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("deleting node %s: %w", id, err)
 	}
 	if isServer(n) {
-		if err := s.publishAddresses(ctx); err != nil {
-			return err
-		}
-		if err := s.removeEtcdMember(ctx, cn); err != nil {
+		if err := s.finishEtcd(ctx, id, cn.Mesh); err != nil {
 			return err
 		}
 	}
 	s.log.Info("node removed", "node", id, "mode", "cooperative")
 	return nil
+}
+
+// finishEtcd is a cooperative server removal's last step (review M1): the
+// document says it is removed, its Node is gone, its etcd member is gone,
+// then EtcdPending is cleared. k3s itself removes the member: its
+// managed-etcd-controller (pinned v1.37.2+k3s1 pkg/etcd/member_controller.go,
+// nodes.OnRemove → RemovePeer) is a finalizer that holds the Node's delete
+// until the member is removed (refused while it is the only voter); while
+// it is pending, the surviving nodeagent's RemoveMember answers 409 ("the
+// Node still exists"). So the Node is waited for first (Timing.NodeGone),
+// then the nodeagent removes the member if k3s didn't (an absent member is
+// success). A failure leaves EtcdPending: the next try starts here.
+func (s *Server) finishEtcd(ctx context.Context, id, mesh string) error {
+	if err := s.publishAddresses(ctx); err != nil {
+		return err
+	}
+	wait := s.timing.NodeGone
+	if wait <= 0 {
+		wait = 5 * time.Minute
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		_, err := s.kube.CoreV1().Nodes().Get(ctx, id, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			return errPlain(http.StatusServiceUnavailable, "node %s is still terminating (k3s removes its etcd member first): the removal goes on when it is retried", id)
+		}
+		if err := sleepCtx(ctx, s.timing.Poll); err != nil {
+			return err
+		}
+	}
+	if err := s.removeEtcdMember(ctx, clusterNode{Name: id, Role: "server", Mesh: mesh}); err != nil {
+		return err
+	}
+	return s.mutate(ctx, func(st *nodeadmState) error {
+		if r := st.Nodes[id]; r != nil {
+			r.EtcdPending = ""
+		}
+		return nil
+	})
 }
 
 // etcdQuorum: the server nodes and the Ready ones among them.

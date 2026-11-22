@@ -35,6 +35,9 @@ func agentServer(t *testing.T, h *harness, id string) (*httptest.Server, *x509.C
 		mu.Lock()
 		*seen = append(*seen, seenCall{r.Method, r.URL.Path, string(b), cn})
 		mu.Unlock()
+		if r.URL.Path == "/v1/agent/upgrade" {
+			w.Write([]byte(`{"state":"current"}`))
+		}
 		if r.URL.Path == "/v1/health" {
 			w.Write([]byte(`{"id":"` + id + `","version":"1","mesh_ip":"10.215.0.1","mesh_pub":"x","k3s":"running","time":"2026-11-18T10:00:00Z"}`))
 		}
@@ -65,6 +68,7 @@ func TestNodeagentCallVectors(t *testing.T) {
 	var f struct {
 		Calls []struct {
 			Name, Call, Via, ViaMesh, Node, NodeMesh, Token, Step, Method, Path, Body string
+			AMD64, ARM64                                                              string
 		} `json:"calls"`
 	}
 	dec := json.NewDecoder(strings.NewReader(strings.NewReplacer(`"via_mesh"`, `"viamesh"`, `"node_mesh"`, `"nodemesh"`).Replace(string(b))))
@@ -87,6 +91,9 @@ func TestNodeagentCallVectors(t *testing.T) {
 					return a.EtcdRemoveMember(ctx, c.Via, c.ViaMesh, c.Node, c.NodeMesh)
 				case "token_rotate":
 					return a.TokenRotate(ctx, c.Via, c.ViaMesh, c.Token, c.Step)
+				case "agent_upgrade":
+					_, err := a.UpgradeAgent(ctx, c.Via, c.ViaMesh, map[string]string{"amd64": c.AMD64, "arm64": c.ARM64})
+					return err
 				default:
 					_, err := a.Health(ctx, c.Via, c.ViaMesh)
 					return err

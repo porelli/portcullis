@@ -43,6 +43,10 @@ type CodeReq struct {
 	Ingress  bool     `json:"ingress"`
 	Storage  bool     `json:"storage"`
 	Mesh     MeshPlan `json:"mesh"`
+	// PublicEndpoint: the node's forwarded public UDP endpoint
+	// ("<ip:port>", optional; Task 30 fix round 1): a NATed node reports
+	// none, so this is what makes it its site's gateway (siteGateway).
+	PublicEndpoint string `json:"public_endpoint,omitempty"`
 }
 
 // LabelsReq is PUT /v1/nodes/{id}/labels (a full replacement).
@@ -174,6 +178,9 @@ type AddressesDoc struct {
 	ServiceCIDR string             `json:"service_cidr"`
 	API         []string           `json:"api"`
 	Nodes       map[string]DocNode `json:"nodes"`
+	// RemovedNames: every node name removed (nodeadmState.RemovedNames),
+	// sorted; params removedNodes (portcullis-removed-nodes).
+	RemovedNames []string `json:"removed_names"`
 }
 
 // DocNode is one node of the document: its addresses and its state

@@ -79,7 +79,11 @@ func (s *Server) buildAddresses(cl []clusterNode, st *nodeadmState) (*AddressesD
 		}
 	}
 	doc := &AddressesDoc{V: 1, MeshCIDR: meshPrefix.String(), ClusterCIDR: s.cfg.ClusterCIDR, ServiceCIDR: s.cfg.ServiceCIDR,
-		API: serverMeshIPs(live), Nodes: map[string]DocNode{}}
+		API: serverMeshIPs(live), Nodes: map[string]DocNode{}, RemovedNames: []string{}}
+	for id := range st.RemovedNames {
+		doc.RemovedNames = append(doc.RemovedNames, id)
+	}
+	sort.Strings(doc.RemovedNames)
 	for _, c := range live {
 		switch {
 		case c.Mesh == "":
@@ -281,6 +285,50 @@ func (s *Server) reconcile(ctx context.Context) {
 		return
 	}
 	s.pushTargets(ctx, nodes, s.probeTargets(nodes, doc))
+	s.upgradeAgents(ctx, nodes, st)
+}
+
+// upgradeAgents (Task 30 fix round 1): every Ready node nodeadm enrolled
+// (joined, not removed, no op) takes the nodeagent this nodeadm serves —
+// `./portcullis up` rolls nodeadm's image, which carries the binaries and
+// their sums (cfg.AgentSHA256, from the digest-pinned image). Asked once
+// per node per process (and again after a failure); one unreachable node
+// never blocks the others. The first node isn't nodeadm's (no record): the
+// CLI upgrades it.
+func (s *Server) upgradeAgents(ctx context.Context, nodes []clusterNode, st *nodeadmState) {
+	sums := map[string]string{"amd64": s.cfg.AgentSHA256["amd64"], "arm64": s.cfg.AgentSHA256["arm64"]}
+	if len(sums["amd64"]) != 64 || len(sums["arm64"]) != 64 {
+		return
+	}
+	key := sums["amd64"] + sums["arm64"]
+	for _, c := range nodes {
+		rec := st.Nodes[c.Name]
+		if rec == nil || rec.Removed || rec.JoinedAt == nil || st.Ops[c.Name] != nil || !c.Ready || c.Mesh == "" {
+			continue
+		}
+		s.upMu.Lock()
+		done := s.upgraded[c.Name] == key
+		s.upMu.Unlock()
+		if done {
+			continue
+		}
+		uctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		state, err := s.agents.UpgradeAgent(uctx, c.Name, c.Mesh, sums)
+		cancel()
+		if err != nil {
+			s.log.Warn("the node's nodeagent isn't upgraded (retried)", "node", c.Name, "err", err.Error())
+			continue
+		}
+		s.upMu.Lock()
+		if s.upgraded == nil {
+			s.upgraded = map[string]string{}
+		}
+		s.upgraded[c.Name] = key
+		s.upMu.Unlock()
+		if state == "upgraded" {
+			s.log.Info("node's nodeagent upgraded", "node", c.Name)
+		}
+	}
 }
 
 // dropRemoved deletes a removed node's record (so its entry leaves the
@@ -296,7 +344,7 @@ func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 		}
 	}
 	for id, r := range st.Nodes {
-		if !r.Removed || st.Ops[id] != nil {
+		if !r.Removed || st.Ops[id] != nil || r.EtcdPending != "" {
 			continue
 		}
 		mesh := r.MeshIP

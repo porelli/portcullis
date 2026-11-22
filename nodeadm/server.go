@@ -38,8 +38,8 @@ type Enroll interface {
 }
 
 // Agents is nodeadm's nodeagent client (nodeadm.control, §20.4): only
-// GET /v1/health, PUT /v1/probes/targets, POST /v1/k3s/token-rotate and
-// POST /v1/etcd/remove-member.
+// GET /v1/health, PUT /v1/probes/targets, POST /v1/k3s/token-rotate,
+// POST /v1/etcd/remove-member and POST /v1/agent/upgrade.
 type Agents interface {
 	Health(ctx context.Context, id, meshIP string) (*AgentHealth, error)
 	PutProbeTargets(ctx context.Context, id, meshIP string, t ProbeTargets) error
@@ -48,6 +48,9 @@ type Agents interface {
 	// etcd client key; nodeadm holds none) to remove the member of node,
 	// which portcullis-cluster-addresses must list removed.
 	EtcdRemoveMember(ctx context.Context, viaID, viaMesh, node, nodeMesh string) error
+	// UpgradeAgent has node id take the nodeagent nodeadm serves (the
+	// binaries' sums by architecture); "current" or "upgraded".
+	UpgradeAgent(ctx context.Context, id, meshIP string, sums map[string]string) (string, error)
 }
 
 // K3sBootstrap answers the status of GET https://<server>:6443/v1-k3s/
@@ -93,11 +96,12 @@ type Timing struct {
 	DrainMax      time.Duration // a drain at most (10 min)
 	NodeReady     time.Duration // a node Ready again after a token apply
 	LonghornEvict time.Duration // Longhorn's replicas off the node
+	NodeGone      time.Duration // a deleted server's Node gone (k3s's etcd finalizer) (5 min)
 }
 
 func defaultTiming() Timing {
 	return Timing{Poll: 2 * time.Second, PDBRefusal: 120 * time.Second, DrainMax: 10 * time.Minute,
-		NodeReady: 5 * time.Minute, LonghornEvict: 10 * time.Minute}
+		NodeReady: 5 * time.Minute, LonghornEvict: 10 * time.Minute, NodeGone: 5 * time.Minute}
 }
 
 // Server is nodeadm.
@@ -137,6 +141,10 @@ type Server struct {
 	remMu      sync.Mutex
 	remStuck   []string // the last round's stuck remediations (snapshot errors)
 	remUnknown []string // the last round's unknown Nodes (snapshot errors)
+	// upMu / upgraded: the nodes whose nodeagent this process saw take its
+	// binaries (node → their sums), so each is asked once per process.
+	upMu     sync.Mutex
+	upgraded map[string]string
 }
 
 // pkiState holds the pki_node CA and nodeadm's own node-nodeadm

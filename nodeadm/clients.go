@@ -314,6 +314,19 @@ func (a agentClient) EtcdRemoveMember(ctx context.Context, viaID, viaMesh, node,
 	return a.do(ctx, viaID, viaMesh, http.MethodPost, "/v1/etcd/remove-member", map[string]string{"node": node, "mesh_ip": nodeMesh}, nil)
 }
 
+func (a agentClient) UpgradeAgent(ctx context.Context, id, meshIP string, sums map[string]string) (string, error) {
+	var out struct {
+		State string `json:"state"`
+	}
+	if err := a.do(ctx, id, meshIP, http.MethodPost, "/v1/agent/upgrade", map[string]string{"amd64": sums["amd64"], "arm64": sums["arm64"]}, &out); err != nil {
+		return "", err
+	}
+	if out.State != "current" && out.State != "upgraded" {
+		return "", fmt.Errorf("nodeagent %s /v1/agent/upgrade answered state %q", id, out.State)
+	}
+	return out.State, nil
+}
+
 func (a agentClient) TokenRotate(ctx context.Context, id, meshIP, newToken, step string) error {
 	// The error never carries the body (the token).
 	return a.do(ctx, id, meshIP, http.MethodPost, "/v1/k3s/token-rotate", map[string]string{"new_token": newToken, "step": step}, nil)

@@ -1,5 +1,5 @@
 {
-  "_comment": "The calls nodeadm makes to a nodeagent (mTLS :7443 on the mesh, client certificate CN nodeadm.control; the nodeagent's certificate is <id>.cluster.portcullis.internal from pki_node and, for a node nodeadm enrolled, carries the serial nodeadm recorded). The nodeagent side (Task 9) answers only nodeadm.control on these routes; POST /v1/etcd/remove-member runs only on a server node, and only for a member whose node is state removed in portcullis-cluster-addresses (review I6: nodeadm holds no etcd key). Bodies are exact (key order as sent).",
+  "_comment": "The calls nodeadm makes to a nodeagent (mTLS :7443 on the mesh, client certificate CN nodeadm.control; the nodeagent's certificate is <id>.cluster.portcullis.internal from pki_node and, for a node nodeadm enrolled, carries the serial nodeadm recorded). The nodeagent side (Task 9) answers only nodeadm.control on these routes; POST /v1/etcd/remove-member runs only on a server node, and only for a member whose node is state removed in portcullis-cluster-addresses (review I6: nodeadm holds no etcd key). Bodies are exact (key order as sent). POST /v1/agent/upgrade names the sha256 of the nodeagent nodeadm serves per architecture (here both that of \"nodeagent vector\\n\"); the node installs its own only when the download matches it, and the first node (adopted) refuses.",
   "calls": [
     {"name": "etcd remove-member", "call": "etcd_remove_member", "via": "n1", "via_mesh": "10.215.0.1",
      "node": "n2", "node_mesh": "10.215.0.2",
@@ -8,6 +8,9 @@
      "token": "K10b7335c14c0febed58f896145ef153d44a59bd0dfa5065771f18cc99c514c0edb::server:aaaabbbbccccddddeeeeffff00001111", "step": "rotate",
      "method": "POST", "path": "/v1/k3s/token-rotate", "body": "{\"new_token\":\"K10b7335c14c0febed58f896145ef153d44a59bd0dfa5065771f18cc99c514c0edb::server:aaaabbbbccccddddeeeeffff00001111\",\"step\":\"rotate\"}"},
     {"name": "health", "call": "health", "via": "n1", "via_mesh": "10.215.0.1",
-     "method": "GET", "path": "/v1/health", "body": ""}
+     "method": "GET", "path": "/v1/health", "body": ""},
+    {"name": "agent upgrade", "call": "agent_upgrade", "via": "n1", "via_mesh": "10.215.0.1",
+     "amd64": "6d69c45e689c1cf75bb37cd3188768ca55cbf50cf2f698b182853c0b035db615", "arm64": "6d69c45e689c1cf75bb37cd3188768ca55cbf50cf2f698b182853c0b035db615",
+     "method": "POST", "path": "/v1/agent/upgrade", "body": "{\"amd64\":\"6d69c45e689c1cf75bb37cd3188768ca55cbf50cf2f698b182853c0b035db615\",\"arm64\":\"6d69c45e689c1cf75bb37cd3188768ca55cbf50cf2f698b182853c0b035db615\"}"}
   ]
 }

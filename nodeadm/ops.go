@@ -138,6 +138,12 @@ func (s *Server) revoke(ctx context.Context, id string) error {
 		var ae *apiError
 		if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
 			if st.Nodes[id] == nil && st.Codes[id] == nil {
+				// Revoked and finished (Task 30 fix round 1): its name is
+				// listed revoked for good, so a revoke asked again (the
+				// Hub restarted mid-call, the CLI asks once more) is done.
+				if rn := st.RemovedNames[id]; rn != nil && rn.Revoked {
+					return nil
+				}
 				return err
 			}
 			n = nil
@@ -358,7 +364,7 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 	}
 	switch next {
 	case "marked":
-		if err := s.forget(ctx, id, op.Addrs); err != nil {
+		if err := s.forget(ctx, id, op.Addrs, true); err != nil {
 			return err
 		}
 	case "tokens_deleted":

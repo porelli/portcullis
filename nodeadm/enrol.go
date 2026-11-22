@@ -114,6 +114,16 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) error {
 	if err := checkMeshPlan(req.Mesh); err != nil {
 		return errPlain(400, "the mesh plan is invalid: %v", err)
 	}
+	if req.PublicEndpoint != "" {
+		ap, err := netip.ParseAddrPort(req.PublicEndpoint)
+		if err != nil || ap.Port() == 0 || !ap.Addr().Is4() {
+			return errPlain(400, "public_endpoint must be an IPv4 address and port")
+		}
+		if err := s.publicPolicy().Check(ap.Addr().String()); err != nil {
+			return errPlain(400, "public_endpoint: %v", err)
+		}
+		req.PublicEndpoint = ap.String()
+	}
 	ctx := r.Context()
 	cl, err := s.clusterNodes(ctx)
 	if err != nil {
@@ -153,11 +163,31 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) error {
 		if n, ok := st.Nodes[req.ServerID]; ok && n.Serial == "" && !n.Removed && n.JoinedAt == nil {
 			delete(st.Nodes, req.ServerID)
 		}
+		// A rejoin under the same name (review M5): the old Node must be
+		// gone (the cluster list above refuses a terminating one) and its
+		// record dropped. Its node-password Secret (<id>.node-password.k3s,
+		// kube-system) is owned by the Node (pinned k3s v1.37.2+k3s1
+		// pkg/nodepassword/controller.go) and garbage-collected after it;
+		// nodeadm can't read kube-system Secrets (portcullis-nodeadm-tokens).
+		// A join that meets it before the GC isn't refused for good: the
+		// k3s agent retries "Node password rejected" every 5 s
+		// (pkg/agent/config/config.go Get: wait.JitterUntilWithContext).
 		if n, ok := st.Nodes[req.ServerID]; ok {
 			if n.Removed {
 				return errPlain(409, "node %s is still being removed: retry later", req.ServerID)
 			}
 			return errPlain(409, "node %s is already enrolled", req.ServerID)
+		}
+		// Task 30 fix round 1: a revoked name is never enrolled again (its
+		// old kubelet client certificate names it and would pass as the
+		// new node); a cooperatively removed one leaves the removed list
+		// with this code (the next document, then params-sync, lets its
+		// kubelet register: the join's release waits for that generation).
+		if rn := st.RemovedNames[req.ServerID]; rn != nil {
+			if rn.Revoked {
+				return errPlain(409, "node %s was revoked: its old kubelet certificate still names it, so that name is never enrolled again: pick another id", req.ServerID)
+			}
+			delete(st.RemovedNames, req.ServerID)
 		}
 		for id, n := range st.Nodes {
 			if n.MeshIP == req.MeshIP {
@@ -171,7 +201,7 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) error {
 		}
 		// A new code for the id voids the older one.
 		st.Codes[req.ServerID] = &codeRecord{KeySHA256: hex.EncodeToString(key[:]), Role: req.Role, Class: req.Class,
-			Site: req.Site, MeshIP: req.MeshIP, Ingress: req.Ingress, Storage: req.Storage, Mesh: req.Mesh,
+			Site: req.Site, MeshIP: req.MeshIP, Ingress: req.Ingress, Storage: req.Storage, Mesh: req.Mesh, Forward: req.PublicEndpoint,
 			IssuedAt: now, ExpiresAt: now.Add(codeTTL)}
 		return nil
 	})
@@ -407,7 +437,7 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 		cur.Used, cur.KeySHA256 = true, ""
 		code = *cur
 		st.Nodes[req.ServerID] = &nodeRecord{Role: cur.Role, Class: cur.Class, Site: cur.Site, MeshIP: cur.MeshIP,
-			Ingress: cur.Ingress, Storage: cur.Storage, Mesh: req.Mesh, EnrolledAt: now, JoinState: joinEnrolled}
+			Ingress: cur.Ingress, Storage: cur.Storage, Mesh: req.Mesh, Forward: cur.Forward, EnrolledAt: now, JoinState: joinEnrolled}
 		return nil
 	})
 	if errors.Is(err, errProof) {
@@ -813,7 +843,7 @@ func checkRTT(role string, servers []string, rtt map[string]int) error {
 func siteGateway(cl []clusterNode, st *nodeadmState, id string) error {
 	rec := st.Nodes[id]
 	sites := map[string]bool{rec.Site: true}
-	reachable := rec.Mesh.Public != nil
+	reachable := rec.Mesh.Public != nil || rec.Forward != ""
 	for _, n := range cl {
 		if n.Name == id {
 			continue
@@ -824,7 +854,7 @@ func siteGateway(cl []clusterNode, st *nodeadmState, id string) error {
 		}
 	}
 	for oid, o := range st.Nodes {
-		if oid != id && o.Site == rec.Site && o.Mesh.Public != nil {
+		if oid != id && o.Site == rec.Site && (o.Mesh.Public != nil || o.Forward != "") {
 			reachable = true
 		}
 	}
@@ -834,11 +864,12 @@ func siteGateway(cl []clusterNode, st *nodeadmState, id string) error {
 	return nil
 }
 
-// nodeReachable: its enrolment reported a public endpoint, or (a node
-// nodeadm didn't enrol, the first one) it has a public address.
+// nodeReachable: its enrolment reported a public endpoint or its code
+// named a forwarded one, or (a node nodeadm didn't enrol, the first one)
+// it has a public address.
 func nodeReachable(n clusterNode, st *nodeadmState) bool {
 	if r := st.Nodes[n.Name]; r != nil {
-		return r.Mesh.Public != nil
+		return r.Mesh.Public != nil || r.Forward != ""
 	}
 	return len(n.Addresses.Public) > 0
 }

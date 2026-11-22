@@ -104,6 +104,7 @@ type fakeAgents struct {
 	etcdRm    []string         // via:node:mesh
 	fail      map[string]error // "rotate"/"apply"/... or "etcd": the call fails (its error echoes the token)
 	effect    map[string]bool  // the failing call took effect first (an answer lost)
+	upgrades  []string         // id:amd64[:4]:arm64[:4] (UpgradeAgent; fail "upgrade:<id>")
 }
 
 func (f *fakeAgents) Health(_ context.Context, id, meshIP string) (*AgentHealth, error) {
@@ -144,6 +145,16 @@ func (f *fakeAgents) TokenRotate(_ context.Context, id, _, tok, step string) err
 		cb(id, step, tok)
 	}
 	return nil
+}
+
+func (f *fakeAgents) UpgradeAgent(_ context.Context, id, _ string, sums map[string]string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail["upgrade:"+id]; err != nil {
+		return "", err
+	}
+	f.upgrades = append(f.upgrades, id+":"+sums["amd64"][:4]+":"+sums["arm64"][:4])
+	return "upgraded", nil
 }
 
 func (f *fakeAgents) EtcdRemoveMember(_ context.Context, via, _, node, mesh string) error {

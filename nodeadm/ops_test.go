@@ -604,7 +604,7 @@ func TestForgetMarksFirst(t *testing.T) {
 	h.enrol(t, j, "")
 	serial := h.state(t).Nodes["n4"].Serial
 	h.enroll.fail = errors.New("vault sealed")
-	if err := h.s.forget(context.Background(), "n4", nil); err == nil {
+	if err := h.s.forget(context.Background(), "n4", nil, false); err == nil {
 		t.Fatal("forget with enroll down didn't report it")
 	}
 	r := h.state(t).Nodes["n4"]
@@ -960,7 +960,7 @@ func TestPendingRevokesSurviveEnrollOutage(t *testing.T) {
 	if len(pend) != 2 || !slices.Contains(pend, oldSerial) || !slices.Contains(pend, certSerial(c1)) || cur != certSerial(c2) {
 		t.Fatalf("queued %v (want the old serial and the superseded renewal's), current %s", pend, cur)
 	}
-	if err := h.s.forget(ctx, "n5", nil); err == nil {
+	if err := h.s.forget(ctx, "n5", nil, false); err == nil {
 		t.Fatal("forget with enroll unable to revoke didn't report it")
 	}
 	if r := h.state(t).Nodes["n5"]; !r.Removed || len(pending(h.state(t))) != 3 || !slices.Contains(pending(h.state(t)), cur) {
@@ -1007,7 +1007,7 @@ func TestPendingRevokeSurvivesReEnrol(t *testing.T) {
 	}
 	old := h.state(t).Nodes["n5"].Serial
 	h.enroll.revokeFail = errors.New("vault sealed")
-	if err := h.s.forget(ctx, "n5", nil); err == nil {
+	if err := h.s.forget(ctx, "n5", nil, false); err == nil {
 		t.Fatal("forget with enroll down didn't report it")
 	}
 	// The removed record leaves (as reconcile drops it); the same id enrols

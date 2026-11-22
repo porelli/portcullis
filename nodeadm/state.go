@@ -33,14 +33,16 @@ const (
 
 type codeRecord struct {
 	// KeySHA256: hex sha256 of the code's secret; "" once used or expired.
-	KeySHA256 string    `json:"key_sha256,omitempty"`
-	Role      string    `json:"role"`
-	Class     string    `json:"class"`
-	Site      string    `json:"site"`
-	MeshIP    string    `json:"mesh_ip"`
-	Ingress   bool      `json:"ingress"`
-	Storage   bool      `json:"storage"`
-	Mesh      MeshPlan  `json:"mesh"`
+	KeySHA256 string   `json:"key_sha256,omitempty"`
+	Role      string   `json:"role"`
+	Class     string   `json:"class"`
+	Site      string   `json:"site"`
+	MeshIP    string   `json:"mesh_ip"`
+	Ingress   bool     `json:"ingress"`
+	Storage   bool     `json:"storage"`
+	Mesh      MeshPlan `json:"mesh"`
+	// Forward: the code's forwarded public endpoint (CodeReq.PublicEndpoint).
+	Forward   string    `json:"forward,omitempty"`
 	IssuedAt  time.Time `json:"issued_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	Used      bool      `json:"used"`
@@ -79,6 +81,14 @@ type nodeRecord struct {
 	TokenIDs []string `json:"token_ids,omitempty"`
 	// Releases: how many times the join material went out (either role).
 	Releases int `json:"releases,omitempty"`
+	// EtcdPending: a cooperatively removed server whose Node delete was
+	// sent and whose etcd member isn't confirmed gone yet (its mesh
+	// address): a retry resumes at the etcd step, never at "enrolment
+	// voided" (review M1); the record isn't dropped meanwhile.
+	EtcdPending string `json:"etcd_pending,omitempty"`
+	// Forward: the forwarded public UDP endpoint its code named (a NATed
+	// node's way in from the other sites; the Hub plans and confirms it).
+	Forward string `json:"forward,omitempty"`
 }
 
 type nodeadmState struct {
@@ -103,6 +113,19 @@ type nodeadmState struct {
 	// Maintenance: nodes cordoned through nodeadm's cordon API (an admin's
 	// mark: the storm guard skips a cordoned node only with it).
 	Maintenance map[string]bool `json:"maintenance,omitempty"`
+	// RemovedNames: every node name nodeadm removed (Task 30 fix round 1),
+	// published as the cluster addresses' removed_names → params
+	// removedNodes: portcullis-removed-nodes refuses that name's kubelet
+	// identity a Node CREATE / UPDATE (its client certificate still
+	// authenticates). A cooperatively removed name leaves the list when a
+	// new code is issued for it; a revoked one never does (a new code for
+	// it is refused: the old kubelet certificate would pass as the new node).
+	RemovedNames map[string]*removedName `json:"removed_names,omitempty"`
+}
+
+type removedName struct {
+	At      time.Time `json:"at"`
+	Revoked bool      `json:"revoked,omitempty"`
 }
 
 type renewal struct {
@@ -124,7 +147,8 @@ type pendingRevoke struct {
 // maintenance mark panicked nodeadm).
 func newState() *nodeadmState {
 	return &nodeadmState{V: 1, Codes: map[string]*codeRecord{}, Nodes: map[string]*nodeRecord{}, Ops: map[string]*revokeOp{},
-		PendingRevokes: map[string]*pendingRevoke{}, Remediations: map[string]time.Time{}, Maintenance: map[string]bool{}}
+		PendingRevokes: map[string]*pendingRevoke{}, Remediations: map[string]time.Time{}, Maintenance: map[string]bool{},
+		RemovedNames: map[string]*removedName{}}
 }
 
 func (st *nodeadmState) clone() *nodeadmState {
@@ -148,6 +172,9 @@ func (st *nodeadmState) clone() *nodeadmState {
 	}
 	if out.Maintenance == nil {
 		out.Maintenance = map[string]bool{}
+	}
+	if out.RemovedNames == nil {
+		out.RemovedNames = map[string]*removedName{}
 	}
 	return out
 }
