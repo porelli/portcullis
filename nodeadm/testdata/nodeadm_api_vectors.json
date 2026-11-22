@@ -2154,7 +2154,7 @@
       "--flannel-conf=/etc/rancher/k3s/flannel-net-conf.json",
       "--kubelet-arg=pod-max-pids=1024",
       "--kubelet-arg=sync-frequency=10s",
-      "--kubelet-arg=address=10.215.0.4",
+      "--bind-address=10.215.0.4",
       "--node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule"
      ]
     }

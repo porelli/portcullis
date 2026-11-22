@@ -362,11 +362,14 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 			t.Errorf("no %s", f)
 		}
 	}
-	agentOK := []string{"--server=", "--token-file=", "--node-name=", "--node-ip=", "--node-label=", "--node-taint=", "--kubelet-arg=", "--flannel-conf=", "--flannel-iface="}
+	// An agent's kubelet listens on the mesh address through
+	// --bind-address (the agent tunnel's own setting), never through
+	// --kubelet-arg=address= alone (Task 28 fix round 1).
+	agentOK := []string{"--server=", "--token-file=", "--node-name=", "--node-ip=", "--node-label=", "--node-taint=", "--kubelet-arg=", "--flannel-conf=", "--flannel-iface=", "--bind-address="}
 	var agentWant []string
 	for _, f := range want {
 		for _, p := range agentOK {
-			if strings.HasPrefix(f, p) {
+			if strings.HasPrefix(f, p) && !strings.HasPrefix(f, "--kubelet-arg=address=") {
 				agentWant = append(agentWant, f)
 			}
 		}
@@ -374,6 +377,8 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 	rec.Role = "agent"
 	if got := joinFlags(rec, "n7", server, "10.42.0.0/16"); !slices.Equal(got, agentWant) {
 		t.Fatalf("agent flags\n got %q\nwant %q", got, agentWant)
+	} else if !slices.Contains(got, "--bind-address="+ip) || slices.Contains(got, "--kubelet-arg=address="+ip) {
+		t.Fatalf("agent flags %q: the kubelet must listen through --bind-address", got)
 	}
 	// The labels and taints nodeadm sets on the registered Node instead.
 	small := &nodeRecord{Role: "agent", Class: "small", Site: "tb", MeshIP: ip}

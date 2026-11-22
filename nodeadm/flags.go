@@ -59,7 +59,16 @@ func joinFlags(rec *nodeRecord, id, serverURL, clusterCIDR string) []string {
 		"--token-file=" + k3sTokenFile,
 		"--node-name=" + id,
 		"--node-ip=" + ip,
-		"--kubelet-arg=address=" + ip,
+		// The kubelet (and kube-proxy's health / metrics) on the mesh
+		// address only, through k3s's own listener setting: k3s v1.37.2's
+		// agent tunnel dials the kubelet at that same address
+		// (pkg/agent/config/config.go:583-591 sets ListenAddress from
+		// --bind-address, pkg/daemons/agent/agent.go:226-227 makes it the
+		// kubelet's address, pkg/agent/tunnel/tunnel.go:96 + :430-438 dial
+		// it). A --kubelet-arg=address=<ip> alone left the tunnel dialing
+		// 0.0.0.0:10250 (refused): no kubectl logs / exec / port-forward on
+		// an agent (found live, Task 28).
+		"--bind-address=" + ip,
 		"--kubelet-arg=pod-max-pids=1024",
 		"--kubelet-arg=sync-frequency=10s",
 		"--flannel-conf=" + k3sFlannelConf,
@@ -74,7 +83,9 @@ func joinFlags(rec *nodeRecord, id, serverURL, clusterCIDR string) []string {
 			"--write-kubeconfig-mode=0600",
 			"--flannel-backend=wireguard-native",
 			"--advertise-address="+ip,
-			"--bind-address="+ip,
+			// init's flags (tests/fixtures/k3s-server-flags.txt): the same
+			// kubelet address as --bind-address gives it.
+			"--kubelet-arg=address="+ip,
 			"--etcd-arg=listen-client-urls=https://"+ip+":2379,https://127.0.0.1:2379",
 			"--etcd-arg=heartbeat-interval=200",
 			"--etcd-arg=election-timeout=2000",
