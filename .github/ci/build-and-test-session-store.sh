@@ -117,10 +117,72 @@ fi
   https://people.portcullis.local/api/me/signin/browser-certificates || true
 if grep -q 'signed in as someone else' /tmp/imp-post.txt; then echo "FAIL: a client-sent X-Forwarded-Impersonation reached the Hub"; exit 1; fi
 echo "PASS: client-sent impersonation headers never reach the Hub (people.<d> through forward-auth + group-gate)"
-# Signing out deletes it from the store: the same cookie no longer opens anything.
+# Sign out (contract §5 "Sign out"): /oauth2/sign_out only as the site
+# bar's same-site POST, through portcullis-signout-guard.
+A=(--resolve "portcullis.local:443:127.0.0.1")
+KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+  --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
+  --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+[ -n "$KC_TOKEN" ] && [ "$KC_TOKEN" != null ] || { echo "FAIL: no Keycloak admin token"; exit 1; }
+echo "::add-mask::$KC_TOKEN"
+kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
+TU="$(kc '/users?username=testuser&exact=true' | jq -r '.[0].id // empty')"
+[ -n "$TU" ] || { echo "FAIL: testuser not found in Keycloak"; exit 1; }
+# This sign-in's Keycloak session = testuser's newest (earlier steps may
+# have left others of his, which this sign-out must not need to end).
+SID_KC="$(kc "/users/$TU/sessions" | jq -r 'max_by(.start) | .id // empty')"
+[ -n "$SID_KC" ] || { echo "FAIL: testuser has no Keycloak session after the sign-in"; exit 1; }
+kc_sessions() { kc "/users/$TU/sessions" | jq --arg s "$SID_KC" '[.[] | select(.id == $s)] | length'; }
+alive() {  # the ticket in the store, /oauth2/auth 202 with the cookie, Keycloak's session
+  [ "$(vk "$FA_PW" forward-auth get "$KEY" | wc -c)" -gt 100 ] \
+    && [ "$("${C[@]}" -o /dev/null -w '%{http_code}' https://auth.portcullis.local/oauth2/auth)" = 202 ] \
+    && [ "$(kc_sessions)" -ge 1 ]
+}
+# 1. A cross-site link / top-level navigation (GET, the Lax cookie sent):
+#    the confirmation page (405), nothing ends — also an old ?rd= link.
+for u in /oauth2/sign_out "/oauth2/sign_out?rd=https%3A%2F%2Fportcullis.local%2F" /oauth2/sign_out/x; do
+  code="$("${C[@]}" -o /tmp/so-page.html -w '%{http_code}' -H 'Sec-Fetch-Site: cross-site' -H 'Sec-Fetch-Mode: navigate' \
+    -H 'Sec-Fetch-Dest: document' "https://auth.portcullis.local$u")"
+  [ "$code" = 405 ] || { echo "FAIL: a cross-site GET of $u answered $code (want the 405 confirmation)"; exit 1; }
+  grep -q 'id="pc-sign-out-confirm"' /tmp/so-page.html || { echo "FAIL: GET $u: no confirmation page"; exit 1; }
+  alive || { echo "FAIL: a cross-site GET of $u signed the browser out"; exit 1; }
+done
+echo "PASS: a cross-site GET of /oauth2/sign_out (also ?rd= and a longer path) shows the confirmation and ends nothing"
+# 2. POSTs the guard refuses: cross-site, a foreign Origin, an rd in the
+#    query or a form body that could carry one.
+refused() {
+  local what="$1"; shift
+  code="$("${C[@]}" -o /dev/null -w '%{http_code}' -X POST "$@")"
+  [ "$code" = 403 ] || { echo "FAIL: $what answered $code (want 403)"; exit 1; }
+  alive || { echo "FAIL: $what signed the browser out"; exit 1; }
+}
+refused "a cross-site POST" -H 'Sec-Fetch-Site: cross-site' -H 'Origin: https://evil.example' -H 'Content-Type: text/plain' \
+  https://auth.portcullis.local/oauth2/sign_out
+refused "a POST with a foreign Origin" -H 'Origin: https://evil.example' -H 'Content-Type: text/plain' https://auth.portcullis.local/oauth2/sign_out
+refused "a same-site POST with ?rd=" -H 'Sec-Fetch-Site: same-site' -H 'Origin: https://portcullis.local' -H 'Content-Type: text/plain' \
+  "https://auth.portcullis.local/oauth2/sign_out?rd=https%3A%2F%2Fhub.portcullis.local%2F"
+refused "a same-site form-encoded POST" -H 'Sec-Fetch-Site: same-site' -H 'Origin: https://portcullis.local' \
+  --data 'rd=https%3A%2F%2Fhub.portcullis.local%2F' https://auth.portcullis.local/oauth2/sign_out
+echo "PASS: cross-site / foreign-origin / rd-carrying sign-out POSTs are refused (403) and end nothing"
+# 3. The site bar's POST (Sign out on hub.<d>: Referrer-Policy no-referrer,
+#    so Origin null): 302 to the fixed Signed out page; the ticket is gone
+#    from the store, the old cookie gets 401, Keycloak's session is gone and
+#    the next request to a forward-auth page goes to sign-in.
 cp "$J" /tmp/sess-before.jar
-"${C[@]}" -o /dev/null https://auth.portcullis.local/oauth2/sign_out
+HDRS="$("${C[@]}" -o /dev/null -D - -X POST -H 'Sec-Fetch-Site: same-site' -H 'Sec-Fetch-Mode: navigate' -H 'Origin: null' \
+  -H 'Content-Type: text/plain' --data-binary '' https://auth.portcullis.local/oauth2/sign_out | tr -d '\r')"
+printf '%s\n' "$HDRS" | head -1 | grep -q ' 302' || { echo "FAIL: the sign-out POST: $(printf '%s\n' "$HDRS" | head -1)"; docker compose logs --tail=20 group-gate forward-auth; exit 1; }
+LOC="$(printf '%s\n' "$HDRS" | sed -n 's/^[Ll]ocation: //p')"
+[ "$LOC" = https://portcullis.local/signed-out ] || { echo "FAIL: the sign-out landed on '$LOC'"; exit 1; }
 [ "$(vk "$FA_PW" forward-auth get "$KEY" | wc -c)" -le 1 ] || { echo "FAIL: the session survived the sign-out"; exit 1; }
 code="$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt --resolve "auth.portcullis.local:443:127.0.0.1" -b /tmp/sess-before.jar https://auth.portcullis.local/oauth2/auth)"
 [ "$code" = 401 ] || { echo "FAIL: the signed-out ticket still answers $code"; exit 1; }
-echo "PASS: sign-out removes the session from the store; the old ticket gets 401"
+for i in $(seq 1 10); do [ "$(kc_sessions)" = 0 ] && break; [ "$i" = 10 ] && { echo "FAIL: testuser's Keycloak session $SID_KC survived the sign-out"; docker compose logs --tail=20 forward-auth; exit 1; }; sleep 1; done
+PORTAL="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' --cacert certs/ca-chain.crt "${A[@]}" --resolve "auth.portcullis.local:443:127.0.0.1" \
+  -b /tmp/sess-before.jar https://portcullis.local/)"
+case "$PORTAL" in "302 https://auth.portcullis.local/"*) ;; *) echo "FAIL: the portal after the sign-out: $PORTAL (want a redirect to sign-in)"; exit 1 ;; esac
+code="$(curl -s -o /tmp/so-page.html -w '%{http_code}' --cacert certs/ca-chain.crt "${A[@]}" https://portcullis.local/signed-out)"
+[ "$code" = 200 ] && grep -q 'id="pc-sign-in-again" href="https://portcullis.local/"' /tmp/so-page.html \
+  || { echo "FAIL: the Signed out page without a session: $code"; exit 1; }
+rm -f /tmp/so-page.html
+echo "PASS: the site bar's sign-out POST lands on https://portcullis.local/signed-out (no session needed); the ticket is gone from the store, the old ticket gets 401, testuser's Keycloak session is gone and the portal redirects to sign-in"

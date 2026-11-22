@@ -273,10 +273,14 @@ _kc_group_mapper_patch() {
 # per extra-domain host (forward-auth-ext, contract §5) and OWNS pruning
 # them (instance disable/delete, hostname changes): configure can't tell a
 # current one from a stale one, so it keeps them all. The realm export's
-# placeholder host is dropped.
+# placeholder host is dropped. post.logout.redirect.uris = exactly the
+# Signed out page https://<domain>/signed-out (contract §5 "Sign out": the
+# sign-out never sends the browser through Keycloak's end-session page,
+# and a hand-made one with this client can land only there).
 _kc_fwd_patch() {
   jq --arg d "$1" '
-    .attributes = ((.attributes // {}) + {"default.acr.values": "", "pkce.code.challenge.method": "S256"}) |
+    .attributes = ((.attributes // {}) + {"default.acr.values": "", "pkce.code.challenge.method": "S256",
+                                          "post.logout.redirect.uris": ("https://" + $d + "/signed-out")}) |
     .defaultClientScopes = ((.defaultClientScopes // []) + ["acr"] | unique) |
     .redirectUris = (["https://auth." + $d + "/oauth2/callback"]
       + [(.redirectUris // [])[] | strings
@@ -536,7 +540,7 @@ keycloak_configure() {
   info "Granting lldap_admin the $KC_REALM realm console..."
   _kc_admin_roles
 
-  info "Configuring the forward-auth client (no default acr, PKCE S256, groups, redirect URIs)..."
+  info "Configuring the forward-auth client (no default acr, PKCE S256, groups, redirect URIs, post-logout URI)..."
   fwd_uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty')"
   if [ -n "$fwd_uuid" ]; then
     # The realm export ships a placeholder host so Keycloak's URL parser

@@ -1169,7 +1169,7 @@ _kube_probe_route() {
 
 # The owner=core Middlewares of portcullis-edge (the chart's four and the
 # CLI's hub-proxy-secret): no Hub route or chain may name them.
-KUBE_EDGE_CORE_MIDDLEWARES="hub-proxy-secret hub-cli-proxy-secret portcullis-auth-console portal-path portal-vpn-path directory-redirect"
+KUBE_EDGE_CORE_MIDDLEWARES="hub-proxy-secret hub-cli-proxy-secret portcullis-auth-console portcullis-signout-guard portal-path portal-vpn-path directory-redirect"
 
 # The @file names apps may use (K15, contract §5): middlewares.yml's six,
 # the core middlewares and the three core services of traefik-dynamic.

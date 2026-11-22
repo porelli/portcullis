@@ -259,6 +259,25 @@ echo "$CFG" | jq -e '.services["forward-auth"] as $m | .services["forward-auth-e
     and $x.environment.OAUTH2_PROXY_COOKIE_REFRESH == "1m"
     and ($x.environment.OAUTH2_PROXY_COOKIE_EXPIRE // null) == null' >/dev/null \
   || { echo "FAIL: forward-auth-ext / portcullis-auth-ext wiring (contract §5)"; exit 1; }
+# Contract §5 "Sign out": /oauth2/sign_out only behind the guard (router
+# oauth2-signout above oauth2-callback; trustForwardHeader false; only the
+# landing page handed on), the Keycloak logout only on forward-auth, and the
+# Signed out page without forward-auth.
+echo "$CFG" | jq -e '.services["forward-auth"] as $m | .services["forward-auth-ext"] as $x | .services["group-gate"].labels as $g
+    | $m.labels["traefik.http.routers.oauth2-signout.rule"] == "Host(`auth.portcullis.local`) && PathPrefix(`/oauth2/sign_out`)"
+    and $m.labels["traefik.http.routers.oauth2-signout.priority"] == "1001"
+    and $m.labels["traefik.http.routers.oauth2-callback.priority"] == "1000"
+    and $m.labels["traefik.http.routers.oauth2-signout.middlewares"] == "rate-limit-auth@file,security-headers@file,portcullis-signout-guard@docker"
+    and $m.labels["traefik.http.routers.oauth2-signout.service"] == "forward-auth"
+    and $g["traefik.http.middlewares.portcullis-signout-guard.forwardauth.address"] == "http://group-gate:8080/signout-guard"
+    and $g["traefik.http.middlewares.portcullis-signout-guard.forwardauth.trustForwardHeader"] == "false"
+    and $g["traefik.http.middlewares.portcullis-signout-guard.forwardauth.authResponseHeaders"] == "X-Auth-Request-Redirect"
+    and $g["traefik.http.routers.signed-out.rule"] == "Host(`portcullis.local`) && Path(`/signed-out`)"
+    and $g["traefik.http.routers.signed-out.middlewares"] == "rate-limit@file,security-headers@file"
+    and $g["traefik.http.routers.signed-out.service"] == "group-gate"
+    and ($m.environment.OAUTH2_PROXY_BACKEND_LOGOUT_URL | startswith("https://auth.portcullis.local/realms/portcullis/protocol/openid-connect/logout?id_token_hint="))
+    and ($x.environment.OAUTH2_PROXY_BACKEND_LOGOUT_URL // null) == null' >/dev/null \
+  || { echo "FAIL: sign-out wiring (oauth2-signout + portcullis-signout-guard, signed-out, backend logout on forward-auth only; contract §5)"; exit 1; }
 grep -qE '^\s+code_challenge_method: S256$' oauth2-proxy/alpha.yaml || { echo "FAIL: oauth2-proxy (both services) must send PKCE S256"; exit 1; }
 if grep -nE '^\s*userIDClaim:' oauth2-proxy/alpha.yaml; then echo "FAIL: userIDClaim is an alias of emailClaim in oauth2-proxy v7"; exit 1; fi
 # Contract §12.1 / §12.4: the domains service. portcullis-domains =
@@ -675,6 +694,6 @@ bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; env_load; 
 # three set to distinct values, every router shows its own class.
 EP_ROUTERS="$(PORTCULLIS_EP_CORE=x-core PORTCULLIS_EP_ADMIN=x-admin PORTCULLIS_EP_ENROL=x-enrol PORTCULLIS_WEB_CORE=w-core PORTCULLIS_WEB_ADMIN=w-admin PORTCULLIS_WEB_ENROL=w-enrol docker compose -f docker-compose.yml --profile '*' config --format json \
     | jq -r '[.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | "\(.key | split(".")[3])=\(.value)"] | sort | join(" ")')"
-WANT_EP="core-vpn-required=websecure dashboard-vpn=vpnsecure dashboard=w-admin enroll-invite=x-enrol grafana-metrics-vpn=vpnsecure grafana-metrics=w-admin hub-mcp=x-admin hub-vpn=vpnsecure hub=w-admin keycloak-admin-vpn-required=websecure keycloak-admin-vpn=vpnsecure keycloak-admin=w-admin keycloak-resources=x-enrol keycloak=x-enrol lldap=x-admin mcp=x-admin oauth2-callback=x-enrol people-cli=x-enrol people-mcp=x-admin people-vpn-enrol-vpn=vpnsecure people-vpn-enrol=w-enrol people-vpn=vpnsecure people=w-core portal-vpn=vpnsecure portal=w-core"
+WANT_EP="core-vpn-required=websecure dashboard-vpn=vpnsecure dashboard=w-admin enroll-invite=x-enrol grafana-metrics-vpn=vpnsecure grafana-metrics=w-admin hub-mcp=x-admin hub-vpn=vpnsecure hub=w-admin keycloak-admin-vpn-required=websecure keycloak-admin-vpn=vpnsecure keycloak-admin=w-admin keycloak-resources=x-enrol keycloak=x-enrol lldap=x-admin mcp=x-admin oauth2-callback=x-enrol oauth2-signout=x-enrol people-cli=x-enrol people-mcp=x-admin people-vpn-enrol-vpn=vpnsecure people-vpn-enrol=w-enrol people-vpn=vpnsecure people=w-core portal-vpn=vpnsecure portal=w-core signed-out=x-enrol"
 [ "$EP_ROUTERS" = "$WANT_EP" ] || { echo "FAIL: core router entrypoint classes: got $EP_ROUTERS, want $WANT_EP"; exit 1; }
 echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate, session store"

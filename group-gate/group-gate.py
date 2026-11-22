@@ -88,7 +88,13 @@ Request paths on group-gate itself (the forwardAuth `address`):
                         cookies or query parameters, names normalised the way
                         PHP does). Otherwise 403. See public_guard_check().
   /portal               the landing page at https://<domain>/
-  /healthz              liveness (no checks, for the container healthcheck)
+  /signout-guard        portcullis-signout-guard (router oauth2-signout on
+                        auth.<domain>/oauth2/sign_out): a sign-out goes on
+                        only as the site bar's same-site POST; a GET gets a
+                        confirmation page. See signout_refusal().
+  /signed-out           the Signed out page at https://<domain>/signed-out
+                        (router signed-out, no session)
+  /healthz             liveness (no checks, for the container healthcheck)
   /metrics              Prometheus metrics (monitoring profile): decisions by
                         endpoint/result, denials and step-ups by reason,
                         policy load errors, CRL freshness (last good fetch,
@@ -743,15 +749,169 @@ PORTAL_CSS = (
     # The mark at the start of every <h1> (MARK_HTML).
     ".pc-mark{display:inline-block;width:1.75rem;height:1.75rem;vertical-align:-.3rem;margin-right:.5rem}"
     ".pc-mark svg{width:100%;height:100%}"
+    # The shared site bar (render_site_bar; the Hub's PortcullisNav in
+    # web/directory.js and web/directory.css draw the same bar): Portal ·
+    # Hub · People · Sign-in on the left, the username and Sign out on the
+    # right.
+    ".pn-bar{display:flex;flex-wrap:wrap;gap:.5rem 1rem;justify-content:space-between;align-items:center;margin:-1rem 0 1rem}"
+    ".pn-nav{display:flex;gap:.25rem;flex-wrap:wrap;font-size:.8125rem}"
+    ".pn-link{color:#94a3b8;padding:.25rem .75rem;border-radius:9999px;border:1px solid transparent}"
+    ".pn-link:hover{color:#e2e8f0;background:#1e293b;text-decoration:none}"
+    ".pn-link.pn-current{color:#f1f5f9;background:#3b82f622;border-color:#3b82f655;font-weight:600}"
+    ".pn-account{display:flex;align-items:center;gap:.75rem;font-size:.8125rem;color:#94a3b8}"
+    ".pn-account strong{color:#60a5fa}.pn-signout{display:inline;margin:0}"
+    ".pn-signout-btn{font:inherit;color:#e2e8f0;background:#1e293b;border:1px solid #334155;border-radius:9999px;"
+    "padding:.25rem .85rem;cursor:pointer;line-height:1.6}"
+    ".pn-signout-btn:hover{background:#334155;text-decoration:none}"
+    ".pn-signout-btn:focus-visible{outline:3px solid #f59e0b;outline-offset:2px}"
 )
+
+
+def _form_action(domain: str) -> str:
+    """CSP form-action: the sign-out endpoint's origin, https://auth.<domain>
+    (the site bar's Sign out posts there), else 'none'."""
+    return f"https://auth.{domain}" if valid_hostname(domain) else "'none'"
+
+
 PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"
               + base64.b64encode(hashlib.sha256(PORTAL_CSS.encode()).digest()).decode()
-              + "'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+              + f"'; img-src data:; base-uri 'none'; form-action {_form_action(DOMAIN)}; frame-ancestors 'none'")
 
 
-def render_portal(user: str, groups: set, apps, domain: str, domains=(), banner: str = "") -> bytes:
+# ── Sign out (contract §5 "Sign out") ──────────────────────────────────
+# The site bar's Sign out is a POST form (enctype text/plain, no fields)
+# to https://auth.<domain>/oauth2/sign_out. Traefik's router oauth2-signout
+# sends that path through portcullis-signout-guard (forwardAuth →
+# /signout-guard, trustForwardHeader false) before oauth2-proxy:
+# signout_refusal() decides, and on allow X-Auth-Request-Redirect names the
+# fixed landing page https://<domain>/signed-out (the router `signed-out`,
+# no session needed). oauth2-proxy then calls Keycloak's end-session
+# endpoint server-side (OAUTH2_PROXY_BACKEND_LOGOUT_URL, id_token_hint),
+# deletes the ticket from the session store and expires the cookie.
+
+SIGNOUT_PATH = "/oauth2/sign_out"
+SIGNOUT_GUARD_PATH = "/signout-guard"
+SIGNED_OUT_PATH = "/signed-out"
+# Fetch metadata a sign-out may carry: a top-level navigation from a page
+# of this site (a sibling host under <domain> is same-site).
+SIGNOUT_FETCH_SITES = ("same-origin", "same-site")
+
+
+def sign_out_url(domain: str) -> str:
+    return f"https://auth.{domain}{SIGNOUT_PATH}"
+
+
+def signed_out_url(domain: str) -> str:
+    return f"https://{domain}{SIGNED_OUT_PATH}"
+
+
+def _header_values(headers, name: str) -> List[str]:
+    """Every value of header `name` (an http.client message or a dict)."""
+    if hasattr(headers, "get_all"):
+        return list(headers.get_all(name) or [])
+    v = headers.get(name)
+    return [] if v is None else [v]
+
+
+def same_site_origin(origin: str, domain: str) -> bool:
+    """An Origin that is https://<domain> or https://<sub>.<domain> (port
+    443 or none, nothing else in it)."""
+    try:
+        p = urllib.parse.urlsplit(origin)
+        port = p.port
+    except ValueError:
+        return False
+    host = (p.hostname or "").lower()
+    if p.scheme != "https" or p.username is not None or p.password is not None or p.path or p.query \
+            or p.fragment or port not in (None, 443) or not valid_hostname(host):
+        return False
+    return host == domain or host.endswith("." + domain)
+
+
+def signout_refusal(method: str, raw_uri: str, headers, domain: str) -> Optional[str]:
+    """None when a request to /oauth2/sign_out may sign this browser out,
+    else why not (logged, never shown):
+
+    - POST only (a GET or HEAD gets the confirmation page instead: a link,
+      an image or a cross-site top-level navigation must not sign anyone
+      out — the session cookie is SameSite=Lax, so those carry it);
+    - exactly the path, no query: nobody passes an `rd`;
+    - Content-Type text/plain or none (at most one): oauth2-proxy reads
+      form fields only from an application/x-www-form-urlencoded body, so
+      no `rd` can come from the body either and the landing page stays the
+      fixed one this guard names;
+    - Sec-Fetch-Site same-origin or same-site when sent (a cross-site POST
+      is refused; it would carry no Lax cookie anyway);
+    - an Origin, when sent and not "null" (the Hub's pages are
+      Referrer-Policy no-referrer, so their cross-origin POSTs say "null"),
+      that is https://<domain> or a host under it; without Sec-Fetch-Site
+      (older browsers) a same-site Origin is required.
+    """
+    if not valid_hostname(domain):
+        return "PORTCULLIS_DOMAIN is not a valid hostname"
+    if method != "POST":
+        return f"method {method[:16] or '-'}"
+    if raw_uri != SIGNOUT_PATH:
+        return "a path or query other than " + SIGNOUT_PATH
+    cts = _header_values(headers, "Content-Type")
+    if len(cts) > 1:
+        return "more than one Content-Type"
+    if cts and cts[0].split(";", 1)[0].strip().lower() != "text/plain":
+        return "Content-Type isn't text/plain"
+    sites = [v.strip().lower() for v in _header_values(headers, "Sec-Fetch-Site")]
+    origins = [v.strip() for v in _header_values(headers, "Origin")]
+    if len(sites) > 1 or len(origins) > 1:
+        return "more than one Sec-Fetch-Site or Origin"
+    site = sites[0] if sites else ""
+    origin = origins[0] if origins else ""
+    if site and site not in SIGNOUT_FETCH_SITES:
+        return f"Sec-Fetch-Site {site[:16]}"
+    if origin and origin != "null" and not same_site_origin(origin, domain):
+        return "an Origin outside the domain"
+    if not site and not same_site_origin(origin, domain):
+        return "neither Sec-Fetch-Site nor a same-site Origin"
+    return None
+
+
+def signout_form(domain: str, label: str = "Sign out", el_id: str = "pn-sign-out",
+                 cls: str = "pn-signout-btn") -> str:
+    """The POST form of a Sign out button (no fields: text/plain carries
+    nothing oauth2-proxy reads)."""
+    e = lambda v: html.escape(v, quote=True)  # noqa: E731
+    return (f'<form class="pn-signout" method="post" action="{e(sign_out_url(domain))}" enctype="text/plain">'
+            f'<button type="submit" class="{e(cls)}" id="{e(el_id)}">{e(label)}</button></form>')
+
+
+def render_site_bar(user: str, domain: str, admin: bool, impersonated: bool = False,
+                    current: str = "portal") -> str:
+    """The shared site bar (the Hub's PortcullisNav draws the same one):
+    Portal · Hub (administrators) · People · Sign-in, then "Signed in as
+    <user>" and Sign out. While an administrator is signed in as someone
+    else, Sign out opens the Stop page (people.<domain>/impersonation/stop),
+    which ends the impersonation first and then signs out."""
+    e = lambda v: html.escape(str(v), quote=True)  # noqa: E731
+    links = [("portal", "Portal", f"https://{domain}/")]
+    if admin:
+        links.append(("hub", "Hub", f"https://hub.{domain}/"))
+    links += [("people", "People", f"https://people.{domain}/"), ("signin", "Sign-in", signin_page_url(domain))]
+    nav = "".join(
+        f'<a class="pn-link{" pn-current" if k == current else ""}" data-site="{k}" href="{e(u)}"'
+        + (' aria-current="page"' if k == current else "") + f">{t}</a>" for k, t, u in links)
+    if impersonated:
+        out = (f'<a class="pn-signout-btn" id="pn-sign-out" href="{e(impersonation_stop_url(domain))}">'
+               "Sign out</a>")
+    else:
+        out = signout_form(domain)
+    return (f'<div class="pn-bar"><nav class="pn-nav" aria-label="Portcullis sites">{nav}</nav>'
+            f'<div class="pn-account"><span class="pn-user">Signed in as <strong>{e(user)}</strong></span>'
+            f"{out}</div></div>")
+
+
+def render_portal(user: str, groups: set, apps, domain: str, domains=(), banner: str = "",
+                  impersonated: bool = False) -> bytes:
     """The portal page; `banner` (render_banner's HTML, already escaped)
-    is the body's first child."""
+    is the body's first child; the site bar (render_site_bar) opens the
+    page (`impersonated`: its Sign out opens the Stop page)."""
     e = lambda v: html.escape(str(v), quote=True)  # noqa: E731
     cards = []
     for a in apps or []:
@@ -803,7 +963,8 @@ def render_portal(user: str, groups: set, apps, domain: str, domains=(), banner:
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         "<meta name=\"color-scheme\" content=\"dark\">"
         f"<title>{e(domain)}</title>{FAVICON_LINK}<style>{PORTAL_CSS}</style></head><body>{banner}<main class=\"container\">"
-        f"<header><h1>{MARK_HTML}{e(domain)}</h1><span class=\"user-badge\">Signed in as <strong>{e(user)}</strong></span></header>"
+        + render_site_bar(user, domain, "lldap_admin" in groups, impersonated)
+        + f"<header><h1>{MARK_HTML}{e(domain)}</h1></header>"
         f"<section><h2>Apps</h2>{app_html}</section>"
         + (f"<section class=\"panel\"><h2>Administration</h2>{ul(admin)}</section>" if admin else "")
         + f"<section class=\"panel\"><h2>Your account</h2>{ul(own)}</section></main></body></html>")
@@ -2062,7 +2223,7 @@ class Metrics:
     """Tiny thread-safe counter registry (no client library in the image)."""
 
     HELP = {
-        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|public_guard|portal) and result (allow|deny|stepup|needs_stronger|present_certificate)."),
+        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|public_guard|portal|signout_guard|signed_out) and result (allow|deny|stepup|needs_stronger|present_certificate)."),
         "group_gate_denials_total": ("counter", "Denied requests by reason."),
         "group_gate_stepups_total": ("counter", "Sign-in pages (403) by reason: stepup, present_certificate, needs_stronger."),
         "group_gate_policy_load_errors_total": ("counter", "Requests denied because the Hub policy file or a policy in it is invalid."),
@@ -3085,10 +3246,16 @@ SIGNIN_CSS = PORTAL_CSS + (
     ".btn{display:inline-block;background:#2563eb;color:#fff;padding:.5rem 1.1rem;border-radius:.4rem;"
     "font-weight:600;margin-right:.5rem}.btn:hover{text-decoration:none;background:#1d4ed8}"
     ".portcullis-sub{color:#94a3b8}"
+    # Sign out's button (signout_form with cls btn: the ended and
+    # confirmation pages) looks like the link buttons.
+    "button.btn{border:0;font:inherit;font-weight:600;cursor:pointer}"
 )
 SIGNIN_CSP = ("default-src 'none'; style-src 'sha256-"
               + base64.b64encode(hashlib.sha256(SIGNIN_CSS.encode()).digest()).decode()
               + "'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+# The pages whose Sign out posts to oauth2-proxy (the ended page, the
+# sign-out confirmation): SIGNIN_CSP with form-action https://auth.<domain>.
+SIGNOUT_CSP = SIGNIN_CSP.replace("form-action 'none'", f"form-action {_form_action(DOMAIN)}")
 
 
 def _canonical(methods) -> List[str]:
@@ -3272,14 +3439,97 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
 
 def render_ended_page(person: str, domain: str) -> bytes:
     """The impersonation's ended page (contract §4, D41): "Your session as
-    <person> has ended." with a link to sign out of the forward-auth
-    session (back to the portal)."""
-    rd = urllib.parse.quote(f"https://{domain}/", safe="")
-    sign_out = html.escape(f"https://auth.{domain}/oauth2/sign_out?rd={rd}", quote=True)
+    <person> has ended." with a Sign out button (the site bar's POST to
+    oauth2-proxy's sign-out; served with SIGNOUT_CSP), which lands on the
+    Signed out page."""
     return _signin_page(
         "Signed in as someone else: ended",
         f"<div id=\"impersonation-ended\"><p>Your session as {html.escape(person)} has ended.</p>"
-        f"<p><a id=\"pc-imp-sign-out\" class=\"btn\" href=\"{sign_out}\">Sign out</a></p></div>")
+        f"<div>{signout_form(domain, el_id='pc-imp-sign-out', cls='btn')}</div></div>")
+
+
+def render_signout_page(domain: str, refused: bool = False) -> bytes:
+    """https://auth.<domain>/oauth2/sign_out opened without the site bar's
+    POST (a link, a bookmark, an old ?rd= URL — 405 — or a POST the guard
+    refused — 403): a confirmation with the same Sign out button. Served
+    with SIGNOUT_CSP; the form posts to its own origin."""
+    e = html.escape
+    note = ("<p class=\"portcullis-sub\">That sign-out request didn't come from a page of this site, so "
+            "nothing was changed.</p>" if refused else "")
+    return _signin_page(
+        "Sign out",
+        f"<div id=\"pc-sign-out-confirm\">{note}<p>Sign out of {e(domain)} in this browser?</p>"
+        f"<div>{signout_form(domain, el_id='pc-sign-out', cls='btn')} "
+        f"<a href=\"{e(f'https://{domain}/', quote=True)}\">Cancel</a></div></div>")
+
+
+# The Signed out page's arch and gate: byte copies of the login theme's
+# keycloak/themes/portcullis/login/resources/img/portcullis-arch.svg and
+# portcullis-gate.svg (tests/test_group_gate.py SignOutTest pins them), as
+# data: URLs (img-src data:); the gate rests down (-4 units), still.
+ARCH_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 34" width="32" height="34">
+  <title>Portcullis: the stone arch (sign-in pages, behind the card)</title>
+  <!-- Mockup gate-styles-v2 option A: the logo's arch (concept-1-mark-dark.svg) run down to the page's foot. -->
+  <path fill="#e8edf5" opacity=".9" d="M2 34V16a14 14 0 0 1 28 0v18h-2V16a12 12 0 0 0-24 0v18z"/>
+</svg>
+"""
+GATE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 68" width="32" height="68">
+  <title>Portcullis: the gate (sign-in pages, behind the card)</title>
+  <!-- Mockup gate-styles-v2 option A (A-bars): the logo's brass bars, three rails and five spikes,
+       in the top 34 units; the bottom 34 are empty on purpose: every offset the drop and rise use
+       (down -4, up -38 units) then stays within one image height. Chromium paints a no-repeat SVG
+       background whose offset is past one image height as if it wrapped: with a 34-unit image the
+       "up" gate (-38) showed closed. -->
+  <path fill="#e3ac52" opacity=".6" d="M5 11h22v1.4H5z M5 17h22v1.4H5z M5 23h22v1.4H5z M8.6 2h1.4v28l-.7 2-.7-2z M12.6 2h1.4v28l-.7 2-.7-2z M16.6 2h1.4v28l-.7 2-.7-2z M20.6 2h1.4v28l-.7 2-.7-2z M24.6 2h1.4v28l-.7 2-.7-2z"/>
+</svg>
+"""
+
+
+def _svg_url(svg: str) -> str:
+    return 'url("data:image/svg+xml;base64,' + base64.b64encode(svg.encode()).decode() + '")'
+
+
+# The login theme's gate geometry (css/portcullis.css: one unit --pc-u, the
+# arch 32 x 34 units at the page's foot, the gate box 24 x 30 inside it).
+SIGNED_OUT_CSS = PORTAL_CSS + (
+    ":root{--pc-u:min(calc(100vh / 35),calc(100vw / 33))}"
+    "body{min-height:100vh}"
+    ".pc-arch,.pc-gate{position:fixed;bottom:0;z-index:0;pointer-events:none}"
+    ".pc-arch{left:calc(50% - 16 * var(--pc-u));width:calc(32 * var(--pc-u));height:calc(34 * var(--pc-u));"
+    f"background:{_svg_url(ARCH_SVG)} 0 0/100% 100% no-repeat}}"
+    ".pc-gate{left:calc(50% - 12 * var(--pc-u));width:calc(24 * var(--pc-u));height:calc(30 * var(--pc-u));"
+    f"border-radius:50% 50% 0 0/40% 40% 0 0;background:{_svg_url(GATE_SVG)} no-repeat;"
+    "background-size:calc(32 * var(--pc-u)) calc(68 * var(--pc-u));"
+    "background-position:calc(-4 * var(--pc-u)) calc(-4 * var(--pc-u))}"
+    ".pc-card{position:relative;z-index:1;max-width:26rem;margin:16vh auto 0;background:#1e293bf2;"
+    "border:1px solid #334155;border-radius:.75rem;padding:1.75rem 2rem;text-align:center;"
+    "box-shadow:0 10px 30px #0008}"
+    ".pc-card h1{margin-bottom:.75rem}.pc-card p{margin:.6rem 0;color:#cbd5e1}"
+    ".pc-card .pc-small{font-size:.85rem;color:#94a3b8}"
+    ".btn{display:inline-block;background:#2563eb;color:#fff;padding:.5rem 1.1rem;border-radius:.4rem;"
+    "font-weight:600;margin-top:.5rem}.btn:hover{text-decoration:none;background:#1d4ed8}"
+)
+SIGNED_OUT_CSP = ("default-src 'none'; style-src 'sha256-"
+                  + base64.b64encode(hashlib.sha256(SIGNED_OUT_CSS.encode()).digest()).decode()
+                  + "'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
+def render_signed_out_page(domain: str) -> bytes:
+    """https://<domain>/signed-out (router `signed-out`, no session): where
+    every sign-out lands. The login theme's arch with the gate down, and
+    "Sign in again" → the portal, whose sign-in drops the gate."""
+    e = lambda v: html.escape(str(v), quote=True)  # noqa: E731
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            "<meta name=\"color-scheme\" content=\"dark\">"
+            f"<title>Signed out · {e(domain)}</title>{FAVICON_LINK}<style>{SIGNED_OUT_CSS}</style></head><body>"
+            "<div class=\"pc-arch\" aria-hidden=\"true\"></div><div class=\"pc-gate\" aria-hidden=\"true\"></div>"
+            f"<main class=\"pc-card\" id=\"pc-signed-out\"><h1>{MARK_HTML}Signed out</h1>"
+            f"<p>You're signed out of {e(domain)} in this browser.</p>"
+            "<p class=\"pc-small\">Apps that keep their own sign-in may stay signed in until their own "
+            "session ends.</p>"
+            f"<p><a class=\"btn\" id=\"pc-sign-in-again\" href=\"{e(f'https://{domain}/')}\">Sign in again</a></p>"
+            "</main></body></html>").encode()
 
 
 # The one header the signed-in username is read from: set by oauth2-proxy
@@ -3435,7 +3685,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(403)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Security-Policy", SIGNIN_CSP)
+            self.send_header("Content-Security-Policy", SIGNOUT_CSP)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -3575,6 +3825,43 @@ class Handler(BaseHTTPRequestHandler):
         self._vpn = dev
         return False
 
+    def _page(self, status: int, body: bytes, csp: str, extra: Optional[dict] = None):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", csp)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _signout_guard(self):
+        """/signout-guard (portcullis-signout-guard, the forwardAuth of the
+        router oauth2-signout on auth.<domain>/oauth2/sign_out*): 200 +
+        X-Auth-Request-Redirect = the Signed out page when
+        signout_refusal() lets it through; a GET / HEAD gets the
+        confirmation page (405), anything else it with a note (403)."""
+        method = (self.headers.get("X-Forwarded-Method", "") or "").upper()
+        raw_uri = self.headers.get("X-Forwarded-Uri", "") or ""
+        why = signout_refusal(method, raw_uri, self.headers, DOMAIN)
+        if why is None:
+            METRICS.inc("group_gate_requests_total", endpoint="signout_guard", result="allow")
+            self.send_response(200)
+            self.send_header("X-Auth-Request-Redirect", signed_out_url(DOMAIN))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            print(f"group-gate: SIGNOUT allowed site={self.headers.get('Sec-Fetch-Site', '-')!r}", flush=True)
+            return
+        METRICS.inc("group_gate_requests_total", endpoint="signout_guard", result="deny")
+        if method in ("GET", "HEAD"):
+            self._page(405, render_signout_page(DOMAIN), SIGNOUT_CSP, {"Allow": "POST"})
+            return
+        METRICS.inc("group_gate_denials_total", reason="signout_refused")
+        self._page(403, render_signout_page(DOMAIN, refused=True), SIGNOUT_CSP)
+        print(f"group-gate: DENIED sign-out reason={why} origin={_log_field(self.headers.get('Origin', '') or '-', 80)!r}",
+              flush=True)
+
     def _vpn_required_page(self):
         """/vpn-required (the Hub's portcullis-vpnonly-<id> routers, through
         vpn-required-path): a static 403, no sign-in, no cookie."""
@@ -3663,7 +3950,8 @@ class Handler(BaseHTTPRequestHandler):
         METRICS.inc("group_gate_requests_total", endpoint="portal", result="allow")
         self._record_opened(user, DOMAIN)
         apps, domains = load_portal_apps()
-        body = render_portal(user, groups, apps, DOMAIN, domains, banner=self._banner)
+        body = render_portal(user, groups, apps, DOMAIN, domains, banner=self._banner,
+                             impersonated=self._imp is not None)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -3762,6 +4050,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if gate_path == "/vpn-required":
             self._vpn_required_page()
+            return
+        if gate_path == SIGNOUT_GUARD_PATH:
+            self._signout_guard()
+            return
+        if gate_path == SIGNED_OUT_PATH:
+            # The router signed-out (Host(<domain>) && Path(/signed-out)): no
+            # session, nothing read from the request.
+            METRICS.inc("group_gate_requests_total", endpoint="signed_out", result="allow")
+            self._page(200, render_signed_out_page(DOMAIN), SIGNED_OUT_CSP)
             return
         # Every other path: the full checks (there is no self-service path).
         # Only VPN_AUTH_PATH (portcullis-groups-vpn@docker, on vpnsecure

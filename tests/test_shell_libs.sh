@@ -1410,8 +1410,10 @@ F1="$(printf '%s' "$FWD" | _kc_fwd_patch ex.org)"
 expect_eq "keycloak configure: forward-auth redirect URIs = main callback + extra-domain callbacks" \
   "$(printf '%s' "$F1" | jq -c .redirectUris)" \
   '["https://auth.ex.org/oauth2/callback","https://grafana.team-b.example.org/oauth2/callback","https://x.team-b.example.org/oauth2/callback"]'
-expect_eq "keycloak configure: forward-auth default acr removed (\"\"), PKCE S256 required, scopes kept" \
-  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"","pkce.code.challenge.method":"S256"},["acr","groups"]]'
+expect_eq "keycloak configure: forward-auth default acr removed (\"\"), PKCE S256 required, post-logout = the Signed out page, scopes kept" \
+  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"","pkce.code.challenge.method":"S256","post.logout.redirect.uris":"https://ex.org/signed-out"},["acr","groups"]]'
+expect_eq "keycloak configure: a post-logout URI already there is replaced, never added to" \
+  "$(printf '%s' "$FWD" | jq -c '.attributes["post.logout.redirect.uris"] = "https://evil.example/##+"' | _kc_fwd_patch ex.org | jq -r '.attributes["post.logout.redirect.uris"]')" 'https://ex.org/signed-out'
 expect_eq "keycloak configure: forward-auth patch idempotent" "$(printf '%s' "$F1" | _kc_fwd_patch ex.org | jq -cS .)" "$(printf '%s' "$F1" | jq -cS .)"
 expect_eq "keycloak configure: placeholder kept when it is the domain" \
   "$(printf '%s' "$FWD" | _kc_fwd_patch portcullis.local | jq -c '.redirectUris[0:1]')" '["https://auth.portcullis.local/oauth2/callback"]'

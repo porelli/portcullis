@@ -234,7 +234,7 @@ DOCKER_TO_K8S = {
     "portcullis-public-guard": "portcullis-public-guard@file", "portcullis-public-guard-vpn": "portcullis-public-guard-vpn@file",
     "vpn-required-path": "vpn-required-path@file",
     "hub-proxy-secret": "hub-proxy-secret", "hub-cli-proxy-secret": "hub-cli-proxy-secret", "portcullis-auth-console": "portcullis-auth-console",
-    "portal-path": "portal-path", "portal-vpn-path": "portal-vpn-path", "directory-redirect": "directory-redirect",
+    "portal-path": "portal-path", "portcullis-signout-guard": "portcullis-signout-guard", "portal-vpn-path": "portal-vpn-path", "directory-redirect": "directory-redirect",
 }
 
 

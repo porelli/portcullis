@@ -131,9 +131,16 @@ Cases (in this order; each later case needs only the state it names):
   imp_ai_refused            the AI client's authorize → #impersonating, no
                             code; alice's pre-start token still works
   imp_refused_concurrent    second start / person taken → 409; next reused → 403
-  imp_stop                  Stop page → sign_out; session gone, cookie dead,
+  imp_stop                  Stop page → POST sign_out → the Signed out page;
+                            session gone, cookie dead,
                             refresh invalid_grant; audit and history
   imp_notice_next_signin    alice's next sign-in: the notice once
+  site_bar_sign_out         alice's certificate session: the site bar on the
+                            portal and the Sign-in page (her name, a POST
+                            Sign out); a cross-site link to /oauth2/sign_out →
+                            the confirmation, nothing ends; Sign out → the
+                            Signed out page, the ticket dead, her Keycloak
+                            session gone, Sign in again signs in
   imp_stop_elsewhere        sam's stop_impersonation → ended page within 5 s
   imp_refused_proofs        synced, no touch, bob's, browser certificate →
                             403; reason "ab" → 400
@@ -2752,7 +2759,13 @@ def main() -> int:
                 # (Playwright delivers the request events only inside its own
                 # calls: hence the wait_for_timeout.)
                 until("/oauth2/sign_out after Stop", lambda: page.wait_for_timeout(500) or
-                      any(u == AUTH + "/oauth2/sign_out" for _, u in seen), 20, every=0.5)
+                      ("POST", AUTH + "/oauth2/sign_out") in seen, 20, every=0.5)
+                # Stop signs out with the site bar's POST and lands on the
+                # Signed out page (contract §5 "Sign out"); Sign in again.
+                page.wait_for_url(PORTAL + "signed-out", timeout=TIMEOUT_MS)
+                assert page.locator("#pc-signed-out").count() == 1, body(page)[:200]
+                base.shot(page, "imp1-signed-out")
+                page.click("#pc-sign-in-again")
                 # Then the sign-in: this browser presents root's YubiKey
                 # certificate to auth.<d> (imp_start's step-up), so Keycloak's
                 # X.509 step signs root himself in again and the portal opens
@@ -2806,7 +2819,8 @@ def main() -> int:
             print(f"    history: {e.get('detail')!r}", flush=True)
             assert "apps opened:" in e["detail"] and "apps opened: none" not in e["detail"], e["detail"]
             state["imp1_done"] = doc
-        check("imp_stop: Stop on the portal → the Stop page POSTs, /oauth2/sign_out, the sign-in page; within 20 s alice "
+        check("imp_stop: Stop on the portal → the Stop page POSTs, then POST /oauth2/sign_out, the Signed out page, Sign "
+              "in again → the sign-in page; within 20 s alice "
               "has no impersonated Keycloak session; the old _oauth2_proxy cookie (200 before) isn't 200; oidc-strong's "
               "refresh token invalid_grant; audit start (reason) and end \"stopped\" by root with the apps; alice's "
               "history has the impersonation entry by root with the reason and the apps", imp_stop)
@@ -2856,6 +2870,58 @@ def main() -> int:
         check("imp_notice_next_signin: alice's own next sign-in shows \"root signed in as you on … UTC for … min: "
               "checking quota. Apps opened: …\" once; Continue reaches echo-cert (forged impersonation headers deleted on "
               "her own session); her next sign-in shows no notice", imp_notice_next_signin)
+
+        def site_bar_sign_out():
+            # Contract §5 "Sign out": alice's own YubiKey-certificate session;
+            # the site bar on the portal and the Sign-in page (username +
+            # Sign out), a cross-site GET of the endpoint ends nothing, then
+            # Sign out on the Sign-in page: the Signed out page, the ticket
+            # dead, her Keycloak session gone, Sign in again → sign-in.
+            needs("imp_alice_cert")
+            ctx = new_context(client_cert=state["imp_alice_cert"], origins=(AUTH, PORTAL.rstrip("/"), PEOPLE))
+            try:
+                page = ctx.new_page()
+                before = session_ids("alice")
+                goto(page, PORTAL)
+                until("the portal as alice", lambda: page.url == PORTAL and "Signed in as" in body(page), 60, every=1)
+                bar = page.locator(".pn-bar")
+                assert "Signed in as alice" in bar.inner_text(), bar.inner_text()
+                assert page.locator("form.pn-signout[method=post][enctype='text/plain'] #pn-sign-out").count() == 1
+                base.shot(page, "sign-out-bar-portal")
+                mine = session_ids("alice") - before
+                assert mine, "no new Keycloak session for alice"
+                old = next(c["value"] for c in ctx.cookies(AUTH) if c["name"] == "_oauth2_proxy")
+                # A cross-site navigation to the endpoint (Sec-Fetch-Site
+                # cross-site, the Lax cookie sent): the confirmation page.
+                other = ctx.new_page()
+                other.set_content(f'<a id="x" href="{AUTH}/oauth2/sign_out?rd={urllib.parse.quote(PORTAL)}">x</a>')
+                with other.expect_navigation():
+                    other.click("#x")
+                assert other.locator("#pc-sign-out-confirm").count() == 1, body(other)[:200]
+                other.close()
+                code, _ = raw_request(f"echo-std.{DOMAIN}", "/", f"_oauth2_proxy={old}")
+                assert code == 200 and mine <= session_ids("alice"), f"after the cross-site GET: HTTP {code}"
+                goto(page, PEOPLE + "/signin")
+                page.wait_for_selector("#site-nav #pn-sign-out", timeout=TIMEOUT_MS)
+                until("the Sign-in page's bar names alice", lambda: "alice" in page.locator("#site-nav").inner_text(), 20, 1)
+                base.shot(page, "sign-out-bar-signin")
+                page.click("#site-nav #pn-sign-out")
+                page.wait_for_url(PORTAL + "signed-out", timeout=TIMEOUT_MS)
+                assert page.locator("#pc-signed-out").count() == 1, body(page)[:200]
+                base.shot(page, "sign-out-signed-out")
+                code, _ = raw_request(f"echo-std.{DOMAIN}", "/", f"_oauth2_proxy={old}")
+                print(f"    the old _oauth2_proxy cookie after Sign out: HTTP {code}", flush=True)
+                assert code in (302, 401, 403), f"the old cookie after Sign out: HTTP {code}"
+                until("alice's Keycloak session gone", lambda: not (mine & session_ids("alice")), 20, every=2)
+                assert not [c for c in ctx.cookies(AUTH) if c["name"] == "_oauth2_proxy" and c["value"]], "cookie kept"
+                page.click("#pc-sign-in-again")
+                until("Sign in again → Keycloak", lambda: page.url.startswith(REALM + "/") or page.url == PORTAL, 30, 1)
+            finally:
+                ctx.close()
+        check("site_bar_sign_out: the portal's and the Sign-in page's site bar show alice and a POST Sign out; a "
+              "cross-site link to /oauth2/sign_out gets the confirmation and ends nothing; Sign out lands on the "
+              "Signed out page, the old ticket isn't 200, alice's Keycloak session is gone, Sign in again signs in",
+              site_bar_sign_out)
 
         def imp_stop_elsewhere():
             ctx, page, _ = root_session("imp2")
