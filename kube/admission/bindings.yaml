@@ -4,7 +4,8 @@
 # portcullis-core-guard-exec on the core namespace,
 # portcullis-nodeadm-guard-tokens on kube-system and
 # portcullis-ingress-guard-pods on portcullis-ingress and
-# portcullis-nodes-guard-labels on Nodes (cluster-scoped; ten); the params
+# portcullis-nodes-guard-labels on Nodes (cluster-scoped) and
+# portcullis-core-guard-frontdoor-status on the core namespace (eleven); the params
 # ConfigMap portcullis-admission-params in the core namespace (written only
 # by the CLI identity, ruling R-ADM: no Role of the Hub or nodeadm there;
 # missing = deny), Deny. The CLI applies each as
@@ -162,6 +163,23 @@ metadata:
   name: portcullis-nodes-guard-labels
 spec:
   policyName: portcullis-node-labels
+  validationActions: ["Deny"]
+  paramRef:
+    name: portcullis-admission-params
+    namespace: portcullis
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis
+---
+# Task 28 fix round 1: frontdoor-status in the core namespace.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-core-guard-frontdoor-status
+spec:
+  policyName: portcullis-frontdoor-status
   validationActions: ["Deny"]
   paramRef:
     name: portcullis-admission-params

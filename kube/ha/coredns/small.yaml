@@ -21,9 +21,15 @@
 #     and the image's /coredns carries the file capability
 #     cap_net_bind_service (found live: without it in the bounding set the
 #     exec itself fails, "operation not permitted");
-#   - k3s's ServiceAccount coredns (system:coredns: read-only endpoints /
-#     services / pods / namespaces / endpointslices) with its token — the
-#     kubernetes plugin needs it; k3s's ConfigMaps coredns (Corefile,
+#   - its own ServiceAccount portcullis-dns (Task 28 fix round 1, review M6:
+#     the pod now runs on edge nodes too) whose ClusterRole reads only what
+#     CoreDNS v1.14.7's kubernetes plugin watches with k3s's Corefile
+#     (`pods insecure`): services and endpointslices (list / watch) and
+#     namespaces (its namespace informer always runs,
+#     plugin/kubernetes/controller.go:201-213); never pods (the pod informer
+#     starts only with `pods verified`, kubernetes.go:304) or endpoints —
+#     k3s's system:coredns would also let a compromised edge node read every
+#     pod spec in the cluster; k3s's ConfigMaps coredns (Corefile,
 #     NodeHosts) and coredns-custom, read-only;
 #   - labelled k8s-app=kube-dns so Service kube-dns selects it (with
 #     PreferSameNode, a small node's pods ask this one).
@@ -44,7 +50,7 @@ spec:
       labels: {portcullis.io/component: dns-small, k8s-app: kube-dns}
     spec:
       priorityClassName: system-cluster-critical
-      serviceAccountName: coredns
+      serviceAccountName: portcullis-dns
       automountServiceAccountToken: true
       dnsPolicy: Default
       nodeSelector: {kubernetes.io/os: linux}
@@ -105,6 +111,34 @@ spec:
             items: [{key: Corefile, path: Corefile}, {key: NodeHosts, path: NodeHosts}]
         - name: custom-config-volume
           configMap: {name: coredns-custom, optional: true}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portcullis-dns
+  namespace: kube-system
+  labels: {app.kubernetes.io/managed-by: portcullis}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-dns
+  labels: {app.kubernetes.io/managed-by: portcullis}
+rules:
+  - apiGroups: [""]
+    resources: [services, namespaces]
+    verbs: [list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-dns
+  labels: {app.kubernetes.io/managed-by: portcullis}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: portcullis-dns}
+subjects: [{kind: ServiceAccount, name: portcullis-dns, namespace: kube-system}]
 ---
 # Both CoreDNS sets (k3s's Deployment and this DaemonSet) by k8s-app.
 apiVersion: policy/v1

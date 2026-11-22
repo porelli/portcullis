@@ -2258,7 +2258,8 @@ kube_vault_shrink_finish() {
 #     a replica that can't be placed would stay Pending — re-review N-1),
 #     required at main, one per node (k3s's own spread is judged only at
 #     scheduling: a rollout left two on one node);
-#   - kube/ha/coredns/small.yaml: our restricted DaemonSet of the same
+#   - kube/ha/coredns/small.yaml: our restricted DaemonSet (its own
+#     read-only ServiceAccount portcullis-dns, Task 28 fix round 1) of the same
 #     CoreDNS on each small node at main and on every node at another
 #     site (Task 28: an edge pod resolves on its own node, never across
 #     sites), and the PDB coredns (both sets);
@@ -2302,5 +2303,8 @@ ha_coredns_revert() {
     && kube_ctl -n kube-system patch service kube-dns --type=merge -p '{"spec": {"trafficDistribution": null}}' >/dev/null \
     && kube_ctl -n kube-system delete daemonset portcullis-dns-small --ignore-not-found >/dev/null \
     && kube_ctl -n kube-system delete poddisruptionbudget coredns --ignore-not-found >/dev/null \
+    && kube_ctl -n kube-system delete serviceaccount portcullis-dns --ignore-not-found >/dev/null \
+    && kube_ctl delete clusterrolebinding portcullis-dns --ignore-not-found >/dev/null \
+    && kube_ctl delete clusterrole portcullis-dns --ignore-not-found >/dev/null \
     || fail "could not put CoreDNS back to k3s's layout (HA off)"
 }

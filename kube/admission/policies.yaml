@@ -1894,3 +1894,62 @@ spec:
           && request.userInfo.extra['authentication.kubernetes.io/node-name'].exists(n, n == object.metadata.name)
           && object.spec == oldObject.spec && variables.newLabels == variables.oldLabels)
     message: SNR's agent may only annotate its own Node
+---
+# portcullis-frontdoor-status (NEW, HA; plan Task 28 fix round 1, contract
+# §12.4, §20.8): frontdoor-status steers every added domain's addresses
+# (the domains service follows it), so in the core namespace only the
+# front door's ServiceAccount (system:serviceaccount:<ns>:frontdoor) and
+# the CLI may write the ConfigMap frontdoor-status — not another
+# ServiceAccount, not an operator with cluster-wide ConfigMap rights
+# (Longhorn's, for one) —, the front door only by UPDATE, and only as its
+# own pod: the key leader and status.json's "leader" must both be the pod
+# name its bound token carries (authentication.kubernetes.io/pod-name), so
+# a follower knows who wrote it. The probe: a dry-run CREATE of
+# frontdoor-status annotated with the generation.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-frontdoor-status
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ''
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      - DELETE
+      resources:
+      - configmaps
+  matchConditions:
+  - name: frontdoor-status
+    expression: "request.name == 'frontdoor-status'"
+  variables:
+  - name: cli
+    expression: "'cliUsername' in params.data && params.data.cliUsername != '' && request.userInfo.username == params.data.cliUsername"
+  - name: frontdoor
+    expression: "request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':frontdoor'"
+  - name: pod
+    expression: >-
+      has(request.userInfo.extra) && 'authentication.kubernetes.io/pod-name' in request.userInfo.extra
+      && size(request.userInfo.extra['authentication.kubernetes.io/pod-name']) == 1
+      ? request.userInfo.extra['authentication.kubernetes.io/pod-name'][0] : ''
+  validations:
+  - expression: >-
+      request.operation == 'DELETE' || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+  - expression: "variables.cli || variables.frontdoor"
+    message: only the front door (and the CLI) may write frontdoor-status
+  - expression: "variables.cli || request.operation == 'UPDATE'"
+    message: the front door only updates frontdoor-status (the chart creates it)
+  - expression: >-
+      variables.cli || (variables.pod != '' && has(object.data) && 'leader' in object.data && object.data['leader'] == variables.pod
+        && 'status.json' in object.data && object.data['status.json'].contains('"leader":"' + variables.pod + '"'))
+    message: the front door writes frontdoor-status only as its own pod (leader = its pod name)

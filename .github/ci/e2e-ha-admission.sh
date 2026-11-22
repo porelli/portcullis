@@ -10,7 +10,8 @@
 # pod through pods/ephemeralcontainers; a "node" vector patches the first
 # Node (or its "target", @NODE2@ = the second) as a node identity or SNR's
 # manager under portcullis-node-labels
-# (round 3 I1: the storm guard's inputs). Run by
+# (round 3 I1: the storm guard's inputs); frontdoor-status writes under
+# portcullis-frontdoor-status (Task 28 fix round 1). Run by
 # e2e-ha-vm (Task 33) after the HA installs; locally against k3d / k3s.
 # With HUB_DEV=1 + PORTCULLIS_DEV_SNR_IMAGE the vectors' SNR image is that
 # one (as ha_render's).
@@ -34,11 +35,24 @@ print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in yaml.
 # portcullis-node-labels (round 3 I1) with its binding and a params
 # ConfigMap of a test generation; SNR's RBAC above lets the manager patch.
 kubectl --context "$ctx" create namespace portcullis --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
-kubectl --context "$ctx" -n portcullis create configmap portcullis-admission-params --from-literal=generation=e2e0ha0000000000 --dry-run=client -o json \
+cli="$(kubectl --context "$ctx" auth whoami -o jsonpath='{.status.userInfo.username}')"
+kubectl --context "$ctx" -n portcullis create configmap portcullis-admission-params --from-literal=generation=e2e0ha0000000000 --from-literal=cliUsername="$cli" --dry-run=client -o json \
   | kubectl --context "$ctx" apply -f - >/dev/null
+# portcullis-frontdoor-status (Task 28 fix round 1): the ConfigMap (made by
+# the CLI, as the chart does), and update rights for the front door's
+# ServiceAccount and an intruder (RBAC allows both: only the policy tells
+# them apart).
+kubectl --context "$ctx" -n portcullis create configmap frontdoor-status --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
+for sa in frontdoor vector-intruder; do
+  kubectl --context "$ctx" -n portcullis create serviceaccount "$sa" --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
+done
+kubectl --context "$ctx" -n portcullis create role vector-frontdoor-status --verb=get,update,create --resource=configmaps --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
+kubectl --context "$ctx" -n portcullis create rolebinding vector-frontdoor-status --role=vector-frontdoor-status \
+  --serviceaccount=portcullis:frontdoor --serviceaccount=portcullis:vector-intruder --dry-run=client -o json | kubectl --context "$ctx" apply -f - >/dev/null
 python3 -c 'import sys, yaml, json
 docs = [d for f in sys.argv[1:] for d in yaml.safe_load_all(open(f)) if d]
-print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in docs if d["metadata"]["name"] in ("portcullis-node-labels", "portcullis-nodes-guard-labels")]}))' \
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in docs if d["metadata"]["name"] in ("portcullis-node-labels", "portcullis-nodes-guard-labels",
+    "portcullis-frontdoor-status", "portcullis-core-guard-frontdoor-status")]}))' \
   kube/admission/policies.yaml kube/admission/bindings.yaml \
   | kubectl --context "$ctx" apply --server-side --force-conflicts --field-manager=portcullis-cli -f - >/dev/null
 # portcullis-barman-rbac (Task 26 review M4) with the plugin's Role (its
@@ -79,6 +93,8 @@ while IFS= read -r v; do
     # An object created as an identity (Task 26 review M4: the barman plugin's RBAC).
     as=(--as "$(jq -r .as.user <<<"$v")")
     while IFS= read -r g; do as+=(--as-group "$g"); done < <(jq -r '.as.groups[]' <<<"$v")
+    # A bound token's extra (the frontdoor-status vectors: its pod name).
+    while IFS= read -r x; do as+=(--as-user-extra "$x"); done < <(jq -r '(.as.extra // {}) | to_entries[] | "\(.key)=\(.value)"' <<<"$v")
     verb=create; [ "$(jq -r '.update // false' <<<"$v")" != true ] || verb=replace
     out="$(jq -c .object <<<"$v" | kubectl --context "$ctx" "${as[@]}" "$verb" --dry-run=server -f - 2>&1)" && got=true || got=false
   else

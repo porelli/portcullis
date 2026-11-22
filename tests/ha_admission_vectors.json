@@ -18883,5 +18883,176 @@
    ]
   },
   "policy": "portcullis-barman-rbac"
+ },
+ {
+  "allowed": true,
+  "as": {
+   "extra": {
+    "authentication.kubernetes.io/pod-name": "frontdoor-0"
+   },
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis:frontdoor"
+  },
+  "name": "frontdoor-status: the front door as its own pod",
+  "object": {
+   "apiVersion": "v1",
+   "data": {
+    "leader": "frontdoor-0",
+    "status.json": "{\"v\":1,\"state\":\"leading\",\"leader\":\"frontdoor-0\"}"
+   },
+   "kind": "ConfigMap",
+   "metadata": {
+    "name": "frontdoor-status",
+    "namespace": "portcullis"
+   }
+  },
+  "policy": "portcullis-frontdoor-status",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "extra": {
+    "authentication.kubernetes.io/pod-name": "frontdoor-0"
+   },
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis:frontdoor"
+  },
+  "name": "frontdoor-status: the front door naming another leader",
+  "object": {
+   "apiVersion": "v1",
+   "data": {
+    "leader": "frontdoor-1",
+    "status.json": "{\"v\":1,\"state\":\"leading\",\"leader\":\"frontdoor-0\"}"
+   },
+   "kind": "ConfigMap",
+   "metadata": {
+    "name": "frontdoor-status",
+    "namespace": "portcullis"
+   }
+  },
+  "policy": "portcullis-frontdoor-status",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "extra": {
+    "authentication.kubernetes.io/pod-name": "frontdoor-0"
+   },
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis:frontdoor"
+  },
+  "name": "frontdoor-status: the front door's status.json naming another leader",
+  "object": {
+   "apiVersion": "v1",
+   "data": {
+    "leader": "frontdoor-0",
+    "status.json": "{\"v\":1,\"state\":\"leading\",\"leader\":\"frontdoor-1\"}"
+   },
+   "kind": "ConfigMap",
+   "metadata": {
+    "name": "frontdoor-status",
+    "namespace": "portcullis"
+   }
+  },
+  "policy": "portcullis-frontdoor-status",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "as": {
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis:frontdoor"
+  },
+  "name": "frontdoor-status: the front door with a token bound to no pod",
+  "object": {
+   "apiVersion": "v1",
+   "data": {
+    "leader": "frontdoor-0",
+    "status.json": "{\"v\":1,\"state\":\"leading\",\"leader\":\"frontdoor-0\"}"
+   },
+   "kind": "ConfigMap",
+   "metadata": {
+    "name": "frontdoor-status",
+    "namespace": "portcullis"
+   }
+  },
+  "policy": "portcullis-frontdoor-status",
+  "update": true
+ },
+ {
+  "allowed": false,
+  "also_refused_by": "already exists",
+  "as": {
+   "extra": {
+    "authentication.kubernetes.io/pod-name": "frontdoor-0"
+   },
+   "groups": [
+    "system:serviceaccounts",
+    "system:serviceaccounts:portcullis",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis:frontdoor"
+  },
+  "name": "frontdoor-status: the front door creating it",
+  "object": {
+   "apiVersion": "v1",
+   "data": {
+    "leader": "frontdoor-0",
+    "status.json": "{\"v\":1,\"state\":\"leading\",\"leader\":\"frontdoor-0\"}"
+   },
+   "kind": "ConfigMap",
+   "metadata": {
+    "name": "frontdoor-status",
+    "namespace": "portcullis"
+   }
+  },
+  "policy": "portcullis-frontdoor-status",
+  "update": false
+ },
+ {
+  "allowed": false,
+  "as": {
+   "extra": {
+    "authentication.kubernetes.io/pod-name": "frontdoor-0"
+   },
+   "groups": [
+    "system:serviceaccounts",
+    "system:authenticated"
+   ],
+   "user": "system:serviceaccount:portcullis:vector-intruder"
+  },
+  "name": "frontdoor-status: another ServiceAccount allowed to update ConfigMaps",
+  "object": {
+   "apiVersion": "v1",
+   "data": {
+    "leader": "frontdoor-0",
+    "status.json": "{\"v\":1,\"state\":\"leading\",\"leader\":\"frontdoor-0\"}"
+   },
+   "kind": "ConfigMap",
+   "metadata": {
+    "name": "frontdoor-status",
+    "namespace": "portcullis"
+   }
+  },
+  "policy": "portcullis-frontdoor-status",
+  "update": true
  }
 ]

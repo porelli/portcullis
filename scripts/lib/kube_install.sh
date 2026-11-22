@@ -631,6 +631,11 @@ _kube_probe_ha() {
       M="$m" jq -n '{apiVersion: "v1", kind: "Node", metadata: (env.M | fromjson),
           spec: {taints: [{key: "nodeadm.portcullis/unlabelled", value: "true", effect: "NoSchedule"}]}}' \
         | kube_ctl --as=system:node:portcullis-admission-probe --as-group=system:nodes --as-group=system:authenticated create --dry-run=server -f - ;;
+    portcullis-core-guard-frontdoor-status)
+      # Task 28 fix round 1: a dry-run CREATE of frontdoor-status (every
+      # identity's first rule refuses this generation's probe).
+      M="$m" jq -n '{apiVersion: "v1", kind: "ConfigMap", metadata: (env.M | fromjson | .name = "frontdoor-status"), data: {}}' \
+        | kube_ctl -n "$cns" --as="$(_kube_hub_sa)" --as-group=system:masters create --dry-run=server -f - ;;
     portcullis-ingress-guard-pods)
       M="$m" IMG="${KUBE_HUB_IMAGE:-$PORTCULLIS_HELPER_IMAGE}" jq -n '{apiVersion: "v1", kind: "Pod", metadata: (env.M | fromjson),
           spec: {automountServiceAccountToken: false, containers: [{name: "c", image: env.IMG, command: ["true"]}]}}' \

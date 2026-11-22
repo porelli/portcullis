@@ -143,6 +143,9 @@ FRONTDOOR_RULES = [
 ]
 
 
+DNS_RULES = [{"apiGroups": [""], "resources": ["services", "namespaces"], "verbs": ["list", "watch"]},
+             {"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["list", "watch"]}]
+
 EDGE_DNS_TERMS = [
     {"matchExpressions": [{"key": "portcullis.io/site", "operator": "In", "values": ["main"]},
                           {"key": "portcullis.io/class", "operator": "In", "values": ["small"]}]},
@@ -163,8 +166,17 @@ def coredns_small_problems(docs):
     out = []
     ds = [d for d in docs if d.get("kind") == "DaemonSet"]
     pdb = [d for d in docs if d.get("kind") == "PodDisruptionBudget"]
-    if len(ds) != 1 or len(pdb) != 1 or len(docs) != 2:
-        return ["coredns small: exactly one DaemonSet and one PodDisruptionBudget"]
+    if len(ds) != 1 or len(pdb) != 1 or sorted(d.get("kind") for d in docs) != ["ClusterRole", "ClusterRoleBinding", "DaemonSet", "PodDisruptionBudget", "ServiceAccount"]:
+        return ["coredns small: exactly one DaemonSet, one PodDisruptionBudget and its ServiceAccount, ClusterRole and binding"]
+    # Task 28 fix round 1 (review M6): its own ServiceAccount, reading only
+    # what CoreDNS's kubernetes plugin watches (no pods, no endpoints).
+    cr = next(d for d in docs if d["kind"] == "ClusterRole")
+    crb = next(d for d in docs if d["kind"] == "ClusterRoleBinding")
+    sa = next(d for d in docs if d["kind"] == "ServiceAccount")
+    if cr["metadata"]["name"] != "portcullis-dns" or cr.get("rules") != DNS_RULES or sa["metadata"] != {"name": "portcullis-dns", "namespace": "kube-system", "labels": {"app.kubernetes.io/managed-by": "portcullis"}} \
+            or crb["roleRef"] != {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "portcullis-dns"} \
+            or crb["subjects"] != [{"kind": "ServiceAccount", "name": "portcullis-dns", "namespace": "kube-system"}]:
+        return [f"coredns small: the ServiceAccount portcullis-dns bound to exactly {DNS_RULES}"]
     sp = ds[0]["spec"]["template"]["spec"]
     psc = sp.get("securityContext", {})
     if psc.get("runAsNonRoot") is not True or not psc.get("runAsUser") or (psc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
@@ -192,8 +204,8 @@ def coredns_small_problems(docs):
     # edge pod resolves on its own node), nothing else: exactly these two
     # ORed terms, no other placement field.
     if sp.get("nodeSelector") != {"kubernetes.io/os": "linux"} or sp.get("affinity") != {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": EDGE_DNS_TERMS}}} \
-            or sp.get("nodeName") or sp.get("serviceAccountName") != "coredns":
-        out.append("coredns small: the small nodes at main and every node outside main, k3s's ServiceAccount coredns")
+            or sp.get("nodeName") or sp.get("serviceAccountName") != "portcullis-dns":
+        out.append("coredns small: the small nodes at main and every node outside main, the ServiceAccount portcullis-dns")
     if sp.get("tolerations") != [{"key": "portcullis.io/small", "operator": "Exists", "effect": "NoSchedule"}, {"key": "CriticalAddonsOnly", "operator": "Exists"}]:
         out.append("coredns small: tolerates the small taint and CriticalAddonsOnly only")
     if ds[0]["spec"]["template"]["metadata"]["labels"].get("k8s-app") != "kube-dns" or pdb[0]["spec"] != {"minAvailable": 1, "selector": {"matchLabels": {"k8s-app": "kube-dns"}}}:
@@ -218,7 +230,10 @@ def check_coredns_small():
                    lambda d: ds(d).pop("affinity"),
                    lambda d: ds(d)["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"].append({"matchExpressions": [{"key": "kubernetes.io/os", "operator": "Exists"}]}),
                    lambda d: ds(d)["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][1]["matchExpressions"].pop(1),
-                   lambda d: ds(d)["tolerations"].append({"operator": "Exists"})):
+                   lambda d: ds(d)["tolerations"].append({"operator": "Exists"}),
+                   # Review M6: k3s's broad ServiceAccount, or pods read again.
+                   lambda d: ds(d).__setitem__("serviceAccountName", "coredns"),
+                   lambda d: next(x for x in d if x["kind"] == "ClusterRole")["rules"][0]["resources"].append("pods")):
         bad = copy.deepcopy(docs)
         mutate(bad)
         if not coredns_small_problems(bad):
@@ -1684,6 +1699,17 @@ def check_ha_infra():
         if not any(v["allowed"] and v["as"]["user"].startswith("system:node:") for v in nl) \
                 or sum(not v["allowed"] for v in nl) < 10 or not any(v["allowed"] and v.get("taints_add") for v in nl):
             F.add("ha_admission_vectors: portcullis-node-labels needs a node's and the manager's refused / admitted vectors")
+        # Task 28 fix round 1 (review M2): who may write frontdoor-status.
+        fs = [v for v in vecs if v["policy"] == "portcullis-frontdoor-status"]
+        if sum(v["allowed"] for v in fs) != 1 or sum(not v["allowed"] for v in fs) < 5:
+            F.add("ha_admission_vectors: portcullis-frontdoor-status needs the front door's own write admitted and the forged ones refused")
+    fsp = next((d for d in yaml.safe_load_all((K.ROOT / "kube/admission/policies.yaml").read_text())
+                if d and d.get("kind") == "ValidatingAdmissionPolicy" and d["metadata"]["name"] == "portcullis-frontdoor-status"), None)
+    fsb = next((d for d in yaml.safe_load_all((K.ROOT / "kube/admission/bindings.yaml").read_text())
+                if d and d["metadata"]["name"] == "portcullis-core-guard-frontdoor-status"), None)
+    if not fsp or not fsb or fsp["spec"].get("failurePolicy") != "Fail" or fsp["spec"]["matchConditions"] != [{"name": "frontdoor-status", "expression": "request.name == 'frontdoor-status'"}] \
+            or fsb["spec"]["policyName"] != "portcullis-frontdoor-status" or fsb["spec"]["validationActions"] != ["Deny"]:
+        F.add("admission: portcullis-frontdoor-status (Fail, frontdoor-status only) and its Deny binding on the core namespace")
     # Round 3 I1: portcullis-node-labels guards the storm guard's inputs.
     nlp = next((d for d in yaml.safe_load_all((K.ROOT / "kube/admission/policies.yaml").read_text())
                 if d and d.get("kind") == "ValidatingAdmissionPolicy" and d["metadata"]["name"] == "portcullis-node-labels"), None)

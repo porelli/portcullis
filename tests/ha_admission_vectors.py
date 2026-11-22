@@ -350,6 +350,30 @@ def vectors():
     obj("barman: a binding to a second subject", rb, lambda o: o["subjects"].append({"kind": "ServiceAccount", "name": "x", "namespace": "cnpg-system"}))
     obj("barman: a binding to a ClusterRole", rb, lambda o: o["roleRef"].update(kind="ClusterRole", name="portcullis-pg-barman-cloud"), also="not found")
     obj("barman: a binding to a user", rb, lambda o: o["subjects"].__setitem__(0, {"kind": "User", "apiGroup": "rbac.authorization.k8s.io", "name": "mallory"}))
+    # portcullis-frontdoor-status (Task 28 fix round 1, review M2): only the
+    # front door's ServiceAccount, by UPDATE, as its own pod (the bound
+    # token's pod name = data.leader = status.json's leader), or the CLI.
+    FS = "portcullis-frontdoor-status"
+    fd = {"user": "system:serviceaccount:portcullis:frontdoor", "groups": ["system:serviceaccounts", "system:serviceaccounts:portcullis", "system:authenticated"],
+          "extra": {"authentication.kubernetes.io/pod-name": "frontdoor-0"}}
+
+    def status(leader="frontdoor-0", doc_leader="frontdoor-0"):
+        return {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "frontdoor-status", "namespace": "portcullis"},
+                "data": {"leader": leader, "status.json": json.dumps({"v": 1, "state": "leading", "leader": doc_leader}, separators=(",", ":"))}}
+
+    def fsv(name, o, who, allowed, update=True, also=None):
+        v = {"policy": FS, "name": f"frontdoor-status: {name}", "allowed": allowed, "as": who, "object": o, "update": update}
+        if also:
+            v["also_refused_by"] = also
+        out.append(v)
+    fsv("the front door as its own pod", status(), fd, True)
+    fsv("the front door naming another leader", status(leader="frontdoor-1"), fd, False)
+    fsv("the front door's status.json naming another leader", status(doc_leader="frontdoor-1"), fd, False)
+    fsv("the front door with a token bound to no pod", status(), {k: v for k, v in fd.items() if k != "extra"}, False)
+    fsv("the front door creating it", status(), fd, False, update=False, also="already exists")
+    intruder = {"user": "system:serviceaccount:portcullis:vector-intruder", "groups": ["system:serviceaccounts", "system:authenticated"],
+                "extra": {"authentication.kubernetes.io/pod-name": "frontdoor-0"}}
+    fsv("another ServiceAccount allowed to update ConfigMaps", status(), intruder, False)
     return out
 
 
