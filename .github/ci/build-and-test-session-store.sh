@@ -61,8 +61,22 @@ for i in $(seq 1 30); do
   sleep 2
 done
 # rd = oauth2-proxy's own /oauth2/auth: 202 once the session loads from the store.
-END="$("${C[@]}" -L --max-redirs 10 -o /dev/null -w '%{http_code} %{url_effective}' \
+# The certificate is an interactive sign-in, so Keycloak stops on its "Let
+# through" page (contract §8.1): its form is posted as the page's script
+# would (empty body, the same cookies and certificate), then the redirects
+# go on to the callback and rd.
+END="$("${C[@]}" -L --max-redirs 10 -o /tmp/sess.page -w '%{http_code} %{url_effective}' \
   "https://auth.portcullis.local/oauth2/start?pc_method=yubikey_cert&rd=https%3A%2F%2Fauth.portcullis.local%2Foauth2%2Fauth")"
+if grep -q 'id="portcullis-let-through-form"' /tmp/sess.page; then
+  ACTION=$(grep -o '<form id="portcullis-let-through-form" action="[^"]*"' /tmp/sess.page | sed 's/.*action="//; s/"$//; s/&amp;/\&/g')
+  case "$ACTION" in
+    https://auth.portcullis.local/realms/portcullis/login-actions/required-action\?*) ;;
+    *) echo "FAIL: the Let through form posts to '$ACTION'"; exit 1 ;;
+  esac
+  END="$("${C[@]}" -L --max-redirs 10 -o /dev/null -w '%{http_code} %{url_effective}' --data-binary '' \
+    "$ACTION")"
+fi
+rm -f /tmp/sess.page
 [ "${END%% *}" = 202 ] || { echo "FAIL: sign-in through forward-auth ended at ${END%%\?*}"; docker compose logs --tail=40 forward-auth; exit 1; }
 echo "PASS: a YubiKey-certificate sign-in through forward-auth; /oauth2/auth answers 202"
 NAMES="$(awk -F'\t' '!/^#/ || /^#HttpOnly_/ { if (NF >= 7) print $6 }' "$J" | grep -E '^_oauth2_proxy(_[0-9]+)?$' | sort | paste -sd' ')"
