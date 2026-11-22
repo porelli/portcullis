@@ -275,9 +275,14 @@ echo "$CFG" | jq -e '.services["forward-auth"] as $m | .services["forward-auth-e
     and $g["traefik.http.routers.signed-out.rule"] == "Host(`portcullis.local`) && Path(`/signed-out`)"
     and $g["traefik.http.routers.signed-out.middlewares"] == "rate-limit@file,security-headers@file"
     and $g["traefik.http.routers.signed-out.service"] == "group-gate"
-    and ($m.environment.OAUTH2_PROXY_BACKEND_LOGOUT_URL | startswith("https://auth.portcullis.local/realms/portcullis/protocol/openid-connect/logout?id_token_hint="))
-    and ($x.environment.OAUTH2_PROXY_BACKEND_LOGOUT_URL // null) == null' >/dev/null \
+    and ($m.environment.PORTCULLIS_BACKEND_LOGOUT_URL | startswith("https://auth.portcullis.local/realms/portcullis/protocol/openid-connect/logout?id_token_hint="))
+    and ($x.environment.PORTCULLIS_BACKEND_LOGOUT_URL // null) == null
+    and (([$m, $x] | map(.environment | has("OAUTH2_PROXY_BACKEND_LOGOUT_URL")) | any) | not)' >/dev/null \
   || { echo "FAIL: sign-out wiring (oauth2-signout + portcullis-signout-guard, signed-out, backend logout on forward-auth only; contract §5)"; exit 1; }
+# The backend logout is a provider option (an OAUTH2_PROXY_BACKEND_LOGOUT_URL
+# env var is ignored under --alpha-config): alpha.yaml takes it from the env.
+grep -qxF '    backendLogoutURL: "${PORTCULLIS_BACKEND_LOGOUT_URL}"' oauth2-proxy/alpha.yaml \
+  || { echo "FAIL: alpha.yaml's provider must take backendLogoutURL from PORTCULLIS_BACKEND_LOGOUT_URL"; exit 1; }
 grep -qE '^\s+code_challenge_method: S256$' oauth2-proxy/alpha.yaml || { echo "FAIL: oauth2-proxy (both services) must send PKCE S256"; exit 1; }
 if grep -nE '^\s*userIDClaim:' oauth2-proxy/alpha.yaml; then echo "FAIL: userIDClaim is an alias of emailClaim in oauth2-proxy v7"; exit 1; fi
 # Contract §12.1 / §12.4: the domains service. portcullis-domains =

@@ -750,7 +750,9 @@ services:
       # session ends, so forward-auth-ext's sessions fail at their next
       # refresh (cookie_refresh 1m). Sign-out is reached only through the
       # router oauth2-signout and its guard (group-gate /signout-guard).
-      OAUTH2_PROXY_BACKEND_LOGOUT_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/logout?id_token_hint={id_token}
+      # Into alpha.yaml's backendLogoutURL (a provider option: the
+      # OAUTH2_PROXY_BACKEND_LOGOUT_URL env var is ignored with --alpha-config).
+      PORTCULLIS_BACKEND_LOGOUT_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/logout?id_token_hint={id_token}
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_SSL_UPSTREAM_INSECURE_SKIP_VERIFY: "true"
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
@@ -862,7 +864,8 @@ services:
       OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_TRUSTED_PROXY_IPS: "172.16.0.0/12,127.0.0.1/32"
       OAUTH2_PROXY_REDIRECT_URL: /oauth2/callback
-      # No OAUTH2_PROXY_BACKEND_LOGOUT_URL here: an extra-domain host's
+      # PORTCULLIS_BACKEND_LOGOUT_URL empty (alpha.yaml's backendLogoutURL):
+      # no backend logout here: an extra-domain host's
       # /oauth2/sign_out (the Hub's per-host /oauth2/ routers, no guard)
       # can be reached by a cross-site link, so it ends only that host's
       # ticket; the Keycloak session ends only through the guarded

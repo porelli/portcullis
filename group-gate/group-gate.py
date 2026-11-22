@@ -786,7 +786,7 @@ PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"
 # signout_refusal() decides, and on allow X-Auth-Request-Redirect names the
 # fixed landing page https://<domain>/signed-out (the router `signed-out`,
 # no session needed). oauth2-proxy then calls Keycloak's end-session
-# endpoint server-side (OAUTH2_PROXY_BACKEND_LOGOUT_URL, id_token_hint),
+# endpoint server-side (alpha.yaml backendLogoutURL, id_token_hint),
 # deletes the ticket from the session store and expires the cookie.
 
 SIGNOUT_PATH = "/oauth2/sign_out"
