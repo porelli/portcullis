@@ -400,6 +400,9 @@ type haResult struct {
 	addrs            map[string][]string
 	changed          map[string]time.Time
 	ours             map[string][]string
+	// pruneOther: our A / AAAA refs in other zones than the one in use
+	// (the zone changed): dropped, their records never deleted.
+	pruneOther map[string][]RecordRef
 }
 
 // haStep makes the due changes of each name of d toward the front door's
@@ -409,23 +412,56 @@ func (s *Service) haStep(ctx context.Context, p dnsProvider, d *Domain, zone str
 	if !h.OK {
 		return haResult{}, fmt.Errorf("the front door's address set can't be followed (%s): high availability publishes the added domains' addresses from it", h.Err)
 	}
-	w := &frontdoor.Writer{Domain: d.Name, Zone: dns.Fqdn(zone), P: p, TTL: frontdoor.TTL(providerMinTTL(d.Provider)), Fence: haFence{}, Policy: s.cfg.AddrPolicy}
+	zone = dns.Fqdn(zone)
+	w := &frontdoor.Writer{Domain: d.Name, Zone: zone, P: p, TTL: frontdoor.TTL(providerMinTTL(d.Provider)), Fence: haFence{}, Policy: s.cfg.AddrPolicy}
 	pub, err := w.Published(ctx)
 	if err != nil {
 		return haResult{}, fmt.Errorf("reading the address set of %s: %w", d.Name, err)
 	}
-	res := haResult{addrs: map[string][]string{}, changed: maps0(d.HAChanged), ours: map[string][]string{}}
+	// The provider's record IDs, where it has them (porkbun, hetzner, the
+	// test fake): a ref is ours only while a live record carries its ID.
+	ids := haIDLister(p)
+	var live []idRecord
+	if ids != nil {
+		rctx, cancel := context.WithTimeout(ctx, frontdoor.ReadTimeout)
+		live, err = ids.recordIDs(rctx, zone)
+		cancel()
+		if err != nil {
+			return haResult{}, fmt.Errorf("reading the record IDs of %s: %w", d.Name, err)
+		}
+	}
+	res := haResult{addrs: map[string][]string{}, changed: maps0(d.HAChanged), ours: map[string][]string{}, pruneOther: map[string][]RecordRef{}}
+	// Ownership (security review): only refs of the zone in use, whose
+	// address is live in this read (and, with IDs, whose ID is live); every
+	// other A / AAAA ref at our names is pruned — another zone's (the zone
+	// changed), one whose record went, one whose address someone else put
+	// back under another ID. A pruned ref's record is never deleted.
+	for z, refs := range d.Records {
+		for _, r := range refs {
+			if r.Type != "A" && r.Type != "AAAA" || !slices.Contains(haNames(d.Name), haAbs(r.Name, z)) {
+				continue
+			}
+			n := haAbs(r.Name, z)
+			if dns.Fqdn(z) != zone {
+				res.pruneOther[z] = append(res.pruneOther[z], r)
+				continue
+			}
+			v, ok := haIP(r.Value)
+			if ok && slices.Contains(pub[n], v) && (ids == nil || haLiveID(live, zone, n, r)) {
+				if !slices.Contains(res.ours[n], v) {
+					res.ours[n] = append(res.ours[n], v)
+				}
+				continue
+			}
+			res.removed = append(res.removed, r)
+		}
+	}
 	var errs []error
 	for _, n := range haNames(d.Name) {
 		res.addrs[n] = pub[n]
-		// Our own addresses still there (one removed by hand is no longer ours).
-		for _, a := range haOurs(d, n) {
-			if slices.Contains(pub[n], a) {
-				res.ours[n] = append(res.ours[n], a)
-			}
-		}
 		_, followed := d.HAAddrs[n]
 		if followed && now.Sub(d.HAChanged[n]) < frontdoor.ChangeEvery {
+			sort.Strings(res.ours[n])
 			continue
 		}
 		changes := haNext(n, pub[n], h.want(n, d.Name), res.ours[n], !followed)
@@ -434,17 +470,30 @@ func (s *Service) haStep(ctx context.Context, p dnsProvider, d *Domain, zone str
 			// An attempt holds off the next one for 60 s too (the front
 			// door's rule: a failing provider isn't hammered).
 			res.changed[n] = now
+			// Never a delete that could take a record not ours: with IDs,
+			// exactly one live record holds the value, and it is ours.
+			if c.Op == "remove" && ids != nil && haLiveCount(live, zone, n, c.Type, c.Value) != 1 {
+				errs = append(errs, fmt.Errorf("not removing %s %s at %s: more than one live record holds it", c.Type, c.Value, n))
+				continue
+			}
 			if err := w.Apply(ctx, c); err != nil {
 				errs = append(errs, err)
 				continue
 			}
-			ref := RecordRef{Name: libdns.RelativeName(dns.Fqdn(n), dns.Fqdn(zone)), Type: c.Type, Value: c.Value}
+			ref := RecordRef{Name: libdns.RelativeName(dns.Fqdn(n), zone), Type: c.Type, Value: c.Value}
 			if c.Op == "add" {
+				if ids != nil {
+					ref.ID = s.haCaptureID(ctx, ids, zone, n, ref, d.Records[zone])
+				}
 				res.written = append(res.written, ref)
 				res.addrs[n] = append(slices.Clone(res.addrs[n]), c.Value)
 				res.ours[n] = append(res.ours[n], c.Value)
 			} else {
-				res.removed = append(res.removed, ref)
+				for _, r := range d.Records[zone] {
+					if r.Type == c.Type && haAbs(r.Name, zone) == n && r.Value == c.Value {
+						res.removed = append(res.removed, r)
+					}
+				}
 				res.addrs[n] = slices.DeleteFunc(slices.Clone(res.addrs[n]), func(a string) bool { return a == c.Value })
 				res.ours[n] = slices.DeleteFunc(res.ours[n], func(a string) bool { return a == c.Value })
 			}
@@ -457,6 +506,93 @@ func (s *Service) haStep(ctx context.Context, p dnsProvider, d *Domain, zone str
 		}
 	}
 	return res, errors.Join(errs...)
+}
+
+// recordIDLister lists a zone's records with their provider IDs (the
+// by-ID delete path: porkbun, hetzner).
+type recordIDLister interface {
+	recordIDs(ctx context.Context, zone string) ([]idRecord, error)
+}
+
+func (p byIDDelete) recordIDs(ctx context.Context, zone string) ([]idRecord, error) {
+	return p.api.listIDs(ctx, zone)
+}
+
+func (p porkbunProvider) recordIDs(ctx context.Context, zone string) ([]idRecord, error) {
+	return p.api.listIDs(ctx, zone)
+}
+
+// haIDLister is p's record-ID lister, nil when its provider has none
+// (then a ref is ours by its zone, name and live value alone).
+func haIDLister(p dnsProvider) recordIDLister {
+	inner, _ := unwrap(p)
+	if l, ok := inner.(recordIDLister); ok {
+		return l
+	}
+	return nil
+}
+
+// haCaptureID is the ID of the record just appended for ref: a live record
+// with its name, type and data whose ID no other ref of ours holds; ""
+// when it can't be told (then the next step prunes the ref and the record
+// counts as foreign: fail closed).
+func (s *Service) haCaptureID(ctx context.Context, ids recordIDLister, zone, n string, ref RecordRef, refs []RecordRef) string {
+	rctx, cancel := context.WithTimeout(ctx, frontdoor.ReadTimeout)
+	defer cancel()
+	live, err := ids.recordIDs(rctx, zone)
+	if err != nil {
+		return ""
+	}
+	taken := map[string]bool{}
+	for _, r := range refs {
+		taken[r.ID] = true
+	}
+	var found []string
+	for _, l := range live {
+		if v, ok := haIP(l.rr.Data); ok && l.rr.Type == ref.Type && haAbs(l.rr.Name, zone) == n && v == ref.Value && !taken[l.id] {
+			found = append(found, l.id)
+		}
+	}
+	if len(found) != 1 {
+		return ""
+	}
+	return found[0]
+}
+
+// haLiveID: a live record carries r's ID with r's name, type and value.
+func haLiveID(live []idRecord, zone, n string, r RecordRef) bool {
+	if r.ID == "" {
+		return false
+	}
+	for _, l := range live {
+		if v, ok := haIP(l.rr.Data); ok && l.id == r.ID && l.rr.Type == r.Type && haAbs(l.rr.Name, zone) == n && v == r.Value {
+			return true
+		}
+	}
+	return false
+}
+
+// haLiveCount counts the live records of type at n holding value.
+func haLiveCount(live []idRecord, zone, n, typ, value string) int {
+	c := 0
+	for _, l := range live {
+		if v, ok := haIP(l.rr.Data); ok && l.rr.Type == typ && haAbs(l.rr.Name, zone) == n && v == value {
+			c++
+		}
+	}
+	return c
+}
+
+func haAbs(name, zone string) string {
+	return strings.ToLower(strings.TrimSuffix(libdns.AbsoluteName(name, dns.Fqdn(zone)), "."))
+}
+
+func haIP(v string) (string, bool) {
+	ip, err := netip.ParseAddr(strings.TrimSpace(v))
+	if err != nil {
+		return "", false
+	}
+	return ip.String(), true
 }
 
 func maps0(m map[string]time.Time) map[string]time.Time {

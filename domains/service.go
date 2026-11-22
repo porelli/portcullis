@@ -407,6 +407,23 @@ func (s *Service) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	old := *d
+	old.Records, old.HAAddrs, old.HAChanged = copyDomain(d).Records, maps.Clone(d.HAAddrs), maps.Clone(d.HAChanged)
+	if s.cfg.HA {
+		// New credentials (or a new provider) may reach other records: the
+		// follower's address refs are no longer proof of ownership (its
+		// records there now count as foreign, kept and named), and every
+		// name is followed again from the start (security review).
+		for z, refs := range d.Records {
+			var keep []RecordRef
+			for _, r := range refs {
+				if r.Type != "A" && r.Type != "AAAA" {
+					keep = append(keep, r)
+				}
+			}
+			d.Records[z] = keep
+		}
+		d.HAAddrs, d.HAChanged = nil, nil
+	}
 	d.Provider, d.Credentials = b.Provider, b.Credentials
 	d.Generation = s.newGenerationLocked()
 	d.State, d.LastError, d.Failures, d.NextAttempt = StatePending, "", 0, time.Time{}
@@ -876,6 +893,9 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 					d.Records = map[string][]RecordRef{}
 				}
 				d.Records[zone] = mergeRecords(dropRecords(d.Records[zone], removed), written)
+				for z, refs := range har.pruneOther {
+					d.Records[z] = dropRecords(d.Records[z], refs)
+				}
 				for _, z := range otherZones {
 					var keep []RecordRef
 					for _, r := range d.Records[z] {

@@ -102,6 +102,10 @@ type RecordRef struct {
 	Name  string `json:"name"`
 	Type  string `json:"type"`
 	Value string `json:"value"`
+	// ID: the provider's record ID where it has one (the HA follower's
+	// address records on porkbun / hetzner): such a ref is ours only while
+	// a live record carries that ID.
+	ID string `json:"id,omitempty"`
 }
 
 // Account is the ACME account (one for all domains).

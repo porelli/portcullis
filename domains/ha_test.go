@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/netip"
@@ -71,6 +72,16 @@ func newHAEnv(t *testing.T) (*testEnv, *haFiles) {
 		c.HA, c.FrontdoorStatusFile, c.ClusterAddressesFile, c.AddrPolicy = true, f.status(), f.cluster, haDocs
 		c.IPv4 = netip.Addr{} // the server's own address isn't used in HA
 	})
+	// The fake provider with record IDs (as porkbun / hetzner): the
+	// follower's ownership checks run on the by-ID path.
+	orig := providers["fake"]
+	providers["fake"] = providerSpec{required: orig.required, build: func(c map[string]string) (dnsProvider, error) {
+		p, err := orig.build(c)
+		if err != nil {
+			return nil, err
+		}
+		return idFake{p.(*fakedns.Provider)}, nil
+	}}
 	return e, f
 }
 
@@ -480,4 +491,118 @@ func TestHAOursFromRecordRefs(t *testing.T) {
 	e.publish(f, []string{a2}, []string{a2})
 	e.waitAddrs(dn, a2)
 	e.waitAddrs("*."+dn, a2)
+}
+
+// rr is an A / AAAA record at the apex or the wildcard of a domain's own
+// fake zone with a TTL (another TTL is another record ID in the fake).
+func addrRR(name, ip string, ttl time.Duration) libdns.RR {
+	typ := "A"
+	if strings.Contains(ip, ":") {
+		typ = "AAAA"
+	}
+	rel := "@"
+	if strings.HasPrefix(name, "*.") {
+		rel = "*"
+	}
+	return libdns.RR{Name: rel, Type: typ, Data: ip, TTL: ttl}
+}
+
+// TestHAOwnershipIsLiveAndZoneScoped (security review): a ref is ours only
+// in the zone in use, while its address is live and its record ID too; a
+// pruned ref's record is never deleted — a ref left from another zone, an
+// address someone else re-created under another ID, and records written
+// under credentials since replaced all stay when they leave the front
+// door's set.
+func TestHAOwnershipIsLiveAndZoneScoped(t *testing.T) {
+	const a1, a2, a3 = "198.51.100.1", "198.51.100.2", "198.51.100.3"
+	t.Run("a ref from another zone", func(t *testing.T) {
+		e, f := newHAEnv(t)
+		e.publish(f, []string{a1}, []string{a1})
+		const d = "team-z.example.org"
+		e.do("PUT", "/domains/"+d, creds(goodToken), true)
+		e.waitState(d, StateReady, 60*time.Second)
+		e.waitAddrs(d, a1)
+		// A ref of an earlier zone naming a2, and a2 put at <d> by someone else.
+		e.svc.mu.Lock()
+		e.svc.doc.Domains[d].Records["example.org."] = []RecordRef{{Name: "team-z", Type: "A", Value: a2, ID: "x"}}
+		e.svc.mu.Unlock()
+		e.zone.Set(d, append(e.zone.Records(d), addrRR(d, a2, time.Hour))...)
+		e.clock.advance(61 * time.Second)
+		e.publish(f, []string{a1, a3}, []string{a1}) // a step: a3 added
+		e.waitAddrs(d, a1, a2, a3)
+		e.clock.advance(61 * time.Second)
+		e.publish(f, []string{a3}, []string{a1}) // a1 (ours) goes, a2 (foreign) stays
+		e.waitAddrs(d, a2, a3)
+		e.clock.advance(61 * time.Second)
+		e.settle(d)
+		if got := addrs(e.zone, d); !slices.Equal(got, []string{a2, a3}) {
+			t.Fatalf("%s = %v: the foreign a2 must stay", d, got)
+		}
+		if refs := e.domain(d).Records["example.org."]; len(refs) != 0 {
+			t.Errorf("the other zone's ref wasn't pruned: %v", refs)
+		}
+	})
+	t.Run("an address re-created by someone else", func(t *testing.T) {
+		e, f := newHAEnv(t)
+		e.publish(f, []string{a1, a2}, []string{a1, a2})
+		const d = "team-y.example.org"
+		e.do("PUT", "/domains/"+d, creds(goodToken), true)
+		e.waitState(d, StateReady, 60*time.Second)
+		e.waitAddrs(d, a1, a2)
+		// Our a1 deleted and put back by hand (another TTL: another ID).
+		var keep []libdns.RR
+		for _, rr := range e.zone.Records(d) {
+			if rr.Data != a1 {
+				keep = append(keep, rr)
+			}
+		}
+		e.zone.Set(d, append(keep, addrRR(d, a1, time.Hour))...)
+		e.clock.advance(61 * time.Second)
+		e.publish(f, []string{a2}, []string{a2})
+		e.waitAddrs("*."+d, a2) // the step ran (the wildcard's a1 was ours)
+		e.settle(d)
+		if got := addrs(e.zone, d); !slices.Equal(got, []string{a1, a2}) {
+			t.Fatalf("%s = %v: the re-created a1 isn't ours and must stay", d, got)
+		}
+		for _, r := range e.domain(d).Records[d+"."] {
+			if r.Type == "A" && r.Value == a1 && r.Name == "@" {
+				t.Errorf("the stale ref wasn't pruned: %+v", r)
+			}
+		}
+		if p := e.planNotices(d); !strings.Contains(p, "foreign A "+a1+" at "+d+" kept") {
+			t.Errorf("the re-created a1 isn't named: %s", p)
+		}
+	})
+	t.Run("a provider or credentials change", func(t *testing.T) {
+		e, f := newHAEnv(t)
+		e.publish(f, []string{a1, a2}, []string{a1, a2})
+		const d = "team-x.example.org"
+		e.do("PUT", "/domains/"+d, creds(goodToken), true)
+		e.waitState(d, StateReady, 60*time.Second)
+		e.waitAddrs(d, a1, a2)
+		if code, body := e.do("POST", "/domains/"+d+"/token", creds("good-"+strings.Repeat("Z", 24)), true); code != 202 {
+			t.Fatalf("token = %d %s", code, body)
+		}
+		e.waitState(d, StateReady, 60*time.Second)
+		for _, r := range e.domain(d).Records[d+"."] {
+			if r.Type == "A" || r.Type == "AAAA" {
+				t.Errorf("an address ref survived the credentials change: %+v", r)
+			}
+		}
+		e.clock.advance(61 * time.Second)
+		e.publish(f, []string{a2}, []string{a2})
+		e.settle(d)
+		if got := addrs(e.zone, d); !slices.Equal(got, []string{a1, a2}) {
+			t.Fatalf("%s = %v: a record written under the old credentials must stay", d, got)
+		}
+	})
+}
+
+// idFake is the fake provider with its record-ID listing (the follower's
+// by-ID ownership path), everything else the fake's own (zone lookup,
+// challenge records).
+type idFake struct{ *fakedns.Provider }
+
+func (f idFake) recordIDs(ctx context.Context, zone string) ([]idRecord, error) {
+	return fakeIDs{f.Provider}.listIDs(ctx, zone)
 }
