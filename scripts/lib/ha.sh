@@ -2406,7 +2406,9 @@ kube_frontdoor_restore_step() {
 #    3 installs   external-snapshotter, Longhorn, fencing (Self Node
 #                 Remediation, every node's agent ready or it stops), then
 #                 cert-manager and the barman-cloud plugin (Task 26 M5:
-#                 before Postgres scales out, so its replicas archive);
+#                 before Postgres scales out, so its replicas archive), and
+#                 a release with HA off so the one-instance Cluster adopts
+#                 the plugin (WAL archiving healthy before the switch);
 #    4 volumes    the writers (Hub, domains, wg) scaled to 0 and gone, then
 #                 hub-state, hub-secrets, hub-backups, domains-data and
 #                 wg-data each copied into <name>-r on the replicated tier
@@ -2573,6 +2575,13 @@ EOC
 
 # ha_enable_step_installs — step 3 (each install fails closed: nothing of
 # it installed past its own refusal; a re-run installs again, idempotent).
+# It ends with the barman-cloud plugin adopted by the one-instance Cluster
+# (fix round 1, I1; found live): a release with HA still off renders the
+# Cluster's plugins stanza now, and the step waits for WAL archiving through
+# it. Otherwise the switch's release added the plugin and the scale-out
+# together: CloudNativePG restarted the primary in place without the
+# plugin's sidecar, its smart shutdown waited on the failing archive
+# command, Postgres was down ~4 min and helm's --wait timed out.
 ha_enable_step_installs() {
   ha_install_snapshotter
   ha_install_longhorn
@@ -2580,6 +2589,22 @@ ha_enable_step_installs() {
   ha_fencing_ready >&2 || fail "fencing isn't ready on every node (above): HA stops here; run ./portcullis ha enable again once it is"
   ha_install_certmanager
   ha_install_barman
+  info "Postgres adopts the backup plugin at one instance (./portcullis up, HA still off)..."
+  stack_up
+  _ha_until "${HA_ARCHIVE_WAIT:-600}" "Postgres didn't archive its WAL through the backup plugin (ContinuousArchiving)" _ha_pg_archiving
+  ok "Postgres archives through the backup plugin."
+}
+
+# _ha_pg_archiving — the release enabled CloudNativePG's backup
+# (backup.cnpg.enabled), the Cluster names the barman-cloud plugin as its
+# WAL archiver, every instance is ready and ContinuousArchiving is True.
+_ha_pg_archiving() {
+  local c
+  [ "$(jq -r '.backup.cnpg.enabled // false' "$(kube_values_file)" 2>/dev/null)" = true ] || return 1
+  c="$(kube_ctl -n "$KUBE_CNPG_NS" get cluster.postgresql.cnpg.io "$KUBE_PG_CLUSTER" -o json 2>/dev/null)" || return 1
+  jq -e 'any(.spec.plugins[]?; .name == "barman-cloud.cloudnative-pg.io" and .isWALArchiver == true)
+    and (.status.readyInstances // 0) == .spec.instances
+    and any(.status.conditions[]?; .type == "ContinuousArchiving" and .status == "True")' <<<"$c" >/dev/null
 }
 
 # _ha_scale_writers — the writers to 0 and their pods gone (each one that
@@ -2665,10 +2690,23 @@ _ha_copy_pod() {
          volumeMounts: [{name: "tmp", mountPath: "/tmp"}, {name: "vol", mountPath: "/vol", readOnly: (env.RO == "ro")}]}],
        volumes: [{name: "tmp", emptyDir: {medium: "Memory"}}, {name: "vol", persistentVolumeClaim: {claimName: env.P, readOnly: (env.RO == "ro")}}]})}' \
     | kube_ctl create -f - >/dev/null || return 1
+  # Recorded for Stop (fix round 1, M1): an interrupted step removes them.
+  [ -z "${_HA_HELPERS:-}" ] || printf '%s\n' "$name" >> "$_HA_HELPERS"
   if ! kube_ctl -n "$(kube_ns)" wait --for=condition=Ready "pod/$name" --timeout="${KUBE_POD_WAIT:-300}s" >/dev/null; then
     _kube_pod_diag "$name"; _kube_helper_done "$name"; return 1
   fi
   echo "$name"
+}
+
+# _ha_helpers_done — every copy helper this run made, removed (Stop, a
+# failure: a deleted one is no harm).
+_ha_helpers_done() {
+  local n
+  [ -n "${_HA_HELPERS:-}" ] && [ -f "$_HA_HELPERS" ] || return 0
+  while IFS= read -r n; do
+    [[ "$n" =~ ^ha-copy-[0-9a-f]{8}$ ]] && _kube_helper_done "$n"
+  done < "$_HA_HELPERS"
+  rm -f "$_HA_HELPERS"
 }
 
 # The manifest of a volume (in its helper pod): every entry but the root
@@ -2784,43 +2822,129 @@ ha_frontdoor_env_sync() {
     | _ha_apply || fail "could not write the Secret frontdoor-env (the front door's DNS credentials)"
 }
 
-# _ha_frontdoor_cert_seed — before Traefik moves: the main domain's
-# certificate Traefik serves now (acme.json's certificate for <d> with
-# exactly *.<d>, valid for another day) as frontdoor-cert's served pair
-# (tls.crt, tls.key, account-uri = Traefik's account), with Helm's
+# The served certificate's validity floor at the switch (fix round 1, I2):
+# it must outlast the worst case of the account switch (step 9), which
+# waits for the old CAA pin to leave every cache — dns_relax_main's
+# settle point, at least the 24 h it assumes when the old pin's lifetime
+# is unknown, and a saved point further out — plus a 7-day margin for the
+# reruns it may need. _ha_cert_floor prints it in seconds.
+HA_CERT_MARGIN=$((7 * 86400))
+_ha_cert_floor() {
+  local now nb wait=$((86400 + 60))
+  now="$(date +%s)"
+  nb="$(_dns_relax_point 2>/dev/null || true)"
+  if [[ "$nb" =~ ^[0-9]+$ ]] && [ $((nb - now)) -gt "$wait" ]; then wait=$((nb - now)); fi
+  echo $((wait + HA_CERT_MARGIN))
+}
+
+# _ha_cert_ok <pem> <floor seconds> — the leaf names exactly <d> and *.<d>
+# (as the domains service's servableHA wants) and is valid for <floor>
+# more seconds; else _HA_CERT_WHY says why.
+_ha_cert_ok() {
+  local pem="$1" floor="$2" d="$PORTCULLIS_DOMAIN" names end
+  _HA_CERT_WHY=""
+  names="$(printf '%s\n' "$pem" | openssl x509 -noout -text 2>/dev/null | sed -n '/Subject Alternative Name/{n;p;}' | tr ',' '\n' | sed -n 's/^ *DNS://p' | LC_ALL=C sort | paste -sd' ' -)"
+  [ -n "$names" ] || { _HA_CERT_WHY="it doesn't parse or names no DNS name"; return 1; }
+  [ "$names" = "*.$d $d" ] || { _HA_CERT_WHY="it names $names, not exactly $d and *.$d"; return 1; }
+  end="$(printf '%s\n' "$pem" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+  if ! printf '%s\n' "$pem" | openssl x509 -noout -checkend "$floor" >/dev/null 2>&1; then
+    _HA_CERT_WHY="it expires $end, under the $((floor / 86400)) days the account switch may need (the CAA settle's worst case + $((HA_CERT_MARGIN / 86400)) days)"
+    return 1
+  fi
+}
+
+# _ha_dynamic_pairs — traefik/dynamic's certificates ("<cert> <key>" host
+# paths of certs/, one per line: their certFile / keyFile under /certs).
+_ha_dynamic_pairs() {
+  cat "$PORTCULLIS_HOME"/traefik/dynamic/*.yml 2>/dev/null | awk '
+    /certFile:/ { c = $NF } /keyFile:/ { k = $NF }
+    c != "" && k != "" { print c " " k; c = ""; k = "" }' \
+  | sed -n 's#^/certs/\([^ /]*\) /certs/\([^ /]*\)$#\1 \2#p' | while read -r c k; do
+      printf '%s %s\n' "$PORTCULLIS_ROOT/certs/$c" "$PORTCULLIS_ROOT/certs/$k"
+    done
+}
+
+# _HA_ACME_SEL — acme.json's certificate of <d> with exactly *.<d> (jq).
+# shellcheck disable=SC2016  # jq's own variables
+_HA_ACME_SEL='(.letsencrypt.Certificates // []) | map(select(.domain.main == env.D and ((.domain.sans // []) | sort) == ["*." + env.D])) | .[0] // empty'
+
+# _ha_main_cert_plan — step 5's first check, before anything changes (fix
+# round 1, I2: fail closed): the certificate the HA ingress serves from the
+# switch until the front door orders its own, valid for _ha_cert_floor.
+# _HA_CERT_SRC = kept (frontdoor-cert already holds such a pair), acme
+# (Traefik's acme.json, seeded) or "dynamic <cert> <key>" (a pair of
+# traefik/dynamic, seeded); anything else refuses, naming what each
+# source holds and how to fix it.
+_ha_main_cert_plan() {
+  local ns d="$PORTCULLIS_DOMAIN" floor have pem pod c k why=""
+  ns="$(kube_ns)"; floor="$(_ha_cert_floor)"
+  _HA_CERT_SRC=""
+  have="$(kube_ctl -n "$ns" get secret frontdoor-cert -o json 2>/dev/null | jq -r '.data["tls.crt"] // empty' 2>/dev/null)" || have=""
+  if [ -n "$have" ]; then
+    pem="$(printf '%s' "$have" | base64 -d 2>/dev/null)" || pem=""
+    if _ha_cert_ok "$pem" "$floor"; then _HA_CERT_SRC=kept; return 0; fi
+    why="$why
+  - frontdoor-cert holds a pair, but $_HA_CERT_WHY"
+  fi
+  if _kube_volume_exists traefik_acme; then
+    pod="$(_kube_helper_pod traefik-acme 65532:65532 ro "$PORTCULLIS_HELPER_IMAGE")" || fail "no helper pod on traefik-acme (Traefik's certificate can't be read): nothing changed"
+    pem="$(kube_ctl -n "$ns" exec "$pod" -- cat /vol/acme.json 2>/dev/null | D="$d" jq -r "$_HA_ACME_SEL | .certificate" 2>/dev/null | base64 -d 2>/dev/null)" || pem=""
+    _kube_helper_done "$pod"
+    if [ -n "$pem" ] && _ha_cert_ok "$pem" "$floor"; then _HA_CERT_SRC=acme; return 0; fi
+    if [ -n "$pem" ]; then why="$why
+  - Traefik's ACME certificate: $_HA_CERT_WHY"; else why="$why
+  - Traefik's acme.json holds no certificate of $d and *.$d"; fi
+  else
+    why="$why
+  - there is no traefik-acme volume (Traefik's ACME storage)"
+  fi
+  while read -r c k; do
+    [ -n "$c" ] || continue
+    if [ ! -r "$c" ] || [ ! -r "$k" ]; then why="$why
+  - traefik/dynamic names ${c#"$PORTCULLIS_ROOT"/} / ${k#"$PORTCULLIS_ROOT"/}, not both readable here"; continue; fi
+    if _ha_cert_ok "$(cat "$c")" "$floor"; then _HA_CERT_SRC="dynamic $c $k"; return 0; fi
+    why="$why
+  - traefik/dynamic's ${c#"$PORTCULLIS_ROOT"/}: $_HA_CERT_WHY"
+  done < <(_ha_dynamic_pairs)
+  [ -n "$(_ha_dynamic_pairs)" ] || why="$why
+  - traefik/dynamic names no certificate"
+  printf 'No certificate of %s can be served from the switch until the front door orders its own:%s\n' "$d" "$why" >&2
+  fail "nothing changed. Fix one: let Traefik order or renew its certificate (./portcullis up with the DNS provider working; check ./portcullis status), or put a pair for $d and *.$d valid $((floor / 86400)) more days under certs/ and name it in traefik/dynamic; then run ./portcullis ha enable again"
+}
+
+# _ha_frontdoor_cert_seed — before Traefik moves: _ha_main_cert_plan's
+# pair as frontdoor-cert's served pair (tls.crt, tls.key, account-uri:
+# Traefik's account, empty for a traefik/dynamic pair), with Helm's
 # ownership metadata (the chart creates the Secret empty: the release
 # adopts it, its data kept). The front door keeps a served pair until its
 # own account's slot holds a servable one (domains/frontdoor/cert.go
 # Promote), so no other certificate is served before the account switch.
-# Nothing when frontdoor-cert already holds a pair, or Traefik has no such
-# certificate (warned: the main domain then has the certificates of
-# traefik/dynamic only until step 9). The key travels pod → jq → kubectl
-# on pipes only.
+# The key travels on pipes only (acme.json: pod → jq → kubectl; a
+# traefik/dynamic key: jq reads the file).
 _ha_frontdoor_cert_seed() {
-  local ns pod pem d="$PORTCULLIS_DOMAIN" have
+  local ns pod d="$PORTCULLIS_DOMAIN" c k
   ns="$(kube_ns)"
-  have="$(kube_ctl -n "$ns" get secret frontdoor-cert -o json 2>/dev/null | jq -r '.data["tls.crt"] // empty' 2>/dev/null)" || have=""
-  [ -z "$have" ] || { info "frontdoor-cert already holds a certificate: kept."; return 0; }
-  _kube_volume_exists traefik_acme || { warn "no traefik-acme volume: no certificate of $d to carry over (until the account switch, step 9, only traefik/dynamic's certificates are served)"; return 0; }
   # shellcheck disable=SC2016  # jq's own variables
-  local sel='(.letsencrypt.Certificates // []) | map(select(.domain.main == env.D and ((.domain.sans // []) | sort) == ["*." + env.D])) | .[0] // empty'
-  pod="$(_kube_helper_pod traefik-acme 65532:65532 ro "$PORTCULLIS_HELPER_IMAGE")" || fail "no helper pod on traefik-acme: nothing switched"
-  pem="$(kube_ctl -n "$ns" exec "$pod" -- cat /vol/acme.json 2>/dev/null | D="$d" jq -r "$sel | .certificate" 2>/dev/null | base64 -d 2>/dev/null)" || pem=""
-  if [ -z "$pem" ] || ! printf '%s\n' "$pem" | openssl x509 -noout -checkend 86400 >/dev/null 2>&1; then
-    _kube_helper_done "$pod"
-    warn "Traefik holds no current certificate of $d and *.$d: nothing to carry over (until the account switch, step 9, only traefik/dynamic's certificates are served)"
-    return 0
-  fi
-  kube_ctl -n "$ns" exec "$pod" -- cat /vol/acme.json \
-    | D="$d" NS="$ns" R="$KUBE_RELEASE" jq -c "($sel) as \$c | (.letsencrypt.Account.Registration.uri // \"\") as \$u
-        | if \$c == null then error(\"no certificate\") else . end
-        | {apiVersion: \"v1\", kind: \"Secret\", type: \"Opaque\",
-           metadata: {name: \"frontdoor-cert\", namespace: env.NS, labels: {\"app.kubernetes.io/managed-by\": \"Helm\"},
-             annotations: {\"helm.sh/resource-policy\": \"keep\", \"meta.helm.sh/release-name\": env.R, \"meta.helm.sh/release-namespace\": env.NS}},
-           data: {\"tls.crt\": \$c.certificate, \"tls.key\": \$c.key, \"account-uri\": (\$u | @base64)}}" \
-    | _ha_apply || { _kube_helper_done "$pod"; fail "could not carry Traefik's certificate of $d into frontdoor-cert: nothing switched"; }
-  _kube_helper_done "$pod"
-  ok "Traefik's certificate of $d (until $(printf '%s\n' "$pem" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)) is the front door's served one until the account switch."
+  local secret='{apiVersion: "v1", kind: "Secret", type: "Opaque",
+           metadata: {name: "frontdoor-cert", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "Helm"},
+             annotations: {"helm.sh/resource-policy": "keep", "meta.helm.sh/release-name": env.R, "meta.helm.sh/release-namespace": env.NS}},
+           data: {"tls.crt": $crt, "tls.key": $key, "account-uri": ($uri | @base64)}}'
+  case "$_HA_CERT_SRC" in
+    kept) info "frontdoor-cert already holds a current certificate of $d: kept."; return 0 ;;
+    acme)
+      pod="$(_kube_helper_pod traefik-acme 65532:65532 ro "$PORTCULLIS_HELPER_IMAGE")" || fail "no helper pod on traefik-acme: nothing switched"
+      kube_ctl -n "$ns" exec "$pod" -- cat /vol/acme.json \
+        | D="$d" NS="$ns" R="$KUBE_RELEASE" jq -c "($_HA_ACME_SEL) as \$c | (.letsencrypt.Account.Registration.uri // \"\") as \$uri
+            | if \$c == null then error(\"no certificate\") else . end | \$c.certificate as \$crt | \$c.key as \$key | $secret" \
+        | _ha_apply || { _kube_helper_done "$pod"; fail "could not carry Traefik's certificate of $d into frontdoor-cert: nothing switched"; }
+      _kube_helper_done "$pod" ;;
+    dynamic\ *)
+      read -r _ c k <<< "$_HA_CERT_SRC"
+      NS="$ns" R="$KUBE_RELEASE" jq -nc --rawfile c "$c" --rawfile k "$k" "(\$c | @base64) as \$crt | (\$k | @base64) as \$key | \"\" as \$uri | $secret" \
+        | _ha_apply || fail "could not carry traefik/dynamic's certificate of $d into frontdoor-cert: nothing switched" ;;
+    *) fail "internal: no certificate plan (_ha_main_cert_plan first)" ;;
+  esac
+  ok "The certificate of $d Traefik serves now ($_HA_CERT_SRC) is the front door's served one until the account switch."
 }
 
 # _ha_writers_on_replicated — a writer's Deployment already mounts a
@@ -2861,6 +2985,7 @@ _ha_services_move() {
 
 # ha_enable_step_switch — step 5.
 ha_enable_step_switch() {
+  _ha_main_cert_plan
   if _ha_writers_on_replicated; then
     info "The core writers already run on the replicated volumes (an earlier switch): no copy again."
   elif ! _ha_writers_stopped || ! _ha_volumes_same; then
@@ -2993,6 +3118,7 @@ ha_enable_step_status() {
 # resumes at the first one not in it.
 _ha_stopped() {
   echo >&2
+  _ha_helpers_done
   warn "ha enable stopped: steps done are recorded in $(_ha_enable_file); run ./portcullis ha enable again to resume at step $(_ha_step_n "$(_ha_enable_next)") ($(_ha_enable_next))"
   exit 130
 }
@@ -3010,6 +3136,7 @@ ha_enable() {
   if ! _ha_enable_done confirm && [ "$yes" != true ] && [ ! -t 0 ]; then
     usage_error "ha enable" "no terminal to confirm on: pass --yes to enable without asking"
   fi
+  _HA_HELPERS="$(mktemp)"
   trap _ha_stopped INT TERM
   for s in $HA_ENABLE_STEPS; do
     _ha_enable_done "$s" && continue
@@ -3022,6 +3149,7 @@ ha_enable() {
     _ha_enable_record "$s"
   done
   trap - INT TERM
+  _ha_helpers_done
   ok "High availability is on (experimental). ./portcullis ha status shows it; the Hub's Settings → High availability too."
 }
 

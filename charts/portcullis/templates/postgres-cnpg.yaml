@@ -55,6 +55,11 @@ spec:
   priorityClassName: portcullis-core
   enableSuperuserAccess: false
   enablePDB: {{ gt $n 1 }}
+  {{- /* A restart's smart shutdown gives up after 15 s, then a fast one
+  (crash-safe; WAL not yet archived stays .ready and is archived after the
+  restart): the default 180 s held Postgres down while an archive command
+  failed (Task 31, found live). stopDelay keeps its 1800 s default. */}}
+  smartShutdownTimeout: 15
   inheritedMetadata:
     labels:
       app.kubernetes.io/managed-by: portcullis

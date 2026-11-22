@@ -8195,7 +8195,8 @@ case "$a" in
   "exec "*" -- find /vol "*) echo "empty $(cat "$HE/k/pod-$2")" >> "$HE/order" ;;
   "exec "*" -- sh -c cd /vol && find . -mindepth 1 -maxdepth 1"*) echo 2 ;;
   "exec "*" -- tar -cf - -C /vol -T /tmp/list") echo "tar from $(cat "$HE/k/pod-$2")" >> "$HE/order"; echo TARDATA ;;
-  "exec -i "*" -- tar -xpf - -C /vol") cat >/dev/null; echo "untar into $(cat "$HE/k/pod-$3")" >> "$HE/order"; [ ! -e "$HE/fault-tar" ] ;;
+  "exec -i "*" -- tar -xpf - -C /vol") cat >/dev/null; echo "untar into $(cat "$HE/k/pod-$3")" >> "$HE/order"
+    [ ! -e "$HE/int-on-untar" ] || { rm -f "$HE/int-on-untar"; kill -INT "$HA_CLI_PID"; sleep 1; }; [ ! -e "$HE/fault-tar" ] ;;
   "exec "*" -- sh -c cd /vol || exit 3"*)
     c="$(cat "$HE/k/pod-$2")"
     if [ -e "$HE/fault-manifest" ] && [ "${c%-r}" != "$c" ]; then printf '%064d\n' 2; else printf '%064d\n' 1; fi ;;
@@ -8203,6 +8204,7 @@ case "$a" in
   "get service "*" -o jsonpath={.spec.type}") [ -e "$HE/k/svc-$3" ] && cat "$HE/k/svc-$3" || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
   "delete service "*) rm -f "$HE/k/svc-$3"; echo "delete service $3" >> "$HE/order" ;;
   "get deployment "*" -o json") [ -e "$HE/k/deploy-$3" ] || exit 1; c=hub-state; [ ! -e "$HE/k/onrep-$3" ] || c=hub-state-r; echo '{"spec":{"template":{"spec":{"volumes":[{"persistentVolumeClaim":{"claimName":"'"$c"'"}}]}}}}' ;;
+  "-n cnpg-system get cluster.postgresql.cnpg.io portcullis-pg -o json") cat "$HE/k/cluster.json" 2>/dev/null || exit 1 ;;
   "get secret frontdoor-cert -o json") cat "$HE/k/frontdoor-cert.json" 2>/dev/null || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
   "exec "*" -- cat /vol/acme.json") cat "$HE/acme.json" ;;
   *) echo "unexpected kubectl $*" >&2; exit 98 ;;
@@ -8360,28 +8362,54 @@ expect_eq "ha_frontdoor_env_sync: credentials.json = the provider and its dns-to
 expect_eq "ha_frontdoor_env_sync: the token never on kubectl's argv" "$(grep -c 'CF-SECRET' "$HE/calls")" 0
 expect_eq "up syncs frontdoor-env in HA" "$(grep -c 'kube_sync_secrets; ! kube_ha_on || ha_frontdoor_env_sync' "$HERE/../scripts/lib/kube.sh")" 1
 
-# Before Traefik moves (Task 29 carry): Traefik's certificate of <d> and
-# *.<d> becomes frontdoor-cert's served pair, with Helm's ownership (the
-# release adopts the Secret, its data kept); the key on pipes only.
+# Before Traefik moves (Task 29 carry; fix round 1, I2): the certificate
+# the HA ingress serves from the switch, valid for the account switch's
+# worst case + 7 days, chosen before anything changes: frontdoor-cert's
+# pair kept, else Traefik's ACME pair, else a traefik/dynamic pair, seeded
+# with Helm's ownership (the release adopts the Secret); the key on pipes
+# only. None → refused, naming each source, nothing written.
 he_vols; touch "$HE/k/pvc-traefik-acme"; rm -f "$HE"/k/applied.*
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=ha.example.org" \
-  -addext "subjectAltName=DNS:ha.example.org,DNS:*.ha.example.org" -keyout "$HE/le.key" -out "$HE/le.crt" >/dev/null 2>&1
+he_cert() { openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days "$1" -subj "/CN=ha.example.org" \
+  -addext "subjectAltName=DNS:ha.example.org,DNS:*.ha.example.org" -keyout "$2.key" -out "$2.crt" >/dev/null 2>&1; }
+he_cert 30 "$HE/le"; he_cert 3 "$HE/near"
 he_b64() { base64 < "$1" | tr -d '\n'; }
-jq -n --arg c "$(he_b64 "$HE/le.crt")" --arg k "$(he_b64 "$HE/le.key")" '{letsencrypt: {Account: {Registration: {uri: "https://acme.example/acct/7"}, PrivateKey: "ACCOUNT-KEY"},
-  Certificates: [{domain: {main: "other.example.org"}, certificate: "X", key: "Y"}, {domain: {main: "ha.example.org", sans: ["*.ha.example.org"]}, certificate: $c, key: $k, Store: "default"}]}}' > "$HE/acme.json"
-hacli "" "need_env; _ha_frontdoor_cert_seed; exit 0" status
-expect_eq "frontdoor-cert seed: Traefik's pair, its account, Helm's ownership" \
-  "$RC|$(cat "$HE"/k/applied.* | jq -c --arg c "$(he_b64 "$HE/le.crt")" --arg k "$(he_b64 "$HE/le.key")" '[.metadata.name, .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["meta.helm.sh/release-name"], .metadata.annotations["helm.sh/resource-policy"], (.data["tls.crt"] == $c), (.data["tls.key"] == $k), (.data["account-uri"] | @base64d)]')" \
-  '0|["frontdoor-cert","Helm","portcullis","keep",true,true,"https://acme.example/acct/7"]'
-expect_eq "frontdoor-cert seed: no key on argv, the helper removed" "$(grep -c 'PRIVATE\|ACCOUNT-KEY' "$HE/calls"):$(grep -c '^delete pod traefik-acme' "$HE/order")" "0:1"
+he_acme() { jq -n --arg c "$(he_b64 "$1.crt")" --arg k "$(he_b64 "$1.key")" '{letsencrypt: {Account: {Registration: {uri: "https://acme.example/acct/7"}, PrivateKey: "ACCOUNT-KEY"},
+  Certificates: [{domain: {main: "other.example.org"}, certificate: "X", key: "Y"}, {domain: {main: "ha.example.org", sans: ["*.ha.example.org"]}, certificate: $c, key: $k, Store: "default"}]}}' > "$HE/acme.json"; }
+he_acme "$HE/le"
+mkdir -p "$HE/home/traefik/dynamic"
+HE_SEED="export PORTCULLIS_HOME='$HE/home'; need_env; _ha_main_cert_plan && echo SRC=\$_HA_CERT_SRC && _ha_frontdoor_cert_seed; exit 0"
+hacli "" "$HE_SEED" status
+expect_eq "switch's certificate: Traefik's pair seeded, its account, Helm's ownership" \
+  "$RC|$(printf '%s' "$OUT" | grep -c '^SRC=acme$')|$(cat "$HE"/k/applied.* | jq -c --arg c "$(he_b64 "$HE/le.crt")" --arg k "$(he_b64 "$HE/le.key")" '[.metadata.name, .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["meta.helm.sh/release-name"], .metadata.annotations["helm.sh/resource-policy"], (.data["tls.crt"] == $c), (.data["tls.key"] == $k), (.data["account-uri"] | @base64d)]')" \
+  '0|1|["frontdoor-cert","Helm","portcullis","keep",true,true,"https://acme.example/acct/7"]'
+expect_eq "switch's certificate: no key on argv, the helpers removed" "$(grep -c 'PRIVATE\|ACCOUNT-KEY' "$HE/calls"):$(grep -c '^delete pod traefik-acme' "$HE/order")" "0:2"
+# A current pair already in frontdoor-cert (a resumed switch): kept.
 rm -f "$HE"/k/applied.*
-echo '{"data":{"tls.crt":"T0xE"}}' > "$HE/k/frontdoor-cert.json"
-hacli "" "need_env; _ha_frontdoor_cert_seed; exit 0" status
-expect_eq "frontdoor-cert seed: a pair already there is kept" "$RC:$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" "0:0"
-rm -f "$HE/k/frontdoor-cert.json"
-jq '.letsencrypt.Certificates |= map(select(.domain.main != "ha.example.org"))' "$HE/acme.json" > "$HE/acme.json.t" && mv "$HE/acme.json.t" "$HE/acme.json"
-hacli "" "need_env; _ha_frontdoor_cert_seed; exit 0" status
-case "$RC:$ERR:$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" in "0:"*"Traefik holds no current certificate of ha.example.org"*":0") t_pass "frontdoor-cert seed: none in acme.json → warned, nothing written" ;; *) t_fail "seed none: $RC $ERR" ;; esac
+jq -n --arg c "$(he_b64 "$HE/le.crt")" '{data: {"tls.crt": $c}}' > "$HE/k/frontdoor-cert.json"
+hacli "" "$HE_SEED" status
+expect_eq "switch's certificate: a current pair in frontdoor-cert is kept" "$RC:$(printf '%s' "$OUT" | grep -c '^SRC=kept$'):$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' ')" "0:1:0"
+# Near expiry (3 days, under the switch's worst case + margin): refused.
+jq -n --arg c "$(he_b64 "$HE/near.crt")" '{data: {"tls.crt": $c}}' > "$HE/k/frontdoor-cert.json"; he_acme "$HE/near"
+hacli "" "$HE_SEED" status
+case "$RC:$ERR" in "1:"*"frontdoor-cert holds a pair, but it expires"*"under the 8 days the account switch may need"*"Traefik's ACME certificate: it expires"*"nothing changed. Fix one: let Traefik order or renew"*) t_pass "switch's certificate: near expiry → refused, naming each source and the fix" ;; *) t_fail "seed near: $RC $ERR" ;; esac
+expect_eq "switch's certificate: a refusal writes nothing" "$(ls "$HE"/k/applied.* 2>/dev/null | wc -l | tr -d ' '):$(grep -c ' apply \| create .*secret\| patch ' "$HE/calls")" "0:0"
+# No traefik-acme volume, no traefik/dynamic certificate: refused.
+rm -f "$HE/k/frontdoor-cert.json" "$HE/k/pvc-traefik-acme"
+hacli "" "$HE_SEED" status
+case "$RC:$ERR" in "1:"*"there is no traefik-acme volume"*"traefik/dynamic names no certificate"*"nothing changed"*) t_pass "switch's certificate: no ACME volume and no traefik/dynamic pair → refused" ;; *) t_fail "seed novol: $RC $ERR" ;; esac
+# A traefik/dynamic pair (the CI-style internal certificate): seeded from
+# certs/ by jq reading the files, no account.
+mkdir -p "$HE/root/certs"; cp "$HE/le.crt" "$HE/root/certs/server.crt"; cp "$HE/le.key" "$HE/root/certs/server.key"
+printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > "$HE/home/traefik/dynamic/ci-certs.yml"
+hacli "" "$HE_SEED" status
+expect_eq "switch's certificate: a traefik/dynamic pair seeded, no account" \
+  "$RC|$(printf '%s' "$OUT" | grep -c '^SRC=dynamic ')|$(cat "$HE"/k/applied.* | jq -c --arg c "$(he_b64 "$HE/le.crt")" '[(.data["tls.crt"] == $c), (.data["account-uri"] | @base64d)]')|$(grep -c 'PRIVATE' "$HE/calls")" '0|1|[true,""]|0'
+# A longer saved CAA settle point raises the floor (the 30-day pair isn't enough for 40 days).
+rm -f "$HE"/k/applied.*; mkdir -p "$HE/root/secrets/domains"
+printf 'RELAX_WRITTEN_AT=%s\nRELAX_OLD_TTL=60\nRELAX_NOT_BEFORE=%s\n' "$(date +%s)" "$(( $(date +%s) + 40 * 86400 ))" > "$HE/root/secrets/domains/acme-relax.env"
+hacli "" "$HE_SEED" status
+case "$RC:$ERR" in "1:"*"under the 47 days"*) t_pass "switch's certificate: a saved settle point further out raises the floor" ;; *) t_fail "seed floor: $RC $ERR" ;; esac
+rm -rf "$HE/root/secrets/domains" "$HE/home/traefik/dynamic/ci-certs.yml" "$HE/root/certs"
 
 # Found live (Task 31): on Kubernetes the dns tool's one-shot runs the
 # release's image: domains_image_ensure builds nothing and never refuses.
@@ -8443,6 +8471,37 @@ expect_eq "an HA release moves Traefik's Services right before helm (after the i
 # Found live (Task 31): a one-shot's stdout is its own (the dns tool's
 # JSON): the image build's progress goes to stderr.
 expect_eq "_rtk_run: the images' build lines go to stderr" "$(awk '/^_rtk_run\(\) \{/,/^}/' "$HERE/../scripts/lib/kube.sh" | grep -c '^  kube_images_ready >&2')" 1
+
+# Fix round 1, I1: step 3 ends with the one-instance Cluster archiving
+# through the barman-cloud plugin — a release with HA still off after the
+# installs, then the wait — so the switch's release never adds the plugin.
+HE_I1='for f in ha_install_snapshotter ha_install_longhorn ha_install_fencing ha_install_certmanager ha_install_barman; do eval "$f() { echo $f >> \"\$HE/ran\"; }"; done
+  ha_fencing_ready() { echo ha_fencing_ready >> "$HE/ran"; }
+  stack_up() { echo "stack_up HA=${PORTCULLIS_HA:-off}" >> "$HE/ran"; [ ! -e "$HE/k/archive-on-up" ] || cp "$HE/k/archive-on-up" "$HE/k/cluster.json"; echo "{\"backup\":{\"cnpg\":{\"enabled\":true}}}" > "$PORTCULLIS_ROOT/secrets/kube/values.yaml"; }
+  export HA_ARCHIVE_WAIT=0; need_env'
+he_cluster() { jq -nc --arg s "$1" --argjson p "$2" '{spec: {instances: 1, plugins: (if $p then [{name: "barman-cloud.cloudnative-pg.io", isWALArchiver: true}] else [] end)}, status: {readyInstances: 1, conditions: [{type: "ContinuousArchiving", status: $s}]}}'; }
+rm -f "$HE/ran" "$HE/k/cluster.json"; he_cluster True true > "$HE/k/archive-on-up"
+hacli "" "$HE_I1; ha_enable_step_installs; echo DONE" status
+expect_eq "step 3: the installs, then a release with HA off, then the plugin's archiving gate" \
+  "$RC:$(tr '\n' ' ' < "$HE/ran"):$(printf '%s' "$OUT" | grep -c 'archives through the backup plugin')" \
+  "0:ha_install_snapshotter ha_install_longhorn ha_install_fencing ha_fencing_ready ha_install_certmanager ha_install_barman stack_up HA=off :1"
+rm -f "$HE/ran"; he_cluster False true > "$HE/k/archive-on-up"
+hacli "" "$HE_I1; ha_enable_step_installs; echo DONE" status
+case "$RC:$ERR" in "1:"*"didn't archive its WAL through the backup plugin"*"run ./portcullis ha enable again"*) t_pass "step 3: archiving not healthy → refused (the switch never runs without it)" ;; *) t_fail "step 3 archive false: $RC $ERR" ;; esac
+he_cluster True false > "$HE/k/archive-on-up"
+hacli "" "$HE_I1; ha_enable_step_installs; echo DONE" status
+expect_eq "step 3: a Cluster without the plugin as WAL archiver → refused" "$RC" 1
+rm -f "$HE/k/archive-on-up" "$HE/k/cluster.json" "$HE/ran"
+
+# Fix round 1, M1: Stop (SIGINT) in the middle of a copy removes that
+# copy's helpers (the trap reads the run's helper list); the record keeps
+# steps 1-3 and the writers stay at 0.
+he_vols; touch "$HE/int-on-untar"; printf '%s' "$he_green" > "$HE/view.json"
+printf '{"v":1,"done":[{"step":"checklist","n":1,"at":"t"},{"step":"confirm","n":2,"at":"t"},{"step":"installs","n":3,"at":"t"}]}' > "$HE/root/secrets/kube/ha-enable.json"
+hacli "" "" enable --yes
+expect_eq "Stop mid-copy: exit 130, both helpers of the interrupted copy removed, the record whole, the writers at 0" \
+  "$RC:$(grep -c '^create pod' "$HE/order"):$(grep -c '^delete pod' "$HE/order"):$(jq -r '.done | length' "$HE/root/secrets/kube/ha-enable.json"):$(cat "$HE/k/deploy-hub")" "130:2:2:3:0"
+rm -f "$HE/root/secrets/kube/ha-enable.json" "$HE/int-on-untar"
 
 echo ""
 echo "$PASS passed, $FAIL failed"
