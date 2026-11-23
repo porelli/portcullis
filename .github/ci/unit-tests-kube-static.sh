@@ -110,7 +110,7 @@ echo "::endgroup::"
 if "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" --set domain= >/dev/null 2>&1; then
   echo "FAIL: the chart renders without domain (required)"; exit 1
 fi
-if "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" --set images.vault=docker.io/hashicorp/vault:2.2.1 >/dev/null 2>&1; then
+if "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" --set images.vault=docker.io/hashicorp/vault:2.2.2 >/dev/null 2>&1; then
   echo "FAIL: the chart renders an image without a digest"; exit 1
 fi
 # The egress policy fails closed without the node / API addresses, and
