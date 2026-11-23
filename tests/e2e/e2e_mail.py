@@ -1613,6 +1613,9 @@ def admin_view_flow(ctx, label: str, mail_first: bool) -> None:
         summary(f"admin view ({label}): {len(seen)} responses, no 421 / 403, every step answered")
     except Exception:
         base.shot(page, f"admin-view-{label}-hub")
+        for other in ctx.pages:
+            if other is not page and not other.is_closed():
+                base.shot(other, f"admin-view-{label}-view")
         print(f"    {label} responses: " + ", ".join(f"{m} {st} {u.split('?')[0]}" for m, st, u in seen[-60:]), flush=True)
         raise
     finally:
@@ -1628,6 +1631,20 @@ def admin_view_end_to_end(p, browser) -> None:
     which Traefik answered there while the core pages' TLS options had
     another name than Traefik's default (contract §5)."""
     needs("setup")
+    # The first posted certificate key (setup's mail rotate) restarts the
+    # provider so the view pins it (contract §19.3): wait for its router
+    # (forward-auth's redirect, not Traefik's 404 for a host without one).
+    import http.client
+    ca = ssl.create_default_context(cafile="certs/ca-chain.crt")
+
+    def routed():
+        c = http.client.HTTPSConnection(f"mail-admin.{DOMAIN}", 443, context=ca, timeout=10)
+        try:
+            c.request("GET", "/portcullis/open")
+            return c.getresponse().status not in (404, 502, 503)
+        finally:
+            c.close()
+    until("mail-admin.<d> routed (the admin view up)", routed, 300, every=5)
     root_page = state["page_root"]
     goto(root_page, HUB + "/", "the Hub as root")
     if base.on_login_pages(root_page):
