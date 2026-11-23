@@ -2522,8 +2522,10 @@ HA_ITEM_LABELS='{"nodes":"3 or more nodes","servers":"3 or more servers","storag
   "dns_provider":"The main domain'"'"'s DNS provider","vault_shrink":"No unfinished Vault HA off"}'
 
 # _ha_checklist_lines <items JSON> — one line per item.
+# An ok item with a text says why it passes (the N−1 check yellow by ruling
+# P7: quorum held, the member waits for its node), printed after its label.
 _ha_checklist_lines() {
-  printf '%s' "$1" | jq -r --argjson l "$HA_ITEM_LABELS" '.[] | (if .ok then "  ok       " else "  not yet  " end) + ($l[.id] // .id) + (if .ok then "" else ": " + .text end)'
+  printf '%s' "$1" | jq -r --argjson l "$HA_ITEM_LABELS" '.[] | (if .ok then "  ok       " else "  not yet  " end) + ($l[.id] // .id) + (if .ok then (if (.text // "") != "" then ": " + .text else "" end) else ": " + .text end)'
 }
 
 # ha_enable_step_checklist — step 1. Refuses (exit 1) naming every red
@@ -3126,17 +3128,27 @@ ha_enable_step_frontdoor() {
   ok "The main domain's certificate and CAA pin are the front door's ($uri)."
 }
 
+# _ha_unconsumed_volumes — the replicated volumes with no consumer in this
+# install's chart values, as a JSON array (controller ruling): wg-data-r
+# while the VPN is off (no `wg` in COMPOSE_PROFILES, kube_render_values'
+# wg.enabled): the chart renders wg-data for every profile, nothing mounts
+# it without wg, and Longhorn reports a detached volume "unknown".
+_ha_unconsumed_volumes() {
+  case ",${COMPOSE_PROFILES:-}," in *,wg,*) echo '[]' ;; *) echo '["wg-data-r"]' ;; esac
+}
+
 # _ha_green <view> — enabled, every item ok, every quorum full (etcd ≥ 3,
 # Vault and Sentinel 3), zero loss, the front door leading or standing by,
-# every replicated volume healthy. Prints the reasons it isn't.
+# every replicated volume with a consumer healthy (_ha_unconsumed_volumes
+# left out). Prints the reasons it isn't.
 _ha_green() {
-  jq -r --argjson l "$HA_ITEM_LABELS" '
+  jq -r --argjson l "$HA_ITEM_LABELS" --argjson skip "$(_ha_unconsumed_volumes)" '
     [ (if .enabled != true then "HA isn'"'"'t on in the Hub (HUB_HA)" else empty end),
       (.checklist[]? | select(.ok != true) | ($l[.id] // .id) + ": " + .text),
       (.quorum // {} | to_entries[] | select(.value.healthy != .value.voters or .value.voters < 3) | "\(.key): \(.value.healthy)/\(.value.voters) healthy"),
       (if .guarantee != "Zero loss on one failure" then "Postgres: " + (.guarantee // "unknown") else empty end),
       (if (.frontdoor.state // "") == "" then "the front door: " + (.frontdoor.error // "no state") else empty end),
-      (.volumes[]? | select(.robustness != "healthy") | "volume \(.name): \(.robustness)")
+      (.volumes[]? | select(.robustness != "healthy" and ((.name as $n | $skip | index($n)) == null)) | "volume \(.name): \(.robustness)")
     ] | .[]' <<<"$1"
 }
 # _ha_spread_lines — fix round 1, M2: each core component whose 2 or more

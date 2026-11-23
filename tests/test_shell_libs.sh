@@ -8377,6 +8377,30 @@ case "$RC:$OUT" in "0:"*"ok       3 or more nodes"*"Guarantee: Degraded"*"Quorum
 hacli "" "" status --json
 expect_eq "ha status --json: {ha, enable, hub}" "$(printf '%s' "$OUT" | jq -c '[.ha, (.enable.done | length), .hub.experimental]')" '[false,4,true]'
 expect_eq "ha status reads only" "$(he_writes)" 0
+# N−1 yellow by ruling P7 (controller ruling): the Hub's item is ok with its
+# reason; ha status prints the reason on the ok line, and step 10's green
+# test passes it, while a not-ok N−1 still blocks.
+# The CLI's libraries in this shell, as the entrypoint sources them.
+# shellcheck disable=SC1090  # its own libraries, by name
+ha_libs() { for l in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" "$HERE/../portcullis"); do . "$HERE/../scripts/lib/$l.sh"; done; }
+he_p7="$(printf '%s' "$he_green" | jq -c '.checklist |= map(select(.id != "n_minus_1")) + [{id: "n_minus_1", ok: true, text: "yellow on n1, n2 and n3 (P7), which passes: if one fails, every core set keeps its minimum"}]')"
+printf '%s' "$he_p7" > "$HE/view.json"
+hacli "" "" status
+case "$RC:$OUT" in "0:"*"  ok       N−1 check: yellow on n1, n2 and n3 (P7), which passes"*) t_pass "ha status: an ok N−1 yellow by P7 says why it passes" ;; *) t_fail "ha status P7: $RC $OUT" ;; esac
+case "$OUT" in *"ok       3 or more nodes:"*) t_fail "ha status: an ok item without a text got a colon: $OUT" ;; *) t_pass "ha status: ok items without a text print the label alone" ;; esac
+he_g7="$(printf '%s' "$he_p7" | jq -c '.enabled = true | .quorum = {etcd: {voters: 3, healthy: 3}, vault: {voters: 3, healthy: 3}, sentinel: {voters: 3, healthy: 3}} | .guarantee = "Zero loss on one failure" | .frontdoor = {state: "leading"} | .volumes = [] | .checklist |= map(.ok = (.ok or .id != "n_minus_1"))')"
+RC=0; OUT="$(cd "$HE/root" && ha_libs; _ha_green "$he_g7")" || RC=$?
+expect_eq "step 10: N−1 yellow by P7 (ok) is green" "$RC:$OUT" "0:"
+RC=0; OUT="$(cd "$HE/root" && ha_libs; _ha_green "$(printf '%s' "$he_g7" | jq -c '.checklist |= map(if .id == "n_minus_1" then .ok = false | .text = "the N−1 check isn'"'"'t green" else . end)')")" || RC=$?
+case "$OUT" in *"N−1 check: the N−1 check isn't green"*) t_pass "step 10: any other N−1 yellow still blocks" ;; *) t_fail "step 10 other yellow: $RC $OUT" ;; esac
+# wg-data-r with no consumer (controller ruling): the VPN off (no wg in
+# COMPOSE_PROFILES) leaves it out of step 10's volume check; another
+# volume, or wg-data-r with the VPN on, still blocks.
+he_gv="$(printf '%s' "$he_g7" | jq -c '.volumes = [{name: "hub-state-r", robustness: "healthy"}, {name: "wg-data-r", robustness: "unknown"}]')"
+hagreen() { (cd "$HE/root" && export COMPOSE_PROFILES="$1" && ha_libs; _ha_green "$2"); }
+expect_eq "step 10: wg-data-r unknown with the VPN off is left out" "$(hagreen "monitoring" "$he_gv")" ""
+expect_eq "step 10: wg-data-r unknown with the VPN on blocks" "$(hagreen "monitoring,wg" "$he_gv")" "volume wg-data-r: unknown"
+expect_eq "step 10: another unknown volume blocks with the VPN off" "$(hagreen "" "$(printf '%s' "$he_gv" | jq -c '.volumes[0].robustness = "degraded"')")" "volume hub-state-r: degraded"
 rm -f "$HE/root/secrets/kube/ha-enable.json"
 
 # test_ha_enable_never_two_writers (step 4, real code against the stub):
