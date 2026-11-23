@@ -9,6 +9,7 @@
 #     and the ingress / gateway shims, and the cainjector to cert-manager
 #     (it injects only into cert-manager's own two webhook configurations);
 #   - leader election in cert-manager, not kube-system;
+#   - every Deployment on the primary site (portcullis.io/site: main);
 #   - replaces every cluster-wide Secret / ACME / shim / CSR right with
 #     rbac.yaml's: Roles in cnpg-system and cert-manager, the webhook
 #     configurations by name.
@@ -74,3 +75,11 @@ patches:
       - op: add
         path: /spec/template/spec/priorityClassName
         value: portcullis-core
+  # On the primary site's nodes only (controller ruling): never on an edge
+  # node (a small one far away). KUBE_PRIMARY_SITE / ha.primarySite = main,
+  # next to upstream's kubernetes.io/os nodeSelector.
+  - target: {kind: Deployment}
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector/portcullis.io~1site
+        value: main

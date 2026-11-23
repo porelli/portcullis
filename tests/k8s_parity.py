@@ -590,6 +590,8 @@ def site_problems(docs, ha=True):
             out.append(f"{n}: site terms {K.site_exprs(sp)} beyond the one In [{K.PRIMARY_SITE}] per term")
         if not pinned and K.site_exprs(sp):
             out.append(f"{n}: a site term {K.site_exprs(sp)} ({'never pinned' if n in K.SITE_FREE else 'not in the pinned set'}{'' if ha else ', and none without HA'})")
+        if ha and n in K.SERVER_PINNED and not K.server_pinned(sp):
+            out.append(f"{n}: no required node affinity {K.SERVER_KEY} In [true] (on a server node, never the edge)")
     return out
 
 
@@ -633,6 +635,12 @@ def check_sites():
     if not any(p.startswith("keycloak:") for p in got) or not any(p.startswith("frontdoor:") for p in got) \
             or not any(p.startswith("postgres:") for p in got):
         F.add(f"site_problems misses an unpinned keycloak, an unpinned CNPG Cluster or a pinned frontdoor (mutation test): {got}")
+    # The front door's server term removed: caught too.
+    bad = [json.loads(json.dumps(d)) for d in docs]
+    fd = next(d for d in bad if d.get("kind") == "Deployment" and d["metadata"]["name"] == "frontdoor")
+    fd["spec"]["template"]["spec"].pop("affinity", None)
+    if not any(p.startswith("frontdoor:") and K.SERVER_KEY in p for p in site_problems(bad)):
+        F.add(f"site_problems misses a frontdoor without its server term (mutation test): {site_problems(bad)}")
     # Any other primary site is refused at render time, with or without HA.
     for extra in ({"ha": dict(ha_vals["ha"], primarySite="edge")}, {"ha": {"primarySite": "edge"}}, {"ha": {"primarySite": ""}}):
         try:

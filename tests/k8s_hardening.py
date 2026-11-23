@@ -1982,6 +1982,16 @@ def check_ha_infra():
     args = pod_spec_of(ctrl)["containers"][0]["args"]
     if f"--namespace={K.CNPG_NS}" not in args or any("acme" in a for a in args):
         F.add(f"certmanager: the controller's args {args} (--namespace={K.CNPG_NS}, no ACME)")
+    # On the primary site only (controller ruling: the rebuild found it on
+    # the small edge agent): every Deployment's nodeSelector names
+    # portcullis.io/site: main, and there are three to check.
+    deps = [d for d in cm if d.get("kind") == "Deployment"]
+    if len(deps) != 3:
+        F.add(f"certmanager: {len(deps)} Deployments (want 3: the site check would pass vacuously)")
+    for d in deps:
+        sel = pod_spec_of(d).get("nodeSelector") or {}
+        if sel.get(K.SITE_KEY) != K.PRIMARY_SITE:
+            F.add(f"certmanager: {d['metadata']['name']}'s nodeSelector {sel} (want {K.SITE_KEY}: {K.PRIMARY_SITE}, never an edge node)")
     for p in barman_problems(renders["barman"]):
         F.add(p)
     # The StorageClass.

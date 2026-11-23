@@ -22,11 +22,16 @@ replica.
 Both are created empty here and kept (helm.sh/resource-policy: keep: an
 uninstall must not lose the account the CAA pins). Its egress adds DNS
 (53) to public addresses: lego's propagation check asks the zone's
-authoritative nameservers; the CA is public 443. */ -}}
+authoritative nameservers; the CA is public 443. On a server node only
+(controller ruling, after the rebuild found it on the small edge agent):
+node-role.kubernetes.io/control-plane, never a site term, so it can still
+run at another site's server and write DNS when main's uplink is down
+(contract §20.11). */ -}}
 {{- if .Values.ha.enabled }}
 {{- $ns := .Release.Namespace }}
 {{- $s := dict
   "name" "frontdoor" "image" "domains" "uid" .Values.uids.domains "gid" .Values.uids.domains
+  "nodeExpressions" (list (dict "key" "node-role.kubernetes.io/control-plane" "operator" "In" "values" (list "true")))
   "memory" "128Mi" "nets" (list "frontdoor") "token" true "serviceAccount" "frontdoor"
   "args" (list "frontdoor") "fsGroup" .Values.uids.domains
   "httpReady" (dict "path" "/healthz" "port" 8090)

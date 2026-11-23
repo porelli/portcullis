@@ -248,6 +248,21 @@ SITE_KEY = "portcullis.io/site"
 SITE_PINNED = {"postgres", "vault", "sessions", "sessions-sentinel", "hub", "domains", "keycloak", "forward-auth", "forward-auth-ext",
                "group-gate", "enroll", "mcp-gate", "wg", "lldap", "oneshot-hub", "lldap-schema"}
 SITE_FREE = {"traefik", "frontdoor", "nodeadm"}
+# On a server node, never by site (controller ruling after the VM rebuild
+# found the front door on the small edge agent): a required term
+# node-role.kubernetes.io/control-plane In [true] in HA, so it still runs
+# at another site's server when main's uplink is down. nodeadm has its own
+# nodeSelector (contract §20.2).
+SERVER_KEY = "node-role.kubernetes.io/control-plane"
+SERVER_PINNED = {"frontdoor"}
+
+
+def server_pinned(spec):
+    """True when every required term holds node-role.kubernetes.io/control-plane In [true]
+    (and there is at least one term)."""
+    want = {"key": SERVER_KEY, "operator": "In", "values": ["true"]}
+    terms = node_terms(spec)
+    return bool(terms) and all(want in t.get("matchExpressions", []) for t in terms)
 
 
 def node_terms(spec):
