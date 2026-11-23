@@ -3,6 +3,15 @@
 groups:
   - name: portcullis
     rules:
+      - alert: Watchdog
+        expr: vector(1)
+        labels: {severity: none}
+        annotations:
+          summary: Alertmanager is working
+          description: >-
+            This alert always fires. If ALERT_WATCHDOG_URL is set, Alertmanager sends
+            it to the watchdog receiver once per minute (a dead-man's switch).
+
       - alert: VaultSealedOrDown
         expr: probe_success{job="vault_health"} == 0
         for: 2m
@@ -317,3 +326,83 @@ groups:
         annotations:
           summary: ./portcullis status reported problems
           description: Run ./portcullis status on the host.
+
+      # High availability (contract §20.2, Task 32): the R7 cluster gauges
+      # (job nodeadm; no target outside HA). Absent series don't fire these
+      # (single-server Docker: none exist), except PortcullisQuorumLost when
+      # nodeadm is down.
+      - alert: PortcullisNodeDown
+        expr: portcullis_node_ready == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "The node {{ $labels.node }} is NotReady"
+          description: >-
+            Its containers keep running but won't be rescheduled, and it won't accept new
+            work. Run ./portcullis ha status and kubectl get nodes -o wide.
+
+      - alert: PortcullisQuorumAtRisk
+        expr: >-
+          portcullis_quorum_voters{state="healthy"}
+          == on(job, instance, system) floor(portcullis_quorum_voters{state="total"} / 2) + 1
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.system }}: one more failure loses quorum"
+          description: >-
+            {{ $labels.system }} has the minimum number of voters needed to work
+            ({{ $value }} of {{ printf "portcullis_quorum_voters{job=\"%s\",instance=\"%s\",system=\"%s\",state=\"total\"}" .Labels.job .Labels.instance .Labels.system | query | first | value }}).
+            One more failure stops writes. Run ./portcullis ha status.
+
+      - alert: PortcullisQuorumLost
+        expr: >-
+          (portcullis_quorum_voters{state="healthy"} < on(job, instance, system) floor(portcullis_quorum_voters{state="total"} / 2) + 1)
+          or (up{job="nodeadm"} == 0)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Quorum lost or nodeadm is down"
+          description: >-
+            A quorum system has fewer than the majority of its voters healthy, or nodeadm
+            can't be scraped: nothing is promoted, moved or flipped. Run ./portcullis ha status.
+
+      - alert: PortcullisVolumeDegraded
+        expr: portcullis_volume_robustness{volume=~".+"} > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "The volume {{ $labels.volume }} is degraded or faulted"
+          description: >-
+            Its robustness is {{ $value }} (0 healthy, 1 degraded, 2 faulted, 3 unknown).
+            A degraded volume has lost one replica; a faulted one has lost all replicas and
+            is offline. Run ./portcullis ha status and check Longhorn.
+
+      - alert: PortcullisDNSFailoverStuck
+        expr: portcullis_frontdoor_unhealthy_published_seconds{name=~".+",address=~".+"} > 300
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNS failover stuck: {{ $labels.name }} has unhealthy address {{ $labels.address }} published for 5+ minutes"
+          description: >-
+            The front door has kept an unhealthy address in the name's published set for more
+            than 5 minutes. Run ./portcullis ha status and check the front door's log.
+
+      - alert: PortcullisBackupStale
+        expr: time() - portcullis_backup_last_success_timestamp_seconds{kind="offsite"} > 26 * 3600
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "No successful offsite backup for 26 hours"
+          description: "The last offsite backup is {{ $value | humanizeDuration }} old. Check the backup schedule (./portcullis backup schedule)."
+
+      - alert: PortcullisVaultNoActive
+        expr: portcullis_vault_active == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: No active Vault voter serves requests
+          description: >-
+            None of the Vault voters is the active node or a standby with a reachable active
+            node. No certificate is signed and new sign-in setups fail. Wait 3 minutes (each
+            voter's liveness restarts a voter that can't reach an active node); if none becomes
+            active, check ./portcullis ha status and the voters' logs.

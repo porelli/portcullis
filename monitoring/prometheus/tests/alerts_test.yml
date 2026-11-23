@@ -593,3 +593,158 @@ tests:
             exp_annotations:
               summary: "hub-usage cannot be scraped"
               description: "hub-metrics:9100 (hub-usage) has been unreachable for 5 minutes."
+
+  # HA: a node goes NotReady → PortcullisNodeDown after 1m.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_node_ready{job="nodeadm",instance="nodeadm:9105",node="node-1"}'
+        values: '1 0 0 0 0'
+      - series: 'portcullis_node_ready{job="nodeadm",instance="nodeadm:9105",node="node-2"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 59s
+        alertname: PortcullisNodeDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: PortcullisNodeDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: nodeadm, instance: "nodeadm:9105", node: node-1}
+            exp_annotations:
+              summary: "The node node-1 is NotReady"
+              description: >-
+                Its containers keep running but won't be rescheduled, and it won't accept new work. Run ./portcullis ha status and kubectl get nodes -o wide.
+
+  # HA: etcd quorum at risk (3 voters, 2 healthy = floor(3/2)+1) for 1m.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="etcd",state="total"}'
+        values: '3x5'
+      - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="etcd",state="healthy"}'
+        values: '3 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 59s
+        alertname: PortcullisQuorumAtRisk
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: PortcullisQuorumAtRisk
+        exp_alerts:
+          - exp_labels: {severity: critical, job: nodeadm, instance: "nodeadm:9105", system: etcd}
+            exp_annotations:
+              summary: "etcd: one more failure loses quorum"
+              description: >-
+                etcd has the minimum number of voters needed to work (2 of 3). One more failure stops writes. Run ./portcullis ha status.
+
+  # HA: quorum lost (1 of 3 healthy, below majority) for 2m, or nodeadm down.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="vault",state="total"}'
+        values: '3x6'
+      - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="vault",state="healthy"}'
+        values: '3 3 1 1 1 1'
+      - series: 'up{job="nodeadm",instance="nodeadm:9105"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 1m59s
+        alertname: PortcullisQuorumLost
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: PortcullisQuorumLost
+        exp_alerts:
+          - exp_labels: {severity: critical, job: nodeadm, instance: "nodeadm:9105", system: vault}
+            exp_annotations:
+              summary: "Quorum lost or nodeadm is down"
+              description: >-
+                A quorum system has fewer than the majority of its voters healthy, or nodeadm can't be scraped: nothing is promoted, moved or flipped. Run ./portcullis ha status.
+
+  # HA: nodeadm down for 2m (another way PortcullisQuorumLost fires).
+  - interval: 1m
+    input_series:
+      - series: 'up{job="nodeadm",instance="nodeadm:9105"}'
+        values: '1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m59s
+        alertname: PortcullisQuorumLost
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: PortcullisQuorumLost
+        exp_alerts:
+          - exp_labels: {severity: critical, job: nodeadm, instance: "nodeadm:9105"}
+            exp_annotations:
+              summary: "Quorum lost or nodeadm is down"
+              description: >-
+                A quorum system has fewer than the majority of its voters healthy, or nodeadm can't be scraped: nothing is promoted, moved or flipped. Run ./portcullis ha status.
+
+  # HA: volume degraded (robustness 1) for 10m.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_volume_robustness{job="nodeadm",instance="nodeadm:9105",volume="hub-state"}'
+        values: '0 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 9m59s
+        alertname: PortcullisVolumeDegraded
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: PortcullisVolumeDegraded
+        exp_alerts:
+          - exp_labels: {severity: warning, job: nodeadm, instance: "nodeadm:9105", volume: hub-state}
+            exp_annotations:
+              summary: "The volume hub-state is degraded or faulted"
+              description: >-
+                Its robustness is 1 (0 healthy, 1 degraded, 2 faulted, 3 unknown). A degraded volume has lost one replica; a faulted one has lost all replicas and is offline. Run ./portcullis ha status and check Longhorn.
+
+  # HA: DNS failover stuck (unhealthy address published > 300s). Starting at
+  # 240s: at t=1m it's 300 (not > 300), at t=2m it's 360 (> 300), at t=3m
+  # it has been > 300 for 1m and fires.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_frontdoor_unhealthy_published_seconds{job="frontdoor",instance="frontdoor:9106",name="example.org",address="203.0.113.1"}'
+        values: '240+60x10'
+    alert_rule_test:
+      - eval_time: 2m59s
+        alertname: PortcullisDNSFailoverStuck
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: PortcullisDNSFailoverStuck
+        exp_alerts:
+          - exp_labels: {severity: warning, job: frontdoor, instance: "frontdoor:9106", name: "example.org", address: "203.0.113.1"}
+            exp_annotations:
+              summary: "DNS failover stuck: example.org has unhealthy address 203.0.113.1 published for 5+ minutes"
+              description: >-
+                The front door has kept an unhealthy address in the name's published set for more than 5 minutes. Run ./portcullis ha status and check the front door's log.
+
+  # HA: backup stale (last success > 26h ago for 1m). At t=26h it's exactly
+  # 26h (not > 26h), at t=26h1m it becomes > 26h, at t=26h2m it has been
+  # > 26h for 1m and fires.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_backup_last_success_timestamp_seconds{job="portcullis",kind="offsite"}'
+        values: '0x1600'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: PortcullisBackupStale
+        exp_alerts: []
+      - eval_time: 26h2m
+        alertname: PortcullisBackupStale
+        exp_alerts:
+          - exp_labels: {severity: warning, job: portcullis, kind: offsite}
+            exp_annotations:
+              summary: "No successful offsite backup for 26 hours"
+              description: "The last offsite backup is 1d 2h 2m 0s old. Check the backup schedule (./portcullis backup schedule)."
+
+  # HA: no active Vault for 2m.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_vault_active{job="nodeadm",instance="nodeadm:9105"}'
+        values: '1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m59s
+        alertname: PortcullisVaultNoActive
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: PortcullisVaultNoActive
+        exp_alerts:
+          - exp_labels: {severity: critical, job: nodeadm, instance: "nodeadm:9105"}
+            exp_annotations:
+              summary: No active Vault voter serves requests
+              description: >-
+                None of the Vault voters is the active node or a standby with a reachable active node. No certificate is signed and new sign-in setups fail. Wait 3 minutes (each voter's liveness restarts a voter that can't reach an active node); if none becomes active, check ./portcullis ha status and the voters' logs.

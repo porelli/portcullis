@@ -1163,6 +1163,13 @@ OUT="$(am ALERT_SMTP_SMARTHOST=smtp.example:587 ALERT_SMTP_TO=ops@example ALERT_
 expect_eq "alertmanager: smtp receiver" "$(printf '%s' "$OUT" | jq -c '.receivers[0].email_configs[0] | [.to, .from, .smarthost, .auth_password, .require_tls]')" \
   '["ops@example","portcullis@d.example","smtp.example:587","p'"'"'w\"d",true]'
 expect_eq "alertmanager: smtp needs a recipient" "$(am ALERT_SMTP_SMARTHOST=smtp.example:587 | jq '.receivers[0] | has("email_configs")')" false
+OUT="$(am ALERT_WATCHDOG_URL='https://watchdog.example/ping')"
+expect_eq "alertmanager: watchdog receiver exists when url is set" "$(printf '%s' "$OUT" | jq -r '.receivers[] | select(.name == "watchdog") | .webhook_configs[0].url')" \
+  'https://watchdog.example/ping'
+expect_eq "alertmanager: watchdog route exists when url is set" "$(printf '%s' "$OUT" | jq -r '.route.routes[]? | select(.receiver == "watchdog") | .matchers[0]')" \
+  'alertname = Watchdog'
+expect_eq "alertmanager: watchdog receiver absent when url is unset" "$(am | jq '.receivers | map(select(.name == "watchdog")) | length')" 0
+expect_eq "alertmanager: watchdog route absent when url is unset" "$(am | jq '.route.routes // [] | length')" 0
 
 # shellcheck disable=SC2034  # read by metrics_textfile_write
 MONITORING_TEXTFILE_DIR="$WORK/textfile"

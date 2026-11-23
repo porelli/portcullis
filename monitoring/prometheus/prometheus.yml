@@ -85,6 +85,13 @@ scrape_configs:
     file_sd_configs:
       - files: [/etc/portcullis/frontdoor-targets.json]
 
+  # nodeadm (HA only, contract §20.2): file_sd written by ./portcullis
+  # (monitoring_prepare): its Service's :9105 on Kubernetes in HA, []
+  # everywhere else (no target, no TargetDown). R7 cluster gauges.
+  - job_name: nodeadm
+    file_sd_configs:
+      - files: [/etc/portcullis/nodeadm-targets.json]
+
   # Multiple servers (contract §17.2): the link role's own metrics and the
   # worker agents' (fetched over the tunnel by wg, labelled server=<id>),
   # from the same wg target as job wg (one process, ruling P25); each job

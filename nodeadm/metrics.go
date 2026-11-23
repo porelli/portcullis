@@ -4,8 +4,8 @@ package main
 // gets no cluster-scoped right): portcullis_node_ready{node},
 // portcullis_quorum_voters{system,state}, portcullis_volume_robustness
 // {volume}, portcullis_pg_sync_standbys, portcullis_fencing_ready{node},
-// portcullis_failover_total{kind}. Refreshed by every snapshot (the
-// metrics loop takes one every 30 s).
+// portcullis_failover_total{kind}, portcullis_vault_active. Refreshed by
+// every snapshot (the metrics loop takes one every 30 s).
 
 import (
 	"net/http"
@@ -15,13 +15,14 @@ import (
 )
 
 type Metrics struct {
-	reg        *prometheus.Registry
-	nodeReady  *prometheus.GaugeVec
-	quorum     *prometheus.GaugeVec
-	robustness *prometheus.GaugeVec
-	pgSync     prometheus.Gauge
-	fencing    *prometheus.GaugeVec
-	failovers  *prometheus.CounterVec
+	reg         *prometheus.Registry
+	nodeReady   *prometheus.GaugeVec
+	quorum      *prometheus.GaugeVec
+	robustness  *prometheus.GaugeVec
+	pgSync      prometheus.Gauge
+	fencing     *prometheus.GaugeVec
+	failovers   *prometheus.CounterVec
+	vaultActive prometheus.Gauge
 }
 
 func newMetrics() *Metrics {
@@ -38,8 +39,10 @@ func newMetrics() *Metrics {
 			Help: "1 while the node's Self Node Remediation agent is Ready."}, []string{"node"}),
 		failovers: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "portcullis_failover_total",
 			Help: "Failovers seen (kind postgres: a new primary)."}, []string{"kind"}),
+		vaultActive: prometheus.NewGauge(prometheus.GaugeOpts{Name: "portcullis_vault_active",
+			Help: "1 while at least one Vault voter serves requests (is the active node or a standby with a reachable active node), else 0."}),
 	}
-	m.reg.MustRegister(m.nodeReady, m.quorum, m.robustness, m.pgSync, m.fencing, m.failovers)
+	m.reg.MustRegister(m.nodeReady, m.quorum, m.robustness, m.pgSync, m.fencing, m.failovers, m.vaultActive)
 	m.failovers.WithLabelValues("postgres")
 	return m
 }
@@ -58,6 +61,7 @@ func (m *Metrics) observe(s *Snapshot) {
 		m.quorum.WithLabelValues(sys, "total").Set(float64(v.Voters))
 		m.quorum.WithLabelValues(sys, "healthy").Set(float64(v.Healthy))
 	}
+	m.vaultActive.Set(b2f(s.Quorum.Vault.Healthy > 0))
 	m.robustness.Reset()
 	for _, v := range s.Volumes {
 		m.robustness.WithLabelValues(v.Name).Set(robustnessValue[v.Robustness])

@@ -32,6 +32,8 @@ VAULT_METRICS_TOKEN_MIN_LEFT=31536000   # 1 year
 #                       with ?template=alertmanager (ntfy formats the alert)
 #   ALERT_SMTP_SMARTHOST host:port, ALERT_SMTP_FROM, ALERT_SMTP_TO,
 #   ALERT_SMTP_USERNAME, ALERT_SMTP_PASSWORD, ALERT_SMTP_REQUIRE_TLS (true)
+#   ALERT_WATCHDOG_URL  dead-man's-switch / watchdog URL (opt-in, empty by
+#                       default; called by the always-firing Watchdog alert)
 # None set → a receiver without integrations (alerts only visible in
 # Grafana / Prometheus). Values are JSON-encoded by jq, so any character
 # is safe.
@@ -42,6 +44,7 @@ alertmanager_config() {
   fi
   ALERT_SMTP_PASSWORD="${ALERT_SMTP_PASSWORD:-}" jq -n \
     --arg webhook "${ALERT_WEBHOOK_URL:-}" --arg ntfy "$ntfy" \
+    --arg watchdog "${ALERT_WATCHDOG_URL:-}" \
     --arg smarthost "${ALERT_SMTP_SMARTHOST:-}" --arg from "${ALERT_SMTP_FROM:-}" --arg to "${ALERT_SMTP_TO:-}" \
     --arg user "${ALERT_SMTP_USERNAME:-}" \
     --arg tls "${ALERT_SMTP_REQUIRE_TLS:-true}" --arg domain "${PORTCULLIS_DOMAIN:-portcullis.local}" '
@@ -53,12 +56,18 @@ alertmanager_config() {
            smarthost: $smarthost, require_tls: ($tls != "false"), send_resolved: true}
           + (if $user | nonempty then {auth_username: $user, auth_password: env.ALERT_SMTP_PASSWORD} else {} end)]
        else [] end) as $mails
+    | (if $watchdog | nonempty then [{url: $watchdog, send_resolved: false}] else [] end) as $watchdog_hooks
+    | ([ {name: "portcullis"}
+         + (if ($hooks | length) > 0 then {webhook_configs: $hooks} else {} end)
+         + (if ($mails | length) > 0 then {email_configs: $mails} else {} end) ]
+       + (if ($watchdog_hooks | length) > 0 then [{name: "watchdog", webhook_configs: $watchdog_hooks}] else [] end)) as $receivers
     | {
         route: {receiver: "portcullis", group_by: ["alertname", "severity"],
-                group_wait: "30s", group_interval: "5m", repeat_interval: "4h"},
-        receivers: [{name: "portcullis"}
-                    + (if ($hooks | length) > 0 then {webhook_configs: $hooks} else {} end)
-                    + (if ($mails | length) > 0 then {email_configs: $mails} else {} end)],
+                group_wait: "30s", group_interval: "5m", repeat_interval: "4h",
+                routes: (if ($watchdog_hooks | length) > 0 then
+                  [{receiver: "watchdog", matchers: ["alertname = Watchdog"], group_wait: "0s",
+                    group_interval: "1m", repeat_interval: "1m"}] else [] end)},
+        receivers: $receivers,
         inhibit_rules: [{source_matchers: ["alertname = VaultSealedOrDown"],
                          target_matchers: ["alertname =~ TargetDown|ServiceProbeFailed"]}]
       }'
@@ -79,6 +88,12 @@ monitoring_prepare() {
     jq -n --arg t "frontdoor.$(kube_ns).svc.cluster.local:9106" '[{targets: [$t], labels: {}}]' > "$m/prometheus/frontdoor-targets.json"
   else
     echo '[]' > "$m/prometheus/frontdoor-targets.json"
+  fi
+  # nodeadm-targets.json: nodeadm's R7 cluster metrics in HA only (Task 32).
+  if _rt_is_kube && kube_ha_on; then
+    jq -n --arg t "nodeadm.$(kube_ns).svc.cluster.local:9105" '[{targets: [$t], labels: {}}]' > "$m/prometheus/nodeadm-targets.json"
+  else
+    echo '[]' > "$m/prometheus/nodeadm-targets.json"
   fi
   # wg-targets.json: the wg job's target only while the profile is on (V13).
   if declare -F vpn_prom_targets >/dev/null; then vpn_prom_targets; fi
