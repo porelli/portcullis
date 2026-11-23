@@ -432,7 +432,7 @@ jobs:
           docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" -w /p/tests --entrypoint promtool "$PROM" test rules alerts_test.yml
           docker run --rm -v "$PWD/monitoring/blackbox/blackbox.yml:/c.yml:ro" "$BB" --config.file=/c.yml --config.check
           mkdir -p /tmp/am
-          for vars in "X=1" "ALERT_WEBHOOK_URL=https://hooks.example/x" "ALERT_NTFY_URL=https://ntfy.sh/topic" \
+          for vars in "X=1" "ALERT_WEBHOOK_URL=https://hooks.example/x" "ALERT_NTFY_URL=https://ntfy.sh/topic" "ALERT_WATCHDOG_URL=https://watchdog.example/ping" \
                       "ALERT_SMTP_SMARTHOST=smtp.example:587 ALERT_SMTP_TO=ops@example ALERT_SMTP_USERNAME=u ALERT_SMTP_PASSWORD=p"; do
             # shellcheck disable=SC2086
             env $vars bash -c 'source scripts/lib/common.sh; source scripts/lib/monitoring.sh; alertmanager_config' > /tmp/am/alertmanager.yml
@@ -440,6 +440,7 @@ jobs:
           done
           jq -e '.uid == "portcullis" and (.panels | length) > 0' monitoring/grafana/dashboards/portcullis.json >/dev/null
           jq -e '.uid == "portcullis-usage" and .title == "Portcullis usage" and (.panels | length) >= 5' monitoring/grafana/dashboards/usage.json >/dev/null
+          jq -e '.uid == "portcullis-ha-cluster" and ([.panels[].title] | index("Replication Lag") == null and index("Failovers") != null and index("Sites") != null) and ([.panels[].targets[]?.expr] | any(test("increase\\(portcullis_failover_total\\[")))' monitoring/grafana/dashboards/cluster.json >/dev/null
           echo "PASS: prometheus config + rules (+ rule tests), alertmanager receivers, blackbox modules, dashboard"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:

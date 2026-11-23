@@ -1151,10 +1151,10 @@ expect_ok "cli cert sync error keeps the list" grep -qx '11:22' "$PKI_ROOT/certs
 # ══ monitoring: alertmanager config, textfile metrics ═════
 # shellcheck source=../scripts/lib/monitoring.sh
 source "$HERE/../scripts/lib/monitoring.sh"
-am() { env -u ALERT_WEBHOOK_URL -u ALERT_NTFY_URL -u ALERT_SMTP_SMARTHOST -u ALERT_SMTP_TO "$@" bash -c \
+am() { env -u ALERT_WEBHOOK_URL -u ALERT_NTFY_URL -u ALERT_SMTP_SMARTHOST -u ALERT_SMTP_TO -u ALERT_WATCHDOG_URL "$@" bash -c \
   "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; alertmanager_config"; }
 OUT="$(am)"
-expect_eq "alertmanager: default receiver has no integrations" "$(printf '%s' "$OUT" | jq -c '.receivers')" '[{"name":"portcullis"}]'
+expect_eq "alertmanager: default receiver has no integrations (+ the Watchdog's empty null)" "$(printf '%s' "$OUT" | jq -c '.receivers')" '[{"name":"portcullis"},{"name":"null"}]'
 expect_eq "alertmanager: route to it" "$(printf '%s' "$OUT" | jq -r '.route.receiver')" portcullis
 OUT="$(am ALERT_WEBHOOK_URL='https://hooks.example/x?a="b"' ALERT_NTFY_URL=https://ntfy.sh/topic)"
 expect_eq "alertmanager: webhook + ntfy (JSON-escaped)" "$(printf '%s' "$OUT" | jq -r '[.receivers[0].webhook_configs[].url] | join(" ")')" \
@@ -1172,6 +1172,53 @@ OUT="$(am)"
 expect_eq "alertmanager: null receiver exists when watchdog url is unset" "$(printf '%s' "$OUT" | jq -r '.receivers[] | select(.name == "null") | .name')" 'null'
 expect_eq "alertmanager: watchdog route goes to null when url is unset" "$(printf '%s' "$OUT" | jq -r '.route.routes[0].receiver')" 'null'
 expect_eq "alertmanager: watchdog route always exists (unset case)" "$(printf '%s' "$OUT" | jq -r '.route.routes[0].matchers[0]')" 'alertname = Watchdog'
+expect_eq "alertmanager: the Watchdog's route is the only child route, it doesn't continue" "$(printf '%s' "$OUT" | jq -c '[(.route.routes | length), (.route.routes[0] | has("continue"))]')" '[1,false]'
+expect_eq "alertmanager: the null receiver has no integration" "$(printf '%s' "$OUT" | jq -c '.receivers[] | select(.name == "null")')" '{"name":"null"}'
+expect_eq "alertmanager: no watchdog receiver without the url" "$(printf '%s' "$OUT" | jq '[.receivers[] | select(.name == "watchdog")] | length')" 0
+OUT="$(am ALERT_WATCHDOG_URL='https://watchdog.example/ping')"
+expect_eq "alertmanager: with the url, no null receiver and the watchdog never gets the other alerts" \
+  "$(printf '%s' "$OUT" | jq -c '[([.receivers[].name] | sort), .route.receiver, (.receivers[] | select(.name == "portcullis") | has("webhook_configs"))]')" '[["portcullis","watchdog"],"portcullis",false]'
+# M10: nodeadm down → PortcullisQuorumLost (its up == 0 branch, no system
+# label) inhibits TargetDown for job nodeadm on the same instance.
+expect_eq "alertmanager: PortcullisQuorumLost (nodeadm down) inhibits TargetDown{job=nodeadm}" \
+  "$(printf '%s' "$OUT" | jq -c '.inhibit_rules[] | select(.source_matchers[0] == "alertname = PortcullisQuorumLost")')" \
+  '{"source_matchers":["alertname = PortcullisQuorumLost","job = nodeadm","system = \"\""],"target_matchers":["alertname = TargetDown","job = nodeadm"],"equal":["job","instance"]}'
+expect_eq "alertmanager: the Vault inhibit rule is kept" "$(printf '%s' "$OUT" | jq -c '.inhibit_rules[0].source_matchers')" '["alertname = VaultSealedOrDown"]'
+# I3: the webhook, ntfy and watchdog URLs (they may carry a token) reach jq
+# through its environment (env.X), never its argv: a jq stub on PATH logs
+# every argv, the URLs must be in the output and in no logged argv.
+mkdir -p "$WORK/jqargv"
+REAL_JQ="$(command -v jq)"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' "$WORK/jqargv/log" "$REAL_JQ" > "$WORK/jqargv/jq"
+chmod +x "$WORK/jqargv/jq"
+OUT="$(PATH="$WORK/jqargv:$PATH" am ALERT_WEBHOOK_URL='https://hooks.example/x?token=HOOKSECRET1' \
+  ALERT_NTFY_URL='https://ntfy.example/t?auth=NTFYSECRET2' ALERT_WATCHDOG_URL='https://watchdog.example/ping/WDSECRET3')"
+expect_eq "alertmanager: the jq stub ran" "$([ -s "$WORK/jqargv/log" ] && echo yes)" yes
+expect_eq "alertmanager: the three URLs are in the config" \
+  "$(printf '%s' "$OUT" | grep -o 'HOOKSECRET1\|NTFYSECRET2\|WDSECRET3' | sort -u | tr '\n' ' ')" 'HOOKSECRET1 NTFYSECRET2 WDSECRET3 '
+expect_eq "alertmanager: no URL on jq's argv" "$(grep -c 'HOOKSECRET1\|NTFYSECRET2\|WDSECRET3\|hooks.example\|ntfy.example\|watchdog.example' "$WORK/jqargv/log" || true)" 0
+expect_eq "alertmanager: alertmanager_config passes no URL with --arg" \
+  "$(declare -f alertmanager_config | grep -cE -- '--arg(json)? +[A-Za-z_]+ +"?\$\{?(ALERT_(WEBHOOK|NTFY|WATCHDOG)_URL|ntfy|watchdog|webhook)' || true)" 0
+
+# C1: monitoring_prepare's file_sd targets — nodeadm in its own namespace
+# (KUBE_NODEADM_NS, the chart's ha.nodeadmNamespace) and the front door in
+# the core one, on Kubernetes in HA only; [] everywhere else (no target, no
+# TargetDown, no HA alert outside HA).
+mon_targets() {
+  local root="$WORK/montargets-$1"; shift
+  rm -rf "$root"; mkdir -p "$root"
+  env -u PORTCULLIS_HA -u CONTAINER_RUNTIME PORTCULLIS_ROOT="$root" PORTCULLIS_DOMAIN=d.example "$@" bash -c "
+    source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'
+    MONITORING_SECRETS='$root/secrets/monitoring'; MONITORING_TEXTFILE_DIR='$root/monitoring/textfile'
+    monitoring_fix_perms() { :; }; vpn_prom_targets() { :; }
+    monitoring_prepare >/dev/null 2>&1 || exit 1
+    jq -c . '$root/secrets/monitoring/prometheus/nodeadm-targets.json' '$root/secrets/monitoring/prometheus/frontdoor-targets.json' | tr '\n' ' '"
+}
+expect_eq "monitoring targets: Kubernetes in HA → nodeadm in portcullis-nodeadm, the front door in the core namespace" \
+  "$(mon_targets ha CONTAINER_RUNTIME=kubernetes PORTCULLIS_HA=on)" \
+  '[{"targets":["nodeadm.portcullis-nodeadm.svc.cluster.local:9105"],"labels":{}}] [{"targets":["frontdoor.portcullis.svc.cluster.local:9106"],"labels":{}}] '
+expect_eq "monitoring targets: Kubernetes without HA → none" "$(mon_targets kube CONTAINER_RUNTIME=kubernetes)" '[] [] '
+expect_eq "monitoring targets: Docker → none" "$(mon_targets docker CONTAINER_RUNTIME=docker PORTCULLIS_HA=on)" '[] [] '
 
 # shellcheck disable=SC2034  # read by metrics_textfile_write
 MONITORING_TEXTFILE_DIR="$WORK/textfile"

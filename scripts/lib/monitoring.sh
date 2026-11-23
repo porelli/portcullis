@@ -75,7 +75,12 @@ alertmanager_config() {
                           group_interval: "1m", repeat_interval: "1m"}]},
         receivers: $receivers,
         inhibit_rules: [{source_matchers: ["alertname = VaultSealedOrDown"],
-                         target_matchers: ["alertname =~ TargetDown|ServiceProbeFailed"]}]
+                         target_matchers: ["alertname =~ TargetDown|ServiceProbeFailed"]},
+                        # nodeadm down: PortcullisQuorumLost (its up == 0 branch,
+                        # no system label) says it; no TargetDown on top.
+                        {source_matchers: ["alertname = PortcullisQuorumLost", "job = nodeadm", "system = \"\""],
+                         target_matchers: ["alertname = TargetDown", "job = nodeadm"],
+                         equal: ["job", "instance"]}]
       }'
 }
 
@@ -95,10 +100,11 @@ monitoring_prepare() {
   else
     echo '[]' > "$m/prometheus/frontdoor-targets.json"
   fi
-  # nodeadm-targets.json: nodeadm's R7 cluster metrics in HA only (Task 32).
+  # nodeadm-targets.json: nodeadm's R7 cluster metrics in HA only (Task 32),
+  # its Service in its own namespace (the chart's ha.nodeadmNamespace =
+  # KUBE_NODEADM_NS: k8s_parity check_monitoring).
   if _rt_is_kube && kube_ha_on; then
-    local nns="${PORTCULLIS_NODEADM_NAMESPACE:-portcullis-nodeadm}"
-    jq -n --arg t "nodeadm.$nns.svc.cluster.local:9105" '[{targets: [$t], labels: {}}]' > "$m/prometheus/nodeadm-targets.json"
+    jq -n --arg t "nodeadm.$KUBE_NODEADM_NS.svc.cluster.local:9105" '[{targets: [$t], labels: {}}]' > "$m/prometheus/nodeadm-targets.json"
   else
     echo '[]' > "$m/prometheus/nodeadm-targets.json"
   fi

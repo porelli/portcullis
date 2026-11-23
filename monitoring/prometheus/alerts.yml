@@ -327,47 +327,60 @@ groups:
           summary: ./portcullis status reported problems
           description: Run ./portcullis status on the host.
 
-      # High availability (contract §20.2, Task 32): the R7 cluster gauges
-      # (job nodeadm; no target outside HA). Absent series don't fire these
-      # (single-server Docker: none exist), except PortcullisQuorumLost when
-      # nodeadm is down.
+      # High availability (contract §20.2, Task 32): nodeadm's R7 cluster
+      # gauges (job nodeadm), the front door's (job frontdoor) and the
+      # offsite backup's textfile metric. Severities are the plan's alert
+      # table (Global Constraints): Problem and Warning → warning,
+      # Critical → critical, Info → info; a "for" only where the table gives
+      # a duration (DNSFailoverStuck's 5 min and BackupStale's 26 h are the
+      # metric's own age, so no "for" on top). Outside HA none fires: nodeadm
+      # and the front door have no target there (their file_sd is []), so
+      # their series are absent, and BackupStale needs up{job="nodeadm"}.
+      # nodeadm drops its cluster gauges after a failed snapshot (absent,
+      # never stale-healthy) and says so with PortcullisNodeadmBlind.
       - alert: PortcullisNodeDown
         expr: portcullis_node_ready == 0
         for: 1m
-        labels: {severity: critical}
+        labels: {severity: warning}
         annotations:
           summary: "The node {{ $labels.node }} is NotReady"
           description: >-
-            Its containers keep running but won't be rescheduled, and it won't accept new
-            work. Run ./portcullis ha status and kubectl get nodes -o wide.
+            It has been NotReady for a minute: its pods aren't rescheduled until fencing
+            confirms it is off. Run ./portcullis ha status and kubectl get nodes -o wide.
 
+      # total = the configured voters (StatefulSet replicas, the server
+      # nodes); 0 configured never alerts.
       - alert: PortcullisQuorumAtRisk
         expr: >-
           portcullis_quorum_voters{state="healthy"}
-          == on(job, instance, system) floor(portcullis_quorum_voters{state="total"} / 2) + 1
-        for: 1m
-        labels: {severity: critical}
+          == on(job, instance, system) (floor(portcullis_quorum_voters{state="total"} / 2) + 1)
+          and on(job, instance, system) portcullis_quorum_voters{state="total"} > 0
+        labels: {severity: warning}
         annotations:
           summary: "{{ $labels.system }}: one more failure loses quorum"
           description: >-
-            {{ $labels.system }} has the minimum number of voters needed to work
-            ({{ $value }} of {{ printf "portcullis_quorum_voters{job=\"%s\",instance=\"%s\",system=\"%s\",state=\"total\"}" .Labels.job .Labels.instance .Labels.system | query | first | value }}).
-            One more failure stops writes. Run ./portcullis ha status.
+            {{ $labels.system }} has {{ $value }} healthy voters, the minimum its quorum
+            needs: one more failure stops it. Run ./portcullis ha status.
 
       - alert: PortcullisQuorumLost
         expr: >-
-          (portcullis_quorum_voters{state="healthy"} < on(job, instance, system) floor(portcullis_quorum_voters{state="total"} / 2) + 1)
-          or (up{job="nodeadm"} == 0)
+          (
+            portcullis_quorum_voters{state="healthy"}
+            < on(job, instance, system) (floor(portcullis_quorum_voters{state="total"} / 2) + 1)
+            and on(job, instance, system) portcullis_quorum_voters{state="total"} > 0
+          )
+          or up{job="nodeadm"} == 0
         for: 2m
         labels: {severity: critical}
         annotations:
           summary: "Quorum lost or nodeadm is down"
           description: >-
-            A quorum system has fewer than the majority of its voters healthy, or nodeadm
-            can't be scraped: nothing is promoted, moved or flipped. Run ./portcullis ha status.
+            A quorum system has fewer than the majority of its configured voters healthy,
+            or nodeadm can't be scraped: nothing is promoted, moved or flipped. Run
+            ./portcullis ha status.
 
       - alert: PortcullisVolumeDegraded
-        expr: portcullis_volume_robustness{volume=~".+"} > 0
+        expr: portcullis_volume_robustness > 0
         for: 10m
         labels: {severity: warning}
         annotations:
@@ -377,23 +390,42 @@ groups:
             A degraded volume has lost one replica; a faulted one has lost all replicas and
             is offline. Run ./portcullis ha status and check Longhorn.
 
-      - alert: PortcullisDNSFailoverStuck
-        expr: portcullis_frontdoor_unhealthy_published_seconds{name=~".+",address=~".+"} > 300
-        for: 1m
+      # Absent while CNPG's Cluster can't be read (never a 0 by default).
+      - alert: PortcullisPostgresNotSynchronous
+        expr: portcullis_pg_sync_standbys < 1
         labels: {severity: warning}
         annotations:
-          summary: "DNS failover stuck: {{ $labels.name }} has unhealthy address {{ $labels.address }} published for 5+ minutes"
+          summary: Postgres has no synchronous standby
           description: >-
-            The front door has kept an unhealthy address in the name's published set for more
-            than 5 minutes. Run ./portcullis ha status and check the front door's log.
+            Degraded: one more failure may lose the last writes. Run ./portcullis ha
+            status and check the CNPG Cluster portcullis-pg.
+
+      - alert: PortcullisFailover
+        expr: increase(portcullis_failover_total[5m]) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "A {{ $labels.kind }} failover happened"
+          description: >-
+            A new {{ $labels.kind }} primary took over in the last 5 minutes, as designed.
+            Run ./portcullis ha status to see where it runs now.
+
+      - alert: PortcullisDNSFailoverStuck
+        expr: portcullis_frontdoor_unhealthy_published_seconds >= 300
+        labels: {severity: warning}
+        annotations:
+          summary: "DNS failover stuck: {{ $labels.name }} still publishes the unhealthy {{ $labels.address }}"
+          description: >-
+            The front door has kept an unhealthy address in the name's published set for
+            5 minutes or more. Run ./portcullis ha status and check the front door's log.
 
       - alert: PortcullisBackupStale
-        expr: time() - portcullis_backup_last_success_timestamp_seconds{kind="offsite"} > 26 * 3600
-        for: 1m
+        expr: >-
+          time() - portcullis_backup_last_success_timestamp_seconds{kind="offsite"} >= 26 * 3600
+          and on() group(up{job="nodeadm"})
         labels: {severity: warning}
         annotations:
           summary: "No successful offsite backup for 26 hours"
-          description: "The last offsite backup is {{ $value | humanizeDuration }} old. Check the backup schedule (./portcullis backup schedule)."
+          description: "The last offsite backup is {{ $value | humanizeDuration }} old. HA requires the offsite destination: check ./portcullis backup destination show and the backup schedule."
 
       - alert: PortcullisVaultNoActive
         expr: portcullis_vault_active == 0
@@ -407,33 +439,31 @@ groups:
             voter's liveness restarts a voter that can't reach an active node); if none becomes
             active, check ./portcullis ha status and the voters' logs.
 
-      - alert: PortcullisPostgresNotSynchronous
-        expr: portcullis_pg_sync_standbys < 1 and on() (count(portcullis_quorum_voters{system="etcd",state="total"}) > 0)
-        for: 5m
-        labels: {severity: warning}
-        annotations:
-          summary: Postgres has no synchronous standbys
-          description: >-
-            CNPG is configured for synchronous replication but has {{ $value }} sync standbys
-            (expected at least 1). One more failure may lose the last writes. Check ./portcullis ha status.
-
-      - alert: PortcullisFailover
-        expr: increase(portcullis_failover_total[5m]) > 0
-        labels: {severity: info}
-        annotations:
-          summary: "{{ $labels.kind }} failover occurred"
-          description: >-
-            A {{ $labels.kind }} failover was detected: {{ $value }} in the last 5 minutes.
-            This is informational; the system failed over as designed.
-
+      # A small node (portcullis.io/class=small): the kubelet reports a
+      # pressure condition, or its pods request more than 90 % of its
+      # allocatable memory.
       - alert: PortcullisSmallNodePressure
-        expr: |
-          (1 - (portcullis_node_allocatable_memory_bytes / portcullis_node_capacity_memory_bytes)) > 0.9
-          and on(node) (portcullis_node_class{class="small"} == 1)
-        for: 10m
+        expr: >-
+          (
+            max by (job, instance, node) (portcullis_node_pressure == 1)
+            or max by (job, instance, node) (portcullis_node_requested_memory_bytes / portcullis_node_allocatable_memory_bytes > 0.9)
+          )
+          and on(job, instance, node) portcullis_node_class{class="small"} == 1
         labels: {severity: warning}
         annotations:
-          summary: "Small node {{ $labels.node }} has memory pressure"
+          summary: "The small node {{ $labels.node }} is under pressure"
           description: >-
-            The small node {{ $labels.node }} is using > 90% of its memory capacity.
-            Small nodes should only run Sentinels and the third Vault voter.
+            Its kubelet reports memory, disk or PID pressure, or its pods request more than 90 %
+            of its allocatable memory. Small nodes run only the Sentinels and the third Vault
+            voter: check what else landed there with kubectl get pods -A -o wide.
+
+      - alert: PortcullisNodeadmBlind
+        expr: portcullis_nodeadm_snapshot_age_seconds > 120
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: nodeadm can't read the cluster
+          description: >-
+            Its last good cluster snapshot is {{ $value | humanizeDuration }} old: the HA
+            gauges are absent, so no other HA alert can fire. Check nodeadm's log
+            (kubectl -n portcullis-nodeadm logs deploy/nodeadm).
