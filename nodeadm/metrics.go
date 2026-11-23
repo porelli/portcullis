@@ -9,7 +9,8 @@ package main
 // portcullis_node_class{node,class}, portcullis_node_pressure
 // {node,condition}, portcullis_node_allocatable_memory_bytes{node},
 // portcullis_node_requested_memory_bytes{node}; and
-// portcullis_nodeadm_snapshot_age_seconds (PortcullisNodeadmBlind).
+// portcullis_nodeadm_snapshot_age_seconds and
+// portcullis_nodeadm_start_time_seconds (PortcullisNodeadmBlind).
 // Refreshed by every snapshot (the metrics loop takes one every 30 s).
 //
 // A failed snapshot drops every cluster gauge (absent series, never the
@@ -20,6 +21,7 @@ package main
 import (
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,9 +45,11 @@ type Metrics struct {
 	allocMem    *prometheus.GaugeVec
 	reqMem      *prometheus.GaugeVec
 
-	mu     sync.Mutex
+	// mu: observe / failed hold it for writing, a scrape for reading, so a
+	// scrape never sees a half-updated set.
+	mu     sync.RWMutex
 	now    func() time.Time
-	lastOK time.Time // the last successful snapshot (the process start before one)
+	lastOK atomic.Int64 // UnixNano of the last successful snapshot (the process start before one)
 }
 
 func newMetrics() *Metrics {
@@ -73,14 +77,16 @@ func newMetrics() *Metrics {
 		reqMem: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "portcullis_node_requested_memory_bytes",
 			Help: "The memory requests of the pods scheduled on the node (not finished)."}, []string{"node"}),
 	}
-	m.lastOK = m.now()
+	m.lastOK.Store(m.now().UnixNano())
 	age := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "portcullis_nodeadm_snapshot_age_seconds",
 		Help: "Seconds since nodeadm's last successful cluster snapshot (since its start before the first)."},
-		func() float64 {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			return m.now().Sub(m.lastOK).Seconds()
-		})
+		func() float64 { return m.now().Sub(time.Unix(0, m.lastOK.Load())).Seconds() })
+	// The process's start (PortcullisNodeadmBlind counts restarts with
+	// changes(): a nodeadm restarting faster than the age can grow).
+	start := prometheus.NewGauge(prometheus.GaugeOpts{Name: "portcullis_nodeadm_start_time_seconds",
+		Help: "Unix time this nodeadm process started."})
+	start.Set(float64(m.now().UnixNano()) / 1e9)
+	m.reg.MustRegister(start)
 	m.reg.MustRegister(m.nodeReady, m.quorum, m.robustness, m.pgSync, m.fencing, m.failovers, m.vaultActive,
 		m.nodeClass, m.pressure, m.allocMem, m.reqMem, age)
 	m.failovers.WithLabelValues("postgres")
@@ -92,6 +98,8 @@ var robustnessValue = map[string]float64{"healthy": 0, "degraded": 1, "faulted":
 // observe sets the gauges from a successful snapshot (nodes gone are
 // dropped).
 func (m *Metrics) observe(s *Snapshot) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.reset()
 	for _, n := range s.Nodes {
 		m.nodeReady.WithLabelValues(n.Name).Set(b2f(n.Ready))
@@ -121,14 +129,17 @@ func (m *Metrics) observe(s *Snapshot) {
 	if s.Postgres.Instances > 0 {
 		m.pgSync.WithLabelValues().Set(float64(s.Postgres.SyncStandbys))
 	}
-	m.mu.Lock()
-	m.lastOK = m.now()
-	m.mu.Unlock()
+	m.lastOK.Store(m.now().UnixNano())
 }
 
 // failed drops every cluster gauge after a snapshot that couldn't be taken.
-func (m *Metrics) failed() { m.reset() }
+func (m *Metrics) failed() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reset()
+}
 
+// reset: the caller holds m.mu for writing.
 func (m *Metrics) reset() {
 	for _, g := range []*prometheus.GaugeVec{m.nodeReady, m.quorum, m.robustness, m.pgSync, m.fencing, m.vaultActive,
 		m.nodeClass, m.pressure, m.allocMem, m.reqMem} {
@@ -136,6 +147,12 @@ func (m *Metrics) reset() {
 	}
 }
 
+// Handler serves /metrics under m.mu's read lock: one consistent set.
 func (m *Metrics) Handler() http.Handler {
-	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{})
+	h := promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		h.ServeHTTP(w, r)
+	})
 }

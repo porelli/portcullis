@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -142,7 +143,7 @@ func TestMetricsFailedSnapshotDropsGauges(t *testing.T) {
 // from the process start (a nodeadm that never could ask is blind too).
 func TestMetricsSnapshotAgeFromStart(t *testing.T) {
 	h := newHarness(t)
-	h.s.metrics.lastOK = vecNow
+	h.s.metrics.lastOK.Store(vecNow.UnixNano())
 	h.setNow(vecNow.Add(121 * time.Second))
 	wantSeries(t, scrape(t, h.s.metrics), `portcullis_nodeadm_snapshot_age_seconds`, 121)
 }
@@ -208,4 +209,103 @@ func TestMetricsSmallNodeInputs(t *testing.T) {
 	wantSeries(t, got, `portcullis_node_allocatable_memory_bytes{node="n4"}`, 4000000000)
 	wantSeries(t, got, `portcullis_node_requested_memory_bytes{node="n4"}`, 3600000000)
 	wantSeries(t, got, `portcullis_node_requested_memory_bytes{node="n1"}`, 0)
+}
+
+var clusterFamilies = []string{"portcullis_node_ready", "portcullis_quorum_voters", "portcullis_volume_robustness",
+	"portcullis_pg_sync_standbys", "portcullis_fencing_ready", "portcullis_vault_active", "portcullis_node_class",
+	"portcullis_node_pressure", "portcullis_node_allocatable_memory_bytes", "portcullis_node_requested_memory_bytes"}
+
+// TestClusterHandlerLeavesGauges (fix round 3): GET /v1/cluster whose
+// request is cancelled (or times out) mid-snapshot fails for its caller
+// only: the gauges the metrics loop set stay, and the snapshot age isn't
+// touched (the alerts' holds keep running).
+func TestClusterHandlerLeavesGauges(t *testing.T) {
+	h := newHarness(t)
+	snapshotFixture(t, h)
+	if _, err := h.s.snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before := scrape(t, h.s.metrics)
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		h.kube.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, cause
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r := httptest.NewRequest("GET", "/v1/cluster", nil).WithContext(ctx)
+		if err := h.s.handleCluster(httptest.NewRecorder(), r); err == nil {
+			t.Fatalf("%v: the handler's snapshot succeeded", cause)
+		}
+		h.kube.ReactionChain = h.kube.ReactionChain[1:]
+		if got := scrape(t, h.s.metrics); len(got) != len(before) {
+			t.Fatalf("%v: the handler's failed snapshot changed the metrics: %d series, had %d", cause, len(got), len(before))
+		} else {
+			for k, v := range before {
+				if got[k] != v {
+					t.Fatalf("%v: %s = %v after the handler's failure, was %v", cause, k, got[k], v)
+				}
+			}
+		}
+	}
+	// A successful handler snapshot doesn't observe either (the loop alone).
+	h.setNow(vecNow.Add(90 * time.Second))
+	if err := h.s.handleCluster(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/cluster", nil)); err != nil {
+		t.Fatal(err)
+	}
+	wantSeries(t, scrape(t, h.s.metrics), `portcullis_nodeadm_snapshot_age_seconds`, 90)
+}
+
+// TestMetricsScrapeConsistent (fix round 3, run under -race): scrapes
+// racing the metrics loop's good and failed snapshots see every cluster
+// family or none, never a half-updated set.
+func TestMetricsScrapeConsistent(t *testing.T) {
+	h := newHarness(t)
+	snapshotFixture(t, h)
+	var failing atomic.Bool
+	h.kube.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if failing.Load() {
+			return true, nil, errors.New("the API server is unreachable")
+		}
+		return false, nil, nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 60; i++ {
+			failing.Store(i%2 == 1)
+			_, _ = h.s.snapshot(context.Background())
+		}
+	}()
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+		}
+		got := scrape(t, h.s.metrics)
+		n := 0
+		for _, f := range clusterFamilies {
+			if hasPrefix(got, f) {
+				n++
+			}
+		}
+		if n != 0 && n != len(clusterFamilies) {
+			t.Fatalf("a scrape saw %d of %d cluster families (half-updated)", n, len(clusterFamilies))
+		}
+	}
+}
+
+// TestMetricsStartTime: portcullis_nodeadm_start_time_seconds is the
+// process's start (PortcullisNodeadmBlind's restart count), set once.
+func TestMetricsStartTime(t *testing.T) {
+	before := time.Now()
+	m := newMetrics()
+	got := scrape(t, m)["portcullis_nodeadm_start_time_seconds"]
+	if got < float64(before.Unix())-1 || got > float64(time.Now().Unix())+1 {
+		t.Fatalf("portcullis_nodeadm_start_time_seconds = %v, want about %d", got, before.Unix())
+	}
+	time.Sleep(10 * time.Millisecond)
+	if again := scrape(t, m)["portcullis_nodeadm_start_time_seconds"]; again != got {
+		t.Fatalf("the start time moved: %v → %v", got, again)
+	}
 }

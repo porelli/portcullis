@@ -29,9 +29,12 @@ const (
 	pgNS = "cnpg-system"
 )
 
-// GET /v1/cluster
+// GET /v1/cluster: a snapshot for the caller only. It never touches the
+// metrics (fix round 3: a cancelled or timed-out request must not drop
+// the gauges and reset the alerts' holds); the metrics loop alone
+// (snapshot) observes.
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) error {
-	snap, err := s.snapshot(r.Context())
+	snap, err := s.takeSnapshot(r.Context())
 	if err != nil {
 		return err
 	}
@@ -55,8 +58,9 @@ func keepLabel(k string) bool {
 	return k == "kubernetes.io/hostname" || k == labelZone || strings.HasPrefix(k, "portcullis.io/") || k == labelDisk || k == labelEnableLB
 }
 
-// snapshot builds the §20.2 snapshot. A failure drops the cluster gauges
-// (absent, never stale-healthy: Metrics.failed).
+// snapshot is the metrics loop's snapshot (main.go, every 30 s): a success
+// sets the gauges, a failure drops them (absent, never stale-healthy:
+// Metrics.failed). Nothing else calls it.
 func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 	snap, err := s.takeSnapshot(ctx)
 	if err != nil {
