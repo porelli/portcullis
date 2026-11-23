@@ -3041,6 +3041,8 @@ ha_enable_step_switch() {
   env_set PORTCULLIS_HA on
   export PORTCULLIS_HA=on
   info "HA on (PORTCULLIS_HA=on in .env): deploying the HA shape (./portcullis up)..."
+  # Task 32 fix round 3: the scale-out's expected alert (no silencing built).
+  info "Monitoring may raise PortcullisQuorumLost until the new voters are ready."
   stack_up
 }
 

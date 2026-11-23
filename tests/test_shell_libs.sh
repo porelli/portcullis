@@ -8581,6 +8581,8 @@ rm -f "$HE/ran"; hacli "" "$HE_SW; ha_enable_step_switch; exit 0" status
 expect_eq "switch on writers already on <pvc>-r: the certificate plan first, no copy check, no copy" "$RC:$(tr '\n' ' ' < "$HE/ran")" "0:plan env seed env_set PORTCULLIS_HA=on up "
 rm -f "$HE/ran"; hacli "" "$HE_SW; _ha_writers_on_replicated() { return 1; }; _ha_volumes_same() { echo same >> \"\$HE/ran\"; return 1; }; ha_enable_step_switch; exit 0" status
 expect_eq "switch after a write since the copy: copied again before anything else changes" "$RC:$(tr '\n' ' ' < "$HE/ran")" "0:plan stopped same COPY env seed env_set PORTCULLIS_HA=on up "
+expect_eq "switch: says once that monitoring may raise PortcullisQuorumLost during the scale-out" \
+  "$(printf '%s\n%s\n' "$OUT" "$ERR" | grep -c 'Monitoring may raise PortcullisQuorumLost until the new voters are ready.')" 1
 
 # Found live (Task 31): a one-shot's stdout is its own (the dns tool's
 # JSON): the local image build's progress goes to stderr.

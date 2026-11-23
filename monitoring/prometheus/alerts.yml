@@ -333,7 +333,10 @@ groups:
       # table (Global Constraints): Problem and Warning → warning,
       # Critical → critical, Info → info; a "for" only where the table gives
       # a duration (DNSFailoverStuck's 5 min and BackupStale's 26 h are the
-      # metric's own age, so no "for" on top). Outside HA none fires: nodeadm
+      # metric's own age, so no "for" on top). Fix round 3 (controller
+      # ruling): QuorumAtRisk, PostgresNotSynchronous and SmallNodePressure
+      # hold 5m (a planned rolling restart or a short standby restart isn't
+      # a warning). Outside HA none fires: nodeadm
       # and the front door have no target there (their file_sd is []), so
       # their series are absent, and BackupStale needs up{job="nodeadm"}.
       # nodeadm drops its cluster gauges after a failed snapshot (absent,
@@ -349,12 +352,14 @@ groups:
             confirms it is off. Run ./portcullis ha status and kubectl get nodes -o wide.
 
       # total = the configured voters (StatefulSet replicas, the server
-      # nodes); 0 configured never alerts.
+      # nodes); fewer than 2 configured never alerts (the doctor's rule: a
+      # single voter has no quorum to put at risk).
       - alert: PortcullisQuorumAtRisk
         expr: >-
           portcullis_quorum_voters{state="healthy"}
           == on(job, instance, system) (floor(portcullis_quorum_voters{state="total"} / 2) + 1)
-          and on(job, instance, system) portcullis_quorum_voters{state="total"} > 0
+          and on(job, instance, system) portcullis_quorum_voters{state="total"} >= 2
+        for: 5m
         labels: {severity: warning}
         annotations:
           summary: "{{ $labels.system }}: one more failure loses quorum"
@@ -393,6 +398,7 @@ groups:
       # Absent while CNPG's Cluster can't be read (never a 0 by default).
       - alert: PortcullisPostgresNotSynchronous
         expr: portcullis_pg_sync_standbys < 1
+        for: 5m
         labels: {severity: warning}
         annotations:
           summary: Postgres has no synchronous standby
@@ -449,6 +455,7 @@ groups:
             or max by (job, instance, node) (portcullis_node_requested_memory_bytes / portcullis_node_allocatable_memory_bytes > 0.9)
           )
           and on(job, instance, node) portcullis_node_class{class="small"} == 1
+        for: 5m
         labels: {severity: warning}
         annotations:
           summary: "The small node {{ $labels.node }} is under pressure"
@@ -457,13 +464,20 @@ groups:
             of its allocatable memory. Small nodes run only the Sentinels and the third Vault
             voter: check what else landed there with kubectl get pods -A -o wide.
 
+      # nodeadm up but blind (its snapshots fail: etcd without quorum
+      # makes every list fail, and the gauges go absent), or restarting
+      # (3 starts within 10 min: each start resets the age). Critical: it
+      # is how a real quorum loss shows while nodeadm still answers.
       - alert: PortcullisNodeadmBlind
-        expr: portcullis_nodeadm_snapshot_age_seconds > 120
+        expr: >-
+          portcullis_nodeadm_snapshot_age_seconds > 90
+          or changes(portcullis_nodeadm_start_time_seconds[10m]) > 2
         for: 1m
-        labels: {severity: warning}
+        labels: {severity: critical}
         annotations:
           summary: nodeadm can't read the cluster
           description: >-
-            Its last good cluster snapshot is {{ $value | humanizeDuration }} old: the HA
-            gauges are absent, so no other HA alert can fire. Check nodeadm's log
+            Its cluster snapshots fail (none for over 90 s) or it keeps restarting: the HA
+            gauges are absent, so the other HA alerts can't fire. etcd without quorum looks
+            like this. Run ./portcullis ha status and check nodeadm's log
             (kubectl -n portcullis-nodeadm logs deploy/nodeadm).

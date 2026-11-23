@@ -637,23 +637,23 @@ tests:
                 It has been NotReady for a minute: its pods aren't rescheduled until fencing
                 confirms it is off. Run ./portcullis ha status and kubectl get nodes -o wide.
 
-  # QuorumAtRisk (no duration in the table): 2 of 3 healthy from 1m →
-  # not at 59s, firing at 1m; 3 of 3 never.
+  # QuorumAtRisk (fix round 3: held 5m): 2 of 3 healthy from 0 → not at
+  # 4m59s, firing at 5m; 3 of 3 never.
   - interval: 1m
     input_series:
       - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="etcd",state="total"}'
-        values: '3x5'
+        values: '3x10'
       - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="etcd",state="healthy"}'
-        values: '3 2 2 2 2'
+        values: '2x10'
       - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="vault",state="total"}'
-        values: '3x5'
+        values: '3x10'
       - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="vault",state="healthy"}'
-        values: '3x5'
+        values: '3x10'
     alert_rule_test:
-      - eval_time: 59s
+      - eval_time: 4m59s
         alertname: PortcullisQuorumAtRisk
         exp_alerts: []
-      - eval_time: 1m
+      - eval_time: 5m
         alertname: PortcullisQuorumAtRisk
         exp_alerts:
           - exp_labels: {severity: warning, job: nodeadm, instance: "nodeadm:9105", system: etcd}
@@ -662,6 +662,22 @@ tests:
               description: >-
                 etcd has 2 healthy voters, the minimum its quorum
                 needs: one more failure stops it. Run ./portcullis ha status.
+
+  # QuorumAtRisk on a single voter (Vault without HA: 1 of 1): never (the
+  # doctor's rule, total >= 2).
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="vault",state="total"}'
+        values: '1x20'
+      - series: 'portcullis_quorum_voters{job="nodeadm",instance="nodeadm:9105",system="vault",state="healthy"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PortcullisQuorumAtRisk
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: PortcullisQuorumLost
+        exp_alerts: []
 
   # QuorumLost (review I6): 3 configured Vault voters, 1 Ready (the others
   # unscheduled) from 1m, for 2m → not at 2m59s, firing at 3m.
@@ -743,17 +759,17 @@ tests:
                 A degraded volume has lost one replica; a faulted one has lost all replicas and
                 is offline. Run ./portcullis ha status and check Longhorn.
 
-  # PostgresNotSynchronous (no duration in the table): 0 sync standbys
-  # from 1m → not at 59s, firing at 1m.
+  # PostgresNotSynchronous (fix round 3: held 5m): 0 sync standbys from 0
+  # → not at 4m59s, firing at 5m.
   - interval: 1m
     input_series:
       - series: 'portcullis_pg_sync_standbys{job="nodeadm",instance="nodeadm:9105"}'
-        values: '1 0 0 0'
+        values: '0x10'
     alert_rule_test:
-      - eval_time: 59s
+      - eval_time: 4m59s
         alertname: PortcullisPostgresNotSynchronous
         exp_alerts: []
-      - eval_time: 1m
+      - eval_time: 5m
         alertname: PortcullisPostgresNotSynchronous
         exp_alerts:
           - exp_labels: {severity: warning, job: nodeadm, instance: "nodeadm:9105"}
@@ -869,39 +885,39 @@ tests:
         alertname: PortcullisVaultNoActive
         exp_alerts: []
 
-  # SmallNodePressure (no duration in the table), from 1m: the small n4's
-  # pods request 92.5 % of its memory, the small n5 reports MemoryPressure;
-  # the home n1 at 95 % and with DiskPressure never alerts. Not at 59s,
-  # firing at 1m.
+  # SmallNodePressure (fix round 3: held 5m), from 0: the small n4's pods
+  # request 92.5 % of its memory, the small n5 reports MemoryPressure; the
+  # home n1 at 95 % and with DiskPressure never alerts. Not at 4m59s,
+  # firing at 5m.
   - interval: 1m
     input_series:
       - series: 'portcullis_node_class{job="nodeadm",instance="nodeadm:9105",node="n4",class="small"}'
-        values: '1x5'
+        values: '1x10'
       - series: 'portcullis_node_class{job="nodeadm",instance="nodeadm:9105",node="n5",class="small"}'
-        values: '1x5'
+        values: '1x10'
       - series: 'portcullis_node_class{job="nodeadm",instance="nodeadm:9105",node="n1",class="home"}'
-        values: '1x5'
+        values: '1x10'
       - series: 'portcullis_node_allocatable_memory_bytes{job="nodeadm",instance="nodeadm:9105",node="n4"}'
-        values: '4000000000x5'
+        values: '4000000000x10'
       - series: 'portcullis_node_requested_memory_bytes{job="nodeadm",instance="nodeadm:9105",node="n4"}'
-        values: '1000000000 3700000000x4'
+        values: '3700000000x10'
       - series: 'portcullis_node_allocatable_memory_bytes{job="nodeadm",instance="nodeadm:9105",node="n5"}'
-        values: '4000000000x5'
+        values: '4000000000x10'
       - series: 'portcullis_node_requested_memory_bytes{job="nodeadm",instance="nodeadm:9105",node="n5"}'
-        values: '1000000000x5'
+        values: '1000000000x10'
       - series: 'portcullis_node_pressure{job="nodeadm",instance="nodeadm:9105",node="n5",condition="MemoryPressure"}'
-        values: '0 1x4'
+        values: '1x10'
       - series: 'portcullis_node_allocatable_memory_bytes{job="nodeadm",instance="nodeadm:9105",node="n1"}'
-        values: '4000000000x5'
+        values: '4000000000x10'
       - series: 'portcullis_node_requested_memory_bytes{job="nodeadm",instance="nodeadm:9105",node="n1"}'
-        values: '3800000000x5'
+        values: '3800000000x10'
       - series: 'portcullis_node_pressure{job="nodeadm",instance="nodeadm:9105",node="n1",condition="DiskPressure"}'
-        values: '1x5'
+        values: '1x10'
     alert_rule_test:
-      - eval_time: 59s
+      - eval_time: 4m59s
         alertname: PortcullisSmallNodePressure
         exp_alerts: []
-      - eval_time: 1m
+      - eval_time: 5m
         alertname: PortcullisSmallNodePressure
         exp_alerts:
           - exp_labels: {severity: warning, job: nodeadm, instance: "nodeadm:9105", node: n4}
@@ -919,12 +935,44 @@ tests:
                 of its allocatable memory. Small nodes run only the Sentinels and the third Vault
                 voter: check what else landed there with kubectl get pods -A -o wide.
 
-  # NodeadmBlind (review M11): the snapshot age passes 120 s at 3m (180),
-  # for 1m → not at 3m59s, firing at 4m.
+  # NodeadmBlind (review M11, fix round 3: critical): nodeadm up, its
+  # snapshots failing since 0 (the age grows); > 90 s from 2m, for 1m →
+  # not at 2m59s, firing at 3m.
   - interval: 1m
     input_series:
       - series: 'portcullis_nodeadm_snapshot_age_seconds{job="nodeadm",instance="nodeadm:9105"}'
         values: '0+60x8'
+      - series: 'portcullis_nodeadm_start_time_seconds{job="nodeadm",instance="nodeadm:9105"}'
+        values: '0x8'
+      - series: 'up{job="nodeadm",instance="nodeadm:9105"}'
+        values: '1x8'
+    alert_rule_test:
+      - eval_time: 2m59s
+        alertname: PortcullisNodeadmBlind
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: PortcullisNodeadmBlind
+        exp_alerts:
+          - exp_labels: {severity: critical, job: nodeadm, instance: "nodeadm:9105"}
+            exp_annotations: &blind
+              summary: nodeadm can't read the cluster
+              description: >-
+                Its cluster snapshots fail (none for over 90 s) or it keeps restarting: the HA
+                gauges are absent, so the other HA alerts can't fire. etcd without quorum looks
+                like this. Run ./portcullis ha status and check nodeadm's log
+                (kubectl -n portcullis-nodeadm logs deploy/nodeadm).
+
+  # NodeadmBlind: nodeadm restarting every 60 s (each start resets the age,
+  # so it never passes 90 s; up stays 1): the third change of its start
+  # time at 3m, for 1m → not at 3m59s, firing at 4m.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_nodeadm_snapshot_age_seconds{job="nodeadm",instance="nodeadm:9105"}'
+        values: '30x10'
+      - series: 'portcullis_nodeadm_start_time_seconds{job="nodeadm",instance="nodeadm:9105"}'
+        values: '0+60x10'
+      - series: 'up{job="nodeadm",instance="nodeadm:9105"}'
+        values: '1x10'
     alert_rule_test:
       - eval_time: 3m59s
         alertname: PortcullisNodeadmBlind
@@ -932,13 +980,20 @@ tests:
       - eval_time: 4m
         alertname: PortcullisNodeadmBlind
         exp_alerts:
-          - exp_labels: {severity: warning, job: nodeadm, instance: "nodeadm:9105"}
-            exp_annotations:
-              summary: nodeadm can't read the cluster
-              description: >-
-                Its last good cluster snapshot is 4m 0s old: the HA
-                gauges are absent, so no other HA alert can fire. Check nodeadm's log
-                (kubectl -n portcullis-nodeadm logs deploy/nodeadm).
+          - exp_labels: {severity: critical, job: nodeadm, instance: "nodeadm:9105"}
+            exp_annotations: *blind
+
+  # One restart (a rollout) and healthy snapshots: never blind.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_nodeadm_snapshot_age_seconds{job="nodeadm",instance="nodeadm:9105"}'
+        values: '30x20'
+      - series: 'portcullis_nodeadm_start_time_seconds{job="nodeadm",instance="nodeadm:9105"}'
+        values: '0x5 300x15'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PortcullisNodeadmBlind
+        exp_alerts: []
 
   # No HA alert outside HA: a Docker install's series (no nodeadm or front
   # door target) fire none of them.
