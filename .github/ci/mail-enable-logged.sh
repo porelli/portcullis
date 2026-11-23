@@ -5,7 +5,13 @@
 #   mail-enable-logged.sh <provider> <out file>
 # Exit: mail enable's. On a failure the last lines of every container the
 # instance had are printed (logs saved under $MAIL_CI_LOGS, default
-# /tmp/mail-instance-logs).
+# /tmp/mail-instance-logs). On a success it then waits (≤ 300 s) for the
+# instance's restart that the first posted mail key owes when the block
+# has admin_view (contract §19.3: the read-only view pins the key): the
+# Hub's record for <provider> a finished, ok restart; exit 1 otherwise.
+# The Hub: $HUB_API when set (rootless Podman's published port), else its
+# address on the portcullis network; the proxy secret from .env, never
+# printed.
 set -uo pipefail
 provider="${1:?usage: mail-enable-logged.sh <provider> <out file>}"
 out="${2:?usage: mail-enable-logged.sh <provider> <out file>}"
@@ -41,4 +47,21 @@ if [ "$rc" != 0 ]; then
     tail -n 40 "$f"
   done
 fi
-exit "$rc"
+[ "$rc" = 0 ] || exit "$rc"
+# A block with admin_view runs the view's service (the stalwart template's
+# admin-view).
+if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=portcullis-$provider" --filter label=com.docker.compose.service=admin-view 2>/dev/null)" ]; then
+  hub_url="${HUB_API:-http://$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)"):8888}"
+  secret="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"
+  [ -z "${GITHUB_ACTIONS:-}" ] || echo "::add-mask::$secret"
+  for i in $(seq 1 150); do
+    curl -s --max-time 30 -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$secret") \
+      "$hub_url/api/instances/$provider/op" > "$logs/op.json" || true
+    jq -e '.op == "restart" and (.running | not)' "$logs/op.json" >/dev/null 2>&1 && break
+    [ "$i" -eq 150 ] && { echo "FAIL: $provider's restart for its first mail key never ended: $(head -c 600 "$logs/op.json")"; exit 1; }
+    sleep 2
+  done
+  jq -e '.ok == true' "$logs/op.json" >/dev/null || { echo "FAIL: $provider's restart for its first mail key failed: $(head -c 600 "$logs/op.json")"; exit 1; }
+  echo "PASS: the first mail key restarted $provider (its admin view pins the key)"
+fi
+exit 0
