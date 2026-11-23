@@ -237,6 +237,10 @@ class AdminViewFlow(unittest.TestCase):
     def test_whole_flow(self):
         self.assertEqual(mc.admin_view_problems(self.good()), [])
 
+    def test_jmap_with_a_trailing_slash(self):
+        seen = [(m, s, u + "/" if u.endswith("/jmap") else u) for m, s, u in self.good()]
+        self.assertEqual(mc.admin_view_problems(seen), [])
+
     def test_a_421_or_403_anywhere(self):
         for status, url in ((421, "https://hub.ci.example.org/"), (403, self.H + "/jmap"), (421, self.H + "/portcullis/open")):
             got = mc.admin_view_problems(self.good() + [("GET", status, url)])

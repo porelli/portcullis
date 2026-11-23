@@ -1594,7 +1594,7 @@ def admin_view_flow(ctx, label: str, mail_first: bool) -> None:
         form.fill("e2e-anyone")
         form.press("Enter")
         def answered(path):
-            return any(m == "POST" and st == 200 and u.split("?")[0].endswith(path) for m, st, u in seen)
+            return any(m == "POST" and st == 200 and u.split("?")[0].rstrip("/").endswith(path) for m, st, u in seen)
         try:
             until(f"{label}: the view answered the token request", lambda: answered("/auth/token"), 30, every=1)
         except AssertionError:
