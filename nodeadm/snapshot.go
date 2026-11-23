@@ -58,6 +58,35 @@ func keepLabel(k string) bool {
 	return k == "kubernetes.io/hostname" || k == labelZone || strings.HasPrefix(k, "portcullis.io/") || k == labelDisk || k == labelEnableLB
 }
 
+// selectedLabelKeys: the node label keys a snapshot pod's nodeSelector or
+// required node affinity names. The Hub's N−1 check matches each pod's
+// required affinity (snapPod) against the snapshot's node labels, so a key
+// the snapshot dropped would leave that pod no node at all: k3s' own addons
+// select on kubernetes.io/os and nodeadm on
+// node-role.kubernetes.io/control-plane, and every node was red (found live
+// on the HA VMs). Pods the snapshot leaves out (unscheduled, finished)
+// count for nothing.
+func selectedLabelKeys(pods []corev1.Pod) map[string]bool {
+	keys := map[string]bool{}
+	for i := range pods {
+		p := &pods[i]
+		if p.Spec.NodeName == "" || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		for k := range p.Spec.NodeSelector {
+			keys[k] = true
+		}
+		if a := p.Spec.Affinity; a != nil && a.NodeAffinity != nil && a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+			for _, t := range a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+				for _, e := range t.MatchExpressions {
+					keys[e.Key] = true
+				}
+			}
+		}
+	}
+	return keys
+}
+
 // snapshot is the metrics loop's snapshot (main.go, every 30 s): a success
 // sets the gauges, a failure drops them (absent, never stale-healthy:
 // Metrics.failed). Nothing else calls it.
@@ -103,6 +132,7 @@ func (s *Server) takeSnapshot(ctx context.Context) (*Snapshot, error) {
 			fencing[p.Spec.NodeName] = true
 		}
 	}
+	selected := selectedLabelKeys(pods.Items)
 	names := map[string]bool{}
 	for _, c := range cl {
 		names[c.Name] = true
@@ -129,7 +159,7 @@ func (s *Server) takeSnapshot(ctx context.Context) (*Snapshot, error) {
 		}
 		snap.pressure[c.Name] = pr
 		for k, v := range n.Labels {
-			if keepLabel(k) {
+			if keepLabel(k) || selected[k] {
 				sn.Labels[k] = v
 			}
 		}
