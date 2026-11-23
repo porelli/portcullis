@@ -758,3 +758,53 @@ func TestStartPage(t *testing.T) {
 		t.Errorf("no route key: %d", r.StatusCode)
 	}
 }
+
+// Every refusal without a session logs one line: who, the path and why
+// (no cookie / unknown session / idle or max / another admin), never
+// the cookie's value.
+func TestRefusalsLogged(t *testing.T) {
+	e := setup(t)
+	last := func() string {
+		t.Helper()
+		if len(e.logs) == 0 {
+			t.Fatal("nothing logged")
+		}
+		return e.logs[len(e.logs)-1]
+	}
+	expect := func(name, path string, hdr map[string]string, reason string) {
+		t.Helper()
+		n := len(e.logs)
+		if resp := e.do(t, "GET", path, "", hdr); resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s: %d", name, resp.StatusCode)
+		}
+		if len(e.logs) != n+1 {
+			t.Fatalf("%s: %d lines logged, want 1: %v", name, len(e.logs)-n, e.logs[n:])
+		}
+		l := last()
+		if !strings.Contains(l, "refused") || !strings.Contains(l, fmt.Sprintf("%q", path)) || !strings.Contains(l, reason) {
+			t.Fatalf("%s: line %q lacks the path %q or the reason %q", name, l, path, reason)
+		}
+		if e.cookie != "" && strings.Contains(l, e.cookie) {
+			t.Fatalf("%s: the cookie value is in the log: %q", name, l)
+		}
+	}
+	expect("no cookie", "/admin/", nil, "no session cookie")
+	e.cookie = "not-a-session-0123456789"
+	expect("unknown", "/jmap/session", nil, "unknown session")
+	e.cookie = ""
+	e.openSession(t)
+	expect("another admin", "/admin/x", map[string]string{"X-Forwarded-User": "alice"}, "another administrator's session")
+	if !strings.Contains(last(), "alice") {
+		t.Fatalf("the refused admin isn't named: %q", last())
+	}
+	e.now = e.now.Add(31 * time.Minute)
+	expect("idle", "/admin/", nil, "ended (idle or max)")
+	// The gate's refusal is logged too, with no header value.
+	n := len(e.logs)
+	if resp := e.do(t, "GET", "/admin/", "", map[string]string{RouteKeyHeader: "wrong"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("gate: %d", resp.StatusCode)
+	}
+	if len(e.logs) != n+1 || !strings.Contains(last(), "not admitted") || strings.Contains(last(), "wrong") {
+		t.Fatalf("gate refusal: %v", e.logs[n:])
+	}
+}

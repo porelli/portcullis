@@ -409,6 +409,9 @@ func who(r *http.Request) string {
 // ServeHTTP is the gate, the session, then the allowlist (contract §19.13).
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !p.admitted(r) || user(r) == "" {
+		// The request's headers aren't trusted here: only the peer
+		// address and the path are logged.
+		p.logf("admin-view: refused %q from %s: not admitted by the gate (Traefik's address, the route key, the admin group and a user are required)", r.URL.Path, r.RemoteAddr)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -440,8 +443,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		startScript(w)
 		return
 	}
-	s, why := p.session(r)
+	s, why, reason := p.session(r)
 	if s == nil {
+		p.logf("admin-view: refused %s on %q: %s", who(r), path, reason)
 		openFromPortcullis(w, why)
 		return
 	}
@@ -588,11 +592,12 @@ func randomToken() string {
 }
 
 // session is the request's live session (its cookie, the same admin,
-// within the idle and total limits), or nil and why.
-func (p *Proxy) session(r *http.Request) (*session, string) {
+// within the idle and total limits), or nil, why (for the page) and the
+// reason (for the log line: never the cookie's value).
+func (p *Proxy) session(r *http.Request) (*session, string, string) {
 	c, err := r.Cookie(SessionCookie)
 	if err != nil || c.Value == "" {
-		return nil, "This page opens only from Portcullis."
+		return nil, "This page opens only from Portcullis.", "no session cookie"
 	}
 	now := p.now()
 	p.mu.Lock()
@@ -600,15 +605,15 @@ func (p *Proxy) session(r *http.Request) (*session, string) {
 	s := p.sessions[c.Value]
 	switch {
 	case s == nil:
-		return nil, "This session isn't known (it ended, or the view restarted)."
+		return nil, "This session isn't known (it ended, or the view restarted).", "unknown session (it ended, or the view restarted)"
 	case now.Sub(s.last) > SessionIdle || now.Sub(s.created) > SessionMax:
 		delete(p.sessions, c.Value)
-		return nil, "This session ended (30 minutes idle or 8 hours open)."
+		return nil, "This session ended (30 minutes idle or 8 hours open).", "the session ended (idle or max)"
 	case s.user != user(r):
-		return nil, "This session belongs to another administrator."
+		return nil, "This session belongs to another administrator.", "another administrator's session (" + s.user + "'s)"
 	}
 	s.last = now
-	return s, ""
+	return s, "", ""
 }
 
 // open starts a session from the Hub's ticket: well formed, MAC'd with
