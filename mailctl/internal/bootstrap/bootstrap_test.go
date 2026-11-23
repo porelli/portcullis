@@ -714,9 +714,13 @@ func TestBasePlanViewer(t *testing.T) {
 	// ResetViewer on the bootstrapped store: a new password, nothing else.
 	srv := httptest.NewServer(f)
 	defer srv.Close()
-	pw, err := ResetViewer(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")))
-	if err != nil || len(pw) < 40 {
-		t.Fatalf("ResetViewer: %q %v", pw, err)
+	f.calls = nil
+	v, err := ResetViewer(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")))
+	if err != nil || len(v.Password) < 40 || v.MadeRole || v.MadeAccount || v.FixedRole {
+		t.Fatalf("ResetViewer: %+v %v", v, err)
+	}
+	if got := strings.Join(setCalls(f), ","); got != "x:Account/set update" {
+		t.Fatalf("ResetViewer on a bootstrapped store: sets %s", got)
 	}
 	// No admin view rule without the proxy's address.
 	if strings.Contains(fmt.Sprint(params().AllowedEndpoints()), "admin-view") {
@@ -724,22 +728,17 @@ func TestBasePlanViewer(t *testing.T) {
 	}
 }
 
-// A store from before the admin view: ResetViewer answers "" (the view
-// stays unavailable) and writes nothing.
-func TestResetViewerWithoutViewer(t *testing.T) {
-	f := newFake()
-	f.put("Domain", map[string]any{"name": ParkingDomain})
-	srv := httptest.NewServer(f)
-	defer srv.Close()
-	pw, err := ResetViewer(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")))
-	if err != nil || pw != "" {
-		t.Fatalf("ResetViewer: %q %v", pw, err)
-	}
+// setCalls is the fake's "x:Obj/set create|update|destroy" calls.
+func setCalls(f *fakeStalwart) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
 	for _, c := range f.calls {
 		if strings.Contains(c, "/set") {
-			t.Fatalf("wrote %s", c)
+			out = append(out, c)
 		}
 	}
+	return out
 }
 
 // TestViewerPasswordNeverReachesViewer (security review N4, R2-M1, data

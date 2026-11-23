@@ -9,6 +9,7 @@ tag's version as its release notes.
 ## [Unreleased]
 
 ### Fixed
+- **Mail admin view on stores older than it** (mailctl bootstrap job): a marked store whose viewer secret file is missing or empty and that has no viewer role or account now gets exactly those (the role with the base plan's read-only permissions, the account on the parking domain with that role alone) and a new password; a viewer role whose permissions drifted is set back to the plan's. Nothing else is touched; without the parking domain the view stays unavailable as before. The view no longer reports "the viewer's password is missing" there.
 - **Kubernetes: nobody could sign in.** Keycloak couldn't read the Hub's `signin-keycloak.json` / `impersonation.json` on the `hub-data` PVC (root 0750, Keycloak has no Hub group), so every sign-in method was off. The PVC root is now 0751: Keycloak opens those 0644 files by name, can't list the volume, and the mount stays read-only. e2e-k3s now signs in and out.
 
 ### Added

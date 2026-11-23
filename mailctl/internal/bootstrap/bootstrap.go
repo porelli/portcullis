@@ -462,15 +462,31 @@ func viewerAccount(ctx context.Context, c *stalwart.Client, parking string) (str
 	return "", nil
 }
 
+// ViewerReset is what ResetViewer did. Password is the admin view
+// account's new password ("" when the view stays unavailable: the store
+// has no parking domain); never logged.
+type ViewerReset struct {
+	Password string
+	// MadeRole, MadeAccount: the store predated the admin view (or lost
+	// these) and ResetViewer made them. FixedRole: the viewer role's
+	// permissions differed from the plan's and were set to them.
+	MadeRole, MadeAccount, FixedRole bool
+}
+
 // ResetViewer gives the admin view's account a new password on a marked
-// store whose viewer secret file is lost (like MintKey: no other object is
-// touched). A store without the account or the viewer role (made before
-// the admin view existed) answers "" and no error: the admin view stays
-// unavailable there, mail is unaffected.
-func ResetViewer(ctx context.Context, c *stalwart.Client) (string, error) {
+// store whose viewer secret file is lost or empty (like MintKey: no other
+// object is touched). A store made before the admin view has no viewer
+// role or account: it makes exactly what is missing — the viewer role
+// with the base plan's permissions, the account on the parking domain
+// with that role alone — and corrects a viewer role whose permissions
+// drifted, so the view stays read-only. It never makes a domain: without
+// the parking domain it answers "" and writes nothing (the admin view
+// stays unavailable there, mail is unaffected).
+func ResetViewer(ctx context.Context, c *stalwart.Client) (ViewerReset, error) {
+	var out ViewerReset
 	doms, err := getAll(ctx, c, "Domain")
 	if err != nil {
-		return "", err
+		return out, err
 	}
 	parking := ""
 	for _, d := range doms {
@@ -478,23 +494,65 @@ func ResetViewer(ctx context.Context, c *stalwart.Client) (string, error) {
 			parking = str(d, "id")
 		}
 	}
+	if parking == "" {
+		return out, nil
+	}
+	roleID, made, fixed, err := ensureViewerRole(ctx, c)
+	if err != nil {
+		return out, err
+	}
+	out.MadeRole, out.FixedRole = made, fixed
+	id, err := viewerAccount(ctx, c, parking)
+	if err != nil {
+		return out, err
+	}
+	out.MadeAccount = id == ""
+	if out.Password, err = ensureViewer(ctx, c, parking, roleID); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// ensureViewerRole finds the viewer role (by its description, the role's
+// name) or makes it from the base plan's definition (viewerRole). A found
+// role whose permissions differ from the plan's gets the plan's, and one
+// that extends other roles stops extending them (it would inherit their
+// writes): that role only, no other field or role. Duplicates are left
+// alone (the account holds the first one only).
+func ensureViewerRole(ctx context.Context, c *stalwart.Client) (id string, made, fixed bool, err error) {
 	roles, err := getAll(ctx, c, "Role")
 	if err != nil {
-		return "", err
+		return "", false, false, err
 	}
-	roleID := ""
+	want := viewerRole()
 	for _, r := range roles {
-		if str(r, "description") == ViewerRole {
-			roleID = str(r, "id")
+		if str(r, "description") != ViewerRole {
+			continue
 		}
+		id = str(r, "id")
+		patch := differs(r, want, map[string]bool{"description": true})
+		var ext map[string]bool
+		_ = json.Unmarshal(r["roleIds"], &ext)
+		if len(ext) > 0 {
+			patch["roleIds"] = set()
+		}
+		if len(patch) == 0 {
+			return id, false, false, nil
+		}
+		res, err := c.Set(ctx, "Role", nil, map[string]map[string]any{id: patch}, nil)
+		if err := checkSet("Role", res, err); err != nil {
+			return "", false, false, err
+		}
+		return id, false, true, nil
 	}
-	if parking == "" || roleID == "" {
-		return "", nil
+	res, err := c.Set(ctx, "Role", map[string]any{"v": want}, nil, nil)
+	if err := checkSet("Role", res, err); err != nil {
+		return "", false, false, err
 	}
-	if id, err := viewerAccount(ctx, c, parking); err != nil || id == "" {
-		return "", err
+	if id = res.CreatedID("v"); id == "" {
+		return "", false, false, errors.New("x:Role/set: no id for the new viewer role")
 	}
-	return ensureViewer(ctx, c, parking, roleID)
+	return id, true, false, nil
 }
 
 // ensureAPIKey makes mailctl's one API key (Inherit, pinned to the

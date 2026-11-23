@@ -448,10 +448,17 @@ func (p Params) Collections() []Named {
 		{Object: "Role", Key: "description", Want: []map[string]any{
 			{"description": MailctlRole, "enabledPermissions": set(stalwart.MailctlRolePermissions...)},
 			{"description": UserRole, "enabledPermissions": set(stalwart.MailPasswordPermissions...)},
-			{"description": ViewerRole, "enabledPermissions": set(stalwart.ViewerRolePermissions...)},
+			viewerRole(),
 		}},
 		{Object: "Domain", Key: "name", Immutable: []string{"name"}, Want: p.domains()},
 	}
+}
+
+// viewerRole is the admin view's role (contract §19.13): the read-only
+// list and nothing else. The one definition: the base plan and
+// ResetViewer's repair of an older store both use it.
+func viewerRole() map[string]any {
+	return map[string]any{"description": ViewerRole, "enabledPermissions": set(stalwart.ViewerRolePermissions...)}
 }
 
 // manual is every domain's management (no ACME, DNS or DKIM automation in
@@ -510,6 +517,8 @@ func init() {
 	for _, u := range []stalwart.Use{
 		{Object: "x:AcmeProvider"},
 		{Object: "x:UserRoles", Variant: "Custom", Field: "roleIds"},
+		// ResetViewer stops a drifted viewer role extending others.
+		{Object: "x:Role", Field: "roleIds"},
 		{Object: "x:CredentialPermissions", Variant: "Inherit"},
 		{Object: "x:PublicText", Variant: "File", Field: "filePath"},
 		{Object: "x:SecretText", Variant: "File", Field: "filePath"},

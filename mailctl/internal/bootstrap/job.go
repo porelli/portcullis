@@ -280,17 +280,31 @@ func (j *Job) Run(ctx context.Context) (err error) {
 	// used (it is pinned to the adapter's address).
 	return j.recovery(ctx, func(c *stalwart.Client) (Result, error) {
 		var res Result
-		// The admin view's password (contract §19.13): a lost viewer
-		// secret file gets a new password only, like the key.
+		// The admin view's password (contract §19.13): a lost or empty
+		// viewer secret file gets a new password only, like the key. A
+		// store from before the admin view gets exactly what it lacks
+		// (the viewer role, the viewer account) and nothing else.
+		healed := false
 		if j.ViewerFile != "" && !viewerFileInPlace(j.ViewerFile) {
-			pw, err := ResetViewer(ctx, c)
+			v, err := ResetViewer(ctx, c)
 			if err != nil {
 				return res, err
 			}
-			if pw == "" {
-				j.logf("bootstrap: the store has no admin view account (it predates it): the read-only admin view stays unavailable")
+			switch {
+			case v.Password == "":
+				j.logf("bootstrap: the store has no parking domain (%s): the read-only admin view stays unavailable (no domain is made here)", ParkingDomain)
+			case v.MadeAccount && v.MadeRole:
+				j.logf("bootstrap: the store had no admin view account: made it (the viewer role and account only)")
+			case v.MadeAccount:
+				j.logf("bootstrap: the store had no admin view account: made it (the viewer account only)")
+			case v.MadeRole:
+				j.logf("bootstrap: the store had no admin view role: made it (the viewer role only; the viewer account holds it alone)")
 			}
-			res.ViewerPassword = pw
+			if v.FixedRole {
+				j.logf("bootstrap: the admin view role's permissions differed from the base plan's: set to the plan's (that role only)")
+			}
+			healed = v.MadeAccount || v.MadeRole || v.FixedRole
+			res.ViewerPassword = v.Password
 		}
 		b, _ := os.ReadFile(j.keyFile())
 		ok, err := KeyInPlace(ctx, c, j.Params.MailctlIP, strings.TrimSpace(string(b)))
@@ -301,7 +315,9 @@ func (j *Job) Run(ctx context.Context) (err error) {
 			// The CI and e2e checks read these lines (build-and-test-mail-
 			// service.sh, e2e-podman-mail.sh): "; nothing to do" only when
 			// the run changed nothing.
-			if res.ViewerPassword != "" {
+			if healed {
+				j.logf("bootstrap: the store is bootstrapped and its API key is in place; the admin view role, account and a new password only")
+			} else if res.ViewerPassword != "" {
 				j.logf("bootstrap: the store is bootstrapped and its API key is in place; a new admin view password only")
 			} else {
 				j.logf("bootstrap: the store is bootstrapped and its API key is in place; nothing to do")
