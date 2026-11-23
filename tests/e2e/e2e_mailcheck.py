@@ -161,3 +161,35 @@ def navigate(page, note, what: str, url: str | None = None, tries: int = 4, wait
             raise AssertionError(f"{what}: the page ended on chrome-error://")
         return resp
     return network_retries(once, note, what, tries=tries, wait=wait, sleep=sleep)
+
+
+# The read-only mail admin view's flow (contract §19.13), in order: the
+# Hub's audited Open action, the start page and its script, the ticket's
+# same-origin POST, Stalwart's web admin, its discovery / sign-in / token
+# (all answered by the view), then a JMAP read.
+ADMIN_VIEW_STEPS = (("POST", "/api/mail/admin-view"), ("GET", "/portcullis/open"), ("GET", "/portcullis/open.js"),
+                    ("POST", "/portcullis/open"), ("GET", "/admin/"), ("GET", "/api/discover/"), ("GET", "/login"),
+                    ("POST", "/auth/token"), ("POST", "/jmap"))
+
+
+def admin_view_problems(seen: list) -> list:
+    """What's wrong with the admin view's flow as the browser saw it: seen
+    is (method, status, url) per response. Every step of ADMIN_VIEW_STEPS
+    answered below 400 at least once, and no 421 (a coalesced connection
+    refused) or 403 anywhere. URLs are reported without their query (a
+    code or state never reaches a log)."""
+    from urllib.parse import urlsplit
+
+    def bare(u: str) -> str:
+        x = urlsplit(u)
+        return f"{x.scheme}://{x.netloc}{x.path}"
+
+    out = [f"{m} {bare(u)} answered {st}" for m, st, u in seen if st in (421, 403)]
+    for method, prefix in ADMIN_VIEW_STEPS:
+        mine = [st for m, st, u in seen if m == method and urlsplit(u).path.startswith(prefix)
+                and not (prefix == "/portcullis/open" and urlsplit(u).path != prefix)]
+        if not mine:
+            out.append(f"no {method} {prefix} at all")
+        elif not any(st < 400 for st in mine):
+            out.append(f"{method} {prefix} never succeeded: {sorted(set(mine))}")
+    return out

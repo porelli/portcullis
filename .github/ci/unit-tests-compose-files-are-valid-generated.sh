@@ -182,7 +182,7 @@ echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["g
         .services["forward-auth-ext"].labels["traefik.http.middlewares.portcullis-auth-ext.forwardauth.authResponseHeadersRegex"]] | all(. == "^X-Forwarded-Attr-"))
     and .services.hub.environment.HUB_PEOPLE_ADDR == ":8889"
     and $h["traefik.http.routers.people.rule"] == "Host(`people.\($d)`)"
-    and $h["traefik.http.routers.people.tls.options"] == "authaware@file"
+    and $h["traefik.http.routers.people.tls.options"] == "default"
     and $h["traefik.http.routers.people.middlewares"] == "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
     and $h["traefik.http.services.\($h["traefik.http.routers.people.service"]).loadbalancer.server.port"] == "8889"
     and $h["traefik.http.services.\($h["traefik.http.routers.hub.service"]).loadbalancer.server.port"] == "8888"
@@ -191,7 +191,7 @@ echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["g
     and (.services["forward-auth"].environment.OAUTH2_PROXY_COOKIE_EXPIRE // null) == null' >/dev/null \
   || { echo "FAIL: attribute-header regex / people router / directory redirect / forward-auth cookie refresh wiring"; exit 1; }
 # Every HTTPS router names its Host: Traefik cannot pick TLS options
-# (authaware / protected / public) for a host-less rule and answers
+# (default / protected / public) for a host-less rule and answers
 # 421 on it (that broke /oauth2/start on app hosts).
 HOSTLESS="$(for files in "docker-compose.yml" "docker-compose.yml -f docker-compose.apps.yml" "docker-compose.test.yml"; do
     # shellcheck disable=SC2086
@@ -379,7 +379,7 @@ echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["m
           and $l["traefik.http.routers.\($r).service"] == "mcp-gate"
           and $l["traefik.http.routers.\($r).entrypoints"] == "websecure,vpnsecure"))
     and ([$l | to_entries[] | select(.key | test("\\.middlewares$")) | .value | select(test("portcullis-auth|portcullis-groups|proxy-secret"))] == [])
-    and $l["traefik.http.routers.mcp.tls.options"] == "authaware@file"
+    and $l["traefik.http.routers.mcp.tls.options"] == "default"
     and $l["traefik.http.routers.hub-mcp.tls.options"] == $hl["traefik.http.routers.hub.tls.options"]
     and $l["traefik.http.routers.people-mcp.tls.options"] == $hl["traefik.http.routers.people.tls.options"]
     and prio("hub-mcp"; $l) > prio("hub"; $hl) and prio("people-mcp"; $l) > prio("people"; $hl)' >/dev/null \
@@ -466,7 +466,7 @@ echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '
   .services.hub as $h | $h.labels as $l
   | $l["traefik.http.routers.people-cli.rule"] == "Host(`people.\($d)`) && PathPrefix(`/api/cli/v1/`)"
     and $l["traefik.http.routers.people-cli.priority"] == "200"
-    and $l["traefik.http.routers.people-cli.tls.options"] == "authaware@file"
+    and $l["traefik.http.routers.people-cli.tls.options"] == "default"
     and $l["traefik.http.routers.people-cli.middlewares"] == "rate-limit-auth@file,strip-identity@file,security-headers@file,hub-cli-proxy-secret@docker"
     and $l["traefik.http.routers.people-cli.entrypoints"] == "websecure,vpnsecure"
     and $l["traefik.http.routers.people-cli.service"] == "hub-cli"

@@ -52,7 +52,7 @@ esvc "" | KH -n "$EDGE" create -f - >/dev/null || fail "the Hub's ExternalName s
 I="$I" H="$H" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "IngressRoute",
   metadata: {name: (env.I + "--r"), labels: {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/owner": "hub", "portcullis.io/instance": env.I}},
   spec: {entryPoints: ["websecure"], routes: [{match: ("Host(`" + env.H + "`)"), kind: "Rule", services: [{kind: "Service", name: (env.I + "--web"), port: 80}]}],
-    tls: {options: {name: "authaware@file"}}}}' | KH -n "$EDGE" create -f - >/dev/null || fail "the Hub's IngressRoute to its edge Service was refused"
+    tls: {}}}' | KH -n "$EDGE" create -f - >/dev/null || fail "the Hub's IngressRoute to its edge Service was refused"
 # Through Traefik (ServiceLB on the node address), whoami answers with its
 # own hostname: the edge Service resolved to the apps Service.
 for _ in $(seq 1 30); do

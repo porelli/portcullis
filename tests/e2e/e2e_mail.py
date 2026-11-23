@@ -99,6 +99,7 @@ TIMEOUT_MS = 30_000
 PEOPLE = f"https://people.{DOMAIN}"
 AUTH = f"https://auth.{DOMAIN}"
 PORTAL = f"https://{DOMAIN}/"
+HUB = f"https://hub.{DOMAIN}"
 LLDAP = "http://127.0.0.1:17170"
 SLA_S = 8
 # The chains are verified against E2E_MAIL_CA (Pebble's issuing root for
@@ -1551,6 +1552,104 @@ def report() -> int:
     return 1 if failed else 0
 
 
+ADMIN_VIEW_INPUT = "input[type=email]:visible, input[type=text]:visible, input:not([type]):visible"
+
+
+def admin_view_flow(ctx, label: str, mail_first: bool) -> None:
+    """One read-only admin view opening in ctx (root's cookies): optionally
+    https://mail.<d>/ first (a name without a router of its own: Traefik's
+    default TLS options), then the Hub's Mail tab → Open … admin
+    (read-only) → the start page takes the ticket over its MessageChannel
+    → Stalwart's web admin → its sign-in form (any name) → the view
+    answers discovery, sign-in and token → a read-only screen. Every
+    response is recorded (method, status, URL; never a body or a
+    cookie): no 421 or 403 anywhere, every step answered."""
+    seen: list = []
+    refused: list = []
+
+    def on_response(r):
+        try:
+            seen.append((r.request.method, r.status, r.url))
+            if r.status == 403 and "/jmap" in r.url:
+                refused.append(r.text()[:400])
+        except PWError:
+            pass
+
+    ctx.on("response", on_response)
+    page = ctx.new_page()
+    try:
+        if mail_first:
+            r = page.goto(f"https://mail.{DOMAIN}/")
+            assert r is None or r.status != 421, f"{label}: https://mail.{DOMAIN}/ itself answered 421"
+        goto(page, f"{HUB}/#apps/stalwart/mail", f"{label}: the Hub's Mail tab")
+        btn = page.locator("[data-mail-admin-view-open]")
+        btn.wait_for(state="visible", timeout=60_000)
+        with ctx.expect_page(timeout=30_000) as pi:
+            btn.click()
+        view = pi.value
+        view.wait_for_url(re.compile(r"^https://mail-admin\.[^/]+/admin/"), timeout=60_000)
+        form = view.locator(ADMIN_VIEW_INPUT).first
+        form.wait_for(state="visible", timeout=60_000)
+        base.shot(view, f"admin-view-{label}-signin")
+        form.fill("e2e-anyone")
+        form.press("Enter")
+        def answered(path):
+            return any(m == "POST" and st == 200 and u.split("?")[0].endswith(path) for m, st, u in seen)
+        try:
+            until(f"{label}: the view answered the token request", lambda: answered("/auth/token"), 30, every=1)
+        except AssertionError:
+            # A form that submits only on its button.
+            b = view.locator("button[type=submit]:visible, button:visible").first
+            if b.count():
+                b.click()
+            until(f"{label}: the view answered the token request", lambda: answered("/auth/token"), 60, every=1)
+        until(f"{label}: a JMAP read answered", lambda: answered("/jmap"), 60, every=1)
+        until(f"{label}: the web admin past its sign-in form", lambda: view.locator(ADMIN_VIEW_INPUT).count() == 0
+              or "/admin/oauth" not in view.url, 30, every=1)
+        view.wait_for_timeout(2000)
+        base.shot(view, f"admin-view-{label}-readonly")
+        problems = mailcheck.admin_view_problems(seen)
+        assert not problems, f"{label}: " + "; ".join(problems) + (f" (refused JMAP: {refused})" if refused else "")
+        summary(f"admin view ({label}): {len(seen)} responses, no 421 / 403, every step answered")
+    except Exception:
+        base.shot(page, f"admin-view-{label}-hub")
+        print(f"    {label} responses: " + ", ".join(f"{m} {st} {u.split('?')[0]}" for m, st, u in seen[-60:]), flush=True)
+        raise
+    finally:
+        ctx.remove_listener("response", on_response)
+
+
+def admin_view_end_to_end(p, browser) -> None:
+    """17: the read-only mail admin view end to end in a browser (contract
+    §19.13): root opens it from the Hub's Mail tab. Then, in a fresh
+    context with root's cookies, https://mail.<d>/ first and the view
+    after it — in Chromium, and in WebKit when E2E_WEBKIT=1 (CI installs
+    it): WebKit reuses the mail.<d> connection and never retries a 421,
+    which Traefik answered there while the core pages' TLS options had
+    another name than Traefik's default (contract §5)."""
+    needs("setup")
+    root_page = state["page_root"]
+    goto(root_page, HUB + "/", "the Hub as root")
+    if base.on_login_pages(root_page):
+        base.passkey_flow(root_page, until=HUB, label="hub-root", expect_stepups=0)
+    cookies = state["ctx_root"].storage_state()
+    admin_view_flow(state["ctx_root"], "chromium", mail_first=False)
+    for name, br in (("chromium-mail-first", browser), ("webkit-mail-first", None)):
+        if br is None:
+            if os.environ.get("E2E_WEBKIT") != "1":
+                summary("admin view: WebKit not installed here (E2E_WEBKIT unset): skipped")
+                continue
+            br = p.webkit.launch()
+        ctx = br.new_context(storage_state=cookies, ignore_https_errors=name.startswith("webkit"))
+        ctx.set_default_timeout(TIMEOUT_MS)
+        try:
+            admin_view_flow(ctx, name, mail_first=True)
+        finally:
+            ctx.close()
+            if name.startswith("webkit"):
+                br.close()
+
+
 def main() -> int:
     os.makedirs(ART, exist_ok=True)
     state["hub_ip"] = hub_ip()
@@ -1562,6 +1661,8 @@ def main() -> int:
                 check("10 restore_voids_mail_passwords", lambda: restore_voids_mail_passwords(browser))
                 return report()
             check("setup: people, mail domains, the team list, DKIM active, mail passwords", lambda: setup(browser))
+            check("17 admin_view_end_to_end: the Hub's Mail tab → the read-only admin view, then mail.<d> first (Chromium, WebKit); no 421 / 403",
+                  lambda: admin_view_end_to_end(p, browser))
             check("1 exchange_both_ways (dkim ed25519 + rsa, spf, dmarc; the DMARC report)", exchange_both_ways)
             check("2 enrolled_domain_alias", enrolled_domain_alias)
             check("3 gtube_rejected_at_data, between_thresholds_to_junk", spam)

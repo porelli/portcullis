@@ -16,7 +16,7 @@ mk() {
   N="$1" H="hub.$D" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "IngressRoute",
     metadata: {name: env.N, labels: {"portcullis.io/owner": "hub", "portcullis.io/instance": "e2e-rebind"}},
     spec: {entryPoints: ["websecure"], routes: [{match: ("Host(`" + env.H + "`)"), kind: "Rule",
-      services: [{name: "e2e-rebind", namespace: "portcullis-apps", port: 80}]}], tls: {options: {name: "authaware@file"}}}}'
+      services: [{name: "e2e-rebind", namespace: "portcullis-apps", port: 80}]}], tls: {}}}'
 }
 ( i=0; while [ ! -e "$T/stop" ]; do i=$((i + 1))
     if out="$(mk "e2e-rebind-$i" | K --as="$HUB" -n portcullis-edge create -f - 2>&1)"; then echo "ADMITTED $i" >> "$T/log"

@@ -1163,7 +1163,7 @@ _kube_probe_route() {
         + (if env.G == "" then {} else {annotations: {"portcullis.io/params-generation": env.G}} end)),
       spec: {entryPoints: ["websecure"], routes: [{match: ("Host(`" + env.H + "`)"), kind: "Rule",
         services: [{name: "portcullis-admission-probe--probe", port: 80}]}],
-        tls: {options: {name: "authaware@file"}}}}' \
+        tls: {}}}' \
     | kube_ctl -n "$KUBE_EDGE_NS" --as="$(_kube_hub_sa)" --as-group=system:masters create --dry-run=server -f -
 }
 

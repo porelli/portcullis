@@ -3,8 +3,8 @@
 # no TLS tier and no Keycloak X.509" (contract §17, ruling P1): pki_node is
 # its own self-signed root, so a node-worker / node-control / node-link
 # certificate, with or without its CA, fails Traefik's protected,
-# protected-any and authaware handshakes (Keycloak's auth.<d> is
-# authaware) and verifies under none of the trust files. Runs from the
+# protected-any and default handshakes (Keycloak's auth.<d> is
+# default) and verifies under none of the trust files. Runs from the
 # workspace root after "Test Keycloak X.509 login" (Traefik, Keycloak, the
 # ci-mtls test app and /tmp/test-client.* are there).
 set -euo pipefail
@@ -49,7 +49,7 @@ issue node-link link.control
 openssl x509 -in "$D/node-worker.crt" -noout -ext extendedKeyUsage | grep -q 'TLS Web Client Authentication' \
   || { echo "FAIL: node-worker has no clientAuth (the test would prove nothing)"; exit 1; }
 
-# 2) A protected-any router next to ci-mtls (protected) and ci-gated (authaware).
+# 2) A protected-any router next to ci-mtls (protected) and ci-gated (default).
 cat > "$D/any.yml" <<YML
 services:
   whoami:
@@ -84,7 +84,7 @@ for h in mtls.portcullis.local gated.portcullis.local auth.portcullis.local; do
   c="$(code "$h" --cert /tmp/test-client.crt --key /tmp/test-client.key)"
   [ "$c" != 000 ] || { echo "FAIL: control: the YubiKey certificate's handshake with $h failed"; exit 1; }
 done
-echo "PASS: control: the YubiKey certificate passes protected, protected-any and authaware"
+echo "PASS: control: the YubiKey certificate passes protected, protected-any and default"
 
 # 3) Every node certificate, with its CA and alone, fails every tier.
 for role in node-worker node-control node-link; do
@@ -95,7 +95,7 @@ for role in node-worker node-control node-link; do
     done
   done
 done
-echo "PASS: node-worker, node-control and node-link certificates (with or without their CA) fail protected, protected-any and authaware (Keycloak's auth host included)"
+echo "PASS: node-worker, node-control and node-link certificates (with or without their CA) fail protected, protected-any and default (Keycloak's auth host included)"
 
 # 4) Keycloak's X.509 truststore and group-gate's CA files: no path.
 for f in certs/truststore/portcullis-ca-chain.pem certs/truststore/portcullis-yubikey-ca.pem \

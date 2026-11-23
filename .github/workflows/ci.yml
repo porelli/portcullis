@@ -1281,7 +1281,7 @@ jobs:
                 keyFile: /certs/server.key
           EOF
           # Test app on portcullis-proxy: one router on the protected tier
-          # (cert required), one on authaware gated by group-gate. ci-gated has
+          # (cert required), one on default gated by group-gate. ci-gated has
           # no portcullis-auth (no browser login in this job) and no group
           # mapping (ALLOW-UNMAPPED): the tests send the identity headers
           # portcullis-auth would set themselves. group-gate denies requests
@@ -1302,14 +1302,14 @@ jobs:
                 traefik.http.routers.ci-mtls.service: ci-whoami
                 traefik.http.routers.ci-gated.rule: Host(`gated.portcullis.local`)
                 traefik.http.routers.ci-gated.entrypoints: websecure
-                traefik.http.routers.ci-gated.tls.options: authaware@file
+                traefik.http.routers.ci-gated.tls.options: default
                 traefik.http.routers.ci-gated.middlewares: client-headers@file,portcullis-groups@docker
                 traefik.http.routers.ci-gated.service: ci-whoami
                 # Public-exception stand-in: every path goes through the
                 # public guard only (the Hub's routers also restrict paths).
                 traefik.http.routers.ci-public.rule: Host(`public.portcullis.local`)
                 traefik.http.routers.ci-public.entrypoints: websecure
-                traefik.http.routers.ci-public.tls.options: authaware@file
+                traefik.http.routers.ci-public.tls.options: default
                 traefik.http.routers.ci-public.middlewares: portcullis-public-guard@docker
                 traefik.http.routers.ci-public.service: ci-whoami
           networks:
@@ -1392,8 +1392,8 @@ jobs:
           echo "PASS: protected tier rejects foreign-CA client cert"
 
           code=$(mtls gated.portcullis.local --cert /tmp/foreign.crt --key /tmp/foreign.key)
-          [ "$code" = 000 ] || { echo "FAIL: authaware tier accepted a cert from a foreign CA ($code)"; exit 1; }
-          echo "PASS: authaware tier rejects foreign-CA client cert"
+          [ "$code" = 000 ] || { echo "FAIL: default tier accepted a cert from a foreign CA ($code)"; exit 1; }
+          echo "PASS: default tier rejects foreign-CA client cert"
 
           code=$(mtls mtls.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key)
           [ "$code" = 200 ] || { echo "FAIL: valid client cert got $code"; cat /tmp/mtls.out; exit 1; }
@@ -4257,15 +4257,19 @@ jobs:
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
-          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
-          /tmp/e2e-venv/bin/playwright install chromium
+          # WebKit too: the admin view after mail.<d> (admin_view_end_to_end;
+          # WebKit reuses that connection and never retries a 421).
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium webkit
+          /tmp/e2e-venv/bin/playwright install chromium webkit
           sudo apt-get install -y -qq libnss3-tools >/dev/null
           mkdir -p "$HOME/.pki/nssdb"
           certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
           certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
 
-      - name: Run the mail scenarios (exchange, alias, spam, mail passwords, lists, postmaster, revocation, leave, re-created username)
+      - name: Run the mail scenarios (admin view, exchange, alias, spam, mail passwords, lists, postmaster, revocation, leave, re-created username)
         timeout-minutes: 30
+        env:
+          E2E_WEBKIT: "1"
         run: |
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET

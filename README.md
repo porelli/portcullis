@@ -87,7 +87,7 @@ each app's sign-in template says which ones it accepts.
 | **YubiKey certificate only** | `tls.options=protected` | Requires a YubiKey certificate at the TLS handshake. High-security admin tools, APIs. |
 | **Any certificate** | `tls.options=protected-any` | Requires a YubiKey or browser certificate at the TLS handshake. |
 | **WebAuthn** | `tls.options=public` + `portcullis-auth@docker` | Redirects to Keycloak → tap YubiKey. Browser apps. |
-| **Both** | `tls.options=authaware` + `portcullis-auth@docker` | Certificate if present, WebAuthn fallback. Best UX. |
+| **Both** | `tls.options=default` + `portcullis-auth@docker` | Certificate if present, WebAuthn fallback. Best UX. |
 | **Public** | `tls.options=public` | No auth. Public pages. |
 
 ## Workflow
@@ -151,7 +151,7 @@ labels:
 **Both (a certificate if available, WebAuthn fallback):**
 ```yaml
 labels:
-  traefik.http.routers.myapp.tls.options: authaware
+  traefik.http.routers.myapp.tls.options: default
   traefik.http.routers.myapp.middlewares: client-headers@file,portcullis-auth@docker,security-headers@file
 ```
 
@@ -203,7 +203,7 @@ All guides are on the [documentation site](https://porelli.github.io/portcullis-
 │   └── web/                        # The setup-link page
 ├── traefik/                        # Static config: env vars in docker-compose.yml
 │   └── dynamic/
-│       ├── tls.yml                 # TLS options (protected/protected-any/authaware/public)
+│       ├── tls.yml                 # TLS options (protected/protected-any/default/public)
 │       ├── middlewares.yml         # Certificate headers, rate limits, security headers
 │       ├── external-services.yml   # Non-Docker services
 │       └── local/                  # Your custom routers/middlewares (gitignored)

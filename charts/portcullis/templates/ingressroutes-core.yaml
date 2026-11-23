@@ -81,15 +81,18 @@ spec:
         - name: {{ printf "core-%s-%v@file" $r.svc $r.port }}
           kind: TraefikService
         {{- end }}
+  {{- /* Traefik's default TLS options (contract §5, tls.yml): no
+         tls.options, which on an IngressRoute would name a TLSOption of
+         this namespace. */}}
+  {{- if $r.resolver }}
   tls:
-    {{- if $r.resolver }}
     certResolver: letsencrypt
     domains:
       - main: {{ $d }}
         sans: [{{ printf "*.%s" $d | quote }}]
-    {{- end }}
-    options:
-      name: authaware@file
+  {{- else }}
+  tls: {}
+  {{- end }}
 {{- end }}
 ---
 # kcinternal (K15): every path to Keycloak, the client's forwarded and

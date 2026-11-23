@@ -63,7 +63,7 @@ ir() {
       routes: [{match: "Host(`e2e.example.org`)", kind: "Rule",
         middlewares: [{name: "client-headers@file"}, {name: "portcullis-auth@file"}, {name: "portcullis-groups@file"}, {name: "e2e--strip"}],
         services: [{name: "e2e--web", port: 80}]}],
-      tls: {certResolver: "letsencrypt", options: {name: "authaware@file"}}}}' | jq "$1"
+      tls: {certResolver: "letsencrypt"}}}' | jq "$1"
 }
 # mw <spec json> [labels json] — a Middleware.
 HUB_LABELS='{"portcullis.io/owner": "hub", "portcullis.io/instance": "e2e"}'
@@ -74,7 +74,7 @@ mw() {
 C=(create --dry-run=server -f -)
 
 # ── controls: the Hub's shapes are admitted ──
-ir . | admitted "an app IngressRoute (its own edge Service, @file + own middlewares, authaware)" "${C[@]}"
+ir . | admitted "an app IngressRoute (its own edge Service, @file + own middlewares, default)" "${C[@]}"
 ir '.spec.routes[0].services[0].kind = "Service"' | admitted "its own edge Service, kind Service (the Hub's ref)" "${C[@]}"
 ir '.spec.entryPoints = ["websecure", "vpnsecure"]' | admitted "entryPoints websecure, vpnsecure" "${C[@]}"
 ir '.spec.routes[0].match = "Host(`a.example.org`) || Host(`b.example.org`) && (PathPrefix(`/x`) || Path(`/y`))" | .spec.routes[0].priority = 1000' \
@@ -160,6 +160,8 @@ ir '.spec.routes[0].middlewares += [{name: "strip-forwarded@file"}]' | refused "
 ir '.spec.routes[0].middlewares += [{name: "x@kubernetescrd"}]' | refused "a provider-qualified middleware" "${C[@]}"
 ir '.spec.tls.secretName = "secrets-certs"' | refused "a TLS secretName" "${C[@]}"
 ir '.spec.tls.options = {name: "default"}' | refused "tls.options outside the tiers" "${C[@]}"
+ir '.spec.tls.options = {name: "default"}' | refused "tls.options naming the old default tier (Traefik's default is no tls.options)" "${C[@]}"
+ir '.spec.tls.options = {name: "public@file"}' | admitted "an app IngressRoute on public@file" "${C[@]}"
 ir '.spec.tls.certResolver = "other"' | refused "another cert resolver" "${C[@]}"
 # Multi-layer routing, an ingress class, the rule syntax, TLS domains (final review I3, M8).
 CORE_IR="$(K -n "$EDGE" get ingressroute -l portcullis.io/owner=core -o jsonpath='{.items[0].metadata.name}')"

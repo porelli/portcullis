@@ -1555,21 +1555,27 @@ TLS_GOT="$(awk '
   /^    [a-z-]+:$/ { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s; n = $1; sub(/:$/, "", n); t = ""; ca = ""; v = ""; s = ""; next }
   /clientAuthType:/ { t = $2 } /^[[:space:]]*- / { ca = (ca ? ca "," : "") $2 } /minVersion:/ { v = $2 } /sniStrict:/ { s = $2 }
   END { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s }' "$TLS_YML")"
-expect_eq "traefik/dynamic/tls.yml defines exactly protected, protected-any, authaware, public with those clientAuth types and chains" "$TLS_GOT" \
+expect_eq "traefik/dynamic/tls.yml defines exactly protected, protected-any, default, public with those clientAuth types and chains" "$TLS_GOT" \
 "protected RequireAndVerifyClientCert /certs/ca-chain-yubikey.crt VersionTLS12 false
 protected-any RequireAndVerifyClientCert /certs/ca-chain.crt VersionTLS12 false
-authaware VerifyClientCertIfGiven /certs/ca-chain.crt VersionTLS12 false
+default VerifyClientCertIfGiven /certs/ca-chain.crt VersionTLS12 false
 public none - VersionTLS12 false"
 expect_eq "tls.yml: only the tls.options block" "$(grep -cvE '^[[:space:]]*(#|$)' "$TLS_YML")" 26
 expect_eq "tls.yml is tracked by git" "$(git -C "$ROOT_DIR" ls-files traefik/dynamic/tls.yml)" "traefik/dynamic/tls.yml"
-# Every core router carries authaware@file.
+# Every core router carries default.
 ROUTERS="$(grep -oE 'traefik\.http\.routers\.[a-z0-9-]+\.rule' "$ROOT_DIR/docker-compose.yml" | sed 's/^traefik\.http\.routers\.//; s/\.rule$//' | sort -u)"
 BAD=""
 for r in $ROUTERS; do
-  grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
+  grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: default$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:27"
-expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
+expect_eq "every core router in docker-compose.yml uses default" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:27"
+expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vcE 'tls\.options: default$' || true)" 0
+# Traefik's default options are the core pages' (and the Hub's optional
+# tier's) one name: a name without a router gets them, and Traefik answers
+# 421 when the names differ (contract §5). The old name must not come back,
+# and default is never provider-qualified.
+expect_eq "no authaware option name or default@file reference in the tracked config, compose files, chart, scripts or CI" \
+  "$(git -C "$ROOT_DIR" grep -nE 'authaware|default@file' -- traefik 'docker-compose*.yml' charts kube scripts portcullis .github tests/e2e ':!.github/ci/e2e-k3s-edge-admission.sh' || true)" ""
 # VPN (contract §16, security ruling): every core router's entrypoints
 # label is literally its class: routers without group-gate take
 # PORTCULLIS_EP_* (websecure,vpnsecure or vpnsecure); routers through
@@ -1701,7 +1707,7 @@ expect_eq "no user-facing text (README, .env.example, docs, monitoring, theme, C
   "$(git -C "$ROOT_DIR" grep -niE 'client cert' -- README.md .env.example docs monitoring keycloak/themes portcullis scripts/lib enroll/web group-gate/group-gate-map.conf \
       | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)" ""
 expect_eq "tls.yml's header says which option uses which chain and who uses it" \
-  "$(grep -cE '^# (protected|protected-any|authaware|public): ' "$TLS_YML"):$(grep -c 'Used by' "$TLS_YML")" "4:4"
+  "$(grep -cE '^# (protected|protected-any|default|public): ' "$TLS_YML"):$(grep -c 'Used by' "$TLS_YML")" "4:4"
 
 # config apply leaves tls.yml byte-identical and writes no traefik file.
 CA_ROOT="$WORK/ca-root"

@@ -1925,7 +1925,7 @@ def main() -> int:
             # protected@file (contract §5: every alternative has
             # yubikey_cert), where a browser certificate can't even finish
             # the handshake; echo-file, on the default template (Standard)
-            # meanwhile, is authaware@file, so the .p12 reaches Keycloak and
+            # meanwhile, is default, so the .p12 reaches Keycloak and
             # the file session reaches group-gate there.
             needs("alice_file")
             c = state["bc"][0]
@@ -1941,11 +1941,11 @@ def main() -> int:
                            "echo-anycert": tls_option("echo-anycert"), "echo-file": tls_option("echo-file")}
                     ok = (not got["signin-keycloak.json has browser_cert"]
                           and not got["group-gate-policy.json has browser_cert"]
-                          and got["echo-anycert"] == "protected@file" and got["echo-file"] == "authaware@file")
+                          and got["echo-anycert"] == "protected@file" and got["echo-file"] == "default")
                     assert ok, got  # until() keeps the last state for the failure message
                     return True
                 until("browser_cert off in both published files, echo-anycert on protected@file, echo-file "
-                      "(Standard) on authaware@file", switched_off, 180, every=5)
+                      "(Standard) on default", switched_off, 180, every=5)
                 # Traefik: on protected@file the browser certificate no longer
                 # finishes the handshake (tls_protected_any had the same files
                 # pass there while the switch was on): 35 / 56 as in
@@ -2005,7 +2005,7 @@ def main() -> int:
             assert not errs, f"restore failed: {errs}"
         check("browser_cert_off_counts_nothing: browser_cert switched off — the valid .p12 alone signs nobody in "
               "(Keycloak keeps the passkey prompt, no LOGIN event) and alice's file session gets 403 on echo-file "
-              "(Standard, authaware@file); echo-anycert moves to protected@file, where the browser certificate's "
+              "(Standard, default); echo-anycert moves to protected@file, where the browser certificate's "
               "handshake is refused (curl 35 / 56); "
               "switched back on in a finally (echo-file / echo-anycert back on protected-any@file)",
               browser_cert_off_counts_nothing)
@@ -3316,7 +3316,7 @@ def main() -> int:
             cert_templates = ("strong", "yubikey-and-certificate", "e2e-cert", "e2e-file", "e2e-anycert")
             std0 = next(t for t in snap0["templates"] if t["id"] == "standard")
             for inst in ("echo-std", "echo-basic"):
-                assert tls_option(inst) == "authaware@file", f"{inst}: {tls_option(inst)}"
+                assert tls_option(inst) == "default", f"{inst}: {tls_option(inst)}"
                 assert ca_names(f"{inst}.{DOMAIN}"), f"{inst}: no CA names with yubikey_cert on"
             assert ca_names(f"auth.{DOMAIN}"), "auth.<d>: no CA names"
 
@@ -3351,13 +3351,13 @@ def main() -> int:
                 until("echo-std on public@file without CA names (Standard has no certificate any more)",
                       lambda: tls_option("echo-std") == "public@file" and not ca_names(f"echo-std.{DOMAIN}"), 180, every=5)
                 # Basic still names family:certificate: the method switches alone move it.
-                assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
+                assert tls_option("echo-basic") == "default" and ca_names(f"echo-basic.{DOMAIN}"), \
                     f"echo-basic before the switch: {tls_option('echo-basic')}"
                 hub_ok("PUT", "/api/signin/methods/yubikey_cert", {"on": False})
                 # browser_cert alone still counts as a certificate there: once
                 # the Hub has applied the switch (both published files without
-                # yubikey_cert, its own tier for echo-basic authaware, no
-                # echo-basic op running), echo-basic stays authaware with CA
+                # yubikey_cert, its own tier for echo-basic default, no
+                # echo-basic op running), echo-basic stays default with CA
                 # names over several samples.
                 def applied():
                     pol, kc_ = hub_json("group-gate-policy.json"), published()
@@ -3365,31 +3365,31 @@ def main() -> int:
                     code, op = hub("GET", "/api/instances/echo-basic/op")
                     running = code == 200 and isinstance(op, dict) and op.get("running")
                     return ("yubikey_cert" not in pol.get("methods", []) and "yubikey_cert" not in kc_["methods"]
-                            and tier == "authaware@file" and not running)
+                            and tier == "default" and not running)
                 until("the Hub applied yubikey_cert off (published, echo-basic's tier, no op running)", applied, 120)
                 for i in range(6):
-                    assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
+                    assert tls_option("echo-basic") == "default" and ca_names(f"echo-basic.{DOMAIN}"), \
                         f"echo-basic with browser_cert still on, sample {i + 1}: {tls_option('echo-basic')}"
                     time.sleep(5)
                 hub_ok("PUT", "/api/signin/methods/browser_cert", {"on": False})
                 until("echo-basic on public@file without CA names (yubikey_cert and browser_cert off)",
                       lambda: tls_option("echo-basic") == "public@file" and not ca_names(f"echo-basic.{DOMAIN}"), 180,
                       every=5)
-                assert ca_names(f"auth.{DOMAIN}"), "auth.<d> lost its CA names (core routers stay on authaware)"
-                assert ca_names(f"hub.{DOMAIN}"), "hub.<d> lost its CA names (core routers stay on authaware)"
+                assert ca_names(f"auth.{DOMAIN}"), "auth.<d> lost its CA names (core routers stay on default)"
+                assert ca_names(f"hub.{DOMAIN}"), "hub.<d> lost its CA names (core routers stay on default)"
             finally:
                 restored = restore()
             assert not restored, f"restore steps failed: {restored}"
             for inst in ("echo-std", "echo-basic"):
-                until(f"{inst} back on authaware@file with CA names",
-                      lambda inst=inst: tls_option(inst) == "authaware@file" and ca_names(f"{inst}.{DOMAIN}"), 180, every=5)
+                until(f"{inst} back on default with CA names",
+                      lambda inst=inst: tls_option(inst) == "default" and ca_names(f"{inst}.{DOMAIN}"), 180, every=5)
             snap1 = hub_ok("GET", "/api/signin")
             shape = lambda v: ({m["id"]: m["on"] for m in v["methods"]}, v["default"], v["core"],  # noqa: E731
                                sorted((t["id"], t["enabled"], json.dumps(t["rule"], sort_keys=True)) for t in v["templates"]))
             assert shape(snap1) == shape(snap0), f"not restored: {shape(snap1)} != {shape(snap0)}"
             picks1 = {i: hub_ok("GET", f"/api/instances/{i}/signin").get("template", "") for i in picks0}
             assert picks1 == picks0, picks1
-        check("tls_follows_switch: an app's client-certificate request follows the switches (authaware → "
+        check("tls_follows_switch: an app's client-certificate request follows the switches (default → "
               "public@file, CA names gone, once both certificate methods are off); auth.<d> / hub.<d> keep them; "
               "everything restored", tls_follows_switch)
 

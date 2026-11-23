@@ -327,8 +327,13 @@ def check_routers(comp):
             if gs != svc and not (svc in ("hub-people", "hub-cli") and gs == "hub") and not (svc == rname and gs == r["owner"]) \
                and not (svc == "grafana-metrics" and gs == "grafana"):
                 F.add(f"router {rname}: service {gs} != compose {svc}")
-            if ir["spec"].get("tls", {}).get("options", {}).get("name") != r.get("tls.options"):
-                F.add(f"router {rname}: tls options {ir['spec'].get('tls')} != compose {r.get('tls.options')}")
+            # compose's `tls.options: default` (Traefik's default, contract
+            # §5) is an IngressRoute with tls but no tls.options there.
+            ir_tls = ir["spec"].get("tls")
+            want_opt = r.get("tls.options")
+            got_opt = (ir_tls or {}).get("options", {}).get("name") if isinstance(ir_tls, dict) else None
+            if not isinstance(ir_tls, dict) or got_opt != (None if want_opt == "default" else want_opt):
+                F.add(f"router {rname}: tls options {ir_tls} != compose {want_opt}")
         for extra in sorted(set(irs) - set(cr) - {"kcinternal", "kcinternal-logout"}):
             F.add(f"IngressRoute {extra}: no compose router")
 

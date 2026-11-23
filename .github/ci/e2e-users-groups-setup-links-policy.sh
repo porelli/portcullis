@@ -110,7 +110,7 @@ services:
       traefik.http.services.e2e.loadbalancer.server.port: "80"
       traefik.http.routers.e2e.rule: Host(`app.portcullis.local`) || Host(`hwk.portcullis.local`) || Host(`mtls.portcullis.local`)
       traefik.http.routers.e2e.entrypoints: websecure
-      traefik.http.routers.e2e.tls.options: authaware@file
+      traefik.http.routers.e2e.tls.options: default
       traefik.http.routers.e2e.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.routers.e2e.service: e2e
 networks:

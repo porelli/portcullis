@@ -262,7 +262,7 @@ _pki_put() {
 # Vault's own copies of the three CA certificates:
 #   yubikey-ca.crt (pki_int), browser-ca.crt (pki_file);
 #   ca-chain.crt = root + pki_int + pki_file (Traefik's protected-any and
-#     authaware options: both kinds);
+#     default options: both kinds);
 #   ca-chain-yubikey.crt = pki_int alone, no root (Traefik's protected
 #     option: Go takes each caFiles certificate as an anchor, so with the
 #     root in it a browser certificate sending pki_file would pass);
@@ -547,7 +547,7 @@ no trust list.
 
 Writes certs/root-ca.crt, intermediate-ca.crt, yubikey-ca.crt,
 browser-ca.crt, ca-chain.crt (root + both intermediates: Traefik's
-protected-any and authaware options), ca-chain-yubikey.crt (the YubiKey
+protected-any and default options), ca-chain-yubikey.crt (the YubiKey
 CA alone, no root: Traefik's protected option — Go trusts every CA in it
 as an anchor, so a root would also admit browser certificates) and Keycloak's truststore
 (certs/truststore/portcullis-ca-chain.pem, portcullis-yubikey-ca.pem,

@@ -200,7 +200,7 @@ config_apply() {
   # until a flip finishes or a pin is written again (dns_tighten_main,
   # dns setup): the old pin may still be cached.
   # TLS options are static (traefik/dynamic/tls.yml, tracked): the Hub
-  # picks one per app router, core routers use authaware.
+  # picks one per app router, core routers use default.
   ok "Updated ACME_CA_SERVER. Apply with: ./portcullis up"
 }
 
@@ -300,7 +300,7 @@ Apply the toggle in .env:
                             sets ACME_CA_SERVER in .env; on a flip clears
                             Traefik's acme.json so it re-registers
 and rebuild certs/ca-bundle.crt. The TLS options in traefik/dynamic/tls.yml
-are static (protected / authaware / public): the Hub picks one per app from
+are static (protected / default / public): the Hub picks one per app from
 its sign-in template and the certificate methods switched on. Then run `portcullis up`: it restarts Traefik and,
 when the bundle changed, the two forward-auth services (they read it only
 at start-up).
