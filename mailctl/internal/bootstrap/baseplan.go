@@ -171,10 +171,16 @@ func (p Params) listeners() Named {
 		// every address; the access rule answers it only /metrics/prometheus,
 		// with the scrape password.
 		l("metrics", "http", false, false, "[::]:9180"),
-		// The read-only admin view (contract §19.13): TLS with the mail
-		// certificate, answered only to the admin-view proxy's address.
-		l(AdminViewListener, "http", true, true, fmt.Sprintf("[::]:%d", AdminViewPort)),
+		adminViewListener(),
 	}}
+}
+
+// adminViewListener is the read-only admin view's listener (contract
+// §19.13): TLS with the mail certificate, answered only to the admin-view
+// proxy's address (AllowedEndpoints). The one definition: the base plan
+// and EnsureAdminView's repair of an older store both use it.
+func adminViewListener() map[string]any {
+	return map[string]any{"name": AdminViewListener, "protocol": "http", "bind": set(fmt.Sprintf("[::]:%d", AdminViewPort)), "useTls": true, "implicitTls": true}
 }
 
 // AllowedEndpoints is the management listener's access rule (M12, Task 2

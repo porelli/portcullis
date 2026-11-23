@@ -555,6 +555,98 @@ func ensureViewerRole(ctx context.Context, c *stalwart.Client) (id string, made,
 	return id, true, false, nil
 }
 
+// AdminViewSetup is what EnsureAdminView did.
+type AdminViewSetup struct {
+	MadeListener  bool // the admin-view listener was missing: made
+	FixedListener bool // it differed from the plan's: corrected
+	SetRule       bool // Http.allowedEndpoints differed from the plan's: set
+	FixedApp      bool // a web admin Application differed: patched
+	NoApp         bool // no Application yet (Stalwart makes it at a start)
+}
+
+// Changed: EnsureAdminView wrote something.
+func (s AdminViewSetup) Changed() bool {
+	return s.MadeListener || s.FixedListener || s.SetRule || s.FixedApp
+}
+
+// EnsureAdminView gives a marked store the admin view's server side
+// (contract §19.13) exactly as the base plan has it, writing only what
+// differs: the admin-view listener (made or corrected; no other listener
+// is read for a change or destroyed), the access rule (Http.
+// allowedEndpoints, wholly the plan's: set to p.AllowedEndpoints() only
+// with a ViewerIP), and the web admin's Application settings (each
+// existing Application patched, as Apply does; none is made: Stalwart
+// makes the WebUI at every start, so a store without one gets it at the
+// next start and the next run patches it). A store made before the admin
+// view lacks all three. They take effect at the server's next start: the
+// job's normal start and the provider's server after it both read them.
+func EnsureAdminView(ctx context.Context, c *stalwart.Client, p Params) (AdminViewSetup, error) {
+	var out AdminViewSetup
+	ls, err := getAll(ctx, c, "NetworkListener")
+	if err != nil {
+		return out, err
+	}
+	want := adminViewListener()
+	var found object
+	for _, l := range ls {
+		if str(l, "name") == AdminViewListener {
+			found = l
+			break
+		}
+	}
+	if found == nil {
+		r, err := c.Set(ctx, "NetworkListener", map[string]any{"v": want}, nil, nil)
+		if err := checkSet("NetworkListener", r, err); err != nil {
+			return out, err
+		}
+		out.MadeListener = true
+	} else if pt := differs(found, want, map[string]bool{"name": true, "@type": true}); len(pt) > 0 {
+		r, err := c.Set(ctx, "NetworkListener", nil, map[string]map[string]any{str(found, "id"): pt}, nil)
+		if err := checkSet("NetworkListener", r, err); err != nil {
+			return out, err
+		}
+		out.FixedListener = true
+	}
+
+	if p.ViewerIP.IsValid() {
+		var got []object
+		if err := c.Get(ctx, "Http", []string{"singleton"}, nil, &got); err != nil {
+			return out, fmt.Errorf("x:Http/get: %w", err)
+		}
+		var have object
+		if len(got) == 1 {
+			have = got[0]
+		}
+		rule := map[string]any{"allowedEndpoints": p.AllowedEndpoints()}
+		if len(differs(have, rule, nil)) > 0 {
+			if err := updateSingleton(ctx, c, Singleton{"Http", rule}); err != nil {
+				return out, err
+			}
+			out.SetRule = true
+		}
+	}
+
+	apps, err := getAll(ctx, c, "Application")
+	if err != nil {
+		return out, err
+	}
+	out.NoApp = len(apps) == 0
+	upd := map[string]map[string]any{}
+	for _, a := range apps {
+		if pt := differs(a, WebUIApplication(), nil); len(pt) > 0 {
+			upd[str(a, "id")] = pt
+		}
+	}
+	if len(upd) > 0 {
+		r, err := c.Set(ctx, "Application", nil, upd, nil)
+		if err := checkSet("Application", r, err); err != nil {
+			return out, err
+		}
+		out.FixedApp = true
+	}
+	return out, nil
+}
+
 // ensureAPIKey makes mailctl's one API key (Inherit, pinned to the
 // adapter's address, no expiry) unless one exists; rotate replaces it.
 func ensureAPIKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr, rotate bool) (string, error) {

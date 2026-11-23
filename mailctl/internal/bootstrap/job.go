@@ -280,11 +280,33 @@ func (j *Job) Run(ctx context.Context) (err error) {
 	// used (it is pinned to the adapter's address).
 	return j.recovery(ctx, func(c *stalwart.Client) (Result, error) {
 		var res Result
+		// The admin view's server side (contract §19.13), on every start:
+		// a store made before the admin view lacks its listener, access
+		// rule and web admin settings; only what differs is written.
+		view, err := EnsureAdminView(ctx, c, j.Params)
+		if err != nil {
+			return res, err
+		}
+		if view.MadeListener {
+			j.logf("bootstrap: the store had no admin view listener: made it (that listener only)")
+		}
+		if view.FixedListener {
+			j.logf("bootstrap: the admin view listener differed from the base plan's: corrected (that listener only)")
+		}
+		if view.SetRule {
+			j.logf("bootstrap: the management access rule differed from the base plan's: set to the plan's (with the admin view's entry)")
+		}
+		if view.FixedApp {
+			j.logf("bootstrap: the web admin's settings differed from the base plan's: set to the plan's")
+		}
+		if view.NoApp {
+			j.logf("bootstrap: the store has no web admin application yet: the mail server makes it at its start, the next run sets it")
+		}
 		// The admin view's password (contract §19.13): a lost or empty
 		// viewer secret file gets a new password only, like the key. A
 		// store from before the admin view gets exactly what it lacks
 		// (the viewer role, the viewer account) and nothing else.
-		healed := false
+		healed := view.Changed()
 		if j.ViewerFile != "" && !viewerFileInPlace(j.ViewerFile) {
 			v, err := ResetViewer(ctx, c)
 			if err != nil {
@@ -303,7 +325,7 @@ func (j *Job) Run(ctx context.Context) (err error) {
 			if v.FixedRole {
 				j.logf("bootstrap: the admin view role's permissions differed from the base plan's: set to the plan's (that role only)")
 			}
-			healed = v.MadeAccount || v.MadeRole || v.FixedRole
+			healed = healed || v.MadeAccount || v.MadeRole || v.FixedRole
 			res.ViewerPassword = v.Password
 		}
 		b, _ := os.ReadFile(j.keyFile())
@@ -316,7 +338,7 @@ func (j *Job) Run(ctx context.Context) (err error) {
 			// service.sh, e2e-podman-mail.sh): "; nothing to do" only when
 			// the run changed nothing.
 			if healed {
-				j.logf("bootstrap: the store is bootstrapped and its API key is in place; the admin view role, account and a new password only")
+				j.logf("bootstrap: the store is bootstrapped and its API key is in place; only the admin view's missing or differing pieces (above)")
 			} else if res.ViewerPassword != "" {
 				j.logf("bootstrap: the store is bootstrapped and its API key is in place; a new admin view password only")
 			} else {
