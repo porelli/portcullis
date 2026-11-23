@@ -3224,10 +3224,16 @@ ha_status() {
   _ha_hub_view || true
   view="$_HA_VIEW"
   if [ "$json" = true ]; then
-    local va=null
-    if kube_ha_on; then if kube_vault_leader >/dev/null 2>&1; then va=true; else va=false; fi; fi
+    local va=null vs=""
+    if kube_ha_on; then
+      _ha_vault_ask; vs="$(_ha_vault_state)"
+      case "$vs" in active) va=true ;; no_active) va=false ;; esac
+    fi
     jq -n --argjson r "$rec" --arg v "$view" --arg e "${_HA_ERR:-}" --arg ha "${PORTCULLIS_HA:-off}" --argjson va "$va" \
-      '{ha: ($ha == "on"), enable: $r, vault_active: $va, hub: (if $v == "" then null else ($v | fromjson) end), hub_error: (if $v == "" then $e else null end)}'
+      --arg vs "$vs" --argjson asked "${_HA_VAULT_ASKED:-0}" --argjson voters "${_HA_VAULT_VOTERS:-0}" \
+      '{ha: ($ha == "on"), enable: $r, vault_active: $va,
+        vault: (if $vs == "" then null else {state: $vs, answered: $asked, voters: $voters} end),
+        hub: (if $v == "" then null else ($v | fromjson) end), hub_error: (if $v == "" then $e else null end)}'
     return 0
   fi
   next="$(_ha_enable_next)"
@@ -3268,15 +3274,47 @@ ha_status() {
   fi
 }
 
+# _ha_vault_ask — every voter asked itself (vault status in its pod,
+# ≤ 6 s each, as kube_vault_leader): _HA_VAULT_LEADER = the voter that says
+# is_self (empty: none), _HA_VAULT_ASKED of _HA_VAULT_VOTERS answered (an
+# exec that fails or prints no status didn't).
+_ha_vault_ask() {
+  local v out
+  _HA_VAULT_LEADER="" _HA_VAULT_ASKED=0 _HA_VAULT_VOTERS=0
+  for v in $(kube_vault_voters); do
+    _HA_VAULT_VOTERS=$((_HA_VAULT_VOTERS + 1))
+    out="$(_kube_bounded 6 kube_ctl -n "$(kube_ns)" --request-timeout=5s exec "$v" -c vault -- vault status -format=json 2>/dev/null)" || true
+    jq -e 'type == "object" and has("ha_enabled")' <<<"$out" >/dev/null 2>&1 || continue
+    _HA_VAULT_ASKED=$((_HA_VAULT_ASKED + 1))
+    if [ -z "$_HA_VAULT_LEADER" ] && jq -e '.is_self == true and .ha_enabled == true' <<<"$out" >/dev/null 2>&1; then _HA_VAULT_LEADER="$v"; fi
+  done
+}
+
+# _ha_vault_state — after _ha_vault_ask: active (a voter leads), no_active
+# (every voter answered, none leads) or unasked (none of those who answered
+# leads, but not every voter answered: one that didn't may lead).
+_ha_vault_state() {
+  if [ -n "$_HA_VAULT_LEADER" ]; then echo active
+  elif [ "$_HA_VAULT_VOTERS" -gt 0 ] && [ "$_HA_VAULT_ASKED" -eq "$_HA_VAULT_VOTERS" ]; then echo no_active
+  else echo unasked; fi
+}
+
 # _ha_no_active_vault_line — HA (Task 31 fix round 2; found live: ~50 min
 # with no active Vault while nodeadm, whose certificate Vault signs, was
-# down and the quorum said nothing): the CLI asks the voters itself
-# (kube_vault_leader: vault status on each, is_self) and says it plainly
-# when none is active. Nothing without HA or when one leads.
+# down and the quorum said nothing): the CLI asks the voters itself and
+# says it plainly when none is active — and (round 3), separately, when it
+# couldn't ask them (whether one is active is then unknown). Nothing
+# without HA or when one leads.
 _ha_no_active_vault_line() {
   kube_ha_on || return 0
-  ! kube_vault_leader >/dev/null 2>&1 || return 0
-  printf 'Vault: no active Vault: no voter leads (sealed, unreachable, or stuck unable to become active), so Vault answers no request (certificates, sign-in setup, nodeadm). Each voter'"'"'s liveness restarts it after 3 minutes without an active node; check: kubectl -n %s get pods -l portcullis.io/component=vault\n' "$(kube_ns)"
+  _ha_vault_ask
+  case "$(_ha_vault_state)" in
+    active) return 0 ;;
+    no_active)
+      printf 'Vault: no active Vault: no voter leads (sealed, unreachable, or stuck unable to become active), so Vault answers no request (certificates, sign-in setup, nodeadm). Each voter'"'"'s liveness restarts it after 3 minutes without an active node; check: kubectl -n %s get pods -l portcullis.io/component=vault\n' "$(kube_ns)" ;;
+    *)
+      printf 'Vault: couldn'"'"'t ask the Vault voters (%s of %s answered kubectl exec … vault status, none of them leads): whether one is active is unknown; check: kubectl -n %s get pods -l portcullis.io/component=vault\n' "$_HA_VAULT_ASKED" "$_HA_VAULT_VOTERS" "$(kube_ns)" ;;
+  esac
 }
 
 help_ha() {
@@ -3301,9 +3339,12 @@ checklist ha enable needs all green, the Postgres guarantee, the etcd,
 Vault and Sentinel quorums, each node (role, class, site, ready, fencing,
 N−1) and the warnings. While ha enable has the Hub stopped (its volumes
 copied, before the switch) it says so. In HA it asks the Vault voters
-itself and says "no active Vault" when none leads (also while the Hub's
-view is unreadable). --json prints {ha, enable, vault_active, hub,
-hub_error} (vault_active null without HA).
+itself and says "no active Vault" when every voter answered and none
+leads, or "couldn't ask the Vault voters" when some didn't answer (also
+while the Hub's view is unreadable). --json prints {ha, enable,
+vault_active, vault, hub, hub_error}: vault_active true / false, null
+without HA or when the voters couldn't all be asked; vault {state:
+active|no_active|unasked, answered, voters}, null without HA.
 HELP
 }
 

@@ -1367,7 +1367,9 @@ WRITE_VERBS = {"create", "update", "patch", "delete", "deletecollection", "*"}
 # Task 31 fix round 2 (security review): who may write a Traefik
 # configuration source — the ConfigMaps / Secrets of the ingress namespace
 # (the HA Traefik's file provider, its certificate files) or any traefik.io
-# object (its CRD provider). (subject, where, what) → the resourceNames it
+# object (its CRD provider) — or (round 3) reach one indirectly:
+# impersonate, RBAC bind / escalate / writes, ServiceAccount tokens, pod
+# creates in the core or ingress namespace. (subject, where, what) → the resourceNames it
 # may be limited to (None = any) and why. Everything else bound in the
 # chart, the storage manifests or the HA installs is a finding.
 TRAEFIK_CONFIG_WRITERS = {
@@ -1376,6 +1378,11 @@ TRAEFIK_CONFIG_WRITERS = {
         "update of exactly tls.crt / tls.key, projected as .crt / .key files the file provider never reads as configuration"),
     (f"{K.NS}/portcullis-hub", K.EDGE_NS, "traefik.io"): (
         None, "the apps' IngressRoutes / Middlewares in the edge namespace, judged by portcullis-edge-routes"),
+    # Round 3 (indirect routes): nodeadm acts only as the admission probe's
+    # node identity, whose one right is nodes create, dry runs only (its
+    # removed-nodes confirmation, Task 30).
+    ("portcullis-nodeadm/nodeadm", "*", "impersonate"): (
+        {"system:node:portcullis-admission-probe"}, "the removed-nodes params' confirmation as the probe's node identity (nodes create, dry runs)"),
 }
 
 
@@ -1396,15 +1403,36 @@ def traefik_config_writers(docs):
             continue
         where = bns if b["kind"] == "RoleBinding" else "*"
         for r in role.get("rules", []):
-            if not set(r.get("verbs", [])) & WRITE_VERBS:
-                continue
             groups, res = set(r.get("apiGroups", [])), set(r.get("resources", []))
             hits = []
-            if groups & {"", "*"} and where in ("*", "portcullis-ingress"):
-                hits += [x for x in ("configmaps", "secrets") if x in res or "*" in res]
-            if groups & {"traefik.io", "traefik.containo.us", "*"}:
-                hits.append("traefik.io")
-            for what in hits:
+            if set(r.get("verbs", [])) & WRITE_VERBS:
+                if groups & {"", "*"} and where in ("*", "portcullis-ingress"):
+                    hits += [x for x in ("configmaps", "secrets") if x in res or "*" in res]
+                if groups & {"traefik.io", "traefik.containo.us", "*"}:
+                    hits.append("traefik.io")
+            # Round 3: the indirect routes to one — act as another identity,
+            # grant oneself rights, mint a ServiceAccount's token, or run a pod
+            # (with any ServiceAccount, any mount) — cluster-wide or in the
+            # namespaces whose identities and objects reach Traefik's sources
+            # (core, ingress, edge). Inside another namespace (an operator's
+            # own) they reach only that namespace's identities, whose direct
+            # grants are judged above.
+            verbs = set(r.get("verbs", []))
+            if where not in ("*", K.NS, "portcullis-ingress", K.EDGE_NS):
+                verbs = set()
+            if verbs & {"impersonate", "*"} and (res & {"users", "groups", "serviceaccounts", "uids", "userextras/scopes", "*"}
+                                                    or any(x.startswith("userextras") for x in res)):
+                hits.append("impersonate")
+            if groups & {"rbac.authorization.k8s.io", "*"}:
+                if verbs & {"bind", "escalate", "*"} and res & {"roles", "clusterroles", "*"}:
+                    hits.append("rbac-bind-escalate")
+                if verbs & WRITE_VERBS and res & {"roles", "rolebindings", "clusterroles", "clusterrolebindings", "*"}:
+                    hits.append("rbac-write")
+            if groups & {"", "*"} and verbs & {"create", "*"} and res & {"serviceaccounts/token", "*"}:
+                hits.append("serviceaccounts/token")
+            if groups & {"", "*"} and verbs & {"create", "*"} and res & {"pods", "*"} and where in ("*", K.NS, "portcullis-ingress"):
+                hits.append("pods")
+            for what in dict.fromkeys(hits):
                 for sub in b.get("subjects", []):
                     key = f"{sub.get('namespace', bns)}/{sub['name']}" if sub["kind"] == "ServiceAccount" else f"{sub['kind']}:{sub['name']}"
                     names = set(r["resourceNames"]) if r.get("resourceNames") else None
@@ -1428,6 +1456,23 @@ def check_traefik_config_writers(docs):
               "subjects": [{"kind": "ServiceAccount", "name": "evil", "namespace": "y"}]}]
     if set(traefik_config_writers(probe)) != {("y/evil", "portcullis-ingress", "configmaps"), ("y/evil", "*", "traefik.io")}:
         F.add("traefik_config_writers misses a grant (mutation test)")
+    # Round 3: each indirect route is found (and a pod create in another
+    # namespace isn't).
+    def grant(kind, ns, rules):
+        role = {"kind": kind, "metadata": {"name": "m", **({"namespace": ns} if ns else {})}, "rules": rules}
+        b = {"kind": kind + "Binding", "metadata": {"name": "m", **({"namespace": ns} if ns else {})}, "roleRef": {"kind": kind, "name": "m"},
+             "subjects": [{"kind": "ServiceAccount", "name": "evil", "namespace": "y"}]}
+        return set(traefik_config_writers([role, b]))
+    for rules, ns, kind, want in [
+            ([{"apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"]}], None, "ClusterRole", ("y/evil", "*", "impersonate")),
+            ([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles"], "verbs": ["bind"]}], None, "ClusterRole", ("y/evil", "*", "rbac-bind-escalate")),
+            ([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["rolebindings"], "verbs": ["create"]}], K.NS, "Role", ("y/evil", K.NS, "rbac-write")),
+            ([{"apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"]}], K.NS, "Role", ("y/evil", K.NS, "serviceaccounts/token")),
+            ([{"apiGroups": [""], "resources": ["pods"], "verbs": ["create"]}], "portcullis-ingress", "Role", ("y/evil", "portcullis-ingress", "pods"))]:
+        if want not in grant(kind, ns, rules):
+            F.add(f"traefik_config_writers misses {want[2]} (mutation test)")
+    if grant("Role", K.APPS_NS, [{"apiGroups": [""], "resources": ["pods"], "verbs": ["create"]}]):
+        F.add("traefik_config_writers flags a pod create outside the core / ingress namespaces (mutation test)")
     for k, names in sorted(traefik_config_writers(docs).items(), key=lambda x: x[0]):
         ok = TRAEFIK_CONFIG_WRITERS.get(k)
         if ok is None or (ok[0] is not None and (names is None or not names <= ok[0])):

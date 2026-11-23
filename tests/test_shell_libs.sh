@@ -8213,7 +8213,8 @@ case "$a" in
   "exec "*" -- cat /vol/acme.json") cat "$HE/acme.json" ;;
   "get statefulset vault -o jsonpath={.spec.replicas}") printf 3 ;;
   "--request-timeout=5s exec vault-"*" -c vault -- vault status -format=json")
-    if [ -e "$HE/k/vault-active-$3" ]; then echo '{"ha_enabled":true,"is_self":true}'; else echo '{"ha_enabled":true,"is_self":false}'; fi ;;
+    if [ -e "$HE/k/vault-down-$3" ]; then echo "error: unable to upgrade connection: container not found" >&2; exit 1
+    elif [ -e "$HE/k/vault-active-$3" ]; then echo '{"ha_enabled":true,"is_self":true}'; else echo '{"ha_enabled":true,"is_self":false}'; fi ;;
   *) echo "unexpected kubectl $*" >&2; exit 98 ;;
 esac
 KSTUB
@@ -8603,7 +8604,24 @@ rm -f "$HE/view.json"
 hacli "" "export PORTCULLIS_HA=on; need_env; ha_status" status
 case "$OUT" in *"Vault: no active Vault"*"The Hub's HA view: unreadable"*) t_pass "ha status: no active Vault also while the Hub's view is unreadable" ;; *) t_fail "ha status no Vault, no view: $OUT" ;; esac
 hacli "" "export PORTCULLIS_HA=on; need_env; ha_status true" status
-expect_eq "ha status --json: vault_active false" "$(jq -r .vault_active <<<"$OUT")" false
+expect_eq "ha status --json: vault_active false, vault no_active (every voter answered)" "$(jq -c '[.vault_active, .vault]' <<<"$OUT")" '[false,{"state":"no_active","answered":3,"voters":3}]'
+# Round 3: an exec that fails is "couldn't ask", never "no active Vault".
+touch "$HE/k/vault-down-vault-0" "$HE/k/vault-down-vault-1" "$HE/k/vault-down-vault-2"
+hacli "" "export PORTCULLIS_HA=on" status
+case "$OUT" in *"no active Vault"*) t_fail "ha status: no exec answered but said no active Vault: $OUT" ;;
+  *"Vault: couldn't ask the Vault voters (0 of 3 answered kubectl exec"*"whether one is active is unknown"*) t_pass "ha status: no voter answered → couldn't ask the Vault voters (round 3)" ;; *) t_fail "ha status couldn't ask: $OUT" ;; esac
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_status true" status
+expect_eq "ha status --json: couldn't ask → vault_active null, vault unasked 0 of 3 (round 3)" "$(jq -c '[.vault_active, .vault]' <<<"$OUT")" '[null,{"state":"unasked","answered":0,"voters":3}]'
+rm -f "$HE/k/vault-down-vault-1" "$HE/k/vault-down-vault-2"
+hacli "" "export PORTCULLIS_HA=on" status
+case "$OUT" in *"Vault: couldn't ask the Vault voters (2 of 3 answered"*) t_pass "ha status: one voter unanswered, the others not leading → couldn't ask (it may lead) (round 3)" ;; *) t_fail "ha status 2 of 3: $OUT" ;; esac
+printf '%s' "$he_green" | jq -c '.enabled = true' > "$HE/view.json"
+hacli "" "export PORTCULLIS_HA=on HA_STATUS_WAIT=0; need_env; _ha_green() { :; }; _ha_spread_lines() { :; }; ha_enable_step_status" status
+case "$RC:$ERR" in "1:"*"couldn't ask the Vault voters"*"ha status isn't all green"*) t_pass "step 10: not green while the voters can't be asked (round 3)" ;; *) t_fail "step 10 unasked: $RC $ERR" ;; esac
+touch "$HE/k/vault-active-vault-1"
+hacli "" "export PORTCULLIS_HA=on; need_env; ha_status true" status
+expect_eq "ha status --json: a leader among those who answered → active (the unanswered one doesn't matter) (round 3)" "$(jq -c '[.vault_active, .vault.state]' <<<"$OUT")" '[true,"active"]'
+rm -f "$HE/k/vault-down-vault-0" "$HE/k/vault-active-vault-1"; rm -f "$HE/view.json"
 printf '%s' "$he_green" | jq -c '.enabled = true' > "$HE/view.json"
 hacli "" "export PORTCULLIS_HA=on HA_STATUS_WAIT=0; need_env; _ha_green() { :; }; _ha_spread_lines() { :; }; ha_enable_step_status" status
 case "$RC:$ERR" in "1:"*"no active Vault"*"ha status isn't all green"*) t_pass "step 10: not green without an active Vault" ;; *) t_fail "step 10 no Vault: $RC $ERR" ;; esac
@@ -8611,7 +8629,7 @@ touch "$HE/k/vault-active-vault-1"
 hacli "" "export PORTCULLIS_HA=on; need_env; ha_status true" status
 expect_eq "ha status --json: vault_active true (vault-1 leads)" "$(jq -r .vault_active <<<"$OUT")" true
 hacli "" "need_env; ha_status true" status
-expect_eq "ha status --json: vault_active null without HA" "$(jq -r .vault_active <<<"$OUT")" null
+expect_eq "ha status --json: vault_active and vault null without HA" "$(jq -c '[.vault_active, .vault]' <<<"$OUT")" '[null,null]'
 rm -f "$HE/k/vault-active-vault-1" "$HE/view.json"; touch "$HE/k/vault-active-vault-0"
 
 # Fix round 2 (Vault, found live): vault/serving.sh, the HA voter's
@@ -8642,6 +8660,13 @@ vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":""}'
 expect_eq "vault serving: no leader advertised → not serving" "$(vs_run)" "1:$LOC "
 vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":"http://evil.example:8200"}'
 expect_eq "vault serving: a leader address that isn't one of our voters is never asked → not serving" "$(vs_run)" "1:$LOC "
+for la in "http://vault-1@evil.example/.vault-internal:8200" "http://vault-1.evil/x.vault-internal:8200" "http://vault-123.vault-internal:8200" "http://vault-1.vault-internal:8200.evil" "https://vault-1.vault-internal:8200"; do
+  vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":"'"$la"'"}'
+  expect_eq "vault serving: a look-alike leader address ($la) is never asked → not serving (round 3)" "$(vs_run)" "1:$LOC "
+done
+vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":"http://vault-12.vault-internal:8200"}'
+vs_answer "http://vault-12.vault-internal:8200/v1/sys/leader" '{"is_self":true}'
+expect_eq "vault serving: a two-digit voter (vault-12) is ours (round 3)" "$(vs_run)" "0:$LOC http://vault-12.vault-internal:8200/v1/sys/leader "
 vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":"http://vault-2.vault-internal:8200"}'
 expect_eq "vault serving: the advertised leader unreachable → not serving" "$(vs_run)" "1:$LOC http://vault-2.vault-internal:8200/v1/sys/leader "
 rm -f "$VS/r/"*

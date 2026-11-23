@@ -22,8 +22,10 @@ a="${VAULT_SERVING_ADDR:-http://127.0.0.1:8200}"
 l="$(wget -q -T 1 -O - "$a/v1/sys/leader" 2>/dev/null)" || exit 1
 case "$l" in *'"is_self":true'*) exit 0 ;; esac
 u="$(printf '%s' "$l" | sed -n 's/.*"leader_address":"\([^"]*\)".*/\1/p')"
+# Strictly one of our voters' names (round 3: a glob's * would let
+# http://vault-1@evil.example/.vault-internal:8200 by).
 case "$u" in
-  http://vault-[0-9]*.vault-internal:8200) ;;
+  http://vault-[0-9].vault-internal:8200 | http://vault-[0-9][0-9].vault-internal:8200) ;;
   *) exit 1 ;;
 esac
 r="$(wget -q -T 1 -O - "$u/v1/sys/leader" 2>/dev/null)" || exit 1

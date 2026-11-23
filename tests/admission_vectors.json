@@ -12749,8 +12749,8 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVDI=",
-    "tls.key": "S0VZMg=="
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1nPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1nPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "as": "frontdoor",
@@ -12769,8 +12769,8 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVA==",
-    "tls.key": "S0VZ"
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "op": "update",
@@ -12791,14 +12791,14 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVDI=",
-    "tls.key": "S0VZMg==",
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1nPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1nPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo=",
     "00-evil.yml": "dGxzOiB7fQ=="
    }
   },
   "as": "frontdoor",
   "want": "deny",
-  "reason_contains": "traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels and annotations unchanged",
+  "reason_contains": "traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels, annotations, finalizers and owners unchanged",
   "existing": {
    "apiVersion": "v1",
    "kind": "Secret",
@@ -12812,8 +12812,8 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVA==",
-    "tls.key": "S0VZ"
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "op": "update",
@@ -12833,13 +12833,13 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVDI=",
-    "tls.key": "S0VZMg=="
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1nPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1nPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "as": "frontdoor",
   "want": "deny",
-  "reason_contains": "traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels and annotations unchanged",
+  "reason_contains": "traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels, annotations, finalizers and owners unchanged",
   "existing": {
    "apiVersion": "v1",
    "kind": "Secret",
@@ -12853,8 +12853,8 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVA==",
-    "tls.key": "S0VZ"
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "op": "update",
@@ -12875,8 +12875,8 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVA==",
-    "tls.key": "S0VZ"
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "as": "frontdoor",
@@ -12899,8 +12899,8 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVA==",
-    "tls.key": "S0VZ"
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "as": "frontdoor",
@@ -12919,8 +12919,8 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVA==",
-    "tls.key": "S0VZ"
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "op": "delete",
@@ -12941,8 +12941,8 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVDI=",
-    "tls.key": "S0VZMg=="
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1nPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1nPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "as": "intruder",
@@ -12961,8 +12961,187 @@
    },
    "type": "kubernetes.io/tls",
    "data": {
-    "tls.crt": "Q0VSVA==",
-    "tls.key": "S0VZ"
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door adding a finalizer to traefik-default-cert is refused (Task 31 fix round 3)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    },
+    "finalizers": [
+     "example.com/hold"
+    ]
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1nPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1nPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
+   }
+  },
+  "as": "frontdoor",
+  "want": "deny",
+  "reason_contains": "traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels, annotations, finalizers and owners unchanged",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door adding an owner reference to traefik-default-cert is refused (Task 31 fix round 3)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    },
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "kind": "ConfigMap",
+      "name": "x",
+      "uid": "00000000-0000-4000-8000-000000000009"
+     }
+    ]
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1nPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1nPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
+   }
+  },
+  "as": "frontdoor",
+  "want": "deny",
+  "reason_contains": "traefik-default-cert stays type kubernetes.io/tls with exactly tls.crt and tls.key, its labels, annotations, finalizers and owners unchanged",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door writing an empty tls.key into traefik-default-cert is refused (Task 31 fix round 3)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1nPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": ""
+   }
+  },
+  "as": "frontdoor",
+  "want": "deny",
+  "reason_contains": "traefik-default-cert's tls.crt and tls.key are PEM (non-empty, starting with -----BEGIN)",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: the front door writing a tls.crt that isn't PEM into traefik-default-cert is refused (Task 31 fix round 3)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "dGxzOiB7c3RvcmVzOiB7fX0K",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1nPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
+   }
+  },
+  "as": "frontdoor",
+  "want": "deny",
+  "reason_contains": "traefik-default-cert's tls.crt and tls.key are PEM (non-empty, starting with -----BEGIN)",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Secret",
+   "metadata": {
+    "name": "traefik-default-cert",
+    "namespace": "portcullis-ingress",
+    "labels": {
+     "app.kubernetes.io/managed-by": "portcullis",
+     "portcullis.io/owner": "core"
+    }
+   },
+   "type": "kubernetes.io/tls",
+   "data": {
+    "tls.crt": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1RPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=",
+    "tls.key": "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1RPT0KLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo="
    }
   },
   "op": "update",
