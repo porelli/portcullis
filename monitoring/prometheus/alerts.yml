@@ -406,3 +406,34 @@ groups:
             node. No certificate is signed and new sign-in setups fail. Wait 3 minutes (each
             voter's liveness restarts a voter that can't reach an active node); if none becomes
             active, check ./portcullis ha status and the voters' logs.
+
+      - alert: PortcullisPostgresNotSynchronous
+        expr: portcullis_pg_sync_standbys < 1 and on() (count(portcullis_quorum_voters{system="etcd",state="total"}) > 0)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Postgres has no synchronous standbys
+          description: >-
+            CNPG is configured for synchronous replication but has {{ $value }} sync standbys
+            (expected at least 1). One more failure may lose the last writes. Check ./portcullis ha status.
+
+      - alert: PortcullisFailover
+        expr: increase(portcullis_failover_total[5m]) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "{{ $labels.kind }} failover occurred"
+          description: >-
+            A {{ $labels.kind }} failover was detected: {{ $value }} in the last 5 minutes.
+            This is informational; the system failed over as designed.
+
+      - alert: PortcullisSmallNodePressure
+        expr: |
+          (1 - (portcullis_node_allocatable_memory_bytes / portcullis_node_capacity_memory_bytes)) > 0.9
+          and on(node) (portcullis_node_class{class="small"} == 1)
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Small node {{ $labels.node }} has memory pressure"
+          description: >-
+            The small node {{ $labels.node }} is using > 90% of its memory capacity.
+            Small nodes should only run Sentinels and the third Vault voter.

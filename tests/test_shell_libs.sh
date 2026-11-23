@@ -1166,10 +1166,12 @@ expect_eq "alertmanager: smtp needs a recipient" "$(am ALERT_SMTP_SMARTHOST=smtp
 OUT="$(am ALERT_WATCHDOG_URL='https://watchdog.example/ping')"
 expect_eq "alertmanager: watchdog receiver exists when url is set" "$(printf '%s' "$OUT" | jq -r '.receivers[] | select(.name == "watchdog") | .webhook_configs[0].url')" \
   'https://watchdog.example/ping'
-expect_eq "alertmanager: watchdog route exists when url is set" "$(printf '%s' "$OUT" | jq -r '.route.routes[]? | select(.receiver == "watchdog") | .matchers[0]')" \
-  'alertname = Watchdog'
-expect_eq "alertmanager: watchdog receiver absent when url is unset" "$(am | jq '.receivers | map(select(.name == "watchdog")) | length')" 0
-expect_eq "alertmanager: watchdog route absent when url is unset" "$(am | jq '.route.routes // [] | length')" 0
+expect_eq "alertmanager: watchdog route always exists (set case)" "$(printf '%s' "$OUT" | jq -r '.route.routes[0].matchers[0]')" 'alertname = Watchdog'
+expect_eq "alertmanager: watchdog route goes to watchdog when url is set" "$(printf '%s' "$OUT" | jq -r '.route.routes[0].receiver')" 'watchdog'
+OUT="$(am)"
+expect_eq "alertmanager: null receiver exists when watchdog url is unset" "$(printf '%s' "$OUT" | jq -r '.receivers[] | select(.name == "null") | .name')" 'null'
+expect_eq "alertmanager: watchdog route goes to null when url is unset" "$(printf '%s' "$OUT" | jq -r '.route.routes[0].receiver')" 'null'
+expect_eq "alertmanager: watchdog route always exists (unset case)" "$(printf '%s' "$OUT" | jq -r '.route.routes[0].matchers[0]')" 'alertname = Watchdog'
 
 # shellcheck disable=SC2034  # read by metrics_textfile_write
 MONITORING_TEXTFILE_DIR="$WORK/textfile"

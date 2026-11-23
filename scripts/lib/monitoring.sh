@@ -42,15 +42,20 @@ alertmanager_config() {
   if [ -n "$ntfy" ]; then
     case "$ntfy" in *\?*) ntfy="$ntfy&template=alertmanager" ;; *) ntfy="$ntfy?template=alertmanager" ;; esac
   fi
-  ALERT_SMTP_PASSWORD="${ALERT_SMTP_PASSWORD:-}" jq -n \
-    --arg webhook "${ALERT_WEBHOOK_URL:-}" --arg ntfy "$ntfy" \
-    --arg watchdog "${ALERT_WATCHDOG_URL:-}" \
+  ALERT_WEBHOOK_URL="${ALERT_WEBHOOK_URL:-}" \
+  ALERT_NTFY_URL="$ntfy" \
+  ALERT_WATCHDOG_URL="${ALERT_WATCHDOG_URL:-}" \
+  ALERT_SMTP_PASSWORD="${ALERT_SMTP_PASSWORD:-}" \
+  jq -n \
     --arg smarthost "${ALERT_SMTP_SMARTHOST:-}" --arg from "${ALERT_SMTP_FROM:-}" --arg to "${ALERT_SMTP_TO:-}" \
     --arg user "${ALERT_SMTP_USERNAME:-}" \
     --arg tls "${ALERT_SMTP_REQUIRE_TLS:-true}" --arg domain "${PORTCULLIS_DOMAIN:-portcullis.local}" '
     def nonempty: . != "";
-    ([ (if $webhook | nonempty then {url: $webhook, send_resolved: true} else empty end),
-       (if $ntfy | nonempty then {url: $ntfy, send_resolved: true} else empty end) ]) as $hooks
+    (env.ALERT_WEBHOOK_URL // "") as $webhook
+    | (env.ALERT_NTFY_URL // "") as $ntfy
+    | (env.ALERT_WATCHDOG_URL // "") as $watchdog
+    | ([ (if $webhook | nonempty then {url: $webhook, send_resolved: true} else empty end),
+         (if $ntfy | nonempty then {url: $ntfy, send_resolved: true} else empty end) ]) as $hooks
     | (if ($smarthost | nonempty) and ($to | nonempty) then
          [{to: $to, from: (if $from | nonempty then $from else "portcullis@" + $domain end),
            smarthost: $smarthost, require_tls: ($tls != "false"), send_resolved: true}
@@ -60,13 +65,14 @@ alertmanager_config() {
     | ([ {name: "portcullis"}
          + (if ($hooks | length) > 0 then {webhook_configs: $hooks} else {} end)
          + (if ($mails | length) > 0 then {email_configs: $mails} else {} end) ]
-       + (if ($watchdog_hooks | length) > 0 then [{name: "watchdog", webhook_configs: $watchdog_hooks}] else [] end)) as $receivers
+       + (if ($watchdog_hooks | length) > 0 then [{name: "watchdog", webhook_configs: $watchdog_hooks}]
+          else [{name: "null"}] end)) as $receivers
     | {
         route: {receiver: "portcullis", group_by: ["alertname", "severity"],
                 group_wait: "30s", group_interval: "5m", repeat_interval: "4h",
-                routes: (if ($watchdog_hooks | length) > 0 then
-                  [{receiver: "watchdog", matchers: ["alertname = Watchdog"], group_wait: "0s",
-                    group_interval: "1m", repeat_interval: "1m"}] else [] end)},
+                routes: [{receiver: (if ($watchdog_hooks | length) > 0 then "watchdog" else "null" end),
+                          matchers: ["alertname = Watchdog"], group_wait: "0s",
+                          group_interval: "1m", repeat_interval: "1m"}]},
         receivers: $receivers,
         inhibit_rules: [{source_matchers: ["alertname = VaultSealedOrDown"],
                          target_matchers: ["alertname =~ TargetDown|ServiceProbeFailed"]}]
@@ -91,7 +97,8 @@ monitoring_prepare() {
   fi
   # nodeadm-targets.json: nodeadm's R7 cluster metrics in HA only (Task 32).
   if _rt_is_kube && kube_ha_on; then
-    jq -n --arg t "nodeadm.$(kube_ns).svc.cluster.local:9105" '[{targets: [$t], labels: {}}]' > "$m/prometheus/nodeadm-targets.json"
+    local nns="${PORTCULLIS_NODEADM_NAMESPACE:-portcullis-nodeadm}"
+    jq -n --arg t "nodeadm.$nns.svc.cluster.local:9105" '[{targets: [$t], labels: {}}]' > "$m/prometheus/nodeadm-targets.json"
   else
     echo '[]' > "$m/prometheus/nodeadm-targets.json"
   fi
