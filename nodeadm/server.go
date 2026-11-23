@@ -70,20 +70,25 @@ type K3sBootstrap interface {
 
 // Config is nodeadm's configuration (from the chart's environment).
 type Config struct {
-	Domain       string // the main domain
-	CoreNS       string // the core namespace (Leases, documents, params)
-	NodeadmNS    string
-	IngressNS    string // portcullis-ingress (Traefik's DaemonSet)
-	FencingNS    string // portcullis-fencing (SNR)
-	LonghornNS   string
-	ClusterCIDR  string
-	ServiceCIDR  string
-	EgressHost   string // NODEADM_PROBE_EGRESS_HOST
-	PodName      string
-	Script       []byte            // join.sh
-	ScriptSHA256 string            // sha256 of Script (the code's script_sha256)
-	AgentFiles   map[string]string // arch → path of nodeagent-<arch>
-	AgentSHA256  map[string]string // arch → sha256
+	Domain      string // the main domain
+	CoreNS      string // the core namespace (Leases, documents, params)
+	NodeadmNS   string
+	IngressNS   string // portcullis-ingress (Traefik's DaemonSet)
+	FencingNS   string // portcullis-fencing (SNR)
+	LonghornNS  string
+	ClusterCIDR string
+	ServiceCIDR string
+	EgressHost  string // NODEADM_PROBE_EGRESS_HOST
+	PodName     string
+	// VaultVoters / SentinelVoters: the configured voters (the chart's
+	// StatefulSet replicas, NODEADM_VAULT_VOTERS / _SENTINEL_VOTERS): the
+	// quorum's total, never the pods that happen to be scheduled.
+	VaultVoters    int
+	SentinelVoters int
+	Script         []byte            // join.sh
+	ScriptSHA256   string            // sha256 of Script (the code's script_sha256)
+	AgentFiles     map[string]string // arch → path of nodeagent-<arch>
+	AgentSHA256    map[string]string // arch → sha256
 	// AllowDocAddrs admits the documentation ranges as public addresses
 	// (tests only, like the front door's testprovider build).
 	AllowDocAddrs bool
@@ -219,8 +224,10 @@ type nonceRec struct {
 
 // newServer wires a Server; the caller sets the collaborators.
 func newServer(cfg Config) *Server {
-	return &Server{cfg: cfg, now: time.Now, timing: defaultTiming(), pki: &pkiState{},
+	s := &Server{cfg: cfg, now: time.Now, timing: defaultTiming(), pki: &pkiState{},
 		kickCh: make(chan struct{}, 1), running: map[string]chan struct{}{}, nonces: map[string]nonceRec{}, joinNonces: map[string]time.Time{}, degraded: map[string]time.Time{},
 		log: slog.New(slog.NewJSONHandler(io.Discard, nil)), metrics: newMetrics(),
 		limit: newLimiter(perSourceRate, perSourceBurst, globalRate, globalBurst)}
+	s.metrics.now = func() time.Time { return s.now() }
+	return s
 }

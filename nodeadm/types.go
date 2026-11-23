@@ -168,6 +168,8 @@ type Snapshot struct {
 	Postgres  Postgres        `json:"postgres"`
 	Volumes   []Volume        `json:"volumes"`
 	Errors    []string        `json:"errors"`
+	// pressure: node → condition (pressureConditions) → True; metrics only.
+	pressure map[string]map[string]bool
 }
 
 // AddressesDoc is the ConfigMap portcullis-cluster-addresses (§20.9).

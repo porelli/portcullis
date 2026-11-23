@@ -201,31 +201,4 @@ spec:
       port: {{ index $svc 1 }}
       targetPort: {{ index $svc 1 }}
 {{- end }}
-{{- if and .Values.ha.enabled .Values.nodeadm.enabled }}
----
-# HA: Prometheus's egress to nodeadm's metrics in its own namespace.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: prometheus-to-nodeadm
-  namespace: {{ .Release.Namespace }}
-  labels:
-    app.kubernetes.io/managed-by: portcullis
-spec:
-  podSelector:
-    matchLabels:
-      portcullis.io/component: prometheus
-  policyTypes: ["Egress"]
-  egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.ha.nodeadmNamespace }}
-          podSelector:
-            matchLabels:
-              portcullis.io/component: nodeadm
-      ports:
-        - protocol: TCP
-          port: 9105
-{{- end }}
 {{- end }}

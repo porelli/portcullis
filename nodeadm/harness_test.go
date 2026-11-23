@@ -360,7 +360,7 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 	h.kube = fake.NewSimpleClientset(objs...)
 	cfg := Config{Domain: "example.org", CoreNS: coreNS, NodeadmNS: "portcullis-nodeadm", IngressNS: "portcullis-ingress",
 		FencingNS: "portcullis-fencing", LonghornNS: "longhorn-system", ClusterCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
-		EgressHost: "api.porkbun.com", PodName: "nodeadm-0", Script: []byte("#!/bin/sh\necho join\n"),
+		EgressHost: "api.porkbun.com", PodName: "nodeadm-0", VaultVoters: 3, SentinelVoters: 3, Script: []byte("#!/bin/sh\necho join\n"),
 		ScriptSHA256: strings.Repeat("a", 64), AgentSHA256: map[string]string{"amd64": strings.Repeat("b", 64), "arm64": strings.Repeat("c", 64)},
 		AgentFiles: map[string]string{}, AllowDocAddrs: true}
 	dir := t.TempDir()

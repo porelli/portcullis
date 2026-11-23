@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -67,6 +68,16 @@ func sha256File(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// voterCount reads a configured voter count (the chart sets it from the
+// StatefulSet's replicas): required, 0–9 (fail closed: no guessed total).
+func voterCount(k string) (int, error) {
+	n, err := strconv.Atoi(os.Getenv(k))
+	if err != nil || n < 0 || n > 9 {
+		return 0, fmt.Errorf("%s must be the configured voter count (0-9)", k)
+	}
+	return n, nil
+}
+
 func run(log *slog.Logger) error {
 	core := env("NODEADM_CORE_NAMESPACE", "portcullis")
 	cfg := Config{
@@ -85,6 +96,13 @@ func run(log *slog.Logger) error {
 	}
 	if cfg.Domain == "" || cfg.PodName == "" || cfg.ClusterCIDR == "" || cfg.ServiceCIDR == "" {
 		return errors.New("PORTCULLIS_DOMAIN, POD_NAME, NODEADM_CLUSTER_CIDR and NODEADM_SERVICE_CIDR are required")
+	}
+	var err error
+	if cfg.VaultVoters, err = voterCount("NODEADM_VAULT_VOTERS"); err != nil {
+		return err
+	}
+	if cfg.SentinelVoters, err = voterCount("NODEADM_SENTINEL_VOTERS"); err != nil {
+		return err
 	}
 	sum := sha256.Sum256(joinScript)
 	cfg.ScriptSHA256 = hex.EncodeToString(sum[:])

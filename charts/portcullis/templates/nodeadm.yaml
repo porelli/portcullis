@@ -382,6 +382,13 @@ spec:
               value: {{ .Values.nodeadm.probeEgressHost | quote }}
             - name: NODEADM_LONGHORN_NAMESPACE
               value: {{ .Values.ha.longhornNamespace }}
+            # The configured quorum voters (portcullis_quorum_voters total,
+            # review I6): the replicas of vault.yaml's and sessions.yaml's
+            # StatefulSets (k8s_parity holds them equal).
+            - name: NODEADM_VAULT_VOTERS
+              value: {{ ternary 3 1 .Values.ha.enabled | quote }}
+            - name: NODEADM_SENTINEL_VOTERS
+              value: {{ ternary 3 0 .Values.ha.enabled | quote }}
             - name: NODEADM_ENROLL_URL
               value: http://enroll.{{ $ns }}.svc.cluster.local:8444
             - name: NODEADM_ENROLL_BEARER_FILE

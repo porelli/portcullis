@@ -2,8 +2,9 @@ package main
 
 // GET /v1/cluster (contract §20.2 "The snapshot"): nodes, enrolling nodes,
 // pods (the N−1 input), quorum, Postgres, volumes and the faults nodeadm
-// knows. Quorum needs no new credential: etcd from the etcd client nodeadm
-// holds, Vault and Sentinel from the readiness of their pods.
+// knows. Quorum needs no new credential: etcd from the server nodes,
+// Vault and Sentinel from the readiness of their pods against the
+// configured voters (Config.VaultVoters / SentinelVoters).
 
 import (
 	"context"
@@ -54,11 +55,22 @@ func keepLabel(k string) bool {
 	return k == "kubernetes.io/hostname" || k == labelZone || strings.HasPrefix(k, "portcullis.io/") || k == labelDisk || k == labelEnableLB
 }
 
-// snapshot builds the §20.2 snapshot.
+// snapshot builds the §20.2 snapshot. A failure drops the cluster gauges
+// (absent, never stale-healthy: Metrics.failed).
 func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
+	snap, err := s.takeSnapshot(ctx)
+	if err != nil {
+		s.metrics.failed()
+		return nil, err
+	}
+	s.metrics.observe(snap)
+	return snap, nil
+}
+
+func (s *Server) takeSnapshot(ctx context.Context) (*Snapshot, error) {
 	now := s.now()
 	snap := &Snapshot{V: 1, TakenAt: rfc3339(now), Nodes: []SnapNode{}, Enrolling: []SnapEnrolling{}, Pods: []SnapPod{},
-		Volumes: []Volume{}, Errors: []string{}}
+		Volumes: []Volume{}, Errors: []string{}, pressure: map[string]map[string]bool{}}
 	cl, err := s.clusterNodes(ctx)
 	if err != nil {
 		return nil, err
@@ -103,6 +115,15 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 				}
 			}
 		}
+		pr := map[string]bool{}
+		for _, cond := range n.Status.Conditions {
+			for _, pc := range pressureConditions {
+				if string(cond.Type) == pc && cond.Status == corev1.ConditionTrue {
+					pr[pc] = true
+				}
+			}
+		}
+		snap.pressure[c.Name] = pr
 		for k, v := range n.Labels {
 			if keepLabel(k) {
 				sn.Labels[k] = v
@@ -121,8 +142,6 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s was removed but registered again (its kubelet still runs; token rotations skip it): revoke it again and reinstall that machine", c.Name))
 		}
 		snap.Nodes = append(snap.Nodes, sn)
-		s.metrics.nodeReady.WithLabelValues(c.Name).Set(b2f(c.Ready))
-		s.metrics.fencing.WithLabelValues(c.Name).Set(b2f(fencing[c.Name]))
 	}
 	snap.Errors = append(snap.Errors, s.remediationErrors()...)
 	ids := make([]string, 0, len(st.Nodes))
@@ -166,6 +185,10 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 			}
 		}
 	}
+	// The totals are the configured voters (review I6): a voter that isn't
+	// scheduled is still a voter the quorum needs.
+	snap.Quorum.Vault = configuredVoters(s.cfg.VaultVoters, snap.Quorum.Vault.Healthy)
+	snap.Quorum.Sentinel = configuredVoters(s.cfg.SentinelVoters, snap.Quorum.Sentinel.Healthy)
 	sort.Slice(snap.Pods, func(i, j int) bool {
 		if snap.Pods[i].Namespace != snap.Pods[j].Namespace {
 			return snap.Pods[i].Namespace < snap.Pods[j].Namespace
@@ -184,8 +207,13 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 			}
 		}
 	}
-	s.metrics.observe(snap)
 	return snap, nil
+}
+
+// configuredVoters: total = the configured voters, healthy = the Ready ones
+// (never more than configured).
+func configuredVoters(configured, ready int) Voters {
+	return Voters{Voters: configured, Healthy: min(ready, configured)}
 }
 
 func b2f(b bool) float64 {

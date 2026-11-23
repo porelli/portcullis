@@ -969,6 +969,88 @@ def check_sessions_vault():
             F.add(f"{fn.__name__} misses a mutated render (mutation test)")
 
 
+def monitoring_problems(docs, ha, monitoring=True):
+    """Task 32 (C1, I6): every object rendered once (kind, namespace,
+    name); Prometheus's egress to nodeadm's metrics is the one
+    NetworkPolicy prometheus-to-nodeadm in the core namespace (namespace
+    ha.nodeadmNamespace + nodeadm's pods, TCP 9105) with monitoring on and
+    absent without; nodeadm's own policy admits the core namespace's
+    Prometheus on 9105 and its Service carries 9105; nodeadm's configured
+    voters (NODEADM_VAULT_VOTERS / _SENTINEL_VOTERS) equal the vault and
+    sessions-sentinel StatefulSets' replicas (0 without a set)."""
+    out, label = [], ("ha: " if ha else "") + ("" if monitoring else "monitoring off: ")
+    seen = {}
+    for d in docs:
+        k = (d.get("kind"), d["metadata"].get("namespace", ""), d["metadata"]["name"])
+        seen[k] = seen.get(k, 0) + 1
+    out += [f"{label}{k[0]} {k[1]}/{k[2]} rendered {n} times" for k, n in sorted(seen.items()) if n > 1]
+    nns = K.values()["ha"]["nodeadmNamespace"]
+    pols = [p for p in K.by_kind(docs, "NetworkPolicy") if p["metadata"]["name"] == "prometheus-to-nodeadm"]
+    want = {"podSelector": {"matchLabels": {"portcullis.io/component": "prometheus"}}, "policyTypes": ["Egress"],
+            "egress": [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": nns}},
+                                "podSelector": {"matchLabels": {"portcullis.io/component": "nodeadm"}}}],
+                        "ports": [{"protocol": "TCP", "port": 9105}]}]}
+    if not monitoring:
+        if pols:
+            out.append(f"{label}prometheus-to-nodeadm rendered without monitoring")
+    elif len(pols) != 1 or pols[0]["metadata"]["namespace"] != K.NS or pols[0]["spec"] != want:
+        out.append(f"{label}prometheus-to-nodeadm: want exactly one in {K.NS}: {want}, got {[p['spec'] for p in pols]}")
+    na = next((p for p in K.by_kind(docs, "NetworkPolicy") if p["metadata"]["name"] == "nodeadm" and p["metadata"]["namespace"] == nns), None)
+    rule = {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": K.NS}},
+                      "podSelector": {"matchLabels": {"portcullis.io/component": "prometheus"}}}],
+            "ports": [{"protocol": "TCP", "port": 9105}]}
+    if na is None or (rule in (na["spec"].get("ingress") or [])) != monitoring:
+        out.append(f"{label}nodeadm's NetworkPolicy: the core namespace's Prometheus on 9105 {'missing' if monitoring else 'without monitoring'}")
+    svc = next((x for x in K.by_kind(docs, "Service") if x["metadata"]["name"] == "nodeadm" and x["metadata"]["namespace"] == nns), None)
+    if svc is None or {"name": "metrics", "port": 9105, "targetPort": 9105} not in svc["spec"]["ports"]:
+        out.append(f"{label}the nodeadm Service in {nns} has no metrics port 9105")
+    dep = next((x for x in docs if x.get("kind") == "Deployment" and x["metadata"]["name"] == "nodeadm"), None)
+    env = {e["name"]: e.get("value") for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]} if dep else {}
+    for var, sts in (("NODEADM_VAULT_VOTERS", "vault"), ("NODEADM_SENTINEL_VOTERS", "sessions-sentinel")):
+        s = _wl(docs, "StatefulSet", sts)
+        n = s["spec"]["replicas"] if s else 0
+        if env.get(var) != str(n):
+            out.append(f"{label}nodeadm's {var} is {env.get(var)!r}, the {sts} StatefulSet has {n} replicas")
+    return out
+
+
+def check_monitoring():
+    """Task 32 (C1, I6) without and with HA, with and without monitoring;
+    the CLI's nodeadm target (monitoring_prepare: nodeadm.$KUBE_NODEADM_NS)
+    is the chart's namespace; and the checks bite (mutation tests)."""
+    vals = yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())
+    plain = K.render({"nodeadm": vals["nodeadm"]})
+    ha = K.render(vals)
+    for docs, h in ((plain, False), (ha, True)):
+        for p in monitoring_problems(docs, h):
+            F.add(p)
+    for p in monitoring_problems(K.render({"nodeadm": vals["nodeadm"], "monitoring": {"enabled": False}}), False, monitoring=False):
+        F.add(p)
+    nodesh = (K.ROOT / "scripts" / "lib" / "node.sh").read_text()
+    m = re.search(r'^KUBE_NODEADM_NS="([^"]+)"$', nodesh, re.M)
+    if not m or m.group(1) != K.values()["ha"]["nodeadmNamespace"]:
+        F.add(f"scripts/lib/node.sh KUBE_NODEADM_NS {m and m.group(1)!r} isn't the chart's ha.nodeadmNamespace")
+    if 'nodeadm.$KUBE_NODEADM_NS.svc.cluster.local:9105' not in (K.ROOT / "scripts" / "lib" / "monitoring.sh").read_text():
+        F.add("monitoring_prepare's nodeadm target isn't nodeadm.$KUBE_NODEADM_NS.svc.cluster.local:9105")
+    if monitoring_problems(ha, True):
+        return
+    def pol(d):
+        return next(p for p in d if p.get("kind") == "NetworkPolicy" and p["metadata"]["name"] == "prometheus-to-nodeadm")
+    muts = [
+        lambda d: d.append(copy.deepcopy(pol(d))),
+        lambda d: pol(d)["spec"]["egress"][0]["to"][0]["namespaceSelector"]["matchLabels"].__setitem__("kubernetes.io/metadata.name", K.NS),
+        lambda d: pol(d)["spec"]["egress"][0]["ports"][0].__setitem__("port", 9106),
+        lambda d: next(e for e in next(x for x in d if x.get("kind") == "Deployment" and x["metadata"]["name"] == "nodeadm")
+                       ["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "NODEADM_VAULT_VOTERS").__setitem__("value", "1"),
+        lambda d: _wl(d, "StatefulSet", "vault")["spec"].__setitem__("replicas", 5),
+    ]
+    for mutate in muts:
+        bad = copy.deepcopy(ha)
+        mutate(bad)
+        if not monitoring_problems(bad, True):
+            F.add("monitoring_problems misses a mutated render (mutation test)")
+
+
 def main():
     comp = K.compose()
     docs = K.render()
@@ -983,6 +1065,7 @@ def main():
     check_sites()
     check_postgres()
     check_sessions_vault()
+    check_monitoring()
     for kind, items in D.items():
         for e in items:
             if (kind, e.get("service"), str(e.get("item"))) not in USED:
