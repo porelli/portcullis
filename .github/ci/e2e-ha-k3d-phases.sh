@@ -77,7 +77,7 @@ init)
   # The fake provider's token: a CI test value (the testprovider build's
   # in-memory zone), in .env as any provider's credentials are.
   bash -c 'source scripts/lib/common.sh; env_set PORTCULLIS_KUBE_IMAGES local; env_set PORTCULLIS_PUBLIC_IPV4 203.0.113.11
-    env_set DNS_PROVIDER fake; env_set FAKE_API_TOKEN ci-ha-fake-token-0123456789; env_set DNS_CAA false; env_set ACME_STAGING true
+    env_set DNS_PROVIDER fake; env_set FAKE_API_TOKEN ci-ha-fake-token-0123456789; env_set DNS_CAA false
     env_set PORTCULLIS_K3S_VERSION "$1"; env_set PORTCULLIS_NODEADM_IMAGE "$2"; env_set PORTCULLIS_TESTPROVIDER 1' _ "$K3S_VERSION" "$ref"
   printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
   # A real install starts on one node and the others join later (node
