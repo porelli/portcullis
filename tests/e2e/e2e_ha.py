@@ -587,10 +587,15 @@ def vault_autopilot(pod: str) -> dict:
 
 
 def vault_healthy_voters(pod: str) -> bool:
+    """Autopilot healthy with three healthy voters (the leader's status is
+    "leader", the others' "voter"); otherwise the view, for the timeout."""
     st = vault_autopilot(pod)
     st = st.get("data", st)
-    voters = [s for s in (st.get("servers") or {}).values() if s.get("status") == "voter" and s.get("healthy")]
-    return bool(st.get("healthy")) and len(voters) == 3
+    servers = st.get("servers") or {}
+    voters = [s for s in servers.values() if s.get("status") in ("leader", "voter") and s.get("healthy")]
+    assert st.get("healthy") and len(voters) == 3, \
+        f"autopilot healthy={st.get('healthy')}: " + json.dumps({k: [v.get("status"), v.get("healthy"), v.get("last_index")] for k, v in servers.items()})
+    return True
 
 
 def vault_leader_loss() -> None:
