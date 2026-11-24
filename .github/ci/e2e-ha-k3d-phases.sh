@@ -32,7 +32,8 @@ redact() { sed -E 's#(https?://[^ ]*/invite/)[A-Za-z0-9_-]+#\1<redacted>#g'; }
 fail() { echo "FAIL: $*"; exit 1; }
 # shellcheck disable=SC2016  # expanded by the inner bash
 CLI_LIBS='for _lib in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" portcullis); do source "scripts/lib/$_lib.sh"; done'
-lib() { bash -c "$CLI_LIBS"'; need_env >/dev/null; '"$1"; }
+lib() { bash -c "$CLI_LIBS"'; need_env >/dev/null
+'"$1"; }
 E2E_DOMAIN="${E2E_DOMAIN:-portcullis.local}"
 K3S_VERSION="v1.37.2+k3s1"
 
@@ -99,8 +100,19 @@ ha)
   rm -f "$RUNNER_TEMP/ha-main.json"
   printf 'tls:\n  certificates:\n    - certFile: /certs/ha-main.crt\n      keyFile: /certs/ha-main.key\n' > traefik/dynamic/ci-ha-main.yml
   t0=$(date +%s)
-  # ha enable's own steps (scripts/lib/ha.sh), its installs left out.
-  lib 'ha_enable_step_volumes && ha_enable_step_switch && ha_enable_step_postgres && ha_enable_step_vault && ha_enable_step_sessions' 2>&1 | redact
+  # ha enable's own steps (scripts/lib/ha.sh), its installs left out:
+  # only the Longhorn and fencing namespaces they make (with their
+  # NetworkPolicies, as ha_install_longhorn / _fencing do), where the HA
+  # chart gives nodeadm its Roles. Each step on its own under errexit (an
+  # && list would ignore a failure inside one).
+  lib 'set -euo pipefail
+    _ha_namespace longhorn "$KUBE_LONGHORN_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
+    _ha_namespace fencing "$KUBE_FENCING_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
+    ha_enable_step_volumes
+    ha_enable_step_switch
+    ha_enable_step_postgres
+    ha_enable_step_vault
+    ha_enable_step_sessions' 2>&1 | redact
   echo "HA switch: $(( $(date +%s) - t0 )) s" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
   # The CI template echo as the Hub's source (as e2e-k3s seeds it, here
   # on the replicated hub-state-r): ha_n_minus_1 makes an instance of it.
