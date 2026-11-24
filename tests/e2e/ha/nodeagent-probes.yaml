@@ -1,0 +1,77 @@
+# Test only (CI job e2e-ha-k3d, tests/e2e/e2e_ha.py; plan Task 33): the
+# nodeagent's public ingress probes on every k3d node, where there is no
+# host to install the real portcullis-nodeagent.service on (no systemd, no
+# pcmesh). `portcullis-nodeagent serve --probes-only --root <dir>` runs the
+# agent's own API (mTLS: the frontdoor.control client) and probe rounds
+# from the state the harness put under <dir>: state.json (the node's id,
+# mesh address = its InternalIP, site), ca.crt (pki_node), node.pem (its
+# node-cluster key and certificate, signed by Vault for
+# <node>.cluster.portcullis.internal) and targets.json (nodeadm's probe
+# targets: every ingress node's public address and site). hostNetwork: it
+# listens on the node's address :7443, where the front door asks, and
+# probes the other nodes' public addresses from the node itself. Never
+# root, no capability, a read-only root; its own namespace (PSA privileged
+# for hostNetwork only), never a Portcullis one.
+# e2e_ha.py fills @IMAGE@ (the nodeagent image imported into every node,
+# by digest) and @ITEMS@ (the Secret's per-node files at their host paths).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: portcullis-e2e
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nodeagent-probes
+  namespace: portcullis-e2e
+spec:
+  selector:
+    matchLabels:
+      app: nodeagent-probes
+  template:
+    metadata:
+      labels:
+        app: nodeagent-probes
+    spec:
+      hostNetwork: true
+      automountServiceAccountToken: false
+      tolerations:
+        - operator: Exists
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nodeagent
+          image: "@IMAGE@"
+          command: ["/nodeagent-linux-amd64", "serve", "--probes-only", "--root", "/probes/$(NODE_NAME)"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: state
+              mountPath: /probes
+              readOnly: true
+      volumes:
+        - name: state
+          secret:
+            secretName: nodeagent-probes
+            defaultMode: 0440
+            items: @ITEMS@

@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests snr-build domains-tests nodeadm-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail e2e-servers e2e-servers-podman"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests snr-build domains-tests nodeadm-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-ha-k3d e2e-mail e2e-servers e2e-servers-podman"
         type: string
         default: all
       # `-f scenarios="4 members_only_list"`: only those scenarios of the e2e
@@ -6059,6 +6059,79 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-k3s-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+  # High availability on k3d (plan Task 33 part A, spec §19.2; the logic,
+  # not the storage): k3d pinned (3 servers with embedded etcd + 1 small
+  # agent, on the mesh range 10.215.0.0/24), init --runtime kubernetes with
+  # nodeadm (built here with the Hub's nodeagent, testprovider) and the fake
+  # DNS provider, then ha enable's own volume / switch / quorum steps (no
+  # Longhorn or fencing in k3d: the replicated tier is a local-path class).
+  # tests/e2e/e2e_ha.py: CNPG failover (pod, then node container), the
+  # sign-in loop through a Keycloak and a gate kill (≤ 5 / 300 failed),
+  # Sentinel promotion, Vault leader loss, the Hub Lease handover, the N−1
+  # check against the scheduler, a published document within 20 s, the
+  # CoreDNS node kill; then the sites cluster (5 servers over main / edge /
+  # tb). Real partitions, power, disks and fencing are e2e-ha-vm's (part B).
+  # Thin: the steps are .github/ci/e2e-ha-k3d-*.sh. Failure artifacts: logs
+  # and events only.
+  e2e-ha-k3d:
+    needs: jobs-input
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ha-k3d,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ha-k3d ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ha-k3d,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ha-k3d ')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 150
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      ACME_STAGING: "true"
+      COMPOSE_FILE: docker-compose.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+      - name: The nodeagent (Hub) and nodeadm images
+        timeout-minutes: 20
+        env:
+          HUB_SRC: ${{ runner.temp }}/portcullis-hub
+        run: bash .github/ci/e2e-ha-k3d-phases.sh images
+      - name: Install k3d (3 servers + 1 small agent)
+        timeout-minutes: 15
+        run: bash .github/ci/e2e-ha-k3d-install.sh main
+      - name: init --runtime kubernetes on k3d (nodeadm, the fake DNS provider)
+        timeout-minutes: 40
+        run: bash .github/ci/e2e-ha-k3d-phases.sh init
+      - name: HA on (ha enable's volume, switch and quorum steps)
+        timeout-minutes: 40
+        run: bash .github/ci/e2e-ha-k3d-phases.sh ha
+      - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+      - name: HA scenarios (tests/e2e/e2e_ha.py)
+        timeout-minutes: 45
+        run: bash .github/ci/e2e-ha-k3d-phases.sh scenarios
+      - name: Sites (5 servers over main, edge and tb)
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-ha-k3d-install.sh sites && bash .github/ci/e2e-ha-k3d-phases.sh sites
+      - name: Collect logs and events
+        if: failure()
+        run: bash .github/ci/e2e-ha-k3d-phases.sh collect
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-ha-k3d-artifacts
           path: e2e-artifacts/
           retention-days: 7
 

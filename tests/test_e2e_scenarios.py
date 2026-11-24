@@ -119,8 +119,22 @@ class Cli(unittest.TestCase):
     def test_every_e2e_job_has_runners(self):
         per_job = scenarios.job_runners(HERE.parent / ".github/workflows/ci.yml")
         for job in ("e2e-mail", "e2e-signin", "e2e-ai", "e2e-vpn", "e2e-folders", "e2e-filesharing",
-                    "e2e-settings", "e2e-instances", "e2e"):
+                    "e2e-settings", "e2e-instances", "e2e", "e2e-ha-k3d"):
             self.assertTrue(per_job.get(job), job)
+
+    def test_ha_k3d_scenarios(self):
+        # Task 33 part A: the job runs tests/e2e/e2e_ha.py, which knows every
+        # k3d scenario (each check gated by scenarios.skip, below).
+        per_job = scenarios.job_runners(HERE.parent / ".github/workflows/ci.yml")
+        self.assertIn(HERE / "e2e" / "e2e_ha.py", per_job.get("e2e-ha-k3d", []))
+        names = scenarios.known([HERE / "e2e" / "e2e_ha.py"])["e2e_ha.py"]
+        for n in ("ha_cnpg_failover", "ha_signin_continuity", "ha_sentinel_promotion", "ha_vault_leader_loss",
+                  "ha_hub_lease_handover", "ha_dns_failover", "ha_n_minus_1", "ha_published_docs",
+                  "ha_dns_failover_sites", "ha_coredns_node_kill"):
+            self.assertIn(n, names)
+        ok = cli("check", "--jobs", "e2e-ha-k3d", "--scenarios", "ha_cnpg_failover")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(cli("check", "--jobs", "e2e-k3s", "--scenarios", "ha_cnpg_failover").returncode, 1)
 
     def test_import_refuses_unknown(self):
         r = subprocess.run([sys.executable, "-c", "import scenarios"], cwd=HERE / "e2e", capture_output=True,

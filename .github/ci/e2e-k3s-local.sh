@@ -20,8 +20,14 @@
 #       then `steps`; removed with its volumes afterwards (--k3s-keep keeps
 #       it for a rerun with `docker exec -it pk-e2e-k3s …`). One cluster at a
 #       time: refuses when the container already exists.
+#
+# E2E_LOCAL_JOB (default e2e-k3s) names the ci.yml job: e2e-ha-k3d-local.sh
+# runs this script for e2e-ha-k3d (container pk-e2e-ha-k3d; with --hub the
+# nodeagent image is built from the Hub checkout too, HUB_SRC=~/hub).
 set -euo pipefail
 here="$(cd "$(dirname "$0")/../.." && pwd)"
+job="${E2E_LOCAL_JOB:-e2e-k3s}"
+case "$job" in e2e-k3s|e2e-ha-k3d) ;; *) echo "E2E_LOCAL_JOB: e2e-k3s or e2e-ha-k3d" >&2; exit 2 ;; esac
 
 steps() {
   local from=1 to=999
@@ -34,9 +40,9 @@ steps() {
     GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY:-$RUNNER_TEMP/step-summary}" GITHUB_HEAD_REF="${GITHUB_HEAD_REF:-}" \
     GITHUB_REF_NAME="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo kube1)}"
   touch "$GITHUB_ENV" "$GITHUB_STEP_SUMMARY"
-  python3 - "$here/.github/workflows/ci.yml" "$RUNNER_TEMP/steps" <<'PY'
+  python3 - "$here/.github/workflows/ci.yml" "$RUNNER_TEMP/steps" "$job" <<'PY'
 import json, sys, yaml, pathlib
-job = yaml.safe_load(open(sys.argv[1]))["jobs"]["e2e-k3s"]
+job = yaml.safe_load(open(sys.argv[1]))["jobs"][sys.argv[3]]
 out = pathlib.Path(sys.argv[2]); out.mkdir(exist_ok=True)
 (out / "env.json").write_text(json.dumps(job.get("env") or {}))
 n = 0
@@ -62,15 +68,15 @@ PY
            while IFS= read -r line; do [ -n "$line" ] && export "$line"; done < "$GITHUB_ENV"
            set +a
            bash -e -o pipefail -c "$(jq -r .run "$f")" ); then
-      echo "::endgroup::"; echo "LOCAL e2e-k3s: FAILED at step [$n] $name"; exit 1
+      echo "::endgroup::"; echo "LOCAL $job: FAILED at step [$n] $name"; exit 1
     fi
-    echo "::endgroup::"; echo "LOCAL e2e-k3s: step [$n] $name OK"
+    echo "::endgroup::"; echo "LOCAL $job: step [$n] $name OK"
   done
-  echo "LOCAL e2e-k3s: every step passed"
+  echo "LOCAL $job: every step passed"
 }
 
 container() {
-  local hub="" keep=false name=pk-e2e-k3s img=pk-e2e-k3s-runner:26.04
+  local hub="" keep=false name="pk-$job" img=pk-e2e-k3s-runner:26.04
   while [ $# -gt 0 ]; do
     case "$1" in --hub) hub="$2"; shift 2 ;; --k3s-keep) keep=true; shift ;; *) break ;; esac
   done
@@ -108,12 +114,13 @@ DOCKERFILE
   docker exec "$name" sudo -u runner mkdir -p "$w"
   (cd "$here" && git ls-files -co --exclude-standard | tar -cf - -T -) | docker exec -i "$name" sudo -u runner tar -C "$w" -xf -
   docker exec "$name" sudo -u runner bash -c "cd $w && git init -q && git add -A && git -c user.email=l@l -c user.name=local commit -qm local && git branch -m kube1"
-  local envs=(-e E2E_K3S_SKIP_DOCKER="${E2E_K3S_SKIP_DOCKER:-}" -e E2E_K3S_SKIP_LONGHORN="${E2E_K3S_SKIP_LONGHORN:-}" -e K3S_LINE="${K3S_LINE:-}" -e GITHUB_REF_NAME=kube1)
+  local envs=(-e E2E_K3S_SKIP_DOCKER="${E2E_K3S_SKIP_DOCKER:-}" -e E2E_K3S_SKIP_LONGHORN="${E2E_K3S_SKIP_LONGHORN:-}" -e K3S_LINE="${K3S_LINE:-}" -e GITHUB_REF_NAME=kube1
+    -e E2E_LOCAL_JOB="$job" -e E2E_SCENARIOS="${E2E_SCENARIOS:-}")
   if [ -n "$hub" ]; then
     git -C "$hub" archive "${HUB_REF:-HEAD}" | docker exec -i "$name" sudo -u runner bash -c 'mkdir -p ~/hub && tar -C ~/hub -xf -'
     docker exec "$name" sudo -u runner bash -c 'cd ~/hub && docker build -q -t portcullis-hub:ci . >/tmp/hub-build.log 2>&1' \
       || { docker exec "$name" tail -n 30 /tmp/hub-build.log; echo "FAIL: the Hub image didn't build"; exit 1; }
-    envs+=(-e HUB_IMAGE=portcullis-hub:ci -e HUB_LOCAL=1)
+    envs+=(-e HUB_IMAGE=portcullis-hub:ci -e HUB_LOCAL=1 -e HUB_SRC=/home/runner/hub)
   fi
   [ -z "${KEYCLOAK_IMAGE:-}" ] || envs+=(-e KEYCLOAK_IMAGE="$KEYCLOAK_IMAGE")
   # docker exec -u, never sudo -E: Ubuntu 26.04's sudo ignores -E, and the
