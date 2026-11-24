@@ -40,6 +40,7 @@ class Recorded:
         self.doc = None
         self.applied = 0
         self.creds = {}  # uuid -> [ {id, uuid, label, ...} ]
+        self.senders = []
         self.n = 0
 
     def __call__(self, req, timeout=None):
@@ -70,8 +71,16 @@ class Recorded:
                 d = json.loads(raw)
             except ValueError:
                 return 400, {"error": "bad"}
-            if "strict" not in self.d and (set(d) != set(KEYS)):
+            if "strict" not in self.d and (set(d) - {"senders"} != set(KEYS)):
                 return 400, {"error": "keys"}
+            # As mailctl: senders optional (absent / present / empty), every
+            # entry well-formed (contract §19.5, §19.14).
+            if "senders" not in d and "senders_required" in self.d:
+                return 400, {"error": 'document: missing key "senders"'}
+            if "senders" in d and "senders_lax" not in self.d:
+                why = self.senders_refusal(d)
+                if why:
+                    return 400, {"error": why}
             # As mailctl: tls.spki_sha256 holds 1-2 keys.
             if not (1 <= len(((d.get("tls") or {}).get("spki_sha256")) or []) <= 2):
                 return 400, {"error": "tls.spki_sha256 must hold 1-2 keys"}
@@ -80,29 +89,39 @@ class Recorded:
                 return 400, {"error": 'document.spam: missing key "dnsbl"'}
             if self.doc and d["generation"] <= self.doc["generation"]:
                 return 409, ({"error": "stale"} if "generation" in self.d else {"error": "stale", "error_kind": "generation"})
+            if self.doc and "sender_mass" in self.d and len(self.doc.get("senders") or []) > 0 and "senders" in d:
+                if len(self.doc["senders"]) > 2 * len(d["senders"]):
+                    return 409, {"error": "mass", "error_kind": "mass_removal", "removed": []}
             if self.doc and len(self.doc["accounts"]) > 0 and "mass" not in self.d:
                 now = {a["uuid"] for a in d["accounts"]}
                 gone = [a for a in self.doc["accounts"] if a["uuid"] not in now]
                 if len(gone) * 2 > len(self.doc["accounts"]) and not d["confirm_mass_removal"]:
                     return 409, {"error": "mass", "error_kind": "mass_removal",
                                  "removed": [{"username": a["username"], "uuid": a["uuid"]} for a in gone]}
+            if "senders" in d:
+                self.senders = d["senders"]
+                keep = {x["uuid"] for x in self.senders} | {a["uuid"] for a in d["accounts"]}
+                self.creds = {u: c for u, c in self.creds.items() if u in keep}
             self.doc = d
             if "noapply" not in self.d:
                 self.applied = d["generation"]
             return 202, {"generation": d["generation"]}
         if p == "/v1/credentials" and m == "POST":
             b = json.loads(req.data)
-            acct = next((a for a in self.doc["accounts"] if a["username"] == b["username"]), None)
+            acct = next((a for a in self.doc["accounts"] + self.senders if a["username"] == b["username"]), None)
             if acct is None:
                 return 404, {"error": "no account"}
             if acct["uuid"] != b["uuid"] and "mismatch" not in self.d:
                 return 409, {"error": "uuid", "error_kind": "account_mismatch"}
+            ips = b.get("allowed_ips")
+            if "allowed_ips" in b and not ips:
+                return 400, {"error": "allowed_ips must name 1-64 networks, or be left out"}
             # As mailctl: at most 5 active mail passwords per person.
             if len(self.creds.get(b["uuid"], [])) >= 5:
                 return 409, {"error": "the account has 5 active mail passwords", "error_kind": "limit"}
             self.n += 1
             row = {"id": str(self.n), "uuid": b["uuid"], "label": b["label"], "created_at": "2026-11-17T10:00:00Z", "expires_at": None,
-                   "last_used_at": None, "allowed_ips": []}
+                   "last_used_at": None, "allowed_ips": list(ips or []) if "sender_ips" not in self.d else []}
             self.creds.setdefault(b["uuid"], []).append(row)
             return 201, {"id": row["id"], "secret": "pw-%d" % self.n, "created_at": row["created_at"], "expires_at": None}
         if p == "/v1/credentials" and m == "GET":
@@ -110,7 +129,7 @@ class Recorded:
             out = []
             for r in self.creds.get(uuid, []):
                 r = dict(r)
-                if self.doc.get("submission_lan_only"):
+                if self.doc.get("submission_lan_only") and not any(x["uuid"] == uuid for x in self.senders):
                     r["allowed_ips"] = ["0.0.0.0/0"] if "lan" in self.d else list(self.doc["local_networks"])
                 if "uuid" in self.d:
                     r["uuid"] = "00000000-0000-4000-8000-000000000000"
@@ -129,6 +148,23 @@ class Recorded:
         return 404, {"error": "not found"}
 
 
+    def senders_refusal(self, d):
+        if not isinstance(d["senders"], list):
+            return "senders: not a list"
+        users = {a["username"] for a in d["accounts"]}
+        seen = set()
+        for x in d["senders"]:
+            if set(x) != {"username", "uuid", "address"}:
+                return "senders: keys"
+            u = x["username"]
+            if not (u == "portcullis-hub-mail" or u.startswith("portcullis-app-")) or u in users or u in seen:
+                return "senders: %s" % u
+            if len(x["uuid"]) != 36 or x["address"] != u + "@" + d["primary_domain"]:
+                return "senders: %s" % u
+            seen.add(u)
+        return None
+
+
 def runs(defects=()):
     with tempfile.NamedTemporaryFile("w", delete=False) as f:
         f.write(SECRET + "\n")
@@ -144,13 +180,15 @@ class RunTest(unittest.TestCase):
         rc, out = runs()
         self.assertEqual(rc, 0, out)
         self.assertNotIn("FAIL", out)
-        self.assertIn("9 checks, 0 failed", out)
+        self.assertIn("13 checks, 0 failed", out)
 
     def test_each_defect_fails_its_check(self):
         for defect, check in [("auth", "auth_refusals"), ("outside", "auth_refusals"), ("strict", "strict_json"),
                               ("mismatch", "account_mismatch"), ("uuid", "uuid_echoed"), ("revoke", "revoke_by_uuid"),
                               ("mass", "mass_removal"), ("lan", "allowed_ips_lan_only"), ("void", "void_empties_every_list"),
-                              ("generation", "stale_generation")]:
+                              ("generation", "stale_generation"), ("senders_required", "senders_optional"),
+                              ("senders_lax", "senders_refused"), ("sender_ips", "sender_credential"),
+                              ("sender_mass", "senders_not_mass_removal")]:
             rc, out = runs([defect])
             self.assertEqual(rc, 1, (defect, out))
             self.assertIn("FAIL " + check + ":", out, defect)

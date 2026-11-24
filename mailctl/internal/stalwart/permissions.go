@@ -19,6 +19,12 @@ var IMAPPermissions = []string{
 // user role: authenticate, emailSend, emailReceive and every imap*.
 var MailPasswordPermissions = append([]string{"authenticate", "emailSend", "emailReceive"}, IMAPPermissions...)
 
+// SenderPermissions is an app mail sender's (contract §19.14): its
+// account's Replace list and its credentials' — authenticate and
+// emailSend only: no emailReceive, imap*, jmap*, pop3*, dav* or sieve*
+// (submission only, no mailbox access).
+var SenderPermissions = []string{"authenticate", "emailSend"}
+
 // ExportPermissions is the export password's Replace list (M5).
 var ExportPermissions = []string{"authenticate", "imapAuthenticate", "imapList", "imapSelect", "imapExamine", "imapFetch", "imapStatus"}
 
@@ -173,7 +179,7 @@ var viewerMethods = func() map[string]bool {
 func ViewerMethodAllowed(method string) bool { return viewerMethods[method] }
 
 func init() {
-	for _, l := range [][]string{MailPasswordPermissions, ExportPermissions, MailctlRolePermissions, ViewerRolePermissions} {
+	for _, l := range [][]string{MailPasswordPermissions, ExportPermissions, MailctlRolePermissions, ViewerRolePermissions, SenderPermissions} {
 		for _, p := range l {
 			Used = append(Used, Use{Enum: "Permission", Value: p})
 		}

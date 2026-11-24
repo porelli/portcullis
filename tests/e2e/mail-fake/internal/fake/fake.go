@@ -65,7 +65,9 @@ type Server struct {
 	Wildcards map[string]string
 	// creds: username → its live passwords; nextNow the clock.
 	creds map[string][]fakeCred
-	Now   func() time.Time
+	// senders: the last present senders list (an absent one keeps it).
+	senders []mailprovider.Sender
+	Now     func() time.Time
 	// stateFile: the store's file (persist.go; "" = memory only); kept:
 	// the credential a hostile void kept (nil: none).
 	stateFile string
@@ -363,8 +365,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 // row is c as GET /v1/credentials answers it: allowed_ips is the Local
 // networks under LAN-only, else [] (AllowedIPs overrides).
 func (s *Server) row(c mailprovider.Credential) mailprovider.Credential {
+	given := c.AllowedIPs
 	c.AllowedIPs = []netip.Prefix{}
-	if s.Hostile && s.Doc != nil && s.Doc.SubmissionLANOnly {
+	if len(given) > 0 && !s.Hostile && s.AllowedIPs == nil {
+		// The create's allowed_ips (a sender's, contract §19.14).
+		c.AllowedIPs = append(c.AllowedIPs, given...)
+	} else if s.Hostile && s.Doc != nil && s.Doc.SubmissionLANOnly {
 		c.AllowedIPs = append(c.AllowedIPs, netip.MustParsePrefix("0.0.0.0/0"))
 	} else if s.AllowedIPs != nil {
 		c.AllowedIPs = append(c.AllowedIPs, s.AllowedIPs...)
@@ -450,6 +456,11 @@ func (s *Server) userOfUUID(uuid string) string {
 	if s.Doc == nil {
 		return ""
 	}
+	for _, x := range s.senders {
+		if x.UUID == uuid {
+			return x.Username
+		}
+	}
 	for _, a := range s.Doc.Accounts {
 		if a.UUID == uuid {
 			return a.Username
@@ -463,6 +474,11 @@ func (s *Server) uuidOf(u string) string {
 	if s.Doc == nil {
 		return ""
 	}
+	for _, x := range s.senders {
+		if x.Username == u {
+			return x.UUID
+		}
+	}
 	for _, a := range s.Doc.Accounts {
 		if a.Username == u {
 			return a.UUID
@@ -474,6 +490,11 @@ func (s *Server) uuidOf(u string) string {
 func (s *Server) account(u string) bool {
 	if s.Doc == nil {
 		return false
+	}
+	for _, x := range s.senders {
+		if x.Username == u {
+			return true
+		}
 	}
 	for _, a := range s.Doc.Accounts {
 		if a.Username == u {
@@ -487,6 +508,7 @@ var (
 	usernameRe = regexp.MustCompile(`^[a-z0-9_.@-]{1,64}$`)
 	uuidRe     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	spkiRe     = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	senderRe   = regexp.MustCompile(`^portcullis-(hub-mail|app-[a-z][a-z0-9-]{0,31})$`)
 )
 
 // parse is state.Parse's refusals (contract §19.5).
@@ -587,6 +609,24 @@ func parse(d *mailprovider.MailState) error {
 			return fmt.Errorf("postmaster %s is no account", p)
 		}
 	}
+	if d.Senders != nil {
+		uuids := map[string]bool{}
+		for _, a := range d.Accounts {
+			uuids[a.UUID] = true
+		}
+		for _, x := range *d.Senders {
+			if !senderRe.MatchString(x.Username) || !uuidRe.MatchString(x.UUID) || x.Address != x.Username+"@"+d.PrimaryDomain {
+				return fmt.Errorf("sender %q", x.Username)
+			}
+			if accts[x.Username] || uuids[x.UUID] {
+				return fmt.Errorf("sender %s collides with an account or another sender", x.Username)
+			}
+			accts[x.Username], uuids[x.UUID] = true, true
+			if err := use(x.Address, "sender "+x.Username); err != nil {
+				return err
+			}
+		}
+	}
 	if d.Limits.RecipientsPerHour < 1 || d.Limits.RecipientsPerHour > 100000 || d.Limits.RecipientsPerDay < 1 || d.Limits.RecipientsPerDay > 100000 {
 		return fmt.Errorf("limits")
 	}
@@ -613,6 +653,10 @@ func (s *Server) putState(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 400, "missing key %s", k)
 			return
 		}
+	}
+	if v, ok := raw["senders"]; ok && string(bytes.TrimSpace(v)) == "null" {
+		errJSON(w, 400, "senders: null (leave it out, or send a list)")
+		return
 	}
 	var d mailprovider.MailState
 	dec := json.NewDecoder(bytes.NewReader(body.Bytes()))
@@ -655,10 +699,16 @@ func (s *Server) putState(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// A removed account loses every password first (M4).
+	// A removed account (or sender) loses every password first (M4).
+	if d.Senders != nil {
+		s.senders = append([]mailprovider.Sender{}, (*d.Senders)...)
+	}
 	keep := map[string]bool{}
 	for _, a := range d.Accounts {
 		keep[a.Username] = true
+	}
+	for _, x := range s.senders {
+		keep[x.Username] = true
 	}
 	for u := range s.creds {
 		if !keep[u] {
@@ -688,10 +738,26 @@ func (s *Server) createCred(w http.ResponseWriter, r *http.Request) {
 		UUID      string     `json:"uuid"`
 		Label     string     `json:"label"`
 		ExpiresAt *time.Time `json:"expires_at"`
+		// AllowedIPs: optional (contract §19.5); present = 1+ networks.
+		AllowedIPs *[]netip.Prefix `json:"allowed_ips"`
 	}
 	if err := strict(r, &body); err != nil {
 		errJSON(w, 400, "bad body")
 		return
+	}
+	var allowed []netip.Prefix
+	if body.AllowedIPs != nil {
+		allowed = *body.AllowedIPs
+		if len(allowed) == 0 {
+			errJSON(w, 400, "allowed_ips must name 1-64 networks, or be left out")
+			return
+		}
+		for _, p := range allowed {
+			if p.Bits() == 0 || p.Masked() != p {
+				errJSON(w, 400, "allowed_ips: %s is not a network", p)
+				return
+			}
+		}
 	}
 	now := s.Now()
 	if n := len([]rune(body.Label)); n < 1 || n > 64 || strings.ContainsAny(body.Label, "\r\n") {
@@ -724,7 +790,7 @@ func (s *Server) createCred(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sec := fmt.Sprintf("mailpw-%s-%d-%d", body.Username, next, now.UnixNano())
-	c := fakeCred{mailprovider.Credential{ID: strconv.Itoa(next), UUID: body.UUID, Label: body.Label, CreatedAt: now, ExpiresAt: body.ExpiresAt}}
+	c := fakeCred{mailprovider.Credential{ID: strconv.Itoa(next), UUID: body.UUID, Label: body.Label, CreatedAt: now, ExpiresAt: body.ExpiresAt, AllowedIPs: allowed}}
 	s.creds[body.Username] = append(cs, c)
 	sort.Slice(s.creds[body.Username], func(i, j int) bool { return s.creds[body.Username][i].ID < s.creds[body.Username][j].ID })
 	s.Created = append(s.Created, sec)

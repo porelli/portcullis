@@ -144,6 +144,12 @@ func List(ctx context.Context, c *stalwart.Client, accountID, uuid string) ([]In
 
 // Create makes one mail password (refused at MaxActive active ones).
 func Create(ctx context.Context, c *stalwart.Client, accountID, label string, expires *time.Time, allowed []string, now time.Time) (Created, error) {
+	return CreateWith(ctx, c, accountID, label, expires, allowed, stalwart.MailPasswordPermissions, now)
+}
+
+// CreateWith makes one credential whose permissions Replace with perms
+// (a person's MailPasswordPermissions, a sender's SenderPermissions).
+func CreateWith(ctx context.Context, c *stalwart.Client, accountID, label string, expires *time.Time, allowed, perms []string, now time.Time) (Created, error) {
 	if !ValidLabel(label) {
 		return Created{}, errors.New("the label must be 1-64 characters on one line")
 	}
@@ -165,7 +171,7 @@ func Create(ctx context.Context, c *stalwart.Client, accountID, label string, ex
 	}
 	fields := map[string]any{
 		"description": label,
-		"permissions": map[string]any{"@type": "Replace", "permissions": setOf(stalwart.MailPasswordPermissions)},
+		"permissions": map[string]any{"@type": "Replace", "permissions": setOf(perms)},
 	}
 	if expires != nil {
 		fields["expiresAt"] = expires.UTC().Format(time.RFC3339)

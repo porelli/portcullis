@@ -166,3 +166,130 @@ func TestLocalNetworkOK(t *testing.T) {
 		}
 	}
 }
+
+func sendersVector(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile("testdata/mailstate_v2_senders.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// The contract's MailState v2 vector with senders (§19.5, §19.14; a byte
+// copy of the contract's block) decodes and encodes back to the same
+// values.
+func TestMailStateV2SendersVector(t *testing.T) {
+	b := sendersVector(t)
+	d, err := Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.SendersPresent() || len(d.SenderList()) != 2 || d.SenderList()[0].Username != "portcullis-hub-mail" ||
+		d.SenderList()[1].Address != "portcullis-app-firefox-sync-fxa@example.com" || d.SenderList()[1].UUID != "7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e" {
+		t.Fatalf("senders %+v", d.SenderList())
+	}
+	out, _ := json.Marshal(d)
+	var a, z any
+	json.Unmarshal(b, &a)
+	json.Unmarshal(out, &z)
+	ab, _ := json.Marshal(a)
+	zb, _ := json.Marshal(z)
+	if string(ab) != string(zb) {
+		t.Fatalf("round trip differs:\n%s\n%s", ab, zb)
+	}
+	// The vector without senders is the older Hub's document, byte for
+	// byte (testdata/mailstate_v2.json, the Hub's current copy).
+	old := strings.Replace(string(b), ` "senders":[{"username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com"},
+            {"username":"portcullis-app-firefox-sync-fxa","uuid":"7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e","address":"portcullis-app-firefox-sync-fxa@example.com"}],
+`, "", 1)
+	if old != string(vector(t)) {
+		t.Fatal("mailstate_v2_senders.json minus its senders isn't mailstate_v2.json")
+	}
+}
+
+// senders is optional (ruling C1): absent = an older Hub (existing
+// senders left untouched), present and empty = remove every sender. Both
+// survive the store's round trip as they are.
+func TestSendersAbsentOrEmpty(t *testing.T) {
+	d, err := Parse(vector(t))
+	if err != nil {
+		t.Fatalf("absent: %v", err)
+	}
+	if d.SendersPresent() || d.Senders != nil {
+		t.Fatalf("absent senders read as present: %+v", d.Senders)
+	}
+	empty := strings.Replace(string(vector(t)), `"aliases":`, `"senders":[],"aliases":`, 1)
+	e, err := Parse([]byte(empty))
+	if err != nil {
+		t.Fatalf("empty: %v", err)
+	}
+	if !e.SendersPresent() || len(e.SenderList()) != 0 {
+		t.Fatalf("empty senders read as %+v (present %v)", e.SenderList(), e.SendersPresent())
+	}
+	dir := t.TempDir()
+	for name, doc := range map[string]*Doc{"absent": d, "empty": e} {
+		st, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Update(func(p *Persistent) error { p.Doc = doc; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		re, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := re.Get().Doc; got.SendersPresent() != doc.SendersPresent() || len(got.SenderList()) != len(doc.SenderList()) {
+			t.Errorf("%s: after the store's round trip present=%v len=%d", name, got.SendersPresent(), len(got.SenderList()))
+		}
+	}
+}
+
+// A malformed senders entry refuses the whole document (contract §19.5).
+func TestParseRefusesSenders(t *testing.T) {
+	base := string(sendersVector(t))
+	rep := func(old, new string) string {
+		if !strings.Contains(base, old) {
+			t.Fatalf("vector lacks %q", old)
+		}
+		return strings.Replace(base, old, new, 1)
+	}
+	hub := `{"username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com"}`
+	cases := map[string]string{
+		"senders null":            strings.Replace(string(vector(t)), `"aliases":`, `"senders":null,"aliases":`, 1),
+		"unknown key":             rep(hub, `{"username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com","label":"x"}`),
+		"missing address":         rep(hub, `{"username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"}`),
+		"missing uuid":            rep(hub, `{"username":"portcullis-hub-mail","address":"portcullis-hub-mail@example.com"}`),
+		"null username":           rep(hub, `{"username":null,"uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com"}`),
+		"duplicate key":           rep(hub, `{"username":"portcullis-hub-mail","username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com"}`),
+		"not a list":              strings.Replace(string(vector(t)), `"aliases":`, `"senders":`+hub+`,"aliases":`, 1),
+		"senders twice":           rep(`"aliases":`, `"senders":[],"aliases":`),
+		"a person's username":     rep(hub, `{"username":"alice","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"alice@example.com"}`),
+		"another form":            rep(hub, `{"username":"portcullis-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-mail@example.com"}`),
+		"uppercase":               rep(hub, `{"username":"portcullis-app-Fxa","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-app-Fxa@example.com"}`),
+		"empty instance":          rep(hub, `{"username":"portcullis-app-","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-app-@example.com"}`),
+		"instance too long":       rep(hub, `{"username":"portcullis-app-a234567890123456789012345678901234","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-app-a234567890123456789012345678901234@example.com"}`),
+		"bad uuid":                rep(`"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"`, `"1a2b3c4d"`),
+		"uppercase uuid":          rep(`"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"`, `"1A2B3C4D-5E6F-7A8B-9C0D-1E2F3A4B5C6D"`),
+		"address of another":      rep(`"address":"portcullis-hub-mail@example.com"`, `"address":"portcullis-app-firefox-sync-fxa@example.com"`),
+		"address another local":   rep(`"address":"portcullis-hub-mail@example.com"`, `"address":"hub@example.com"`),
+		"address another domain":  rep(`"address":"portcullis-hub-mail@example.com"`, `"address":"portcullis-hub-mail@team-b.example.org"`),
+		"address on no domain":    rep(`"address":"portcullis-hub-mail@example.com"`, `"address":"portcullis-hub-mail@example.net"`),
+		"address not an address":  rep(`"address":"portcullis-hub-mail@example.com"`, `"address":"portcullis-hub-mail"`),
+		"username twice":          rep(`"username":"portcullis-app-firefox-sync-fxa","uuid":"7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e","address":"portcullis-app-firefox-sync-fxa@example.com"`, `"username":"portcullis-hub-mail","uuid":"7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e","address":"portcullis-hub-mail@example.com"`),
+		"uuid twice":              rep(`"7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e"`, `"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"`),
+		"a person's uuid":         rep(`"7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e"`, `"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"`),
+		"a person named a sender": strings.Replace(rep(`"username":"bob","uuid":"0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d","display_name":"Bob B.","addresses":["bob@example.com"]`, `"username":"portcullis-app-firefox-sync-fxa","uuid":"0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d","display_name":"Bob B.","addresses":["portcullis-app-firefox-sync-fxa@example.com"]`), `"members":["alice","bob"]`, `"members":["alice","portcullis-app-firefox-sync-fxa"]`, 1),
+		"a person's alias":        rep(`"aliases":[{"address":"sales@example.com","username":"alice"}]`, `"aliases":[{"address":"portcullis-hub-mail@example.com","username":"alice"}]`),
+		"a person's 2nd address":  rep(`"addresses":["bob@example.com"]`, `"addresses":["bob@example.com","portcullis-app-firefox-sync-fxa@example.com"]`),
+		"a list's address":        rep(`"address":"team@example.com"`, `"address":"portcullis-hub-mail@example.com"`),
+		"a sender as postmaster":  rep(`"postmaster":["root"]`, `"postmaster":["portcullis-hub-mail"]`),
+		"a sender as list member": rep(`"members":["alice","bob"]`, `"members":["alice","portcullis-hub-mail"]`),
+	}
+	for name, doc := range cases {
+		if _, err := Parse([]byte(doc)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

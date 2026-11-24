@@ -74,6 +74,12 @@ type Live struct {
 	Lists          []LiveList
 	Keys           []LiveKey
 	Throttles      []LiveThrottle
+	// Senders are the app mail senders' accounts (description
+	// portcullis-sender:<uuid>, contract §19.14): never people, so never
+	// in Accounts (the plan, the mass-removal count, the credentials of a
+	// person, LAN-only). SenderKeys are the senders' lookup namespace.
+	Senders    []LiveSender
+	SenderKeys []LiveKey
 }
 
 type obj = map[string]json.RawMessage
@@ -139,6 +145,10 @@ func Read(ctx context.Context, c *stalwart.Client) (*Live, error) {
 			l.MailctlAliases = aliasAddrs(a["aliases"], l.DomainNames)
 			continue
 		}
+		if strings.HasPrefix(desc, DescSenderPrefix) {
+			l.Senders = append(l.Senders, liveSender(a, l))
+			continue
+		}
 		if !strings.HasPrefix(desc, DescPrefix) {
 			continue
 		}
@@ -178,14 +188,20 @@ func Read(ctx context.Context, c *stalwart.Client) (*Live, error) {
 		sort.Strings(ll.Recipients)
 		l.Lists = append(l.Lists, ll)
 	}
-	for _, ns := range []string{NSMembersOnly, NSPosters} {
+	for _, ns := range []string{NSMembersOnly, NSPosters, NSSenders} {
 		keys, err := getAll(ctx, c, "MemoryLookupKey", map[string]string{"namespace": ns})
 		if err != nil {
 			return nil, err
 		}
 		for _, k := range keys {
-			if sval(k, "namespace") == ns {
-				l.Keys = append(l.Keys, LiveKey{ID: sval(k, "id"), Namespace: ns, Key: sval(k, "key")})
+			if sval(k, "namespace") != ns {
+				continue
+			}
+			lk := LiveKey{ID: sval(k, "id"), Namespace: ns, Key: sval(k, "key")}
+			if ns == NSSenders {
+				l.SenderKeys = append(l.SenderKeys, lk)
+			} else {
+				l.Keys = append(l.Keys, lk)
 			}
 		}
 	}

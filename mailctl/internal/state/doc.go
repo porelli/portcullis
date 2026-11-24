@@ -28,7 +28,8 @@ const (
 	MailDraining = "draining"
 )
 
-// Doc is MailState v2. Every key is required; only relay may be null.
+// Doc is MailState v2. Every key is required but senders (optional,
+// contract §19.14); only relay may be null.
 type Doc struct {
 	Version           int    `json:"version"`
 	Generation        int64  `json:"generation"`
@@ -45,12 +46,17 @@ type Doc struct {
 	ConfirmMassRemoval bool      `json:"confirm_mass_removal"`
 	Domains            []Domain  `json:"domains"`
 	Accounts           []Account `json:"accounts"`
-	Aliases            []Alias   `json:"aliases"`
-	Lists              []List    `json:"lists"`
-	Postmaster         []string  `json:"postmaster"`
-	Limits             Limits    `json:"limits"`
-	Spam               Spam      `json:"spam"`
-	LocalNetworks      []string  `json:"local_networks"`
+	// Senders: app mail senders and Portcullis's own (§19.14). nil = the
+	// key absent (an older Hub: existing senders are left untouched);
+	// non-nil, pointing at an empty list = every sender removed. A
+	// pointer with omitempty: the store's round trip keeps the two apart.
+	Senders       *[]Sender `json:"senders,omitempty" optional:"true"`
+	Aliases       []Alias   `json:"aliases"`
+	Lists         []List    `json:"lists"`
+	Postmaster    []string  `json:"postmaster"`
+	Limits        Limits    `json:"limits"`
+	Spam          Spam      `json:"spam"`
+	LocalNetworks []string  `json:"local_networks"`
 }
 
 // Client address modes (client_ip, contract §19.8).
@@ -88,6 +94,36 @@ type Account struct {
 	DisplayName string   `json:"display_name"`
 	Addresses   []string `json:"addresses"`
 	QuotaBytes  int64    `json:"quota_bytes"`
+}
+
+// Sender is one app mail sender (contract §19.14): a submission-only
+// account, Username portcullis-hub-mail or portcullis-app-<instance>,
+// Address <username>@<primary_domain>, UUID the Hub's.
+type Sender struct {
+	Username string `json:"username"`
+	UUID     string `json:"uuid"`
+	Address  string `json:"address"`
+}
+
+// SendersPresent: the document carries senders (possibly empty).
+func (d *Doc) SendersPresent() bool { return d != nil && d.Senders != nil }
+
+// SenderList is the document's senders (nil when absent or empty).
+func (d *Doc) SenderList() []Sender {
+	if d == nil || d.Senders == nil {
+		return nil
+	}
+	return *d.Senders
+}
+
+// Sender looks up a sender by username.
+func (d *Doc) Sender(username string) (Sender, bool) {
+	for _, s := range d.SenderList() {
+		if s.Username == username {
+			return s, true
+		}
+	}
+	return Sender{}, false
 }
 
 // Alias delivers Address to one account (and lets it send as Address).
@@ -135,7 +171,13 @@ var (
 	reLocal    = regexp.MustCompile(`^[a-z0-9!#$%&'*+/=?^_{|}~-]+(\.[a-z0-9!#$%&'*+/=?^_{|}~-]+)*$`)
 	reDNSSEC   = regexp.MustCompile(`^[a-z_]{1,32}$`)
 	reSPKI     = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	// reSender: portcullis-hub-mail, or portcullis-app-<instance> (an
+	// instance id: a template id's form, §3 / §11.1).
+	reSender = regexp.MustCompile(`^portcullis-(hub-mail|app-[a-z][a-z0-9-]{0,31})$`)
 )
+
+// ValidSenderUsername is a sender's username form (contract §19.5).
+func ValidSenderUsername(u string) bool { return reSender.MatchString(u) }
 
 // Duration bounds of dkim_rotate and former_retention.
 const (
@@ -302,6 +344,9 @@ func requireKeys(raw []byte, t reflect.Type, where string) error {
 			name := strings.Split(f.Tag.Get("json"), ",")[0]
 			v, ok := m[name]
 			if !ok {
+				if f.Tag.Get("optional") == "true" {
+					continue
+				}
 				return fmt.Errorf("%s: missing key %q", where, name)
 			}
 			if string(v) == "null" {
@@ -488,6 +533,31 @@ func (d *Doc) validate() error {
 	for _, p := range d.Postmaster {
 		if !users[p] {
 			return fmt.Errorf("postmaster: %s is not an account", p)
+		}
+	}
+	// Senders (§19.14): never a person's username, uuid or address, nor
+	// another sender's.
+	for _, sn := range d.SenderList() {
+		who := "sender " + sn.Username
+		if !reSender.MatchString(sn.Username) {
+			return fmt.Errorf("senders: %q is not portcullis-hub-mail or portcullis-app-<instance>", sn.Username)
+		}
+		if users[sn.Username] {
+			return fmt.Errorf("senders: %s is a person's account or another sender", sn.Username)
+		}
+		users[sn.Username] = true
+		if !reUUID.MatchString(sn.UUID) {
+			return fmt.Errorf("%s: uuid %q is not a UUID", who, sn.UUID)
+		}
+		if uuids[sn.UUID] {
+			return fmt.Errorf("%s: uuid %s twice", who, sn.UUID)
+		}
+		uuids[sn.UUID] = true
+		if sn.Address != sn.Username+"@"+d.PrimaryDomain {
+			return fmt.Errorf("%s: the address must be %s@%s", who, sn.Username, d.PrimaryDomain)
+		}
+		if err := claim(sn.Address, who); err != nil {
+			return err
 		}
 	}
 	for _, v := range []int{d.Limits.RecipientsPerHour, d.Limits.RecipientsPerDay} {

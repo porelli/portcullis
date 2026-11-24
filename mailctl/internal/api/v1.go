@@ -7,9 +7,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/mail"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -411,12 +413,9 @@ func (v *V1) listCreds(w http.ResponseWriter, r *http.Request) {
 	}
 	out := []creds.Info{}
 	found := false
-	for _, la := range live.Accounts {
-		if !strings.EqualFold(la.UUID, uuid) {
-			continue
-		}
+	for _, id := range accountsOfUUID(live, uuid) {
 		found = true
-		list, err := creds.List(ctx, v.C, la.ID, uuid)
+		list, err := creds.List(ctx, v.C, id, uuid)
 		if err != nil {
 			v.unreachable(w, err)
 			return
@@ -436,6 +435,54 @@ type createReq struct {
 	UUID      string     `json:"uuid"`
 	Label     string     `json:"label"`
 	ExpiresAt *time.Time `json:"expires_at"`
+	// AllowedIPs (optional, contract §19.5): absent = from anywhere;
+	// present = the networks the credential may submit from (1-64, each a
+	// network, never one that amounts to anywhere).
+	AllowedIPs []string `json:"allowed_ips"`
+}
+
+// MaxAllowedIPs bounds a credential's allowed_ips.
+const MaxAllowedIPs = 64
+
+// allowedIPs checks a create's allowed_ips: canonical networks (never
+// split or widened), each within state.LocalNetworkOK's bounds.
+func allowedIPs(ips []string) ([]string, error) {
+	if len(ips) == 0 {
+		return nil, errors.New("allowed_ips must name 1-64 networks, or be left out")
+	}
+	if len(ips) > MaxAllowedIPs {
+		return nil, fmt.Errorf("allowed_ips: more than %d networks", MaxAllowedIPs)
+	}
+	out := make([]string, 0, len(ips))
+	for _, n := range ips {
+		p, err := netip.ParsePrefix(n)
+		if err != nil || p.Masked() != p {
+			return nil, fmt.Errorf("allowed_ips: %q is not a network", n)
+		}
+		if err := state.LocalNetworkOK(p); err != nil {
+			return nil, fmt.Errorf("allowed_ips: %s: %w", n, err)
+		}
+		out = append(out, p.String())
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// accountsOfUUID: every account (a person's, live or parked, or an app
+// mail sender's) carrying uuid.
+func accountsOfUUID(live *reconcile.Live, uuid string) []string {
+	var ids []string
+	for _, la := range live.Accounts {
+		if strings.EqualFold(la.UUID, uuid) {
+			ids = append(ids, la.ID)
+		}
+	}
+	for _, ls := range live.Senders {
+		if strings.EqualFold(ls.UUID, uuid) {
+			ids = append(ids, ls.ID)
+		}
+	}
+	return ids
 }
 
 // mismatch: the account under this username isn't the person the Hub
@@ -465,13 +512,13 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createReq
 	if err := state.NoDuplicateKeys(b); err != nil {
-		writeErr(w, http.StatusBadRequest, "the body must be {username, uuid, label, expires_at}")
+		writeErr(w, http.StatusBadRequest, "the body must be {username, uuid, label, expires_at[, allowed_ips]}")
 		return
 	}
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&req); err != nil || d.More() {
-		writeErr(w, http.StatusBadRequest, "the body must be {username, uuid, label, expires_at}")
+		writeErr(w, http.StatusBadRequest, "the body must be {username, uuid, label, expires_at[, allowed_ips]}")
 		return
 	}
 	var keys map[string]json.RawMessage
@@ -479,6 +526,20 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	for _, k := range []string{"username", "uuid", "label", "expires_at"} {
 		if _, ok := keys[k]; !ok {
 			writeErr(w, http.StatusBadRequest, "missing "+k)
+			return
+		}
+	}
+	var allowed []string
+	raw, ipsGiven := keys["allowed_ips"]
+	if ipsGiven {
+		var err error
+		if string(bytes.TrimSpace(raw)) == "null" {
+			err = errors.New("allowed_ips must name 1-64 networks, or be left out")
+		} else {
+			allowed, err = allowedIPs(req.AllowedIPs)
+		}
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
@@ -506,17 +567,28 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "no accepted mail document yet")
 		return
 	}
+	refuse := func() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "the account " + strings.ToLower(req.Username) + " belongs to another person", "error_kind": "account_mismatch"})
+	}
+	if _, sender := doc.Sender(req.Username); sender {
+		v.createSenderCred(ctx, w, doc, req, allowed, refuse)
+		return
+	}
 	if _, known := doc.Account(req.Username); !known {
 		writeErr(w, http.StatusNotFound, "no such account")
+		return
+	}
+	// A person's mail passwords are the Local networks' under LAN-only
+	// (the runner restricts every one of them): another list is refused,
+	// never silently replaced.
+	if ipsGiven && doc.SubmissionLANOnly {
+		writeErr(w, http.StatusBadRequest, "allowed_ips can't be set on a person's mail password while submission is LAN-only")
 		return
 	}
 	live, err := reconcile.Read(ctx, v.C)
 	if err != nil {
 		v.unreachable(w, err)
 		return
-	}
-	refuse := func() {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "the account " + strings.ToLower(req.Username) + " belongs to another person", "error_kind": "account_mismatch"})
 	}
 	if mismatch(live, doc, req.Username, req.UUID) {
 		refuse()
@@ -541,7 +613,11 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 		refuse()
 		return
 	}
-	cr, err := creds.Create(ctx, v.C, id, req.Label, req.ExpiresAt, creds.AllowedIPs(doc.SubmissionLANOnly, reconcile.LocalNets(doc, doc.Rewritten())), v.now())
+	ips := creds.AllowedIPs(doc.SubmissionLANOnly, reconcile.LocalNets(doc, doc.Rewritten()))
+	if ipsGiven {
+		ips = allowed
+	}
+	cr, err := creds.Create(ctx, v.C, id, req.Label, req.ExpiresAt, ips, v.now())
 	switch {
 	case errors.Is(err, creds.ErrLimit):
 		writeKind(w, http.StatusConflict, "limit", err.Error())
@@ -552,6 +628,53 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	}
 	if v.Logf != nil {
 		v.Logf("credentials: created mail password %s for %s", cr.ID, strings.ToLower(req.Username))
+	}
+	writeJSON(w, http.StatusCreated, cr)
+}
+
+// createSenderCred makes an app mail sender's credential (contract
+// §19.14): the sender's permissions only (authenticate, emailSend),
+// allowed_ips as asked (absent = anywhere; LAN-only and the client
+// address mode govern people's passwords, never a sender's). The caller
+// holds the pass lock and the one document snapshot.
+func (v *V1) createSenderCred(ctx context.Context, w http.ResponseWriter, doc *state.Doc, req createReq, allowed []string, refuse func()) {
+	s, _ := doc.Sender(req.Username)
+	if s.UUID != strings.ToLower(req.UUID) {
+		refuse()
+		return
+	}
+	live, err := reconcile.Read(ctx, v.C)
+	if err != nil {
+		v.unreachable(w, err)
+		return
+	}
+	// Another live sender under this name (a uuid the Hub replaced, the
+	// pass not run yet): not the sender the Hub names.
+	for _, ls := range live.Senders {
+		if ls.Name == s.Username && ls.UUID != s.UUID {
+			refuse()
+			return
+		}
+	}
+	id := reconcile.FindSender(live, doc, s.Username)
+	if id == "" {
+		writeErr(w, http.StatusNotFound, "no such account (the sender isn't made yet)")
+		return
+	}
+	if v.beforeCreate != nil {
+		v.beforeCreate()
+	}
+	cr, err := creds.CreateWith(ctx, v.C, id, req.Label, req.ExpiresAt, allowed, stalwart.SenderPermissions, v.now())
+	switch {
+	case errors.Is(err, creds.ErrLimit):
+		writeKind(w, http.StatusConflict, "limit", err.Error())
+		return
+	case err != nil:
+		v.unreachable(w, err)
+		return
+	}
+	if v.Logf != nil {
+		v.Logf("credentials: created sender credential %s for %s", cr.ID, s.Username)
 	}
 	writeJSON(w, http.StatusCreated, cr)
 }
@@ -576,12 +699,7 @@ func (v *V1) deleteCred(w http.ResponseWriter, r *http.Request) {
 	// Every account with that uuid (final review L9: two can carry it
 	// after a hand edit or a half-failed create): the revoke goes to each,
 	// and 204 only once it went everywhere.
-	var accts []string
-	for _, la := range live.Accounts {
-		if strings.EqualFold(la.UUID, uuid) {
-			accts = append(accts, la.ID)
-		}
-	}
+	accts := accountsOfUUID(live, uuid)
 	for _, acct := range accts {
 		if err := creds.Revoke(ctx, v.C, acct, r.PathValue("id")); err != nil {
 			v.unreachable(w, err)

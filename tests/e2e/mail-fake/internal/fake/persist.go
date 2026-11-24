@@ -25,6 +25,7 @@ type stored struct {
 	Applied int                     `json:"applied"`
 	Creds   map[string][]fakeCred   `json:"creds"`
 	Kept    *keptCred               `json:"kept"`
+	Senders []mailprovider.Sender   `json:"senders"`
 }
 
 // keptCred is the credential a hostile void kept (hostile.go).
@@ -48,7 +49,7 @@ func (s *Server) UseStateFile(file string) error {
 		if err := json.Unmarshal(b, &st); err != nil {
 			return fmt.Errorf("%s: %w", file, err)
 		}
-		s.Doc, s.Applied, s.kept = st.Doc, st.Applied, st.Kept
+		s.Doc, s.Applied, s.kept, s.senders = st.Doc, st.Applied, st.Kept, st.Senders
 		if st.Creds != nil {
 			s.creds = st.Creds
 		}
@@ -63,7 +64,7 @@ func (s *Server) saveLocked() {
 	if s.stateFile == "" {
 		return
 	}
-	b, err := json.Marshal(stored{Doc: s.Doc, Applied: s.Applied, Creds: s.creds, Kept: s.kept})
+	b, err := json.Marshal(stored{Doc: s.Doc, Applied: s.Applied, Creds: s.creds, Kept: s.kept, Senders: s.senders})
 	if err == nil {
 		tmp := filepath.Join(filepath.Dir(s.stateFile), ".state.json.tmp")
 		if err = os.WriteFile(tmp, b, 0o600); err == nil {

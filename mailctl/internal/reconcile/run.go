@@ -164,10 +164,12 @@ func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Per
 	ops.Redisable = redisable
 	// A failed sweep never skips the rest of the pass (an account whose
 	// passwords couldn't be read counts as not exporting: re-disabled).
-	if err := r.applyOps(ctx, l, doc, ops, err); err != nil || sweepErr != nil {
-		return errors.Join(sweepErr, err)
-	}
-	return nil
+	applyErr := r.applyOps(ctx, l, doc, ops, err)
+	// The senders (contract §19.14) on their own path: excluded from the
+	// mass-removal rule, so a refused removal of people (or any other
+	// failure above) never holds them back.
+	senderErr := ApplySenders(ctx, r.C, l, doc, PlanSenders(l, doc))
+	return errors.Join(sweepErr, applyErr, senderErr)
 }
 
 func (r *Runner) applyOps(ctx context.Context, l *Live, doc *state.Doc, ops Ops, err error) error {

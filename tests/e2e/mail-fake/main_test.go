@@ -325,3 +325,62 @@ func TestHonestSetsFileMatches(t *testing.T) {
 		t.Fatalf("%s differs from the honest sets (regenerate with MAIL_FAKE_UPDATE=1 go test ./...): %v", honestSetsFile, err)
 	}
 }
+
+// withSenders adds a senders list to doc's JSON (nil = left out).
+func withSenders(d string, senders ...string) string {
+	var m map[string]any
+	json.Unmarshal([]byte(d), &m)
+	list := []map[string]any{}
+	for i, u := range senders {
+		list = append(list, map[string]any{"username": u, "uuid": fmt.Sprintf("10000000-0000-4000-8000-%012d", i+1), "address": u + "@example.org"})
+	}
+	m["senders"] = list
+	b, _ := json.Marshal(m)
+	return string(b)
+}
+
+// Senders (contract §19.14): optional; a sender's credential with
+// allowed_ips; an absent list keeps the senders, an empty one removes
+// them (their credentials too) and is never a mass removal; malformed
+// senders are refused.
+func TestHonestSenders(t *testing.T) {
+	_, _, call := serveFake(t)
+	if c, b := call("PUT", "/v1/state", withSenders(doc(1, false, "alice"), "portcullis-hub-mail", "portcullis-app-fxa")); c != 202 {
+		t.Fatalf("PUT with senders: %d %s", c, b)
+	}
+	app := `"username":"portcullis-app-fxa","uuid":"10000000-0000-4000-8000-000000000002","label":"fxa","expires_at":null`
+	if c, b := call("POST", "/v1/credentials", `{`+app+`,"allowed_ips":["172.18.0.0/16"]}`); c != 201 {
+		t.Fatalf("sender credential: %d %s", c, b)
+	}
+	if c, b := call("GET", "/v1/credentials?uuid=10000000-0000-4000-8000-000000000002", ""); c != 200 || !bytes.Contains(b, []byte(`"allowed_ips":["172.18.0.0/16"]`)) {
+		t.Fatalf("list: %d %s", c, b)
+	}
+	if c, b := call("POST", "/v1/credentials", `{`+app+`,"allowed_ips":[]}`); c != 400 {
+		t.Fatalf("empty allowed_ips: %d %s", c, b)
+	}
+	// Absent: kept.
+	if c, b := call("PUT", "/v1/state", doc(2, false, "alice")); c != 202 {
+		t.Fatalf("absent: %d %s", c, b)
+	}
+	if c, b := call("GET", "/v1/credentials?uuid=10000000-0000-4000-8000-000000000002", ""); c != 200 || !bytes.Contains(b, []byte(`"id":"1"`)) {
+		t.Fatalf("after an absent list: %d %s", c, b)
+	}
+	// Empty: removed, no mass-removal refusal.
+	if c, b := call("PUT", "/v1/state", withSenders(doc(3, false, "alice"))); c != 202 {
+		t.Fatalf("empty: %d %s", c, b)
+	}
+	if c, _ := call("GET", "/v1/credentials?uuid=10000000-0000-4000-8000-000000000002", ""); c != 404 {
+		t.Fatalf("a removed sender still answers: %d", c)
+	}
+	for name, d := range map[string]string{
+		"a person's name": withSenders(doc(4, false, "portcullis-app-fxa"), "portcullis-app-fxa"),
+		"another form":    withSenders(doc(4, false, "alice"), "portcullis-mail"),
+		"twice":           withSenders(doc(4, false, "alice"), "portcullis-app-fxa", "portcullis-app-fxa"),
+		"an unknown key":  strings.Replace(withSenders(doc(4, false, "alice"), "portcullis-app-fxa"), `"address":`, `"label":"x","address":`, 1),
+		"another address": strings.Replace(withSenders(doc(4, false, "alice"), "portcullis-app-fxa"), `"portcullis-app-fxa@example.org"`, `"fxa@example.org"`, 1),
+	} {
+		if c, _ := call("PUT", "/v1/state", d); c != 400 {
+			t.Errorf("%s: %d (want 400)", name, c)
+		}
+	}
+}

@@ -73,19 +73,34 @@ class Ctx:
 
 
 UUIDS = ["c0f0a000-0000-4000-8000-0000000000%02d" % i for i in range(1, 9)]
+# App mail senders (contract §19.14): portcullis-app-<instance>.
+SENDER_UUIDS = ["c0f0b000-0000-4000-8000-0000000000%02d" % i for i in range(1, 5)]
+SENDERS = ["portcullis-app-conformance", "portcullis-hub-mail", "portcullis-app-conformance-b", "portcullis-app-conformance-c"]
 
 
-def doc(ctx, accounts, lan_only=False, local=None, confirm=False):
+def sender(i):
+    return {"username": SENDERS[i], "uuid": SENDER_UUIDS[i], "address": SENDERS[i] + "@conformance.test"}
+
+
+def doc(ctx, accounts, lan_only=False, local=None, confirm=False, senders=None):
+    """senders: None = the key left out (an older Hub); a list of SENDERS
+    indexes = present (possibly empty)."""
     accts = [{"username": u, "uuid": UUIDS[i], "display_name": u, "addresses": [u + "@conformance.test"], "quota_bytes": 0}
              for i, u in enumerate(accounts)]
-    return {"version": 2, "generation": ctx.next_gen(), "primary_domain": "conformance.test",
+    return with_senders({"version": 2, "generation": ctx.next_gen(), "primary_domain": "conformance.test",
             "mail_hostname": "mail.conformance.test", "client_ip": "preserved", "submission_lan_only": lan_only,
             "dkim_rotate": "4380h", "former_retention": "720h", "relay": None, "tls": {"spki_sha256": [ctx.spki]},
             "confirm_mass_removal": confirm,
             "domains": [{"name": "conformance.test", "dmarc_start": "reject", "dmarc_floor": "reject", "mail": "on", "dnssec": "unsigned"}],
             "accounts": accts, "aliases": [], "lists": [], "postmaster": [], "limits": {"recipients_per_hour": 100, "recipients_per_day": 1000},
             "spam": {"junk_score": 5, "reject_score": 10, "dnsbl": {"spamhaus": False, "spamcop": False, "barracuda": False}, "allow": [], "block": []},
-            "local_networks": local if local is not None else ["192.168.77.0/24"]}
+            "local_networks": local if local is not None else ["192.168.77.0/24"]}, senders)
+
+
+def with_senders(d, senders):
+    if senders is not None:
+        d["senders"] = [sender(i) for i in senders]
+    return d
 
 
 def put(ctx, d):
@@ -107,8 +122,11 @@ def put(ctx, d):
     return 0, j, b + (" (not applied within %d s)" % ctx.apply_wait).encode()
 
 
-def cred(ctx, user, uuid, label="conformance"):
-    st, j, _ = ctx.call("POST", "/v1/credentials", {"username": user, "uuid": uuid, "label": label, "expires_at": None})
+def cred(ctx, user, uuid, label="conformance", allowed_ips=None):
+    body = {"username": user, "uuid": uuid, "label": label, "expires_at": None}
+    if allowed_ips is not None:
+        body["allowed_ips"] = allowed_ips
+    st, j, _ = ctx.call("POST", "/v1/credentials", body)
     if st == 201 and j:
         ctx.created.append((uuid, j.get("id"), j.get("secret")))
     return st, j
@@ -150,9 +168,9 @@ def check_strict_json(ctx):
 def reset(ctx):
     """Setup: a document with no account, mass removal confirmed (the
     provider may hold accounts from before)."""
-    st, _, b = put(ctx, doc(ctx, [], confirm=True))
+    st, _, b = put(ctx, doc(ctx, [], confirm=True, senders=[]))
     if st != 202:
-        return "the empty document (confirm_mass_removal): HTTP %d %s" % (st, b[:200])
+        return "the empty document (confirm_mass_removal, no senders): HTTP %d %s" % (st, b[:200])
     return None
 
 
@@ -256,6 +274,86 @@ def check_void(ctx):
     return None
 
 
+def check_senders_optional(ctx):
+    """senders is optional (§19.5): absent (an older Hub), present and
+    empty are all accepted."""
+    for name, s in (("absent", None), ("present", [0, 1]), ("absent again", None), ("empty", [])):
+        st, j, b = put(ctx, doc(ctx, ["alice"], senders=s))
+        if st != 202:
+            return "senders %s: HTTP %d %s (want 202)" % (name, st, b[:200])
+    return None
+
+
+def check_senders_refused(ctx):
+    """A malformed sender refuses the whole document (400)."""
+    bad = {
+        "a person's username": {"username": "alice", "uuid": SENDER_UUIDS[0], "address": "alice@conformance.test"},
+        "another address": {"username": SENDERS[0], "uuid": SENDER_UUIDS[0], "address": "app@conformance.test"},
+        "a uuid that isn't one": {"username": SENDERS[0], "uuid": "c0f0b000", "address": SENDERS[0] + "@conformance.test"},
+        "an unknown key": dict(sender(0), label="x"),
+    }
+    for name, s in bad.items():
+        d = doc(ctx, ["alice"])
+        d["senders"] = [s]
+        st, _, _ = put(ctx, d)
+        if st != 400:
+            return "a sender with %s: HTTP %d (want 400)" % (name, st)
+    d = doc(ctx, ["alice"])
+    d["senders"] = [sender(0), sender(0)]
+    st, _, _ = put(ctx, d)
+    if st != 400:
+        return "a sender twice: HTTP %d (want 400)" % st
+    d = doc(ctx, ["alice"])
+    d["senders"] = None
+    st, _, _ = put(ctx, d)
+    if st != 400:
+        return "senders null: HTTP %d (want 400)" % st
+    return None
+
+
+def check_sender_credential(ctx):
+    """A sender's credential takes allowed_ips (optional, §19.5): listed
+    exactly as asked, even under LAN-only (a person's rule); an empty list
+    is refused."""
+    st, _, b = put(ctx, doc(ctx, ["alice"], lan_only=True, senders=[0]))
+    if st != 202:
+        return "PUT a document with a sender: HTTP %d %s" % (st, b[:200])
+    nets = ["172.18.0.0/16"]
+    st, j = cred(ctx, SENDERS[0], SENDER_UUIDS[0], "sender", allowed_ips=nets)
+    if st != 201 or not (j or {}).get("secret"):
+        return "the sender's credential: HTTP %d %r" % (st, (j or {}).get("error"))
+    st, rows, _ = ctx.call("GET", "/v1/credentials?uuid=" + SENDER_UUIDS[0])
+    if st != 200 or not rows or any(sorted(r.get("allowed_ips") or []) != nets for r in rows):
+        return "the sender's credentials: HTTP %d %r (want allowed_ips %r)" % (st, rows, nets)
+    st, _ = cred(ctx, SENDERS[0], SENDER_UUIDS[0], "sender", allowed_ips=[])
+    if st != 400:
+        return "allowed_ips []: HTTP %d (want 400)" % st
+    st, j = cred(ctx, SENDERS[0], SENDER_UUIDS[1], "sender")
+    if st != 409 or (j or {}).get("error_kind") != "account_mismatch":
+        return "the sender with another uuid: HTTP %d %r (want 409 account_mismatch)" % (st, j)
+    put(ctx, doc(ctx, ["alice"], senders=[]))
+    return None
+
+
+def check_senders_not_mass_removal(ctx):
+    """Senders are excluded from the 50 % rule: removing every sender is
+    accepted, and so is a list without one of them (its credentials go)."""
+    st, _, b = put(ctx, doc(ctx, ["alice"], senders=[0, 2, 3]))
+    if st != 202:
+        return "PUT three senders: HTTP %d %s" % (st, b[:200])
+    cred(ctx, SENDERS[2], SENDER_UUIDS[2], "gone")
+    st, j, _ = put(ctx, doc(ctx, ["alice"], senders=[0]))
+    if st != 202:
+        return "removing two of three senders: HTTP %d %r (want 202)" % (st, j)
+    st, rows, _ = ctx.call("GET", "/v1/credentials?uuid=" + SENDER_UUIDS[2])
+    if st == 200 and rows:
+        return "a removed sender's credentials are still listed: %r" % rows
+    st, j, _ = put(ctx, doc(ctx, ["alice"], senders=[]))
+    if st != 202:
+        return "removing every sender: HTTP %d %r (want 202)" % (st, j)
+    return None
+
+
 API_CHECKS = [
     ("auth_refusals", check_auth),
     ("strict_json", check_strict_json),
@@ -265,5 +363,9 @@ API_CHECKS = [
     ("revoke_by_uuid", check_revoke_by_uuid),
     ("mass_removal", check_mass_removal),
     ("allowed_ips_lan_only", check_allowed_ips),
+    ("senders_optional", check_senders_optional),
+    ("senders_refused", check_senders_refused),
+    ("sender_credential", check_sender_credential),
+    ("senders_not_mass_removal", check_senders_not_mass_removal),
     ("void_empties_every_list", check_void),
 ]

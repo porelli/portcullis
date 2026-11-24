@@ -30,12 +30,15 @@ type MailState struct {
 	ConfirmMassRemoval bool      `json:"confirm_mass_removal"`
 	Domains            []Domain  `json:"domains"`
 	Accounts           []Account `json:"accounts"`
-	Aliases            []Alias   `json:"aliases"`
-	Lists              []List    `json:"lists"`
-	Postmaster         []string  `json:"postmaster"`
-	Limits             Limits    `json:"limits"`
-	Spam               Spam      `json:"spam"`
-	LocalNetworks      []string  `json:"local_networks"`
+	// Senders (contract §19.14): nil = absent (an older Hub: existing
+	// senders untouched); non-nil = the complete list, possibly empty.
+	Senders       *[]Sender `json:"senders,omitempty"`
+	Aliases       []Alias   `json:"aliases"`
+	Lists         []List    `json:"lists"`
+	Postmaster    []string  `json:"postmaster"`
+	Limits        Limits    `json:"limits"`
+	Spam          Spam      `json:"spam"`
+	LocalNetworks []string  `json:"local_networks"`
 }
 
 // StateVersion is the only MailState version.
@@ -87,6 +90,13 @@ type Account struct {
 	DisplayName string   `json:"display_name"`
 	Addresses   []string `json:"addresses"`
 	QuotaBytes  int64    `json:"quota_bytes"`
+}
+
+// Sender is one app mail sender (contract §19.14).
+type Sender struct {
+	Username string `json:"username"`
+	UUID     string `json:"uuid"`
+	Address  string `json:"address"`
 }
 
 // Alias delivers Address to one account.

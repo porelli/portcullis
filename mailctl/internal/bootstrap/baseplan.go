@@ -59,6 +59,9 @@ const (
 const (
 	NSListMembersOnly = "list-members-only"
 	NSListPosters     = "list-posters"
+	// NSSenders: the app mail senders' addresses (contract §19.14),
+	// refused at RCPT with 550 5.1.1 (a sender receives nothing).
+	NSSenders = "portcullis-senders"
 )
 
 // Relay is the optional smarthost.
@@ -284,11 +287,13 @@ func spamRules() Named {
 	}}
 }
 
-// rcptScript selects the trusted Sieve script that refuses at RCPT: the
+// rcptScript selects the trusted Sieve script that refuses at RCPT: an
+// app mail sender's address (contract §19.14: it receives nothing), the
 // parking domain (a parked account would accept and bounce later, Task 2)
 // and members-only lists for anyone who isn't a member (M10).
 func rcptScript() map[string]any {
 	return expr("false",
+		[2]string{fmt.Sprintf("key_exists('%s', rcpt)", NSSenders), "'" + ScriptParked + "'"},
 		[2]string{fmt.Sprintf("rcpt_domain == '%s'", ParkingDomain), "'" + ScriptParked + "'"},
 		[2]string{fmt.Sprintf("key_exists('%s', rcpt) && !key_exists('%s', rcpt + '|' + authenticated_as)", NSListMembersOnly, NSListPosters), "'" + ScriptList + "'"},
 	)
@@ -299,7 +304,7 @@ func sieveScripts() Named {
 		return map[string]any{"name": name, "contents": contents, "isActive": true, "description": "Portcullis (mailctl base plan)"}
 	}
 	return Named{Object: "SieveSystemScript", Key: "name", Want: []map[string]any{
-		s(ScriptParked, "require [\"reject\"];\nreject \"550 5.1.1 Mailbox does not exist\";\n"),
+		s(ScriptParked, ParkedRejectSieve),
 		s(ScriptList, "require [\"reject\"];\nreject \"550 5.7.1 only members may post\";\n"),
 		// P30 (+ security ruling): an authenticated sender's message has
 		// exactly one From: header holding exactly one address, equal to the
@@ -309,6 +314,10 @@ func sieveScripts() Named {
 		s(ScriptFrom, FromCheckSieve),
 	}}
 }
+
+// ParkedRejectSieve is the RCPT-stage refusal of an address that takes no
+// mail (the parking domain, an app mail sender's address).
+const ParkedRejectSieve = "require [\"reject\"];\nreject \"550 5.1.1 Mailbox does not exist\";\n"
 
 // FromCheckSieve is the DATA-stage script for authenticated sessions.
 const FromCheckSieve = `require ["envelope", "variables", "reject", "relational", "comparator-i;ascii-numeric"];
