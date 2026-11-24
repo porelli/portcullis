@@ -789,6 +789,50 @@ def check_cnpg():
             F.add("the CNPG Cluster: priorityClassName portcullis-core, imageName by digest, enableSuperuserAccess false")
 
 
+
+# The front door's Traefik document (domains/traefik.go, controller ruling on
+# /healthz, Task 33): its only routers are the readiness route on the traefik
+# entrypoint and the ingress health route: exactly Host(auth.<d>) &&
+# Path(/healthz), GET / HEAD, ping@internal on websecure with TLS, the auth
+# routes' rate limit, priority 10002 (above the Keycloak catch-all 10001,
+# below every other auth route). Anything else there is a public route nobody
+# reviewed.
+INGRESS_HEALTH = {
+    "rule": "\"Host(`auth.\" + main + \"`) && Path(`\" + IngressHealthPath + \"`) && (Method(`GET`) || Method(`HEAD`))\"",
+    "service": '"ping@internal"', "middlewares": '[]string{"rate-limit-auth@file", "security-headers@file"}', "priority": "10002",
+    "entrypoints": '[]string{"websecure"}', "tls": "&struct{}{}", "path": '"/healthz"'}
+
+
+def ingress_health_problems(src: str) -> list[str]:
+    out = []
+    m = re.search(r'const IngressHealthPath = ("[^"]*")', src)
+    if not m or m.group(1) != INGRESS_HEALTH["path"]:
+        out.append(f"domains/traefik.go: IngressHealthPath {m.group(1) if m else 'missing'} (want {INGRESS_HEALTH['path']})")
+    m = re.search(r"func ingressHealthRouter\(main string\) dynamicRouter \{\n(.*?)\n\}", src, re.S)
+    body = m.group(1) if m else ""
+    want = {"EntryPoints": INGRESS_HEALTH["entrypoints"], "Rule": INGRESS_HEALTH["rule"], "Service": INGRESS_HEALTH["service"],
+            "Middlewares": INGRESS_HEALTH["middlewares"], "Priority": INGRESS_HEALTH["priority"], "TLS": INGRESS_HEALTH["tls"]}
+    for k, v in want.items():
+        if not re.search(re.escape(k) + r":\s*" + re.escape(v) + r"[,}]", body):
+            out.append(f"domains/traefik.go: the ingress health route's {k} isn't {v}")
+    routers = re.findall(r"(\w+Router): (?:\{|ingressHealthRouter)", src)
+    if sorted(set(routers)) != ["IngressHealthRouter", "MainCertReadyRouter"]:
+        out.append(f"domains/traefik.go: the document's routers are {sorted(set(routers))} (only the readiness and ingress health routes are reviewed)")
+    return out
+
+
+def check_ingress_health() -> None:
+    src = (K.ROOT / "domains" / "traefik.go").read_text()
+    for p in ingress_health_problems(src):
+        F.add(p)
+    for mut in (lambda t: t.replace("Path(`\" + IngressHealthPath", "PathPrefix(`\" + IngressHealthPath"),
+                lambda t: t.replace(" && (Method(`GET`) || Method(`HEAD`))", ""),
+                lambda t: t.replace('"rate-limit-auth@file", ', ""),
+                lambda t: t.replace("Priority: 10002", "Priority: 99999"),
+                lambda t: t.replace("IngressHealthRouter: ingressHealthRouter(main)}}", "IngressHealthRouter: ingressHealthRouter(main), ExtraRouter: {}}}")):
+        if not ingress_health_problems(mut(src)):
+            F.add("ingress_health_problems misses a mutated route (mutation test)")
+
 def main():
     # Every profile on, and the one-shots.
     docs = K.render()
@@ -920,6 +964,7 @@ def main():
     check_placement_twins()
     check_token_literal()
     check_ingress_allowlists(K.render({"ha": {"enabled": True}}) + docs)
+    check_ingress_health()
     # Every PVC a pod claims is rendered, with and without the optional
     # profiles (compose's named volumes exist in every profile), and in HA.
     for extra in (None, {"wg": {"enabled": False}}, {"ha": {"enabled": True}}):

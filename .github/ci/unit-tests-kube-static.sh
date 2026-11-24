@@ -227,6 +227,16 @@ for pair in $copies; do
   fi
   cmp -s "$own" "$TOOLS/theirs" || { echo "::error::$own differs from portcullis-hub $ref:$theirs ($sha)"; diff "$own" "$TOOLS/theirs" | head -40 || true; fail=1; }
 done
+# The nodeagent probe asks exactly the front door's ingress health route
+# (controller ruling on /healthz, Task 33): the Hub's probe path is
+# domains/traefik.go's IngressHealthPath, on auth.<d>.
+if curl -fsSL --retry 3 -o "$TOOLS/probes.go" "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/nodeagent/host/probes.go"; then
+  want="$(sed -n 's/^const IngressHealthPath = "\(.*\)"$/\1/p' domains/traefik.go)"
+  grep -qF 'name := "auth." + domain' "$TOOLS/probes.go" && grep -qF '"https://"+name+"'"$want"'"' "$TOOLS/probes.go" && [ -n "$want" ] \
+    || { echo "::error::the Hub's nodeagent probe ($ref $sha) doesn't ask https://auth.<d>$want, the front door's ingress health route"; fail=1; }
+else
+  echo "::error::portcullis-hub $ref ($sha) has no internal/nodeagent/host/probes.go"; fail=1
+fi
 # The two Go modules' strict vector decoders are one file, kept in step.
 cmp -s domains/strict_vectors_test.go nodeadm/strict_vectors_test.go \
   || { echo "::error::domains/ and nodeadm/strict_vectors_test.go differ: keep them byte-identical"; fail=1; }

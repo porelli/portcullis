@@ -148,15 +148,22 @@ func TestMainCertReadyRoute(t *testing.T) {
 	nb, na := now.Add(-time.Hour), now.Add(60*24*time.Hour)
 	good, gk := mkCert(t, []string{testMain, "*." + testMain}, nil, nb, na)
 	doc, _ := buildDynamic(nil, &mainCert{CertPEM: good, KeyPEM: gk}, testMain, "", now)
-	if doc.HTTP == nil || len(doc.HTTP.Routers) != 1 {
+	if doc.HTTP == nil || len(doc.HTTP.Routers) != 2 {
 		t.Fatalf("no readiness route with the main certificate: %+v", doc.HTTP)
 	}
 	r := doc.HTTP.Routers[MainCertReadyRouter]
 	if r.Rule != "Path(`/portcullis-main-cert`)" || r.Service != "ping@internal" || len(r.EntryPoints) != 1 || r.EntryPoints[0] != "traefik" {
 		t.Errorf("route %+v", r)
 	}
+	h := doc.HTTP.Routers[IngressHealthRouter]
+	if h.Rule != "Host(`auth."+testMain+"`) && Path(`/healthz`) && (Method(`GET`) || Method(`HEAD`))" || h.Service != "ping@internal" ||
+		len(h.EntryPoints) != 1 || h.EntryPoints[0] != "websecure" || h.TLS == nil || h.Priority != 10002 ||
+		strings.Join(h.Middlewares, ",") != "rate-limit-auth@file,security-headers@file" {
+		t.Errorf("ingress health route %+v", h)
+	}
 	b, err := json.Marshal(doc)
-	if err != nil || !strings.Contains(string(b), `"http":{"routers":{"portcullis-main-cert-ready":{"entryPoints":["traefik"],"rule":"Path(`+"`/portcullis-main-cert`"+`)","service":"ping@internal"}}}`) {
+	if err != nil || !strings.Contains(string(b), `"portcullis-main-cert-ready":{"entryPoints":["traefik"],"rule":"Path(`+"`/portcullis-main-cert`"+`)","service":"ping@internal"}`) ||
+		!strings.Contains(string(b), `"portcullis-ingress-health":{"entryPoints":["websecure"],`) || !strings.Contains(string(b), `"tls":{}`) {
 		t.Errorf("document %s (%v)", b, err)
 	}
 	expired := pair(t, []string{testMain, "*." + testMain}, nil, now.Add(-48*time.Hour), now.Add(-time.Hour))

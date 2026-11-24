@@ -32,9 +32,12 @@ type dynamicHTTP struct {
 }
 
 type dynamicRouter struct {
-	EntryPoints []string `json:"entryPoints"`
-	Rule        string   `json:"rule"`
-	Service     string   `json:"service"`
+	EntryPoints []string  `json:"entryPoints"`
+	Rule        string    `json:"rule"`
+	Service     string    `json:"service"`
+	Middlewares []string  `json:"middlewares,omitempty"`
+	Priority    int       `json:"priority,omitempty"`
+	TLS         *struct{} `json:"tls,omitempty"`
 }
 
 // MainCertReadyPath is the HA Traefik's readiness route (Task 31 fix round
@@ -49,6 +52,24 @@ const MainCertReadyPath = "/portcullis-main-cert"
 
 // MainCertReadyRouter is that route's router name.
 const MainCertReadyRouter = "portcullis-main-cert-ready"
+
+// IngressHealthPath / IngressHealthRouter: the front door's probe target
+// (contract §20.4, §20.8; controller ruling, Task 33): every nodeagent asks
+// https://auth.<d>/healthz at each ingress node's public address, and the
+// answer says only that this node's Traefik serves (ping@internal; a
+// backend's health is its own HA concern). Exactly that path, GET and HEAD
+// only, on websecure with TLS, the auth routes' rate limit; priority 10002
+// sits above the Keycloak catch-all on auth.<d> (10001) and below every
+// other auth route, and the exact path is none of Keycloak's.
+const IngressHealthPath = "/healthz"
+
+const IngressHealthRouter = "portcullis-ingress-health"
+
+func ingressHealthRouter(main string) dynamicRouter {
+	return dynamicRouter{EntryPoints: []string{"websecure"},
+		Rule:    "Host(`auth." + main + "`) && Path(`" + IngressHealthPath + "`) && (Method(`GET`) || Method(`HEAD`))",
+		Service: "ping@internal", Middlewares: []string{"rate-limit-auth@file", "security-headers@file"}, Priority: 10002, TLS: &struct{}{}}
+}
 
 type dynamicTLS struct {
 	Certificates []dynamicCert `json:"certificates"`
@@ -154,7 +175,8 @@ func buildDynamic(domains map[string]*Domain, mc *mainCert, main, mailHost strin
 		} else {
 			doc.TLS.Certificates = append(doc.TLS.Certificates, dynamicCert{CertFile: mc.CertPEM, KeyFile: mc.KeyPEM})
 			doc.HTTP = &dynamicHTTP{Routers: map[string]dynamicRouter{MainCertReadyRouter: {
-				EntryPoints: []string{"traefik"}, Rule: "Path(`" + MainCertReadyPath + "`)", Service: "ping@internal"}}}
+				EntryPoints: []string{"traefik"}, Rule: "Path(`" + MainCertReadyPath + "`)", Service: "ping@internal"},
+				IngressHealthRouter: ingressHealthRouter(main)}}
 		}
 	}
 	names := make([]string, 0, len(domains))
