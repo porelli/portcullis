@@ -32,6 +32,12 @@ redact() { sed -E 's#(https?://[^ ]*/invite/)[A-Za-z0-9_-]+#\1<redacted>#g'; }
 fail() { echo "FAIL: $*"; exit 1; }
 # shellcheck disable=SC2016  # expanded by the inner bash
 CLI_LIBS='for _lib in $(sed -n "s/^for _lib in \(.*\); do\$/\1/p" portcullis); do source "scripts/lib/$_lib.sh"; done'
+# CRDS_ONLY: a YAML stream's CustomResourceDefinitions as one List (stdin → stdout).
+# shellcheck disable=SC2089,SC2090  # Python source, passed whole
+CRDS_ONLY='import sys, yaml, json
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [d for d in yaml.safe_load_all(sys.stdin) if d and d.get("kind") == "CustomResourceDefinition"]}))'
+# shellcheck disable=SC2090
+export CRDS_ONLY
 lib() { bash -c "$CLI_LIBS"'; need_env >/dev/null
 '"$1"; }
 E2E_DOMAIN="${E2E_DOMAIN:-portcullis.local}"
@@ -71,7 +77,7 @@ init)
   # The fake provider's token: a CI test value (the testprovider build's
   # in-memory zone), in .env as any provider's credentials are.
   bash -c 'source scripts/lib/common.sh; env_set PORTCULLIS_KUBE_IMAGES local; env_set PORTCULLIS_PUBLIC_IPV4 203.0.113.11
-    env_set DNS_PROVIDER fake; env_set FAKE_API_TOKEN ci-ha-fake-token-0123456789; env_set DNS_CAA false
+    env_set DNS_PROVIDER fake; env_set FAKE_API_TOKEN ci-ha-fake-token-0123456789; env_set DNS_CAA false; env_set ACME_STAGING true
     env_set PORTCULLIS_K3S_VERSION "$1"; env_set PORTCULLIS_NODEADM_IMAGE "$2"; env_set PORTCULLIS_TESTPROVIDER 1' _ "$K3S_VERSION" "$ref"
   printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
   # A real install starts on one node and the others join later (node
@@ -103,10 +109,13 @@ ha)
   # ha enable's own steps (scripts/lib/ha.sh), its installs left out:
   # only the Longhorn and fencing namespaces they make (with their
   # NetworkPolicies, as ha_install_longhorn / _fencing do), where the HA
-  # chart gives nodeadm its Roles. Each step on its own under errexit (an
+  # chart gives nodeadm its Roles, and Longhorn's CRDs alone from the pinned
+  # chart (ha_render longhorn; up writes its BackupTarget once the
+  # namespace exists; no Longhorn manager runs). Each step on its own under errexit (an
   # && list would ignore a failure inside one).
   lib 'set -euo pipefail
     _ha_namespace longhorn "$KUBE_LONGHORN_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
+    ha_render longhorn "$(kube_apiserver_sources)" "$(kube_node_host_sources)" | python3 -c "$CRDS_ONLY" | _ha_apply
     _ha_namespace fencing "$KUBE_FENCING_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
     ha_enable_step_volumes
     ha_enable_step_switch

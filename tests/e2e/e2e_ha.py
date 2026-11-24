@@ -769,6 +769,21 @@ def published(ctx: str | None = None) -> dict[str, list[str]]:
     return {n: sorted(v.get("addresses") or []) for n, v in (st.get("names") or {}).items()}
 
 
+def cert_fp(pem: str) -> str:
+    r = subprocess.run(["openssl", "x509", "-noout", "-fingerprint", "-sha256"], input=pem, capture_output=True, text=True, check=True)
+    return r.stdout.strip().split("=", 1)[1]
+
+
+def served_fp(addr: str, sni: str) -> str:
+    """The leaf a TLS handshake to addr:443 gets (from the runner, routed to
+    the node's public address)."""
+    argv = ["openssl", "s_client", "-connect", f"{addr}:443", "-showcerts"] + (["-servername", sni] if sni else ["-noservername"])
+    out = subprocess.run(argv, input="", capture_output=True, text=True, timeout=20).stdout
+    m = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", out, re.S)
+    assert m, f"no certificate from {addr} (SNI {sni or 'none'})"
+    return cert_fp(m.group(0))
+
+
 def block_443(addr: str, on: bool, ctx_nodes: list[str]) -> None:
     """Traefik unreachable at addr (TCP 443 dropped in the raw table, before
     the hostPort DNAT, on every node: the probers' and the node's own)."""
@@ -791,6 +806,16 @@ def dns_failover() -> None:
     assert len(ing) >= 3, f"ingress nodes {ing}"
     names = [DOMAIN, f"*.{DOMAIN}"]
     want = sorted(ing.values())
+    # Every ingress node serves the front door's served pair (frontdoor-cert
+    # → the domains provider → each Traefik replica), by SNI and without.
+    import base64
+    served = base64.b64decode(Kj("-n", NS, "get", "secret", "frontdoor-cert")["data"]["tls.crt"]).decode()
+    want_fp = cert_fp(served)
+    for n, a in sorted(ing.items()):
+        for sni in (f"auth.{DOMAIN}", ""):
+            got = served_fp(a, sni)
+            assert got == want_fp, f"{n} ({a}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
+    note(f"ha_dns_failover: every ingress node serves frontdoor-cert's certificate ({want_fp[:16]}…), with and without SNI")
     wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
     save("frontdoor-status-before.json", fd_status())
     fd_node = Kj("-n", NS, "get", "pods", "-l", "portcullis.io/component=frontdoor")["items"][0]["spec"]["nodeName"]
