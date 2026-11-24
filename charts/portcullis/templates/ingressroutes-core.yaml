@@ -92,10 +92,15 @@ spec:
          tls.options, which on an IngressRoute would name a TLSOption of
          this namespace. */}}
   {{- /* No ACME resolver in HA (spec §11.2): the domains HTTP provider's
-  certificates. */}}
-  {{- if and $r.resolver (not $.Values.ha.enabled) }}
+  certificates. The domains stay (Traefik reads them only with a resolver)
+  so `ha enable`'s upgrade never turns this tls into an empty object: Helm
+  4's server-side apply sends that change as tls: null, which the CRD
+  refuses. */}}
+  {{- if $r.resolver }}
   tls:
+    {{- if not $.Values.ha.enabled }}
     certResolver: letsencrypt
+    {{- end }}
     domains:
       - main: {{ $d }}
         sans: [{{ printf "*.%s" $d | quote }}]
