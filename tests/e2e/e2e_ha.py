@@ -163,28 +163,53 @@ killed: set[str] = set()
 
 
 ISOLATE = "PCE2E"
+REJECT_API = ["INPUT", "-i", "eth0", "-p", "tcp", "--dport", "6443", "-j", "REJECT", "--reject-with", "tcp-reset"]
 
 
 def kill_node(node: str) -> float:
-    """The node cut off (its container's eth0 dropped both ways in its own
-    chain: the kubelet's heartbeats, etcd, the pods' tunnels and its public
-    address all go silent; the API port answers a reset so the harness's
-    load balancer skips it at once). A node that stops answering, as on a
-    VM; its processes run on and resume when it's healed (a restarted k3d
-    server container didn't come back Ready in CI). The time it happened."""
-    rules = [["-N", ISOLATE], ["-A", ISOLATE, "-i", "lo", "-j", "RETURN"], ["-A", ISOLATE, "-o", "lo", "-j", "RETURN"],
-             ["-A", ISOLATE, "-i", "eth0", "-p", "tcp", "--dport", "6443", "-j", "REJECT", "--reject-with", "tcp-reset"],
-             ["-A", ISOLATE, "-j", "DROP"], ["-I", "INPUT", "1", "-j", ISOLATE], ["-I", "OUTPUT", "1", "-j", ISOLATE],
-             ["-I", "FORWARD", "1", "-j", ISOLATE]]
+    """The node cut off: its container's traffic dropped both ways in the
+    raw table, in a chain of its own (kube-router rewrites the filter
+    table's INPUT chain: a jump there was seen gone, and a jump it saved
+    and restored would outlive the heal), but for the API port, which the
+    filter table answers with a reset so the harness's load balancer skips
+    the node at once (its reset leaves through OUTPUT). A node that stops
+    answering, as a VM does; its processes run on and resume when it's
+    healed (a restarted or paused k3d server container doesn't come back
+    healthy). The time it happened."""
+    rules = [["-t", "raw", "-N", ISOLATE], ["-t", "raw", "-A", ISOLATE, "-i", "lo", "-j", "RETURN"],
+             ["-t", "raw", "-A", ISOLATE, "-o", "lo", "-j", "RETURN"],
+             ["-t", "raw", "-A", ISOLATE, "-i", "eth0", "-p", "tcp", "--dport", "6443", "-j", "RETURN"],
+             ["-t", "raw", "-A", ISOLATE, "-p", "tcp", "--tcp-flags", "RST", "RST", "--sport", "6443", "-j", "RETURN"],
+             ["-t", "raw", "-A", ISOLATE, "-j", "DROP"],
+             ["-t", "raw", "-I", "PREROUTING", "1", "-j", ISOLATE], ["-t", "raw", "-I", "OUTPUT", "1", "-j", ISOLATE],
+             ["-I", *REJECT_API]]
     for r in rules:
         docker("exec", node, "iptables", "-w", *r)
     killed.add(node)
     return time.time()
 
 
+def heal(node: str) -> None:
+    """Every rule of the isolation gone, checked: the jumps deleted until
+    none is left, the chain flushed and deleted, the API reset removed."""
+    for _ in range(10):
+        for chain in ("PREROUTING", "OUTPUT"):
+            while subprocess.run(["docker", "exec", node, "iptables", "-w", "-t", "raw", "-D", chain, "-j", ISOLATE],
+                                 capture_output=True, timeout=30).returncode == 0:
+                pass
+        while subprocess.run(["docker", "exec", node, "iptables", "-w", "-D", *REJECT_API], capture_output=True, timeout=30).returncode == 0:
+            pass
+        subprocess.run(["docker", "exec", node, "iptables", "-w", "-t", "raw", "-F", ISOLATE], capture_output=True, timeout=30)
+        subprocess.run(["docker", "exec", node, "iptables", "-w", "-t", "raw", "-X", ISOLATE], capture_output=True, timeout=30)
+        left = docker("exec", node, "sh", "-c", "iptables -w -t raw -S; iptables -w -S | grep -- '--dport 6443 -j REJECT' || true")
+        if ISOLATE not in left and "REJECT" not in left:
+            return
+        time.sleep(2)
+    raise AssertionError(f"{node}: the isolation rules didn't go: {left[-400:]}")
+
+
 def start_node(node: str) -> None:
-    for r in (["-D", "INPUT", "-j", ISOLATE], ["-D", "OUTPUT", "-j", ISOLATE], ["-D", "FORWARD", "-j", ISOLATE], ["-F", ISOLATE], ["-X", ISOLATE]):
-        subprocess.run(["docker", "exec", node, "iptables", "-w", *r], capture_output=True, timeout=30)
+    heal(node)
     killed.discard(node)
     try:
         wait_for(f"node {node} Ready again", lambda: node_ready(node), 300, 5)
