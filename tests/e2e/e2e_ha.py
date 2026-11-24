@@ -905,6 +905,16 @@ def served_fp(addr: str, sni: str) -> str:
     return cert_fp(m.group(0))
 
 
+def traefik_unready(node: str, on: bool) -> None:
+    """The node's Traefik made not Ready: its readiness probe (the kubelet,
+    :8080) dropped in the node's raw table. With one site the probes never
+    count (same-site results don't, §20.8): the front door judges a node by
+    its readiness, Node and Traefik."""
+    pod = next(p for p in pods("portcullis-ingress", "app.kubernetes.io/name=traefik") if p["spec"].get("nodeName") == node)
+    ip = pod["status"]["podIP"]
+    docker("exec", node, "iptables", "-w", "-t", "raw", "-I" if on else "-D", "OUTPUT", "-d", ip, "-p", "tcp", "--dport", "8080", "-j", "DROP")
+
+
 def block_443(addr: str, on: bool, ctx_nodes: list[str]) -> None:
     """Traefik unreachable at addr (TCP 443 dropped in the raw table, before
     the hostPort DNAT, on every node: the probers' and the node's own)."""
@@ -918,9 +928,10 @@ def dns_failover() -> None:
     """The front door (testprovider: the fake DNS zone), its probers (the
     probes DaemonSet): every ingress node's public address published for
     <d> and *.<d>; a dead ingress node's address removed after about 30 s
-    (3 failed rounds), the others kept; then Traefik made unreachable on the
+    (3 failed rounds), the others kept; then Traefik made not Ready on the
     other ingress nodes one at a time: the second one's goes, the last one
-    is never removed (fail static)."""
+    is never removed (fail static). One site: the probes don't count (same
+    site), readiness decides; the sites cluster proves the probes."""
     probes_up()
     nodes = node_facts()
     ing = {n["name"]: n["public"][0] for n in nodes if n["ingress"] and n["public"]}
@@ -950,14 +961,14 @@ def dns_failover() -> None:
     d = time.time() - t
     note(f"ha_dns_failover: ingress node {victim} killed → {ing[victim]} removed after {d:.0f} s; {rest} kept")
     assert 25 <= d <= 120, f"removed after {d:.0f} s (want about 30 s: 3 failed rounds 10 s apart)"
-    alive = [n["name"] for n in nodes if n["name"] != victim]
     second = next(n for n in sorted(ing) if n not in (victim, fd_node))
-    block_443(ing[second], True, alive)
+    traefik_unready(second, True)
     try:
         last = sorted(a for n, a in ing.items() if n not in (victim, second))
-        wait_for(f"{second}'s address removed (Traefik unreachable)", lambda: all(published().get(n) == last for n in names), 240, 2)
-        note(f"ha_dns_failover: {second}'s Traefik unreachable → {ing[second]} removed; {last} left")
-        block_443(last[0], True, alive)
+        wait_for(f"{second}'s address removed (its Traefik not Ready)", lambda: all(published().get(n) == last for n in names), 240, 2)
+        note(f"ha_dns_failover: {second}'s Traefik not Ready → {ing[second]} removed; {last} left")
+        third = next(n for n, a in ing.items() if a == last[0])
+        traefik_unready(third, True)
         try:
             t2 = time.time()
             while time.time() - t2 < 90:
@@ -965,9 +976,9 @@ def dns_failover() -> None:
                 time.sleep(5)
             note(f"ha_dns_failover: the last address {last} failing too → kept for 90 s (fail static)")
         finally:
-            block_443(last[0], False, alive)
+            traefik_unready(third, False)
     finally:
-        block_443(ing[second], False, alive)
+        traefik_unready(second, False)
     save("frontdoor-status-after.json", fd_status())
 
 
