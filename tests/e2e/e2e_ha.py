@@ -1141,9 +1141,10 @@ def sites_scenario() -> None:
             kill_node(n)
         time.sleep(90)
     finally:
+        # kill_node isolates (the node container keeps running): heal it.
         for n in edge + [tb]:
             if n in killed:
-                docker("start", n)
+                heal(n)
                 killed.discard(n)
     wait_for("the API back", lambda: K("get", "--raw", "/readyz", timeout=10, ok=False).strip() == "ok", 300, 5)
     after = fd_status()
