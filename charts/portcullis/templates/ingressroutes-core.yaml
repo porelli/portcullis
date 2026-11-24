@@ -83,16 +83,18 @@ spec:
         {{- end }}
   {{- /* Traefik's default TLS options (contract §5, tls.yml): no
          tls.options, which on an IngressRoute would name a TLSOption of
-         this namespace. */}}
-  {{- if $r.resolver }}
+         this namespace. tls is never empty: every route keeps the domains
+         (Traefik reads them only with a resolver), because Helm 4's
+         server-side apply sends a tls emptied by an upgrade (e.g. the
+         dropped options: authaware@file) as tls: null, which the CRD
+         refuses; k8s_hardening.py checks it. */}}
   tls:
+    {{- if $r.resolver }}
     certResolver: letsencrypt
+    {{- end }}
     domains:
       - main: {{ $d }}
         sans: [{{ printf "*.%s" $d | quote }}]
-  {{- else }}
-  tls: {}
-  {{- end }}
 {{- end }}
 ---
 # kcinternal (K15): every path to Keycloak, the client's forwarded and

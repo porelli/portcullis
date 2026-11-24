@@ -321,6 +321,28 @@ MUTATIONS = [
 ]
 
 
+def empty_tls_problems(docs):
+    """An IngressRoute's tls is absent or a non-empty object: Helm 4's
+    server-side apply sends a tls an upgrade empties (tls: {} after
+    options / certResolver) as tls: null, which the CRD refuses, so the
+    upgrade fails."""
+    out = []
+    for ir in K.by_kind(docs, "IngressRoute"):
+        if "tls" in ir["spec"] and not (isinstance(ir["spec"]["tls"], dict) and ir["spec"]["tls"]):
+            out.append(f"IngressRoute {ir['metadata']['name']}: tls is {ir['spec']['tls']!r} (absent or non-empty: Helm 4 upgrades send an emptied tls as null)")
+    return out
+
+
+def _tls_emptied(docs):
+    next(d for d in docs if d.get("kind") == "IngressRoute" and d["metadata"]["name"] == "hub")["spec"]["tls"] = {}
+    return docs
+
+
+def _tls_null(docs):
+    next(d for d in docs if d.get("kind") == "IngressRoute" and d["metadata"]["name"] == "lldap")["spec"]["tls"] = None
+    return docs
+
+
 def storage_docs():
     out = []
     for p in sorted((K.ROOT / "kube" / "storage").glob("*.yaml")):
@@ -410,6 +432,10 @@ def check_edge(docs):
                 or r[0].get("middlewares") != k.get("middlewares") or r[0].get("services") != k.get("services")
                 or not (isinstance(r[0].get("priority"), int) and r[0]["priority"] > len(k["match"]))):
             F.add(f"IngressRoute kcinternal-logout isn't kcinternal's route on the exact logout path without access logs: {r}")
+    for p in empty_tls_problems(docs):
+        F.add(p)
+    if not empty_tls_problems(_tls_emptied(copy.deepcopy(docs))) or not empty_tls_problems(_tls_null(copy.deepcopy(docs))):
+        F.add("empty_tls_problems misses an empty or null tls (mutation test)")
     for name, ir in irs.items():
         for r in ir["spec"]["routes"]:
             if "observability" in r and name != "kcinternal-logout":
