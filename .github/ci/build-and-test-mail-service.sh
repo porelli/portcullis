@@ -207,7 +207,12 @@ setup)
   done
   docker inspect "$(cid stalwart)" | jq -e '.[0].NetworkSettings.Networks | keys | map(select(. == "portcullis-proxy" or . == "portcullis")) == []' >/dev/null \
     || fail "stalwart is on a core network: $(docker inspect "$(cid stalwart)" | jq -c '.[0].NetworkSettings.Networks | keys')"
-  echo "PASS: management listener 404 from another internal address (API key too); stalwart on no core network"
+  # The admin view's listener (contract §19.13) is bound after the job's
+  # runs (EnsureAdminView also makes it on a store from before the admin
+  # view): it answers TLS, and its rule refuses any address but the proxy's.
+  code="$(docker run --rm --network "${PROJ}_internal" "$CURL_IMG" -sk -o /dev/null -w '%{http_code}' https://172.31.255.2:8443/admin || true)"
+  [ "$code" = 404 ] || fail "the admin-view listener (8443) from another internal address got '$code' (want 404: bound, refused by its rule)"
+  echo "PASS: management listener 404 from another internal address (API key too); admin-view listener bound, 404 off the proxy's address; stalwart on no core network"
 
   # 4. The certificate: SAN exactly the host, the key reused by a second
   # mail cert, presented on all four published ports.

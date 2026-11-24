@@ -61,7 +61,7 @@ PEOPLE_API = os.environ.get("E2E_PEOPLE_API", "").rstrip("/")
 RUNTIME = os.environ.get("E2E_RUNTIME", "docker")
 INST = os.environ.get("E2E_USAGE_INSTANCE", "echo-use")
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
-APPS_HEADER = ("instance,template,name,status,cpu_cores,mem_bytes,mem_limit_bytes,cpu_limit_cores,pids,pids_limit,"
+APPS_HEADER = ("server,instance,template,name,status,cpu_cores,mem_bytes,mem_limit_bytes,cpu_limit_cores,pids,pids_limit,"
                "net_rx_bps,net_tx_bps,blk_read_bps,blk_write_bps,partial,measured_at")
 
 results: list[tuple[str, bool, str]] = []

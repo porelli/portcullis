@@ -84,7 +84,9 @@ for i in $(seq 1 40); do
   [ "$i" -eq 40 ] && { docker compose logs --tail=40 hub; fail "hub /healthz"; }
   sleep 2
 done
-echo "127.0.0.1 $E2E_DOMAIN auth.$E2E_DOMAIN enroll.$E2E_DOMAIN hub.$E2E_DOMAIN people.$E2E_DOMAIN" | sudo tee -a /etc/hosts >/dev/null
+# mail.<d> (no HTTPS router: Traefik's default TLS options) and the
+# read-only admin view, for e2e_mail's admin_view_end_to_end.
+echo "127.0.0.1 $E2E_DOMAIN auth.$E2E_DOMAIN enroll.$E2E_DOMAIN hub.$E2E_DOMAIN people.$E2E_DOMAIN mail.$E2E_DOMAIN mail-admin.$E2E_DOMAIN" | sudo tee -a /etc/hosts >/dev/null
 SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
 hub() { local m="$1" p="$2"; shift 2
         curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \

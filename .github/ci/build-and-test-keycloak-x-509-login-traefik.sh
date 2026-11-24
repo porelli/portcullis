@@ -7,7 +7,7 @@ set -e
 # The Hub isn't running yet: write a minimal signin-keycloak.json
 # (contract §8.1, the starting methods) into hub_data, or the sign-in
 # extension denies everything (DENY_ALL). The Hub's start replaces it.
-printf '%s' '{"version":1,"methods":["passkey_device","passkey_synced","security_key","yubikey_cert"],"add_stronger":false,"templates":{"standard":{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}},"clients":{},"authenticators":{},"mds":{"serial":0,"next_update":"0001-01-01T00:00:00Z"}}' \
+printf '%s' '{"version":1,"methods":["passkey_device","passkey_synced","security_key","yubikey_cert"],"add_stronger":false,"templates":{"standard":{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}},"clients":{},"authenticators":{},"mds":{"serial":0,"next_update":"0001-01-01T00:00:00Z"},"app_hosts":[]}' \
   | docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
       sh -c 'cat > /d/signin-keycloak.json.tmp && chmod 644 /d/signin-keycloak.json.tmp && mv /d/signin-keycloak.json.tmp /d/signin-keycloak.json'
 # pc_method=yubikey_cert = the YubiKey certificate only (the other
@@ -18,22 +18,59 @@ printf '%s' '{"version":1,"methods":["passkey_device","passkey_synced","security
 NOPKCE='/realms/portcullis/protocol/openid-connect/auth?client_id=portcullis-forward-auth&response_type=code&scope=openid&pc_method=yubikey_cert&prompt=login&state=ci&nonce=ci&redirect_uri=https%3A%2F%2Fauth.portcullis.local%2Foauth2%2Fcallback'
 AUTHQ="$NOPKCE&code_challenge=83JUujMAYgRhPwEoyXqFBcdcLnEjuT8NyjHlOlacyZo&code_challenge_method=S256"
 got_code() { grep -qiE '^location: .*[?&]code=' "$1"; }
+# A sign-in that succeeded but stops on the extension's "Let through" page
+# (contract §8.1: a page whose form posts back to Keycloak, which then
+# redirects with the code) counts as authenticated too: every negative
+# check below refuses both, so the page can never hide a forged sign-in.
+let_through() { grep -q 'id="portcullis-let-through-form"' "$1"; }
+# Keycloak usually gets there with a 302 to the required action's page.
+to_let_through() { grep -qiE '^location: [^ ]*/login-actions/required-action\?([^ ]*&)?execution=portcullis-let-through' "$1"; }
+# Any required action at all comes only after the flow signed someone in.
+ra_redirect() { grep -qiE '^location: [^ ]*/login-actions/required-action\?' "$1"; }
+authenticated() { got_code "$1" || let_through "$1" || ra_redirect "$1"; }
 
 # 0) Without PKCE the forward-auth client issues no code (a stolen
 #    code for an extra-domain callback is useless without the verifier).
-curl -s -o /dev/null -D /tmp/kc-nopkce.h --cacert certs/ca-chain.crt \
+curl -s -D - --cacert certs/ca-chain.crt \
   --cert /tmp/test-client.crt --key /tmp/test-client.key \
-  --resolve "auth.portcullis.local:443:127.0.0.1" "https://auth.portcullis.local$NOPKCE" || true
-if got_code /tmp/kc-nopkce.h; then echo "FAIL: portcullis-forward-auth issued a code without PKCE"; cat /tmp/kc-nopkce.h; exit 1; fi
+  --resolve "auth.portcullis.local:443:127.0.0.1" "https://auth.portcullis.local$NOPKCE" > /tmp/kc-nopkce.h || true
+if authenticated /tmp/kc-nopkce.h; then echo "FAIL: portcullis-forward-auth issued a code without PKCE"; cat /tmp/kc-nopkce.h; exit 1; fi
 echo "PASS: portcullis-forward-auth refuses authorization requests without PKCE"
 
 # 1) Positive control: a real TLS client cert through Traefik (also
 #    proves the CRL check + truststore re-validation pass).
-curl -s -o /dev/null -D /tmp/kc-ok.h --cacert certs/ca-chain.crt \
+#    The certificate is an interactive sign-in: Keycloak answers the
+#    "Let through" page (contract §8.1); its form is posted as the page's
+#    script would (empty body, the same cookies and certificate), and only
+#    then comes the 302 with the code.
+JAR=$(mktemp)
+kc_tls() { curl -s -D - -b "$JAR" -c "$JAR" --cacert certs/ca-chain.crt \
   --cert /tmp/test-client.crt --key /tmp/test-client.key \
-  --resolve "auth.portcullis.local:443:127.0.0.1" "https://auth.portcullis.local$AUTHQ" || true
-got_code /tmp/kc-ok.h || { echo "FAIL: X.509 login through Traefik did not authenticate"; cat /tmp/kc-ok.h; docker compose logs --tail=60 keycloak; exit 1; }
-echo "PASS: X.509 login through Traefik (CRL checked, chain re-validated) issues a code"
+  --resolve "auth.portcullis.local:443:127.0.0.1" "$@" || true; }
+kc_tls "https://auth.portcullis.local$AUTHQ" > /tmp/kc-ok.h
+if to_let_through /tmp/kc-ok.h; then
+  NEXT=$(grep -i '^location: ' /tmp/kc-ok.h | head -1 | sed 's/^[Ll]ocation: //' | tr -d '\r')
+  case "$NEXT" in
+    https://auth.portcullis.local/realms/portcullis/login-actions/required-action\?*) ;;
+    *) echo "FAIL: the sign-in redirects to '$NEXT'"; exit 1 ;;
+  esac
+  kc_tls "$NEXT" > /tmp/kc-ok.h
+fi
+let_through /tmp/kc-ok.h || { echo "FAIL: X.509 login through Traefik did not reach the Let through page"; head -c 3000 /tmp/kc-ok.h; docker compose logs --tail=60 keycloak; exit 1; }
+if got_code /tmp/kc-ok.h; then echo "FAIL: a code before the Let through page was posted"; exit 1; fi
+ACTION=$(grep -o '<form id="portcullis-let-through-form" action="[^"]*"' /tmp/kc-ok.h | sed 's/.*action="//; s/"$//; s/&amp;/\&/g')
+case "$ACTION" in
+  https://auth.portcullis.local/realms/portcullis/login-actions/required-action\?*) ;;
+  *) echo "FAIL: the Let through form posts to '$ACTION'"; exit 1 ;;
+esac
+# The main forward-auth callback with state 'ci' (no app URL): no host
+# named, never auth.<domain> (contract §8.1 "Let through").
+grep -q 'Let through — opening your app…' /tmp/kc-ok.h && ! grep -q 'opening auth\.' /tmp/kc-ok.h \
+  || { echo "FAIL: the Let through page names a host for a state without one"; grep -o 'Let through[^<]*' /tmp/kc-ok.h; exit 1; }
+kc_tls -X POST --data-binary '' "$ACTION" > /tmp/kc-ok2.h
+rm -f "$JAR"
+got_code /tmp/kc-ok2.h || { echo "FAIL: X.509 login through Traefik did not authenticate after the Let through page"; head -c 3000 /tmp/kc-ok2.h; docker compose logs --tail=60 keycloak; exit 1; }
+echo "PASS: X.509 login through Traefik (CRL checked, chain re-validated) shows the Let through page, then issues a code"
 
 # 2) Forged header with that same valid, enrolled cert, sent straight
 #    to Keycloak from everywhere except Traefik's address. Turn off
@@ -54,12 +91,12 @@ FORGE=(-H "X-Forwarded-Tls-Client-Cert: $CERT_HDR" -H "X-Forwarded-For: 172.31.2
 CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
 BEFORE=$(docker compose logs keycloak 2>&1 | grep -c 'X-Forwarded-Tls-Client-Cert" is not trusted' || true)
 for net in portcullis portcullis-auth; do
-  docker run --rm --network "$net" "$CURL_IMG" -s -o /dev/null -D - "${FORGE[@]}" "http://keycloak:8080$AUTHQ" > "/tmp/kc-forged-$net.h" || true
+  docker run --rm --network "$net" "$CURL_IMG" -s -D - "${FORGE[@]}" "http://keycloak:8080$AUTHQ" > "/tmp/kc-forged-$net.h" || true
   grep -q '^HTTP/' "/tmp/kc-forged-$net.h" || { echo "FAIL: no answer from Keycloak on $net"; exit 1; }
-  if got_code "/tmp/kc-forged-$net.h"; then echo "FAIL: forged cert header authenticated from the $net network"; exit 1; fi
+  if authenticated "/tmp/kc-forged-$net.h"; then echo "FAIL: forged cert header authenticated from the $net network"; exit 1; fi
 done
-curl -s -o /dev/null -D /tmp/kc-forged-host.h "${FORGE[@]}" "http://127.0.0.1:8080$AUTHQ" || true
-if got_code /tmp/kc-forged-host.h; then echo "FAIL: forged cert header authenticated via 127.0.0.1:8080"; exit 1; fi
+curl -s -D - "${FORGE[@]}" "http://127.0.0.1:8080$AUTHQ" > /tmp/kc-forged-host.h || true
+if authenticated /tmp/kc-forged-host.h; then echo "FAIL: forged cert header authenticated via 127.0.0.1:8080"; exit 1; fi
 sleep 2
 AFTER=$(docker compose logs keycloak 2>&1 | grep -c 'X-Forwarded-Tls-Client-Cert" is not trusted' || true)
 [ "$AFTER" -ge $((BEFORE + 3)) ] || { echo "FAIL: Keycloak did not log the untrusted cert header 3x ($BEFORE → $AFTER)"; docker compose logs --tail=40 keycloak; exit 1; }

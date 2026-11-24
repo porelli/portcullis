@@ -1,0 +1,144 @@
+# The admin view's viewer reads these plain fields (TestViewerSecretFreeFields): path, kind, why no secret is there.
+Account.credentials.otpUrl	uri	masked by Stalwart like the secret (MASKED_PASSWORD)
+Account.credentials.publicKey	name	a passkey public key
+Account.quotas	map	quota sizes
+AcmeProvider.accountHashPrefix	uri	ACME settings; no ACME in Stalwart (the base plan destroys every AcmeProvider), its keys are masked secrets
+AcmeProvider.accountUri	uri	the ACME account URL (no ACME in Stalwart: destroyed by the base plan)
+AcmeProvider.directory	uri	the ACME directory URL (no ACME in Stalwart: destroyed by the base plan)
+Alert.condition	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+Alert.emailAlert.body	text	an alert template; mailctl writes none (no secret source flows here)
+Alert.eventAlert.eventMessage	text	an alert template; mailctl writes none
+Application.resourceUrl	name	file:// path of the pinned web admin bundle
+Application.urlPrefix	name	URL prefixes (/admin)
+CalendarScheduling.httpRsvpUrl	uri	the public RSVP URL
+Certificate.certificate.value	text	the public certificate chain (the key is a masked file reference)
+DkimReportSettings.dkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DkimReportSettings.fromAddress	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DkimReportSettings.fromName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DkimReportSettings.sendFrequency	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DkimReportSettings.subject	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DkimSignature.headers	name	signed header names
+DkimSignature.publicKey	text	the DKIM public key, published in DNS
+DmarcReportSettings.aggregateContactInfo	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.aggregateDkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.aggregateFromAddress	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.aggregateFromName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.aggregateOrgName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.aggregateSendFrequency	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.failureDkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.failureFromAddress	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.failureFromName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.failureSendFrequency	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.failureSubject	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DmarcReportSettings.maxAggregateReportSize	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+Domain.dnsZoneFile	text	the domain's public zone text
+Domain.reportAddressUri	name	a report mailto: URI
+Domain.subAddressing.customRule	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DsnReportSettings.dkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DsnReportSettings.fromAddress	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+DsnReportSettings.fromName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+Email.defaultFolders	map	default folder names
+Encryption.discoveryProxy	uri	a key-discovery proxy URL; mailctl writes none
+Encryption.gatewayMinTrust	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+Encryption.gatewayOutbound	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+Encryption.harvestKeys	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+Encryption.hkpServers	uri	public keyserver URLs
+ExternalPublicKey.key	text	a public key
+ExternalPublicKey.nextKey	text	a public key
+IndexQueueStatus.status.reason	text	an indexer status text
+MemoryLookupKey.key	name	a lookup entry: mailctl's allow / block list domains and addresses
+Metadata.imapServerAdmin	uri	the IMAP METADATA admin contact URI
+Metadata.imapServerComment	text	the IMAP METADATA server comment
+MtaExtensions.chunking	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.deliverBy	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.dsn	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.expn	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.futureRelease	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.mtPriority	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.noSoliciting	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.pipelining	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.requireTls	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaExtensions.vrfy	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaInboundSession.idleTimeout	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaInboundSession.maxDuration	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaInboundSession.transferLimit	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaInboundThrottle.key	name	rate-limit key names
+MtaInboundThrottle.match	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaMilter.enable	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaOutboundStrategy.connection	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaOutboundStrategy.route	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaOutboundStrategy.schedule	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaOutboundStrategy.tls	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaOutboundThrottle.key	name	rate-limit key names
+MtaOutboundThrottle.match	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaQueueQuota.key	name	quota key names
+MtaQueueQuota.match	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaRoute.authUsername	name	the relay username (its password is a masked file reference)
+MtaStageAuth.maxFailures	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageAuth.mustMatchSender	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageAuth.require	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageAuth.saslMechanisms	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageAuth.waitOnFail	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageConnect.hostname	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageConnect.script	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageConnect.smtpGreeting	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.addAuthResultsHeader	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.addDateHeader	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.addMessageIdHeader	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.addReceivedHeader	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.addReceivedSpfHeader	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.addReturnPathHeader	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.dkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.enableSpamFilter	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.maxMessageSize	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.maxMessages	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.maxReceivedHeaders	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageData.script	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageEhlo.rejectNonFqdn	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageEhlo.require	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageEhlo.script	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageMail.isSenderAllowed	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageMail.rewrite	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageMail.script	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageRcpt.allowRelaying	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageRcpt.maxFailures	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageRcpt.maxRecipients	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageRcpt.rewrite	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageRcpt.script	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+MtaStageRcpt.waitOnFail	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+OAuthClient.postLogoutRedirectUris	uri	redirect URIs
+OAuthClient.redirectUris	uri	redirect URIs
+PublicKey.key	text	a public key
+ReportSettings.outboundReportSubmitter	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SenderAuth.arcVerify	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SenderAuth.dkimVerify	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SenderAuth.dmarcVerify	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SenderAuth.reverseIpVerify	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SenderAuth.spfEhloVerify	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SenderAuth.spfFromVerify	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SieveSystemInterpreter.defaultFromAddress	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SieveSystemInterpreter.defaultFromName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SieveSystemInterpreter.defaultReturnPath	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SieveSystemInterpreter.dkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SieveSystemScript.contents	sieve	mailctl's own system Sieve scripts (bootstrap sieveScripts: literals, no secret)
+SieveUserInterpreter.allowedNotifyUris	name	notify URI schemes
+SieveUserInterpreter.dkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SieveUserInterpreter.protectedHeaders	name	header names
+SmimeTrustAnchor.certificate	text	a public trust-anchor certificate
+SpamRule.condition	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SpamSettings.spamFilterRulesUrl	uri	the adapter's internal rules URL
+SpfReportSettings.dkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SpfReportSettings.fromAddress	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SpfReportSettings.fromName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SpfReportSettings.sendFrequency	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SpfReportSettings.subject	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+SystemSettings.providerInfo	map	autoconfig provider display info
+SystemSettings.services	map	advertised service hostnames
+Tenant.quotas	map	quota sizes
+TlsReportSettings.contactInfo	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+TlsReportSettings.dkimSignDomain	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+TlsReportSettings.fromAddress	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+TlsReportSettings.fromName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+TlsReportSettings.maxReportSize	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+TlsReportSettings.orgName	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)
+TlsReportSettings.sendFrequency	expression	an expression: mailctl's own literals or Stalwart's defaults; no secret source flows here (data-flow tests: the DQS key, DKIM keys and passwords reach only denied objects or masked fields)

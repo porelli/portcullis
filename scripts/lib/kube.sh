@@ -1181,13 +1181,13 @@ _kube_probe_route() {
         + (if env.G == "" then {} else {annotations: {"portcullis.io/params-generation": env.G}} end)),
       spec: {entryPoints: ["websecure"], routes: [{match: ("Host(`" + env.H + "`)"), kind: "Rule",
         services: [{name: "portcullis-admission-probe--probe", port: 80}]}],
-        tls: {options: {name: "authaware@file"}}}}' \
+        tls: {}}}' \
     | kube_ctl -n "$KUBE_EDGE_NS" --as="$(_kube_hub_sa)" --as-group=system:masters create --dry-run=server -f -
 }
 
 # The owner=core Middlewares of portcullis-edge (the chart's four and the
 # CLI's hub-proxy-secret): no Hub route or chain may name them.
-KUBE_EDGE_CORE_MIDDLEWARES="hub-proxy-secret hub-cli-proxy-secret portcullis-auth-console portal-path portal-vpn-path directory-redirect"
+KUBE_EDGE_CORE_MIDDLEWARES="hub-proxy-secret hub-cli-proxy-secret portcullis-auth-console portcullis-signout-guard portal-path portal-vpn-path directory-redirect"
 
 # The @file names apps may use (K15, contract §5): middlewares.yml's six,
 # the core middlewares and the three core services of traefik-dynamic.

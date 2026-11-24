@@ -70,14 +70,14 @@ services:
       traefik.http.services.ci-vpnecho.loadbalancer.server.port: "80"
       traefik.http.routers.ci-vpnecho.rule: Host(`vpnecho.portcullis.local`)
       traefik.http.routers.ci-vpnecho.entrypoints: websecure,vpnsecure
-      traefik.http.routers.ci-vpnecho.tls.options: authaware@file
+      traefik.http.routers.ci-vpnecho.tls.options: default
       traefik.http.routers.ci-vpnecho.service: ci-vpnecho
       # Through group-gate (its normal public guard, websecure): proves a
       # request carrying every forged header reaches group-gate and isn't
       # let in by them.
       traefik.http.routers.ci-vpnguard.rule: Host(`vpnguard.portcullis.local`)
       traefik.http.routers.ci-vpnguard.entrypoints: websecure
-      traefik.http.routers.ci-vpnguard.tls.options: authaware@file
+      traefik.http.routers.ci-vpnguard.tls.options: default
       traefik.http.routers.ci-vpnguard.middlewares: portcullis-public-guard@docker
       traefik.http.routers.ci-vpnguard.service: ci-vpnecho
 networks:

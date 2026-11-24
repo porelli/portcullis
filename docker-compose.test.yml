@@ -24,7 +24,7 @@ services:
       traefik.enable: "true"
       traefik.http.routers.whoami-auth.rule: Host(`app.${PORTCULLIS_DOMAIN:-portcullis.local}`)
       traefik.http.routers.whoami-auth.entrypoints: websecure
-      traefik.http.routers.whoami-auth.tls.options: authaware@file
+      traefik.http.routers.whoami-auth.tls.options: default
       traefik.http.routers.whoami-auth.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.whoami-auth.loadbalancer.server.port: "80"
 

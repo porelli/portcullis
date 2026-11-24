@@ -3205,7 +3205,12 @@ class ImpersonationTest(GateTest):
         code, hdrs, body = result
         self.assertEqual(code, 403, body)
         self.assertIn(f"Your session as {person} has ended.", body)
-        self.assertIn('href="https://auth.example.com/oauth2/sign_out?rd=https%3A%2F%2Fexample.com%2F"', body)
+        # A link to the confirmation page on auth.<d>: the ended page shows on
+        # app hosts, whose origin the sign-out guard never accepts.
+        self.assertIn('<a id="pc-imp-sign-out" class="btn" href="https://auth.example.com/oauth2/sign_out">Sign out</a>',
+                      body)
+        self.assertNotIn("?rd=", body)
+        self.assertNotIn("<form", body)
         for h in gg.IMPERSONATION_HEADERS:
             self.assertNotIn(h, hdrs)
         self.assertNotIn("X-Forwarded-User", hdrs)
@@ -3712,6 +3717,8 @@ class BrandingTest(GateTest):
             "needs-impersonated": gg.render_needs_page("App", set(), STRONG, None, False, "example.com",
                                                        impersonated=rec).decode(),
             "ended": gg.render_ended_page("alice", "example.com").decode(),
+            "sign-out": gg.render_signout_page("example.com").decode(),
+            "signed-out": gg.render_signed_out_page("example.com").decode(),
             "deny": self.deny_body(),
         }
 
@@ -3733,7 +3740,7 @@ class BrandingTest(GateTest):
                 self.assertIn("<h1>" + gg.MARK_HTML, page)
 
     def test_csp_allows_data_images(self):
-        for csp in (gg.PORTAL_CSP, gg.SIGNIN_CSP):
+        for csp in (gg.PORTAL_CSP, gg.SIGNIN_CSP, gg.SIGNOUT_CSP, gg.SIGNED_OUT_CSP):
             self.assertIn("img-src data:", csp)
         self.assertIn(".pc-mark{", gg.PORTAL_CSS)
         self.assertTrue(gg.SIGNIN_CSS.startswith(gg.PORTAL_CSS))
@@ -3742,9 +3749,167 @@ class BrandingTest(GateTest):
         for name, page in self.pages().items():
             with self.subTest(page=name):
                 self.assertNotIn('src="http', page)
-                self.assertNotIn("url(", page)
+                # CSS images only as data: URLs (the Signed out page's arch and gate).
+                self.assertEqual(page.count("url("), page.count('url("data:image/svg+xml;base64,'))
                 for tag in re.findall(r'<(\w+)[^>]*\shref="http', page):
                     self.assertEqual(tag, "a")
+
+
+class SignOutTest(GateTest):
+    """Sign out (contract §5 "Sign out"): the guard in front of
+    oauth2-proxy's /oauth2/sign_out, the Signed out page and the site bar."""
+
+    POST = {"X-Forwarded-Method": "POST", "X-Forwarded-Uri": "/oauth2/sign_out",
+            "Content-Type": "text/plain", "Sec-Fetch-Site": "same-site", "Origin": "https://example.com"}
+
+    def guard(self, drop=(), **over):
+        h = {k: v for k, v in {**self.POST, **over}.items() if k not in drop and v is not None}
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}/signout-guard", headers=h)
+        try:
+            with urllib.request.urlopen(r) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, dict(e.headers), e.read().decode()
+
+    def test_each_core_page_form_allowed(self):
+        # The real forms: the portal (Traefik's strict-origin-when-cross-origin
+        # sends its origin), the Hub and people.<d> (no-referrer pages switched
+        # to strict-origin before the submit), the confirmation page on
+        # auth.<d> (same-origin; its Origin may also be null).
+        cases = {
+            "portal": {"Origin": "https://example.com"},
+            "hub": {"Origin": "https://hub.example.com"},
+            "people / Sign-in page": {"Origin": "https://people.example.com"},
+            "confirmation page": {"Sec-Fetch-Site": "same-origin", "Origin": "https://auth.example.com"},
+            "confirmation page, Origin null": {"Sec-Fetch-Site": "same-origin", "Origin": "null"},
+            "an older browser (no fetch metadata)": {"Sec-Fetch-Site": None, "Origin": "https://people.example.com"},
+            "charset": {"Content-Type": "text/plain;charset=UTF-8"},
+            "no Content-Type": {"Content-Type": None},
+        }
+        for name, c in cases.items():
+            with self.subTest(name):
+                code, hdrs, body = self.guard(**c)
+                self.assertEqual(code, 200, body)
+                self.assertEqual(hdrs.get("X-Auth-Request-Redirect"), "https://example.com/signed-out")
+                self.assertNotIn("X-Forwarded-User", hdrs)
+
+    def test_get_shows_the_confirmation(self):
+        for m in ("GET", "HEAD"):
+            for uri in ("/oauth2/sign_out", "/oauth2/sign_out?rd=https%3A%2F%2Fevil.example%2F"):
+                with self.subTest(m=m, uri=uri):
+                    code, hdrs, body = self.guard(**{"X-Forwarded-Method": m, "X-Forwarded-Uri": uri,
+                                                     "Sec-Fetch-Site": "cross-site", "Origin": None})
+                    self.assertEqual(code, 405)
+                    self.assertEqual(hdrs.get("Allow"), "POST")
+                    self.assertNotIn("X-Auth-Request-Redirect", hdrs)
+                    self.assertIn('action="https://auth.example.com/oauth2/sign_out" enctype="text/plain"', body)
+                    self.assertIn("form-action https://auth.example.com https://example.com;", hdrs["Content-Security-Policy"])
+                    self.assertIn("frame-ancestors 'none'", hdrs["Content-Security-Policy"])
+                    self.assertNotIn("evil", body)
+
+    def test_refused(self):
+        cases = {
+            # An app under the domain is same-site, never proof.
+            "an app (same-site)": {"Origin": "https://app.example.com"},
+            "an app, no Origin": {"Origin": None},
+            "Origin null, same-site": {"Origin": "null"},
+            "an app under hub": {"Origin": "https://x.hub.example.com"},
+            "an app claiming same-origin elsewhere": {"Sec-Fetch-Site": "same-site", "Origin": "https://grafana.example.com"},
+            "cross-site": {"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"},
+            "cross-site with a core Origin": {"Sec-Fetch-Site": "cross-site", "Origin": "https://example.com"},
+            "cross-site, no origin": {"Sec-Fetch-Site": "cross-site", "Origin": None},
+            "user-typed": {"Sec-Fetch-Site": "none"},
+            "foreign origin": {"Origin": "https://evil.example"},
+            "look-alike": {"Origin": "https://evilexample.com"},
+            "suffix trick": {"Origin": "https://example.com.evil.example"},
+            "http origin": {"Origin": "http://example.com"},
+            "explicit port": {"Origin": "https://example.com:443"},
+            "other port": {"Origin": "https://example.com:8443"},
+            "upper case": {"Origin": "https://HUB.example.com"},
+            "no fetch metadata, null origin": {"Sec-Fetch-Site": None, "Origin": "null"},
+            "no fetch metadata, no origin": {"Sec-Fetch-Site": None, "Origin": None},
+            "no fetch metadata, an app": {"Sec-Fetch-Site": None, "Origin": "https://app.example.com"},
+            "query rd": {"X-Forwarded-Uri": "/oauth2/sign_out?rd=https%3A%2F%2Fhub.example.com%2F"},
+            "bare query": {"X-Forwarded-Uri": "/oauth2/sign_out?"},
+            "longer path": {"X-Forwarded-Uri": "/oauth2/sign_outx"},
+            "form body": {"Content-Type": "application/x-www-form-urlencoded"},
+            "form body, odd case": {"Content-Type": "Application/X-WWW-Form-Urlencoded; charset=utf-8"},
+            "multipart": {"Content-Type": "multipart/form-data; boundary=x"},
+            "PUT": {"X-Forwarded-Method": "PUT"},
+            "no method": {"X-Forwarded-Method": None},
+        }
+        for name, c in cases.items():
+            with self.subTest(name):
+                code, hdrs, body = self.guard(**c)
+                self.assertIn(code, (403, 405), body)
+                self.assertNotIn("X-Auth-Request-Redirect", hdrs)
+
+    def test_refusal_unit(self):
+        R = gg.signout_refusal
+        ok = {"Content-Type": "text/plain", "Sec-Fetch-Site": "same-site", "Origin": "https://example.com"}
+        self.assertIsNone(R("POST", "/oauth2/sign_out", ok, "example.com"))
+        self.assertIsNotNone(R("POST", "/oauth2/sign_out", ok, ""))
+        import email.message
+        m = email.message.Message()
+        for k, v in ok.items():
+            m[k] = v
+        self.assertIsNone(R("POST", "/oauth2/sign_out", m, "example.com"))
+        for dup in ("Content-Type", "Sec-Fetch-Site", "Origin"):
+            m2 = email.message.Message()
+            for k, v in ok.items():
+                m2[k] = v
+            m2[dup] = ok[dup]
+            self.assertIsNotNone(R("POST", "/oauth2/sign_out", m2, "example.com"), dup)
+
+    def test_signed_out_page(self):
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}/signed-out")
+        with urllib.request.urlopen(r) as resp:
+            body, hdrs = resp.read().decode(), dict(resp.headers)
+        self.assertIn("<h1>" + gg.MARK_HTML + "Signed out</h1>", body)
+        self.assertIn('<a class="btn" id="pc-sign-in-again" href="https://example.com/">Sign in again</a>', body)
+        self.assertIn('class="pc-arch"', body)
+        self.assertIn('class="pc-gate"', body)
+        self.assertEqual(hdrs["Cache-Control"], "no-store")
+        css = re.search(r"<style>(.*?)</style>", body, re.S).group(1)
+        import base64
+        import hashlib
+        want = "'sha256-" + base64.b64encode(hashlib.sha256(css.encode()).digest()).decode() + "'"
+        self.assertIn(want, hdrs["Content-Security-Policy"])
+        self.assertIn("form-action 'none'", hdrs["Content-Security-Policy"])
+        # The gate rests down (the login theme's -4 units), still.
+        self.assertIn("background-position:calc(-4 * var(--pc-u)) calc(-4 * var(--pc-u))", css)
+        self.assertNotIn("animation", css)
+
+    def test_arch_and_gate_are_the_theme_copies(self):
+        img = os.path.join(HERE, "..", "keycloak", "themes", "portcullis", "login", "resources", "img")
+        with open(os.path.join(img, "portcullis-arch.svg")) as f:
+            self.assertEqual(gg.ARCH_SVG, f.read())
+        with open(os.path.join(img, "portcullis-gate.svg")) as f:
+            self.assertEqual(gg.GATE_SVG, f.read())
+
+    def test_portal_site_bar(self):
+        page = gg.render_portal("bob", {"users_x"}, [], "example.com").decode()
+        bar = re.search(r'<div class="pn-bar">.*?</div></div>', page).group(0)
+        self.assertIn('<a class="pn-link pn-current" data-site="portal" href="https://example.com/" '
+                      'aria-current="page">Portal</a>', bar)
+        self.assertNotIn("hub.example.com", bar)
+        self.assertIn('href="https://people.example.com/"', bar)
+        self.assertIn('href="https://people.example.com/signin"', bar)
+        self.assertIn("Signed in as <strong>bob</strong>", bar)
+        self.assertIn('<form class="pn-signout" method="post" action="https://auth.example.com/oauth2/sign_out" '
+                      'enctype="text/plain"><button type="submit" class="pn-signout-btn" id="pn-sign-out">Sign out'
+                      '</button></form>', bar)
+        admin = gg.render_portal("root", {"lldap_admin"}, [], "example.com").decode()
+        self.assertIn('data-site="hub" href="https://hub.example.com/"', admin)
+        # While signed in as someone else: Sign out opens the Stop page.
+        imp = gg.render_portal("alice", set(), [], "example.com", impersonated=True).decode()
+        self.assertIn('<a class="pn-signout-btn" id="pn-sign-out" href="https://people.example.com/impersonation/stop">'
+                      'Sign out</a>', imp)
+        self.assertNotIn("<form", imp)
+        self.assertIn("form-action https://auth.example.com https://example.com;", gg.PORTAL_CSP)
+        hostile = gg.render_portal('<b>"x', set(), [], "example.com").decode()
+        self.assertIn("Signed in as <strong>&lt;b&gt;&quot;x</strong>", hostile)
 
 
 class JwtClaimsTest(unittest.TestCase):

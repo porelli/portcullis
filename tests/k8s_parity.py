@@ -243,7 +243,7 @@ DOCKER_TO_K8S = {
     "portcullis-public-guard": "portcullis-public-guard@file", "portcullis-public-guard-vpn": "portcullis-public-guard-vpn@file",
     "vpn-required-path": "vpn-required-path@file",
     "hub-proxy-secret": "hub-proxy-secret", "hub-cli-proxy-secret": "hub-cli-proxy-secret", "portcullis-auth-console": "portcullis-auth-console",
-    "portal-path": "portal-path", "portal-vpn-path": "portal-vpn-path", "directory-redirect": "directory-redirect",
+    "portal-path": "portal-path", "portcullis-signout-guard": "portcullis-signout-guard", "portal-vpn-path": "portal-vpn-path", "directory-redirect": "directory-redirect",
 }
 
 
@@ -336,9 +336,14 @@ def check_routers(comp):
             if gs != svc and not (svc in ("hub-people", "hub-cli") and gs == "hub") and not (svc == rname and gs == r["owner"]) \
                and not (svc == "grafana-metrics" and gs == "grafana"):
                 F.add(f"router {rname}: service {gs} != compose {svc}")
-            if ir["spec"].get("tls", {}).get("options", {}).get("name") != r.get("tls.options"):
-                F.add(f"router {rname}: tls options {ir['spec'].get('tls')} != compose {r.get('tls.options')}")
-        for extra in sorted(set(irs) - set(cr) - {"kcinternal", "portcullis-node"}):
+            # compose's `tls.options: default` (Traefik's default, contract
+            # §5) is an IngressRoute with tls but no tls.options there.
+            ir_tls = ir["spec"].get("tls")
+            want_opt = r.get("tls.options")
+            got_opt = (ir_tls or {}).get("options", {}).get("name") if isinstance(ir_tls, dict) else None
+            if not isinstance(ir_tls, dict) or got_opt != (None if want_opt == "default" else want_opt):
+                F.add(f"router {rname}: tls options {ir_tls} != compose {want_opt}")
+        for extra in sorted(set(irs) - set(cr) - {"kcinternal", "kcinternal-logout", "portcullis-node"}):
             F.add(f"IngressRoute {extra}: no compose router")
 
 

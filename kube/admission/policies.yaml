@@ -1290,7 +1290,10 @@ spec:
     - name: coreServices
       expression: "['group-gate@file', 'forward-auth-ext@file', 'mcp-gate@file']"
     - name: tiers
-      expression: "['authaware@file', 'public@file', 'protected@file', 'protected-any@file']"
+      # Traefik's default tier is an IngressRoute without tls.options
+      # (contract §5): a name "default" here would be a TLSOption of the
+      # edge namespace, so only the three named tiers may be named.
+      expression: "['public@file', 'protected@file', 'protected-any@file']"
     - name: entryPoints
       expression: "['websecure', 'vpnsecure']"
     - name: reserved
@@ -1436,7 +1439,7 @@ spec:
         || ((!has(object.spec.tls.options) || (object.spec.tls.options.name in variables.tiers && !has(object.spec.tls.options.namespace)))
             && !has(object.spec.tls.secretName) && !has(object.spec.tls.store) && !has(object.spec.tls.domains)
             && (!has(object.spec.tls.certResolver) || object.spec.tls.certResolver == 'letsencrypt'))
-      message: "tls.options outside the four tiers, another resolver, tls.domains, or a TLS secret / store reference"
+      message: "tls.options other than none (Traefik's default) or a named tier, another resolver, tls.domains, or a TLS secret / store reference"
     # A Middleware is named after its own instance label, so no instance
     # can squat another's middleware names.
     - expression: "variables.exempt || variables.del || object.kind != 'Middleware' || variables.ownObj"

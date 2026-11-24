@@ -12,7 +12,7 @@
 #    user taps YubiKey in browser. Works without any local software.
 #    Best for: browser apps, general users who only have WebAuthn enrolled.
 #
-# You can combine both: use authaware TLS (passes cert if present) + forward auth
+# You can combine both: use default TLS (passes cert if present) + forward auth
 # (falls back to WebAuthn login if no cert). This gives the best experience —
 # mTLS users get instant access, WebAuthn users get a login prompt.
 
@@ -42,7 +42,7 @@ services:
 
   # ============================================================
   # BEST OF BOTH — mTLS if cert present, otherwise WebAuthn login
-  # (authaware TLS + forward auth fallback)
+  # (default TLS + forward auth fallback)
   # ============================================================
   wiki:
     image: docker.io/requarks/wiki:2.5.317@sha256:e4708eed80c014449c0c8426c8d466c7a52a62131555bb44372fa48378b448b8
@@ -52,7 +52,7 @@ services:
       traefik.enable: "true"
       traefik.http.routers.wiki.rule: Host(`wiki.${PORTCULLIS_DOMAIN:-portcullis.local}`)
       traefik.http.routers.wiki.entrypoints: websecure
-      traefik.http.routers.wiki.tls.options: authaware@file
+      traefik.http.routers.wiki.tls.options: default
       traefik.http.routers.wiki.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.wiki.loadbalancer.server.port: "3000"
 

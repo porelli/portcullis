@@ -273,10 +273,14 @@ _kc_group_mapper_patch() {
 # per extra-domain host (forward-auth-ext, contract §5) and OWNS pruning
 # them (instance disable/delete, hostname changes): configure can't tell a
 # current one from a stale one, so it keeps them all. The realm export's
-# placeholder host is dropped.
+# placeholder host is dropped. post.logout.redirect.uris = exactly the
+# Signed out page https://<domain>/signed-out (contract §5 "Sign out": the
+# sign-out never sends the browser through Keycloak's end-session page,
+# and a hand-made one with this client can land only there).
 _kc_fwd_patch() {
   jq --arg d "$1" '
-    .attributes = ((.attributes // {}) + {"default.acr.values": "", "pkce.code.challenge.method": "S256"}) |
+    .attributes = ((.attributes // {}) + {"default.acr.values": "", "pkce.code.challenge.method": "S256",
+                                          "post.logout.redirect.uris": ("https://" + $d + "/signed-out")}) |
     .defaultClientScopes = ((.defaultClientScopes // []) + ["acr"] | unique) |
     .redirectUris = (["https://auth." + $d + "/oauth2/callback"]
       + [(.redirectUris // [])[] | strings
@@ -517,6 +521,7 @@ keycloak_configure() {
   # tokens carry no act / pc_imp and look like the person's own.
   _kc_impersonation_mapper "$scope_id"
   _kc_impersonation_notice
+  _kc_let_through
 
   info "Ensuring the groups client scope..."
   if [ "$(kc_get "/$KC_REALM/client-scopes" | jq '[.[] | select(.name == "groups")] | length')" = 0 ]; then
@@ -535,7 +540,7 @@ keycloak_configure() {
   info "Granting lldap_admin the $KC_REALM realm console..."
   _kc_admin_roles
 
-  info "Configuring the forward-auth client (no default acr, PKCE S256, groups, redirect URIs)..."
+  info "Configuring the forward-auth client (no default acr, PKCE S256, groups, redirect URIs, post-logout URI)..."
   fwd_uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty')"
   if [ -n "$fwd_uuid" ]; then
     # The realm export ships a placeholder host so Keycloak's URL parser
@@ -628,6 +633,42 @@ _kc_impersonation_notice() {
   printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a and .enabled == true' >/dev/null 2>&1 \
     || fail "the $ra required action can't be enabled in Keycloak: people wouldn't be told an administrator signed in as them. Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
   echo "    $ra required action enabled"
+}
+
+# KC_LET_THROUGH — the sign-in's last page ("Let through — opening <host>…",
+# contract §8.1 "Let through") exactly as realm-export.json has it (the
+# extension's smoke realm holds the same entry): last of all required
+# actions; the extension adds it to an authentication itself, never to a
+# person, so it is never a default action.
+KC_LET_THROUGH='{"alias":"portcullis-let-through","name":"Let through","providerId":"portcullis-let-through","enabled":true,"defaultAction":false,"priority":1000,"config":{}}'
+
+# _kc_let_through — registers the extension's portcullis-let-through
+# required action when the realm lacks it (POST register-required-action:
+# a realm imported before it was in realm-export.json) and keeps it
+# enabled, not a default action, at its priority. Only a warning when that
+# fails: the page is the gate's rise, not a check — without it people go
+# straight on to the app.
+_kc_let_through() {
+  local ra=portcullis-let-through cur code
+  cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+  if ! printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a' >/dev/null 2>&1; then
+    code="$(jq -nc --argjson w "$KC_LET_THROUGH" '$w | {providerId, name}' \
+      | kc_send POST "/$KC_REALM/authentication/register-required-action")"
+    _kc_report "$ra required action registered" "$code" 204 201 || true
+    cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+  fi
+  if ! printf '%s' "$cur" | jq -e --argjson w "$KC_LET_THROUGH" '.enabled == true and .defaultAction == false and .priority == $w.priority' >/dev/null 2>&1; then
+    code="$(jq -nc --arg c "$cur" --argjson w "$KC_LET_THROUGH" \
+        '((try ($c | fromjson) catch {}) | if type == "object" then . else {} end) + ($w | {alias, name, providerId, enabled, defaultAction, priority})' \
+      | kc_send PUT "/$KC_REALM/authentication/required-actions/$ra")"
+    _kc_report "$ra required action enabled" "$code" 204 || true
+    cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+  fi
+  if printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a and .enabled == true' >/dev/null 2>&1; then
+    echo "    $ra required action enabled"
+  else
+    warn "the $ra required action isn't enabled in Keycloak: people go straight on to the app after signing in (no \"Let through\" page). Run ./portcullis keycloak configure again."
+  fi
 }
 
 # Client scope that carries `email` but never `email_verified`. LLDAP lets
@@ -997,6 +1038,8 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
     (both on the acr scope) and groups scope
   - registers and enables the portcullis-impersonation-notice required
     action (the person's notice after an administrator signed in as them)
+  - registers and enables the portcullis-let-through required action (the
+    "Let through" page after an interactive sign-in, the gate rising)
   - ensures the email-unverified scope (email claim, no email_verified) that
     Hub templates opt into with keycloak_clients[].email_verified_claim: false
   - portcullis-forward-auth: acr/groups scopes, no default acr, requires PKCE S256, the

@@ -131,9 +131,16 @@ Cases (in this order; each later case needs only the state it names):
   imp_ai_refused            the AI client's authorize → #impersonating, no
                             code; alice's pre-start token still works
   imp_refused_concurrent    second start / person taken → 409; next reused → 403
-  imp_stop                  Stop page → sign_out; session gone, cookie dead,
+  imp_stop                  Stop page → POST sign_out → the Signed out page;
+                            session gone, cookie dead,
                             refresh invalid_grant; audit and history
   imp_notice_next_signin    alice's next sign-in: the notice once
+  site_bar_sign_out         alice's certificate session: the site bar on the
+                            portal and the Sign-in page (her name, a POST
+                            Sign out); a cross-site link to /oauth2/sign_out →
+                            the confirmation, nothing ends; Sign out → the
+                            Signed out page, the ticket dead, her Keycloak
+                            session gone, Sign in again signs in
   imp_stop_elsewhere        sam's stop_impersonation → ended page within 5 s
   imp_refused_proofs        synced, no touch, bob's, browser certificate →
                             403; reason "ab" → 400
@@ -1918,7 +1925,7 @@ def main() -> int:
             # protected@file (contract §5: every alternative has
             # yubikey_cert), where a browser certificate can't even finish
             # the handshake; echo-file, on the default template (Standard)
-            # meanwhile, is authaware@file, so the .p12 reaches Keycloak and
+            # meanwhile, is default, so the .p12 reaches Keycloak and
             # the file session reaches group-gate there.
             needs("alice_file")
             c = state["bc"][0]
@@ -1934,11 +1941,11 @@ def main() -> int:
                            "echo-anycert": tls_option("echo-anycert"), "echo-file": tls_option("echo-file")}
                     ok = (not got["signin-keycloak.json has browser_cert"]
                           and not got["group-gate-policy.json has browser_cert"]
-                          and got["echo-anycert"] == "protected@file" and got["echo-file"] == "authaware@file")
+                          and got["echo-anycert"] == "protected@file" and got["echo-file"] == "default")
                     assert ok, got  # until() keeps the last state for the failure message
                     return True
                 until("browser_cert off in both published files, echo-anycert on protected@file, echo-file "
-                      "(Standard) on authaware@file", switched_off, 180, every=5)
+                      "(Standard) on default", switched_off, 180, every=5)
                 # Traefik: on protected@file the browser certificate no longer
                 # finishes the handshake (tls_protected_any had the same files
                 # pass there while the switch was on): 35 / 56 as in
@@ -1998,7 +2005,7 @@ def main() -> int:
             assert not errs, f"restore failed: {errs}"
         check("browser_cert_off_counts_nothing: browser_cert switched off — the valid .p12 alone signs nobody in "
               "(Keycloak keeps the passkey prompt, no LOGIN event) and alice's file session gets 403 on echo-file "
-              "(Standard, authaware@file); echo-anycert moves to protected@file, where the browser certificate's "
+              "(Standard, default); echo-anycert moves to protected@file, where the browser certificate's "
               "handshake is refused (curl 35 / 56); "
               "switched back on in a finally (echo-file / echo-anycert back on protected-any@file)",
               browser_cert_off_counts_nothing)
@@ -2752,7 +2759,13 @@ def main() -> int:
                 # (Playwright delivers the request events only inside its own
                 # calls: hence the wait_for_timeout.)
                 until("/oauth2/sign_out after Stop", lambda: page.wait_for_timeout(500) or
-                      any(u == AUTH + "/oauth2/sign_out" for _, u in seen), 20, every=0.5)
+                      ("POST", AUTH + "/oauth2/sign_out") in seen, 20, every=0.5)
+                # Stop signs out with the site bar's POST and lands on the
+                # Signed out page (contract §5 "Sign out"); Sign in again.
+                page.wait_for_url(PORTAL + "signed-out", timeout=TIMEOUT_MS)
+                assert page.locator("#pc-signed-out").count() == 1, body(page)[:200]
+                base.shot(page, "imp1-signed-out")
+                page.click("#pc-sign-in-again")
                 # Then the sign-in: this browser presents root's YubiKey
                 # certificate to auth.<d> (imp_start's step-up), so Keycloak's
                 # X.509 step signs root himself in again and the portal opens
@@ -2806,7 +2819,8 @@ def main() -> int:
             print(f"    history: {e.get('detail')!r}", flush=True)
             assert "apps opened:" in e["detail"] and "apps opened: none" not in e["detail"], e["detail"]
             state["imp1_done"] = doc
-        check("imp_stop: Stop on the portal → the Stop page POSTs, /oauth2/sign_out, the sign-in page; within 20 s alice "
+        check("imp_stop: Stop on the portal → the Stop page POSTs, then POST /oauth2/sign_out, the Signed out page, Sign "
+              "in again → the sign-in page; within 20 s alice "
               "has no impersonated Keycloak session; the old _oauth2_proxy cookie (200 before) isn't 200; oidc-strong's "
               "refresh token invalid_grant; audit start (reason) and end \"stopped\" by root with the apps; alice's "
               "history has the impersonation entry by root with the reason and the apps", imp_stop)
@@ -2856,6 +2870,70 @@ def main() -> int:
         check("imp_notice_next_signin: alice's own next sign-in shows \"root signed in as you on … UTC for … min: "
               "checking quota. Apps opened: …\" once; Continue reaches echo-cert (forged impersonation headers deleted on "
               "her own session); her next sign-in shows no notice", imp_notice_next_signin)
+
+        def site_bar_sign_out():
+            # Contract §5 "Sign out": alice's own YubiKey-certificate session;
+            # the site bar on the portal and the Sign-in page (username +
+            # Sign out), a cross-site GET of the endpoint ends nothing, then
+            # Sign out on the Sign-in page: the Signed out page, the ticket
+            # dead, her Keycloak session gone, Sign in again → sign-in.
+            needs("imp_alice_cert")
+            ctx = new_context(client_cert=state["imp_alice_cert"], origins=(AUTH, PORTAL.rstrip("/"), PEOPLE))
+            try:
+                page = ctx.new_page()
+                before = session_ids("alice")
+                goto(page, PORTAL)
+
+                def at_portal():
+                    # The impersonation notice, when an earlier case left it
+                    # owed (imp_notice_next_signin normally takes it).
+                    if page.locator("#portcullis-notice-continue").count():
+                        page.click("#portcullis-notice-continue")
+                        return False
+                    return page.url == PORTAL and "Signed in as" in body(page)
+                until("the portal as alice", at_portal, 60, every=1)
+                bar = page.locator(".pn-bar")
+                assert "Signed in as alice" in bar.inner_text(), bar.inner_text()
+                assert page.locator("form.pn-signout[method=post][enctype='text/plain'] #pn-sign-out").count() == 1
+                base.shot(page, "sign-out-bar-portal")
+                mine = session_ids("alice") - before
+                assert mine, "no new Keycloak session for alice"
+                old = next(c["value"] for c in ctx.cookies(AUTH) if c["name"] == "_oauth2_proxy")
+                # A cross-site navigation to the endpoint (Sec-Fetch-Site
+                # cross-site, the Lax cookie sent): the confirmation page.
+                other = ctx.new_page()
+                other.set_content(f'<a id="x" href="{AUTH}/oauth2/sign_out?rd={urllib.parse.quote(PORTAL)}">x</a>')
+                with other.expect_navigation():
+                    other.click("#x")
+                assert other.locator("#pc-sign-out-confirm").count() == 1, body(other)[:200]
+                other.close()
+                # (oauth2-proxy's own check: alice's certificate session meets
+                # the apps' templates only with her certificate presented.)
+                code, _ = raw_request(f"auth.{DOMAIN}", "/oauth2/auth", f"_oauth2_proxy={old}")
+                assert code == 202 and mine <= session_ids("alice"), f"after the cross-site GET: HTTP {code}"
+                goto(page, PEOPLE + "/signin")
+                page.wait_for_selector("#site-nav #pn-sign-out", timeout=TIMEOUT_MS)
+                until("the Sign-in page's bar names alice", lambda: "alice" in page.locator("#site-nav").inner_text(), 20, 1)
+                base.shot(page, "sign-out-bar-signin")
+                page.click("#site-nav #pn-sign-out")
+                page.wait_for_url(PORTAL + "signed-out", timeout=TIMEOUT_MS)
+                assert page.locator("#pc-signed-out").count() == 1, body(page)[:200]
+                base.shot(page, "sign-out-signed-out")
+                code, _ = raw_request(f"auth.{DOMAIN}", "/oauth2/auth", f"_oauth2_proxy={old}")
+                print(f"    the old _oauth2_proxy cookie at /oauth2/auth after Sign out: HTTP {code}", flush=True)
+                assert code == 401, f"the old cookie after Sign out: HTTP {code}"
+                code, _ = raw_request(f"echo-std.{DOMAIN}", "/", f"_oauth2_proxy={old}")
+                assert code == 302, f"the next request to echo-std with the old cookie: HTTP {code} (want the sign-in redirect)"
+                until("alice's Keycloak session gone", lambda: not (mine & session_ids("alice")), 20, every=2)
+                assert not [c for c in ctx.cookies(AUTH) if c["name"] == "_oauth2_proxy" and c["value"]], "cookie kept"
+                page.click("#pc-sign-in-again")
+                until("Sign in again → Keycloak", lambda: page.url.startswith(REALM + "/") or page.url == PORTAL, 30, 1)
+            finally:
+                ctx.close()
+        check("site_bar_sign_out: the portal's and the Sign-in page's site bar show alice and a POST Sign out; a "
+              "cross-site link to /oauth2/sign_out gets the confirmation and ends nothing; Sign out lands on the "
+              "Signed out page, the old ticket gets 401 at /oauth2/auth and echo-std redirects to sign-in, alice's Keycloak session is gone, Sign in again signs in",
+              site_bar_sign_out)
 
         def imp_stop_elsewhere():
             ctx, page, _ = root_session("imp2")
@@ -3238,7 +3316,7 @@ def main() -> int:
             cert_templates = ("strong", "yubikey-and-certificate", "e2e-cert", "e2e-file", "e2e-anycert")
             std0 = next(t for t in snap0["templates"] if t["id"] == "standard")
             for inst in ("echo-std", "echo-basic"):
-                assert tls_option(inst) == "authaware@file", f"{inst}: {tls_option(inst)}"
+                assert tls_option(inst) == "default", f"{inst}: {tls_option(inst)}"
                 assert ca_names(f"{inst}.{DOMAIN}"), f"{inst}: no CA names with yubikey_cert on"
             assert ca_names(f"auth.{DOMAIN}"), "auth.<d>: no CA names"
 
@@ -3273,13 +3351,13 @@ def main() -> int:
                 until("echo-std on public@file without CA names (Standard has no certificate any more)",
                       lambda: tls_option("echo-std") == "public@file" and not ca_names(f"echo-std.{DOMAIN}"), 180, every=5)
                 # Basic still names family:certificate: the method switches alone move it.
-                assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
+                assert tls_option("echo-basic") == "default" and ca_names(f"echo-basic.{DOMAIN}"), \
                     f"echo-basic before the switch: {tls_option('echo-basic')}"
                 hub_ok("PUT", "/api/signin/methods/yubikey_cert", {"on": False})
                 # browser_cert alone still counts as a certificate there: once
                 # the Hub has applied the switch (both published files without
-                # yubikey_cert, its own tier for echo-basic authaware, no
-                # echo-basic op running), echo-basic stays authaware with CA
+                # yubikey_cert, its own tier for echo-basic default, no
+                # echo-basic op running), echo-basic stays default with CA
                 # names over several samples.
                 def applied():
                     pol, kc_ = hub_json("group-gate-policy.json"), published()
@@ -3287,31 +3365,31 @@ def main() -> int:
                     code, op = hub("GET", "/api/instances/echo-basic/op")
                     running = code == 200 and isinstance(op, dict) and op.get("running")
                     return ("yubikey_cert" not in pol.get("methods", []) and "yubikey_cert" not in kc_["methods"]
-                            and tier == "authaware@file" and not running)
+                            and tier == "default" and not running)
                 until("the Hub applied yubikey_cert off (published, echo-basic's tier, no op running)", applied, 120)
                 for i in range(6):
-                    assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
+                    assert tls_option("echo-basic") == "default" and ca_names(f"echo-basic.{DOMAIN}"), \
                         f"echo-basic with browser_cert still on, sample {i + 1}: {tls_option('echo-basic')}"
                     time.sleep(5)
                 hub_ok("PUT", "/api/signin/methods/browser_cert", {"on": False})
                 until("echo-basic on public@file without CA names (yubikey_cert and browser_cert off)",
                       lambda: tls_option("echo-basic") == "public@file" and not ca_names(f"echo-basic.{DOMAIN}"), 180,
                       every=5)
-                assert ca_names(f"auth.{DOMAIN}"), "auth.<d> lost its CA names (core routers stay on authaware)"
-                assert ca_names(f"hub.{DOMAIN}"), "hub.<d> lost its CA names (core routers stay on authaware)"
+                assert ca_names(f"auth.{DOMAIN}"), "auth.<d> lost its CA names (core routers stay on default)"
+                assert ca_names(f"hub.{DOMAIN}"), "hub.<d> lost its CA names (core routers stay on default)"
             finally:
                 restored = restore()
             assert not restored, f"restore steps failed: {restored}"
             for inst in ("echo-std", "echo-basic"):
-                until(f"{inst} back on authaware@file with CA names",
-                      lambda inst=inst: tls_option(inst) == "authaware@file" and ca_names(f"{inst}.{DOMAIN}"), 180, every=5)
+                until(f"{inst} back on default with CA names",
+                      lambda inst=inst: tls_option(inst) == "default" and ca_names(f"{inst}.{DOMAIN}"), 180, every=5)
             snap1 = hub_ok("GET", "/api/signin")
             shape = lambda v: ({m["id"]: m["on"] for m in v["methods"]}, v["default"], v["core"],  # noqa: E731
                                sorted((t["id"], t["enabled"], json.dumps(t["rule"], sort_keys=True)) for t in v["templates"]))
             assert shape(snap1) == shape(snap0), f"not restored: {shape(snap1)} != {shape(snap0)}"
             picks1 = {i: hub_ok("GET", f"/api/instances/{i}/signin").get("template", "") for i in picks0}
             assert picks1 == picks0, picks1
-        check("tls_follows_switch: an app's client-certificate request follows the switches (authaware → "
+        check("tls_follows_switch: an app's client-certificate request follows the switches (default → "
               "public@file, CA names gone, once both certificate methods are off); auth.<d> / hub.<d> keep them; "
               "everything restored", tls_follows_switch)
 

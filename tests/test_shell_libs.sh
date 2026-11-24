@@ -581,7 +581,7 @@ services:
         aliases:
           - "portcullis-mcp-gitea--gitea"
     labels: !override
-      "traefik.http.routers.web.tls.options": "authaware@file"
+      "traefik.http.routers.web.tls.options": "default"
   other:
     networks:
       portcullis-proxy:
@@ -912,9 +912,9 @@ expect_eq "protected (ca-chain-yubikey.crt) accepts a YubiKey leaf" \
   "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "$YK_SENT" "$STUB_DIR/pem/leaf-yk")" accepted
 expect_eq "protected (ca-chain-yubikey.crt) accepts a YubiKey leaf sent alone" \
   "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "" "$STUB_DIR/pem/leaf-yk")" accepted
-expect_eq "protected-any / authaware (ca-chain.crt) accept a browser leaf" \
+expect_eq "protected-any / default (ca-chain.crt) accept a browser leaf" \
   "$(hs "$PKI_ROOT/certs/ca-chain.crt" "$BR_SENT" "$STUB_DIR/pem/leaf-br")" accepted
-expect_eq "protected-any / authaware (ca-chain.crt) accept a YubiKey leaf" \
+expect_eq "protected-any / default (ca-chain.crt) accept a YubiKey leaf" \
   "$(hs "$PKI_ROOT/certs/ca-chain.crt" "$YK_SENT" "$STUB_DIR/pem/leaf-yk")" accepted
 # The check catches the flaw: with the root in the file, the browser leaf passes.
 cat "$STUB_DIR/pem/root" "$STUB_DIR/pem/int" > "$STUB_DIR/pem/old-yk-chain"
@@ -1070,7 +1070,7 @@ expect_eq "pki_node: no chain / truststore / group-gate file holds the node CA (
   "$(grep -rlF "$NODE_BODY" "$NODE_C" | grep -v '/node-ca.crt$' || true)" ""
 # The handshakes themselves, with Go's semantics (every caFiles certificate
 # an anchor, the client's chain untrusted input): a node-worker leaf sending
-# the node CA fails Traefik's protected, protected-any and authaware
+# the node CA fails Traefik's protected, protected-any and default
 # options and Keycloak's truststore.
 NODE_SENT="$STUB_DIR/pem/node-sent"; cat "$STUB_DIR/pem/node" > "$NODE_SENT"
 for ca in ca-chain-yubikey.crt ca-chain.crt truststore/portcullis-ca-chain.pem truststore/portcullis-yubikey-ca.pem \
@@ -1083,7 +1083,7 @@ done
 expect_eq "pki_node: the node leaf is valid under node-ca.crt (control)" \
   "$(hs "$NODE_C/node-ca.crt" "" "$STUB_DIR/pem/leaf-node")" accepted
 # The check catches the flaw ruling P1 removed: a node CA under the root
-# would pass Traefik's protected-any / authaware.
+# would pass Traefik's protected-any / default.
 cat "$STUB_DIR/pem/node-root" "$STUB_DIR/pem/root" > "$STUB_DIR/pem/node-root-sent"
 expect_eq "pki_node: the handshake check detects a node CA under the root (ca-chain.crt would accept it)" \
   "$(hs "$NODE_C/ca-chain.crt" "$STUB_DIR/pem/node-root-sent" "$STUB_DIR/pem/leaf-node-root")" accepted
@@ -1479,8 +1479,10 @@ F1="$(printf '%s' "$FWD" | _kc_fwd_patch ex.org)"
 expect_eq "keycloak configure: forward-auth redirect URIs = main callback + extra-domain callbacks" \
   "$(printf '%s' "$F1" | jq -c .redirectUris)" \
   '["https://auth.ex.org/oauth2/callback","https://grafana.team-b.example.org/oauth2/callback","https://x.team-b.example.org/oauth2/callback"]'
-expect_eq "keycloak configure: forward-auth default acr removed (\"\"), PKCE S256 required, scopes kept" \
-  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"","pkce.code.challenge.method":"S256"},["acr","groups"]]'
+expect_eq "keycloak configure: forward-auth default acr removed (\"\"), PKCE S256 required, post-logout = the Signed out page, scopes kept" \
+  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"","pkce.code.challenge.method":"S256","post.logout.redirect.uris":"https://ex.org/signed-out"},["acr","groups"]]'
+expect_eq "keycloak configure: a post-logout URI already there is replaced, never added to" \
+  "$(printf '%s' "$FWD" | jq -c '.attributes["post.logout.redirect.uris"] = "https://evil.example/##+"' | _kc_fwd_patch ex.org | jq -r '.attributes["post.logout.redirect.uris"]')" 'https://ex.org/signed-out'
 expect_eq "keycloak configure: forward-auth patch idempotent" "$(printf '%s' "$F1" | _kc_fwd_patch ex.org | jq -cS .)" "$(printf '%s' "$F1" | jq -cS .)"
 expect_eq "keycloak configure: placeholder kept when it is the domain" \
   "$(printf '%s' "$FWD" | _kc_fwd_patch portcullis.local | jq -c '.redirectUris[0:1]')" '["https://auth.portcullis.local/oauth2/callback"]'

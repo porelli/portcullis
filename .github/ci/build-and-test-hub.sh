@@ -37,6 +37,22 @@ case "$code" in 401|403|000) echo "FAIL: hub WITH proxy secret got $code"; docke
 docker compose exec -T hub sh -c 'test "$(id -u)" = 10001 && test -w /project/templates && test -w /project/appfiles && ! grep -q POSTGRES_PASSWORD /project/.env && docker version >/dev/null' \
   || { echo "FAIL: hub runtime (uid / templates / env subset / DOCKER_HOST)"; docker compose logs --tail=20 hub; exit 1; }
 echo "PASS: Hub runs as 10001 without the socket, sees only the env subset, enforces the proxy secret"
+# Contract §5 "TLS tier per host": a connection made for a name without a
+# router of its own (mail.<d>: Traefik's default TLS options) and reused
+# for a core page must not get 421 Misdirected Request (Traefik compares
+# the options' NAMES; core routers are on `default`). curl sends SNI
+# mail.<d> and Host hub.<d> on one connection, over HTTP/2.
+for i in $(seq 1 30); do
+  code=$(curl -s -o /dev/null -w '%{http_code} %{http_version}' --http2 --cacert certs/ca-chain.crt \
+           --resolve "mail.portcullis.local:443:127.0.0.1" -H 'Host: hub.portcullis.local' https://mail.portcullis.local/ || true)
+  case "$code" in "404 "*|"000 "*) ;; *) break ;; esac
+  sleep 1
+done
+case "$code" in
+  "421 "*) echo "FAIL: SNI mail.<d> with Host hub.<d> answered 421 Misdirected Request: hub's TLS options aren't Traefik's default"; exit 1 ;;
+  "302 2"|"401 2"|"403 2") echo "PASS: SNI mail.<d> + Host hub.<d> on one HTTP/2 connection reaches hub's router ($code), no 421" ;;
+  *) echo "FAIL: SNI mail.<d> with Host hub.<d>: $code (want the hub router's 302 / 401 / 403 over HTTP/2)"; exit 1 ;;
+esac
 
 # Template sources: the Hub synced them at start (status file) and
 # syncs again on SIGHUP — what `./portcullis upgrade` does (hub_sources_sync).

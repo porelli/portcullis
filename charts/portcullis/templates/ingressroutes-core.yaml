@@ -26,6 +26,8 @@ core Service's cluster DNS name. k8s_parity.py compares these with compose. */ -
   (dict "name" "keycloak-admin" "ep" $ep.web.admin "rule" $kcAdmin "prio" 10 "mw" (list "rate-limit-auth@file" "client-cert-pem@file" "portcullis-auth-console" "portcullis-groups@file" "security-headers@file") "svc" "keycloak" "port" 8080)
   (dict "name" "keycloak-admin-vpn" "ep" "vpnsecure" "rule" $kcAdmin "prio" 10 "mw" (list "rate-limit-auth@file" "client-cert-pem@file" "portcullis-auth-console" "portcullis-groups-vpn@file" "security-headers@file") "svc" "keycloak" "port" 8080)
   (dict "name" "oauth2-callback" "ep" $ep.ep.enrol "rule" (printf "%s && PathPrefix(`/oauth2`)" $sub.auth) "prio" 1000 "mw" list "svc" "forward-auth" "port" 4180)
+  (dict "name" "oauth2-signout" "ep" $ep.ep.enrol "rule" (printf "%s && PathPrefix(`/oauth2/sign_out`)" $sub.auth) "prio" 1001 "mw" (list "rate-limit-auth@file" "security-headers@file" "portcullis-signout-guard") "svc" "forward-auth" "port" 4180)
+  (dict "name" "signed-out" "ep" $ep.ep.enrol "rule" (printf "%s && Path(`/signed-out`)" $h) "mw" (list "rate-limit@file" "security-headers@file") "svc" "group-gate" "port" 8080)
   (dict "name" "portal" "ep" $ep.web.core "rule" $h "mw" (list "rate-limit@file" "client-headers@file" "portcullis-auth@file" "portal-path" "security-headers@file") "svc" "group-gate" "port" 8080)
   (dict "name" "portal-vpn" "ep" "vpnsecure" "rule" $h "mw" (list "rate-limit@file" "client-headers@file" "portcullis-auth@file" "portal-vpn-path" "security-headers@file") "svc" "group-gate" "port" 8080)
   (dict "name" "core-vpn-required" "ep" "websecure" "rule" (printf "%s || %s || %s || %s || %s || %s || %s" $h $sub.traefik $sub.hub $sub.directory $sub.metrics $sub.people $sub.mcp) "prio" 1 "mw" (list "rate-limit@file" "vpn-required-path@file" "security-headers@file") "svc" "group-gate" "port" 8080)
@@ -86,17 +88,20 @@ spec:
         - name: {{ printf "core-%s-%v@file" $r.svc $r.port }}
           kind: TraefikService
         {{- end }}
+  {{- /* Traefik's default TLS options (contract §5, tls.yml): no
+         tls.options, which on an IngressRoute would name a TLSOption of
+         this namespace. */}}
+  {{- /* No ACME resolver in HA (spec §11.2): the domains HTTP provider's
+  certificates. */}}
+  {{- if and $r.resolver (not $.Values.ha.enabled) }}
   tls:
-    {{- if and $r.resolver (not $.Values.ha.enabled) }}
-    {{- /* No ACME resolver in HA (spec §11.2): the domains HTTP provider's
-    certificates. */}}
     certResolver: letsencrypt
     domains:
       - main: {{ $d }}
         sans: [{{ printf "*.%s" $d | quote }}]
-    {{- end }}
-    options:
-      name: authaware@file
+  {{- else }}
+  tls: {}
+  {{- end }}
 {{- end }}
 ---
 # kcinternal (K15): every path to Keycloak, the client's forwarded and
@@ -120,6 +125,35 @@ spec:
         {{- if .Values.ha.enabled }}
         - name: core-retry@file
         {{- end }}
+      services:
+        - name: core-keycloak-8080@file
+          kind: TraefikService
+---
+# kcinternal-logout (contract §5 "Sign out"): forward-auth's backend logout
+# (PORTCULLIS_BACKEND_LOGOUT_URL = keycloak-internal:8081/…/logout?
+# id_token_hint=…) on its own router, the same middleware and service as
+# kcinternal, with no access log: the query carries the session's ID token.
+# Keycloak's 8080 stays Traefik-only (it trusts proxy headers from the pod
+# CIDR), so the call can't skip Traefik. Exactly the path; above
+# kcinternal's PathPrefix(`/`).
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: kcinternal-logout
+  namespace: {{ .Values.edgeNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
+spec:
+  entryPoints: ["kcinternal"]
+  routes:
+    - match: Path(`/realms/portcullis/protocol/openid-connect/logout`)
+      kind: Rule
+      priority: 100
+      observability:
+        accessLogs: false
+      middlewares:
+        - name: strip-forwarded@file
       services:
         - name: core-keycloak-8080@file
           kind: TraefikService

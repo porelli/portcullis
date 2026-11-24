@@ -14,6 +14,14 @@ providers:
     clientSecret: ${FORWARD_AUTH_CLIENT_SECRET}
     scope: openid email profile groups
     code_challenge_method: S256
+    # Sign out (contract §5 "Sign out"): /oauth2/sign_out first calls
+    # Keycloak's end-session endpoint server-side with the session's
+    # id_token_hint, so the SSO session ends. A provider option: under
+    # --alpha-config the OAUTH2_PROXY_BACKEND_LOGOUT_URL env var is silently
+    # ignored. From PORTCULLIS_BACKEND_LOGOUT_URL, which only forward-auth
+    # sets (forward-auth-ext's is empty: no backend logout from its
+    # unguarded per-host /oauth2/ routers).
+    backendLogoutURL: "${PORTCULLIS_BACKEND_LOGOUT_URL}"
     oidcConfig:
       issuerURL: https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis
       skipDiscovery: false

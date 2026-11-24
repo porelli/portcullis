@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/portcullis/mailctl/internal/stalwart"
+	"github.com/portcullis/mailctl/internal/stalwart/fake"
 )
 
 func dnsbl(e *env, typ, name, zone string, enable bool) string {
@@ -119,5 +122,57 @@ func TestSettings(t *testing.T) {
 	}
 	if e.f.Get("SpamDnsblServer", "", dbl)["enable"] != true {
 		t.Fatal("domain list off in degraded mode")
+	}
+}
+
+// TestDQSKeyNeverReachesViewer (security review N4, data flow): the DQS
+// key, mailctl's secret source for the spam settings, is written only
+// where the admin view's viewer can't read it.
+func TestDQSKeyNeverReachesViewer(t *testing.T) {
+	e := newEnv(t)
+	d := baseDoc(t)
+	dnsbl(e, "Ip", "STWT_RBL_SPAMHAUS_IP", "ip_reverse + '.zen.spamhaus.org'", true)
+	dnsbl(e, "Domain", "STWT_DBL_SPAMHAUS_DOMAIN", "value + '.dbl.spamhaus.org'", true)
+	kf := filepath.Join(t.TempDir(), "dqs-key")
+	const key = "sentinelkey0123456789"
+	os.WriteFile(kf, []byte(key+"\n"), 0o600)
+	if err := Settings(context.Background(), e.c, d, SettingsOpts{DQSKeyFile: kf}); err != nil {
+		t.Fatal(err)
+	}
+	assertNoViewerLeak(t, e.f, key)
+}
+
+// assertNoViewerLeak fails when secret reaches a field the viewer reads,
+// in any write the fake received or anything it stores; it also fails when
+// secret was written nowhere (a vacuous check).
+func assertNoViewerLeak(t *testing.T, f *fake.Server, secret string) {
+	t.Helper()
+	schema, err := os.ReadFile("../stalwart/testdata/schema-v1.1.0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ty, err := stalwart.ParseTypes(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, w := range f.Written {
+		if b, _ := json.Marshal(w.Fields); strings.Contains(string(b), secret) {
+			seen = true
+		}
+		if l := stalwart.ViewerSecretLeaks(ty, w.Object, w.Fields, secret); len(l) > 0 {
+			t.Errorf("a secret reaches the viewer: %v", l)
+		}
+	}
+	for st, objs := range f.Stores() {
+		obj, _, _ := strings.Cut(st, "@")
+		for _, o := range objs {
+			if l := stalwart.ViewerSecretLeaks(ty, obj, o, secret); len(l) > 0 {
+				t.Errorf("a stored secret reaches the viewer: %v", l)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("the secret was never written: the check proves nothing")
 	}
 }

@@ -988,7 +988,7 @@ case "$p" in
   # The authenticator-app actions: absent until configure registers them
   # (POST register-required-action), then the last PUT; their config is the
   # last PUT unless KC_OTP_KEEP is set (Keycloak keeping the old one).
-  "$R/authentication/required-actions/CONFIGURE_TOTP"|"$R/authentication/required-actions/delete_credential")
+  "$R/authentication/required-actions/CONFIGURE_TOTP"|"$R/authentication/required-actions/delete_credential"|"$R/authentication/required-actions/portcullis-let-through")
     jq -sc --arg p "$p" --arg a "${p##*/}" '([.[] | select(.m == "PUT" and .p == $p) | .b | fromjson] | last)
         // (if any(.[]; .m == "POST" and (.p | endswith("/register-required-action")) and (.b | fromjson | .providerId) == $a)
             then {alias: $a, providerId: $a, name: $a, enabled: false, defaultAction: false, priority: 1000, config: {}} else {} end)' "$KC_LOG" ;;
@@ -1031,7 +1031,7 @@ expect_eq "keycloak configure: OTP settings equal realm-export.json's" \
   "$(jq -cS 'with_entries(select(.key | startswith("otpPolicy")))' "$HERE/../keycloak/realm-export.json")" \
   "$(bash -c ". '$HERE/../scripts/lib/keycloak.sh'; printf '%s' \"\$KC_REALM_OTP_SETTINGS\"" | jq -cS .)"
 expect_eq "keycloak configure registers CONFIGURE_TOTP and delete_credential when the realm lacks them" \
-  "$(jq -sc '[.[] | select(.m == "POST" and (.p | endswith("/authentication/register-required-action"))) | .b | fromjson]' "$WORK/kc/log")" \
+  "$(jq -sc '[.[] | select(.m == "POST" and (.p | endswith("/authentication/register-required-action"))) | .b | fromjson | select(.providerId != "portcullis-let-through")]' "$WORK/kc/log")" \
   '[{"providerId":"CONFIGURE_TOTP","name":"Configure OTP"},{"providerId":"delete_credential","name":"Delete Credential"}]'
 expect_eq "keycloak configure enables both (CONFIGURE_TOTP at 85, delete_credential at 100, never a default action)" \
   "$(jq -sc '[.[] | select(.m == "PUT" and (.p | test("/required-actions/(CONFIGURE_TOTP|delete_credential)$"))) | .b | fromjson | [.alias, .enabled, .defaultAction, .priority]]' "$WORK/kc/log")" \
@@ -1093,6 +1093,12 @@ expect_eq "keycloak configure: stock webauthn-register (two-factor) required act
 expect_eq "keycloak configure (stub admin API): the impersonation mapper POSTed onto the acr scope, the disabled notice action enabled (never registered)" \
   "$(jq -sc '[.[] | select(.m != "GET") | select(.p | test("acr-id/protocol-mappers|required-actions/portcullis-impersonation-notice")) | .m + " " + .p + " " + (.b | fromjson | .protocolMapper // (.enabled | tostring))]' "$WORK/kc/log")" \
   '["POST /admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models oidc-amr-mapper","POST /admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models portcullis-impersonation","PUT /admin/realms/portcullis/authentication/required-actions/portcullis-impersonation-notice true"]'
+expect_eq "keycloak configure (stub admin API): the missing let-through action registered, then enabled last (priority 1000, never a default action)" \
+  "$(jq -sc '[.[] | select(.m != "GET") | select((.p | endswith("/required-actions/portcullis-let-through")) or ((.p | endswith("/register-required-action")) and (.b | fromjson | .providerId) == "portcullis-let-through")) | .m + " " + (.p | sub(".*/"; "")) + " " + (.b | fromjson | if .priority then "\(.enabled) \(.defaultAction) \(.priority) \(.name)" else .name end)]' "$WORK/kc/log")" \
+  '["POST register-required-action Let through","PUT portcullis-let-through true false 1000 Let through"]'
+expect_eq "realm-export: requiredActions has exactly the pinned portcullis-let-through entry (KC_LET_THROUGH)" \
+  "$(jq -cS '[.requiredActions[] | select(.alias == "portcullis-let-through" or .providerId == "portcullis-let-through")]' "$HERE/../keycloak/realm-export.json")" \
+  "$(sed -n "s/^KC_LET_THROUGH='\(.*\)'\$/\1/p" "$HERE/../scripts/lib/keycloak.sh" | jq -cS '[.]')"
 
 # ── keycloak configure: the impersonation mapper and the notice action
 # (contract §8, sign-in part 3; F5), with kc_get / kc_send stubbed ──
@@ -1359,6 +1365,12 @@ expect_eq "keycloak gets PORTCULLIS_PORTAL_URL = the portal" \
 expect_eq "every forward-auth middleware's authResponseHeaders lists X-Forwarded-Impersonator and X-Forwarded-Impersonation" \
   "$(sed -n 's/^      traefik\.http\.middlewares\.\([a-z-]*\)\.forwardauth\.authResponseHeaders: \(.*\)$/\1 \2/p' "$HERE/../docker-compose.yml" \
       | while read -r mw hdrs; do
+          # The sign-out guard hands on no identity (oauth2-proxy, its only
+          # backend, reads none): exactly the landing page header.
+          if [ "$mw" = portcullis-signout-guard ]; then
+            [ "$hdrs" = X-Auth-Request-Redirect ] || echo "$mw: hands on more than X-Auth-Request-Redirect"
+            continue
+          fi
           if printf ',%s,' "$hdrs" | grep -q ',X-Forwarded-Impersonator,' && printf ',%s,' "$hdrs" | grep -q ',X-Forwarded-Impersonation,'; then
             echo "$mw"
           else echo "$mw: missing an impersonation header"; fi
@@ -1660,21 +1672,27 @@ TLS_GOT="$(awk '
   /^    [a-z-]+:$/ { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s; n = $1; sub(/:$/, "", n); t = ""; ca = ""; v = ""; s = ""; next }
   /clientAuthType:/ { t = $2 } /^[[:space:]]*- / { ca = (ca ? ca "," : "") $2 } /minVersion:/ { v = $2 } /sniStrict:/ { s = $2 }
   END { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s }' "$TLS_YML")"
-expect_eq "traefik/dynamic/tls.yml defines exactly protected, protected-any, authaware, public with those clientAuth types and chains" "$TLS_GOT" \
+expect_eq "traefik/dynamic/tls.yml defines exactly protected, protected-any, default, public with those clientAuth types and chains" "$TLS_GOT" \
 "protected RequireAndVerifyClientCert /certs/ca-chain-yubikey.crt VersionTLS12 false
 protected-any RequireAndVerifyClientCert /certs/ca-chain.crt VersionTLS12 false
-authaware VerifyClientCertIfGiven /certs/ca-chain.crt VersionTLS12 false
+default VerifyClientCertIfGiven /certs/ca-chain.crt VersionTLS12 false
 public none - VersionTLS12 false"
 expect_eq "tls.yml: only the tls.options block" "$(grep -cvE '^[[:space:]]*(#|$)' "$TLS_YML")" 26
 expect_eq "tls.yml is tracked by git" "$(git -C "$ROOT_DIR" ls-files traefik/dynamic/tls.yml)" "traefik/dynamic/tls.yml"
-# Every core router carries authaware@file.
+# Every core router carries default.
 ROUTERS="$(grep -oE 'traefik\.http\.routers\.[a-z0-9-]+\.rule' "$ROOT_DIR/docker-compose.yml" | sed 's/^traefik\.http\.routers\.//; s/\.rule$//' | sort -u)"
 BAD=""
 for r in $ROUTERS; do
-  grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
+  grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: default$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:25"
-expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
+expect_eq "every core router in docker-compose.yml uses default" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:27"
+expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vcE 'tls\.options: default$' || true)" 0
+# Traefik's default options are the core pages' (and the Hub's optional
+# tier's) one name: a name without a router gets them, and Traefik answers
+# 421 when the names differ (contract §5). The old name must not come back,
+# and default is never provider-qualified.
+expect_eq "no authaware option name or default@file reference in the tracked config, compose files, chart, scripts or CI" \
+  "$(git -C "$ROOT_DIR" grep -nE 'authaware|default@file' -- traefik 'docker-compose*.yml' charts kube scripts portcullis .github tests/e2e ':!.github/ci/e2e-k3s-edge-admission.sh' || true)" ""
 # VPN (contract §16, security ruling): every core router's entrypoints
 # label is literally its class: routers without group-gate take
 # PORTCULLIS_EP_* (websecure,vpnsecure or vpnsecure); routers through
@@ -1689,7 +1707,7 @@ for r in dashboard keycloak-admin hub grafana-metrics; do EP_WANT="$EP_WANT$r \$
 for r in portal people; do EP_WANT="$EP_WANT$r \${PORTCULLIS_WEB_CORE:-websecure}"$'\n'; done
 EP_WANT="${EP_WANT}people-vpn-enrol \${PORTCULLIS_WEB_ENROL:-websecure}"$'\n'
 for r in lldap mcp hub-mcp people-mcp; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}"$'\n'; done
-for r in keycloak keycloak-resources oauth2-callback enroll-invite people-cli; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
+for r in keycloak keycloak-resources oauth2-callback oauth2-signout signed-out enroll-invite people-cli; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
 for r in dashboard keycloak-admin hub grafana-metrics portal people people-vpn-enrol; do EP_WANT="$EP_WANT$r-vpn vpnsecure"$'\n'; done
 for r in core-vpn-required keycloak-admin-vpn-required; do EP_WANT="$EP_WANT$r websecure"$'\n'; done
 EP_WANT="$(printf '%s' "$EP_WANT" | LC_ALL=C sort | tr '\n' ';')"
@@ -1806,7 +1824,7 @@ expect_eq "no user-facing text (README, .env.example, docs, monitoring, theme, C
   "$(git -C "$ROOT_DIR" grep -niE 'client cert' -- README.md .env.example docs monitoring keycloak/themes portcullis scripts/lib enroll/web group-gate/group-gate-map.conf \
       | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)" ""
 expect_eq "tls.yml's header says which option uses which chain and who uses it" \
-  "$(grep -cE '^# (protected|protected-any|authaware|public): ' "$TLS_YML"):$(grep -c 'Used by' "$TLS_YML")" "4:4"
+  "$(grep -cE '^# (protected|protected-any|default|public): ' "$TLS_YML"):$(grep -c 'Used by' "$TLS_YML")" "4:4"
 
 # config apply leaves tls.yml byte-identical and writes no traefik file.
 CA_ROOT="$WORK/ca-root"

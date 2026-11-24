@@ -1503,6 +1503,43 @@ def check_edge(docs):
                 F.add(f"{d['kind']} {d['metadata']['name']} in {ns}: core Traefik objects live in {K.EDGE_NS} (Traefik's only watched namespace)")
             if (d["metadata"].get("labels") or {}).get("portcullis.io/owner") != "core":
                 F.add(f"{d['kind']} {d['metadata']['name']}: no portcullis.io/owner=core (the Hub could change it)")
+    # Keycloak reads the Hub's signin-keycloak.json / impersonation.json
+    # (0644) from hub-data: the PVC root is 0751 (traverse, no listing) and
+    # Keycloak gets no Hub group (10001) and no fsGroup, read-only mount.
+    pvcs = {d["metadata"]["name"]: d for d in K.by_kind(docs, "PersistentVolumeClaim")}
+    hd = pvcs.get("hub-data")
+    if not hd or hd["metadata"]["annotations"].get("portcullis.io/mode") != "0751":
+        F.add(f"PVC hub-data: mode {hd and hd['metadata']['annotations'].get('portcullis.io/mode')} (want 0751: Keycloak traverses, never lists)")
+    for dep in K.by_kind(docs, "Deployment"):
+        if dep["metadata"]["name"] != "keycloak":
+            continue
+        ps = dep["spec"]["template"]["spec"]
+        sc = ps.get("securityContext") or {}
+        if sc.get("fsGroup") is not None or 10001 in (sc.get("supplementalGroups") or []):
+            F.add(f"keycloak: fsGroup {sc.get('fsGroup')} / supplementalGroups {sc.get('supplementalGroups')} (it needs no Hub group)")
+        mnt = [m for c in ps["containers"] for m in c.get("volumeMounts", []) if m["name"] == "hub-data"]
+        if not mnt or not all(m.get("readOnly") for m in mnt):
+            F.add("keycloak: hub-data isn't mounted read-only")
+    # Sign out's backend logout (contract §5 "Sign out"): kcinternal-logout
+    # = kcinternal's entrypoint, middleware and service on exactly the
+    # logout path, with its access log off (the query carries the ID token),
+    # and the only route anywhere with observability set.
+    irs = {d["metadata"]["name"]: d for d in K.by_kind(docs, "IngressRoute")}
+    lo, ki = irs.get("kcinternal-logout"), irs.get("kcinternal")
+    if not lo or not ki:
+        F.add("IngressRoute kcinternal-logout or kcinternal missing")
+    else:
+        r, k = lo["spec"]["routes"], ki["spec"]["routes"][0]
+        if (lo["spec"].get("entryPoints") != ["kcinternal"] or len(r) != 1
+                or r[0].get("match") != "Path(`/realms/portcullis/protocol/openid-connect/logout`)"
+                or r[0].get("observability") != {"accessLogs": False}
+                or r[0].get("middlewares") != k.get("middlewares") or r[0].get("services") != k.get("services")
+                or not (isinstance(r[0].get("priority"), int) and r[0]["priority"] > len(k["match"]))):
+            F.add(f"IngressRoute kcinternal-logout isn't kcinternal's route on the exact logout path without access logs: {r}")
+    for name, ir in irs.items():
+        for r in ir["spec"]["routes"]:
+            if "observability" in r and name != "kcinternal-logout":
+                F.add(f"IngressRoute {name}: observability set (only kcinternal-logout turns its access log off)")
     # The apps' bounds (core-routes.json → params reservedHosts /
     # maxAppPriority), with their mutation tests.
     cr = json.loads((K.CHART / "core-routes.json").read_text())

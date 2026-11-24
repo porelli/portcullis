@@ -85,11 +85,13 @@ printf '%s' '{"version": 7,
 # The extension's signin-keycloak.json (normally written by the Hub;
 # without it nobody signs in, contract §8.1): the same methods and
 # templates, no native-OIDC clients, the CI trust list (Chromium's
-# virtual authenticator = a security key) and no FIDO list yet.
+# virtual authenticator = a security key), no FIDO list yet, and the
+# policy's hosts as app_hosts (the "Let through" page names only those).
 docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/group-gate-policy.json \
   | jq -c --slurpfile auth tests/e2e/fixtures/virtual-authenticators.json \
       '{version: 1, methods, add_stronger, templates, clients: {}, authenticators: $auth[0],
-        mds: {serial: 0, next_update: "0001-01-01T00:00:00Z"}}' \
+        mds: {serial: 0, next_update: "0001-01-01T00:00:00Z"},
+        app_hosts: ([.core, .hosts, .groups] | map(keys) | add | unique)}' \
   | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" \
       sh -c 'cat > /d/signin-keycloak.json.tmp && chmod 644 /d/signin-keycloak.json.tmp && mv /d/signin-keycloak.json.tmp /d/signin-keycloak.json'
 # Shared custom fields (normally written by the Hub): e2e_login.py
@@ -108,7 +110,7 @@ services:
       traefik.http.services.e2e.loadbalancer.server.port: "80"
       traefik.http.routers.e2e.rule: Host(`app.portcullis.local`) || Host(`hwk.portcullis.local`) || Host(`mtls.portcullis.local`)
       traefik.http.routers.e2e.entrypoints: websecure
-      traefik.http.routers.e2e.tls.options: authaware@file
+      traefik.http.routers.e2e.tls.options: default
       traefik.http.routers.e2e.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.routers.e2e.service: e2e
 networks:

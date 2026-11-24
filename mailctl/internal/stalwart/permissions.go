@@ -1,5 +1,7 @@
 package stalwart
 
+import "strings"
+
 // Permission lists (contract §19.4, §19.6, §19.11; the names are Stalwart
 // v1.1.0's `Permission` enum, checked against the schema snapshot).
 
@@ -83,8 +85,95 @@ var MailctlRolePermissions = func() []string {
 	return out
 }()
 
+// ViewerRolePermissions is the role portcullis-viewer: the read-only
+// mail admin view (contract §19.13). authenticate plus the Get and Query
+// permission of every management object of v1.1.0 except
+// ViewerDenied's, and nothing else: no Create, Update, Destroy, action,
+// task, live*, impersonate, jmap*, imap*, pop3*, sieve*, dav*, email* or
+// fetchAnyBlob permission. Stalwart masks every secret field on a read
+// ("****"; includeSecrets stays false), and the bootstrap job (the
+// recovery admin) is the only one that can grant it: mailctl's own role
+// lacks most of these reads and every sysRole* permission.
+var ViewerRolePermissions = []string{
+	"authenticate",
+	"sysAccountGet", "sysAccountQuery", "sysAccountSettingsGet", "sysAcmeProviderGet", "sysAcmeProviderQuery",
+	"sysAddressBookGet", "sysAlertGet", "sysAlertQuery", "sysAllowedIpGet", "sysAllowedIpQuery",
+	"sysApplicationGet", "sysApplicationQuery", "sysAuthenticationGet", "sysBlockedIpGet", "sysBlockedIpQuery",
+	"sysCalendarGet", "sysCalendarAlarmGet", "sysCalendarSchedulingGet", "sysCertificateGet",
+	"sysCertificateQuery", "sysClusterNodeGet", "sysClusterNodeQuery", "sysClusterRoleGet",
+	"sysClusterRoleQuery", "sysDataRetentionGet", "sysDkimReportSettingsGet", "sysDkimSignatureGet",
+	"sysDkimSignatureQuery", "sysDmarcReportSettingsGet", "sysDnsResolverGet", "sysDomainGet",
+	"sysDomainQuery", "sysDsnReportSettingsGet", "sysEmailGet", "sysEncryptionGet", "sysEventTracingLevelGet",
+	"sysEventTracingLevelQuery", "sysExternalPublicKeyGet", "sysExternalPublicKeyQuery", "sysFileStorageGet",
+	"sysHttpFormGet", "sysImapGet", "sysIndexQueueStatusGet", "sysIndexQueueStatusQuery", "sysJmapGet",
+	"sysMailingListGet", "sysMailingListQuery", "sysMemoryLookupKeyGet", "sysMemoryLookupKeyQuery",
+	"sysMetadataGet", "sysMetricGet", "sysMetricQuery", "sysMtaConnectionStrategyGet",
+	"sysMtaConnectionStrategyQuery", "sysMtaDeliveryScheduleGet", "sysMtaDeliveryScheduleQuery",
+	"sysMtaExtensionsGet", "sysMtaInboundSessionGet", "sysMtaInboundThrottleGet", "sysMtaInboundThrottleQuery",
+	"sysMtaMilterGet", "sysMtaMilterQuery", "sysMtaOutboundStrategyGet", "sysMtaOutboundThrottleGet",
+	"sysMtaOutboundThrottleQuery", "sysMtaQueueQuotaGet", "sysMtaQueueQuotaQuery", "sysMtaRouteGet",
+	"sysMtaRouteQuery", "sysMtaStageAuthGet", "sysMtaStageConnectGet", "sysMtaStageDataGet",
+	"sysMtaStageEhloGet", "sysMtaStageMailGet", "sysMtaStageRcptGet", "sysMtaStsGet", "sysMtaTlsStrategyGet",
+	"sysMtaTlsStrategyQuery", "sysMtaVirtualQueueGet", "sysMtaVirtualQueueQuery", "sysNetworkListenerGet",
+	"sysNetworkListenerQuery", "sysOAuthClientGet", "sysOAuthClientQuery", "sysOidcProviderGet",
+	"sysPublicKeyGet", "sysPublicKeyQuery", "sysReportSettingsGet", "sysRoleGet", "sysRoleQuery",
+	"sysSearchGet", "sysSecurityGet", "sysSenderAuthGet", "sysSharingGet", "sysSieveSystemInterpreterGet",
+	"sysSieveSystemScriptGet", "sysSieveSystemScriptQuery", "sysSieveUserInterpreterGet",
+	"sysSmimeTrustAnchorGet", "sysSmimeTrustAnchorQuery", "sysSpamClassifierGet", "sysSpamFileExtensionGet",
+	"sysSpamFileExtensionQuery", "sysSpamPyzorGet", "sysSpamRuleGet", "sysSpamRuleQuery", "sysSpamSettingsGet",
+	"sysSpamTagGet", "sysSpamTagQuery", "sysSpfReportSettingsGet", "sysSystemSettingsGet", "sysTaskManagerGet",
+	"sysTenantGet", "sysTenantQuery", "sysTlsReportSettingsGet", "sysWebDavGet",
+}
+
+// ViewerDenied are the management objects whose reads the viewer never
+// gets (contract §19.13):
+//   - credentials and their metadata: AccountPassword, ApiKey,
+//     AppPassword, Passkey, OAuthGrant, Bootstrap, SymmetricKey, Enterprise;
+//   - people's data: SpamTrainingSample, ArchivedItem, MaskedEmail,
+//     SieveUserScript;
+//   - messages and their envelopes: QueuedMessage (the queue) and the
+//     received and sent DMARC, TLS and ARF reports;
+//   - every object whose plain (unmasked) fields can hold a secret: a
+//     connection URL or username, HTTP headers, a DNS or HTTP provider's
+//     keys, a lookup zone (the Spamhaus DQS key sits in SpamDnsblServer's
+//     zone): the stores, directories, DNS servers, hooks, tracers,
+//     metrics exporters, AI models, HTTP lookups and the DNSBL settings,
+//     free-form lookup values (MemoryLookupKeyValue) and tasks (their
+//     inputs, blobs and failure texts);
+//   - the server's logs and traces: Log, Trace.
+//
+// TestViewerSecretFreeFields walks the schema snapshot so a field that
+// could hold a secret can't come back unjudged.
+var ViewerDenied = []string{"AccountPassword", "ApiKey", "AppPassword", "Passkey", "OAuthGrant", "Bootstrap", "SymmetricKey",
+	"Enterprise", "SpamTrainingSample", "ArchivedItem", "MaskedEmail", "SieveUserScript",
+	"QueuedMessage", "ArfExternalReport", "DmarcExternalReport", "DmarcInternalReport", "TlsExternalReport", "TlsInternalReport",
+	"SpamDnsblServer", "SpamDnsblSettings", "AiModel", "SpamAi", "Asn", "BlobStore", "Cache", "Coordinator", "DataStore", "Directory",
+	"DnsServer", "Http", "HttpLookup", "InMemoryStore", "Metrics", "MetricsStore", "MtaHook", "SearchStore", "StoreLookup",
+	"Tracer", "TracingStore", "WebHook", "MemoryLookupKeyValue", "Task",
+	"Log", "Trace"}
+
+// viewerMethods are the only JMAP methods the admin view forwards: x:<Obj>/get
+// and x:<Obj>/query for exactly the objects ViewerRolePermissions reads
+// (one list for both layers, contract §19.13).
+var viewerMethods = func() map[string]bool {
+	m := map[string]bool{}
+	for _, p := range ViewerRolePermissions {
+		if obj, ok := strings.CutSuffix(strings.TrimPrefix(p, "sys"), "Get"); ok && p != obj {
+			m["x:"+obj+"/get"] = true
+		} else if obj, ok := strings.CutSuffix(strings.TrimPrefix(p, "sys"), "Query"); ok {
+			m["x:"+obj+"/query"] = true
+		}
+	}
+	return m
+}()
+
+// ViewerMethodAllowed reports a JMAP method the admin view may forward:
+// exactly x:<Obj>/get or x:<Obj>/query (lowercase x:, exact case) of an
+// object the viewer's role reads. Everything else is refused.
+func ViewerMethodAllowed(method string) bool { return viewerMethods[method] }
+
 func init() {
-	for _, l := range [][]string{MailPasswordPermissions, ExportPermissions, MailctlRolePermissions} {
+	for _, l := range [][]string{MailPasswordPermissions, ExportPermissions, MailctlRolePermissions, ViewerRolePermissions} {
 		for _, p := range l {
 			Used = append(Used, Use{Enum: "Permission", Value: p})
 		}

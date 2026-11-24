@@ -769,3 +769,50 @@ func TestDMARCNeverBelowFloor(t *testing.T) {
 		t.Fatal("AtLeast")
 	}
 }
+
+// TestDKIMKeysNeverReachViewer (security review N4, R2-M1, data flow):
+// the DKIM private keys mailctl makes are written only into masked secret
+// fields. The sentinel is a slice of each generated key's own body (an
+// un-armoured copy anywhere would match), checked in every write and
+// every stored object.
+func TestDKIMKeysNeverReachViewer(t *testing.T) {
+	e := newEnv(t, nil)
+	e.step(t)
+	schema, err := os.ReadFile("../stalwart/testdata/schema-v1.1.0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ty, err := stalwart.ParseTypes(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bodies []string
+	for _, w := range e.f.Written {
+		pk, _ := w.Fields["privateKey"].(map[string]any)
+		pem, _ := pk["secret"].(string)
+		for _, ln := range strings.Split(pem, "\n") {
+			if len(ln) >= 40 && !strings.HasPrefix(ln, "-----") {
+				bodies = append(bodies, ln[8:40])
+				break
+			}
+		}
+	}
+	if len(bodies) < 2 {
+		t.Fatalf("%d DKIM keys written: the check proves nothing", len(bodies))
+	}
+	for _, b := range bodies {
+		for _, w := range e.f.Written {
+			if l := stalwart.ViewerSecretLeaks(ty, w.Object, w.Fields, b); len(l) > 0 {
+				t.Errorf("a private key reaches the viewer: %v", l)
+			}
+		}
+		for st, objs := range e.f.Stores() {
+			obj, _, _ := strings.Cut(st, "@")
+			for _, o := range objs {
+				if l := stalwart.ViewerSecretLeaks(ty, obj, o, b); len(l) > 0 {
+					t.Errorf("a stored private key reaches the viewer: %v", l)
+				}
+			}
+		}
+	}
+}

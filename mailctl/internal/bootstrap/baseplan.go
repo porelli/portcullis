@@ -23,9 +23,22 @@ const (
 	UserRole       = "portcullis-mail-user"
 	MailctlAccount = "portcullis-mailctl"
 	APIKeyName     = "mailctl"
-	SMTPPort       = 10025 // the MX listener (host port 25)
-	MgmtPort       = 8080  // the management listener (JMAP / API)
-	TLSDir         = "/run/portcullis/mail/tls"
+	// The read-only mail admin view (contract §19.13): its role and its
+	// account on the parking domain, whose password only the template's
+	// admin-view service holds.
+	ViewerRole    = "portcullis-viewer"
+	ViewerAccount = "portcullis-viewer"
+	// AdminViewPort is the admin view's TLS listener: Stalwart serves its
+	// web admin's sign-in only over TLS and only to a trusted host
+	// (STALWART_PUBLIC_URL), so the admin-view proxy dials it here.
+	AdminViewPort     = 8443
+	AdminViewListener = "admin-view"
+	// WebUIBundle is the web admin bundle, pinned in the mailctl image and
+	// copied with mailctl into mailctl_bin (never downloaded at run time).
+	WebUIBundle = "/portcullis/bin/webui.zip"
+	SMTPPort    = 10025 // the MX listener (host port 25)
+	MgmtPort    = 8080  // the management listener (JMAP / API)
+	TLSDir      = "/run/portcullis/mail/tls"
 	// The slot's files, mounted by the Hub's override at a fixed path
 	// into the gated services (contract §19.1).
 	SlotDir       = "/run/portcullis/mail/slot"
@@ -71,6 +84,10 @@ type Params struct {
 	// LANOnly: submission_lan_only (the SASL rule admits only the
 	// Local networks; loopback only with rewritten client addresses).
 	LANOnly bool
+	// ViewerIP is the admin-view proxy's internal address (contract
+	// §19.13): the only client the admin-view listener answers. Invalid =
+	// no admin view rule.
+	ViewerIP netip.Addr
 }
 
 // saslNets: the Local networks the SASL rule admits (none with rewritten
@@ -133,7 +150,7 @@ type Named struct {
 	Immutable []string
 }
 
-// listeners are the six (Global Constraints); every other one is destroyed.
+// listeners are the seven (Global Constraints, plus the admin view's); every other one is destroyed.
 func (p Params) listeners() Named {
 	l := func(name, proto string, tls, implicit bool, binds ...string) map[string]any {
 		return map[string]any{"name": name, "protocol": proto, "bind": set(binds...), "useTls": tls, "implicitTls": implicit}
@@ -154,7 +171,16 @@ func (p Params) listeners() Named {
 		// every address; the access rule answers it only /metrics/prometheus,
 		// with the scrape password.
 		l("metrics", "http", false, false, "[::]:9180"),
+		adminViewListener(),
 	}}
+}
+
+// adminViewListener is the read-only admin view's listener (contract
+// §19.13): TLS with the mail certificate, answered only to the admin-view
+// proxy's address (AllowedEndpoints). The one definition: the base plan
+// and EnsureAdminView's repair of an older store both use it.
+func adminViewListener() map[string]any {
+	return map[string]any{"name": AdminViewListener, "protocol": "http", "bind": set(fmt.Sprintf("[::]:%d", AdminViewPort)), "useTls": true, "implicitTls": true}
 }
 
 // AllowedEndpoints is the management listener's access rule (M12, Task 2
@@ -163,10 +189,27 @@ func (p Params) listeners() Named {
 // real control.
 func (p Params) AllowedEndpoints() map[string]any {
 	ip := p.MailctlIP.String()
-	return expr("404",
-		[2]string{fmt.Sprintf("listener == 'management' && remote_ip == '%s' && (starts_with(path, '/jmap') || starts_with(path, '/api') || path == '/.well-known/jmap')", ip), "200"},
-		[2]string{"listener == 'metrics' && path == '/metrics/prometheus'", "200"},
-	)
+	rules := [][2]string{
+		{fmt.Sprintf("listener == 'management' && remote_ip == '%s' && (starts_with(path, '/jmap') || starts_with(path, '/api') || path == '/.well-known/jmap')", ip), "200"},
+		{"listener == 'metrics' && path == '/metrics/prometheus'", "200"},
+	}
+	if p.ViewerIP.IsValid() {
+		// The admin view (contract §19.13): only the proxy's address, only
+		// the web admin's paths (the proxy filters them again).
+		rules = append(rules, [2]string{fmt.Sprintf("listener == '%s' && remote_ip == '%s' && (%s)", AdminViewListener, p.ViewerIP, adminViewPaths), "200"})
+	}
+	return expr("404", rules...)
+}
+
+// adminViewPaths are the paths the admin-view listener answers: the web
+// admin, its sign-in and token endpoints, its reads.
+const adminViewPaths = "starts_with(path, '/admin') || path == '/login' || starts_with(path, '/logo') || starts_with(path, '/api/') || starts_with(path, '/auth/') || starts_with(path, '/jmap') || starts_with(path, '/.well-known/o')"
+
+// WebUIApplication is the web admin's settings (contract §19.13): served
+// only at /admin (never the /account self-service: a mail password opens
+// no web interface, P11), from the bundle pinned in the mailctl image.
+func WebUIApplication() map[string]any {
+	return map[string]any{"enable": true, "urlPrefix": set("/admin"), "resourceUrl": "file://" + WebUIBundle}
 }
 
 func (p Params) senderAuth() map[string]any {
@@ -300,7 +343,9 @@ func (p Params) systemSettings() map[string]any {
 	if h == "" {
 		h = PlaceholderHostname
 	}
-	return map[string]any{"maxBufferedMemory": 134217728, "defaultHostname": h}
+	// includeSecrets stays false: Stalwart masks every secret on a read
+	// only then (the admin view's viewer reads settings, contract §19.13).
+	return map[string]any{"maxBufferedMemory": 134217728, "defaultHostname": h, "includeSecrets": false}
 }
 
 func (p Params) domains() []map[string]any {
@@ -409,9 +454,17 @@ func (p Params) Collections() []Named {
 		{Object: "Role", Key: "description", Want: []map[string]any{
 			{"description": MailctlRole, "enabledPermissions": set(stalwart.MailctlRolePermissions...)},
 			{"description": UserRole, "enabledPermissions": set(stalwart.MailPasswordPermissions...)},
+			viewerRole(),
 		}},
 		{Object: "Domain", Key: "name", Immutable: []string{"name"}, Want: p.domains()},
 	}
+}
+
+// viewerRole is the admin view's role (contract §19.13): the read-only
+// list and nothing else. The one definition: the base plan and
+// ResetViewer's repair of an older store both use it.
+func viewerRole() map[string]any {
+	return map[string]any{"description": ViewerRole, "enabledPermissions": set(stalwart.ViewerRolePermissions...)}
 }
 
 // manual is every domain's management (no ACME, DNS or DKIM automation in
@@ -462,7 +515,7 @@ func init() {
 	reg("Certificate", map[string]any{"certificate": nil, "privateKey": nil})
 	reg("SystemSettings", map[string]any{"defaultCertificateId": nil, "defaultDomainId": nil})
 	reg("Authentication", map[string]any{"defaultUserRoleIds": nil})
-	reg("Application", map[string]any{"enable": nil})
+	reg("Application", WebUIApplication())
 	reg("Asn", map[string]any{"@type": "Resource", "asnUrls": nil, "geoUrls": nil})
 	stalwart.Used = append(stalwart.Used, stalwart.Use{Object: "x:Asn", Variant: "Disabled"})
 	reg("Account", map[string]any{"@type": "User", "name": nil, "domainId": nil, "description": nil, "credentials": nil, "roles": nil})
@@ -470,6 +523,8 @@ func init() {
 	for _, u := range []stalwart.Use{
 		{Object: "x:AcmeProvider"},
 		{Object: "x:UserRoles", Variant: "Custom", Field: "roleIds"},
+		// ResetViewer stops a drifted viewer role extending others.
+		{Object: "x:Role", Field: "roleIds"},
 		{Object: "x:CredentialPermissions", Variant: "Inherit"},
 		{Object: "x:PublicText", Variant: "File", Field: "filePath"},
 		{Object: "x:SecretText", Variant: "File", Field: "filePath"},

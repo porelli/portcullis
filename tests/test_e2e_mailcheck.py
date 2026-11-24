@@ -218,5 +218,49 @@ class MailStatus(unittest.TestCase):
             self.assertIn(want, got)
 
 
+class AdminViewFlow(unittest.TestCase):
+    """admin_view_problems: the admin view's whole flow as the browser saw
+    it (method, status, URL), every step answered, no 421 / 403 anywhere."""
+
+    H = "https://mail-admin.ci.example.org"
+
+    def good(self):
+        h = self.H
+        return [("GET", 200, "https://mail.ci.example.org/"), ("GET", 404, "https://mail.ci.example.org/"),
+                ("GET", 200, "https://hub.ci.example.org/"), ("POST", 200, "https://hub.ci.example.org/api/mail/admin-view"),
+                ("GET", 200, h + "/portcullis/open"), ("GET", 200, h + "/portcullis/open.js"),
+                ("POST", 302, h + "/portcullis/open"), ("GET", 200, h + "/admin/"),
+                ("GET", 200, h + "/api/discover/anyone%40x"), ("GET", 302, h + "/login?response_type=code&state=s"),
+                ("GET", 200, h + "/admin/oauth/callback?code=c&state=s"), ("POST", 200, h + "/auth/token"),
+                ("GET", 200, h + "/jmap/session"), ("POST", 200, h + "/jmap")]
+
+    def test_whole_flow(self):
+        self.assertEqual(mc.admin_view_problems(self.good()), [])
+
+    def test_jmap_with_a_trailing_slash(self):
+        seen = [(m, s, u + "/" if u.endswith("/jmap") else u) for m, s, u in self.good()]
+        self.assertEqual(mc.admin_view_problems(seen), [])
+
+    def test_a_421_or_403_anywhere(self):
+        for status, url in ((421, "https://hub.ci.example.org/"), (403, self.H + "/jmap"), (421, self.H + "/portcullis/open")):
+            got = mc.admin_view_problems(self.good() + [("GET", status, url)])
+            self.assertTrue(any(str(status) in p and url.split("?")[0] in p for p in got), (status, got))
+
+    def test_query_strings_never_in_the_problems(self):
+        got = mc.admin_view_problems([("GET", 421, self.H + "/login?code=secret-code&state=s")])
+        self.assertFalse(any("secret-code" in p for p in got), got)
+
+    def test_each_step_missing(self):
+        from urllib.parse import urlsplit
+        for method, prefix in mc.ADMIN_VIEW_STEPS:
+            seen = [x for x in self.good() if not (x[0] == method and urlsplit(x[2]).path.startswith(prefix))]
+            got = mc.admin_view_problems(seen)
+            self.assertTrue(any(prefix in p for p in got), (prefix, got))
+
+    def test_a_failed_step(self):
+        seen = [(m, 400 if u.endswith("/auth/token") else s, u) for m, s, u in self.good()]
+        self.assertTrue(any("/auth/token" in p for p in mc.admin_view_problems(seen)))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -185,6 +185,9 @@ func randomSecret(n int) (string, error) {
 // and no rotation was asked for.
 type Result struct {
 	APIKey string
+	// ViewerPassword is the admin view account's new password (never
+	// logged; the job writes it to the viewer secret file).
+	ViewerPassword string
 }
 
 // Apply runs the base plan as the recovery admin (c), idempotently.
@@ -271,19 +274,21 @@ func Apply(ctx context.Context, c *stalwart.Client, p Params, rotateKey bool, lo
 	}}); err != nil {
 		return res, err
 	}
-	// The WebUI is re-created at every start if missing: disable, never destroy.
+	// The WebUI is re-created at every start if missing (never destroy
+	// it): only the read-only admin view (contract §19.13) reaches it, at
+	// /admin, from the bundle pinned in the mailctl image.
 	apps, err := getAll(ctx, c, "Application")
 	if err != nil {
 		return res, err
 	}
-	off := map[string]map[string]any{}
+	upd = map[string]map[string]any{}
 	for _, a := range apps {
-		if string(a["enable"]) != "false" {
-			off[str(a, "id")] = map[string]any{"enable": false}
+		if pt := differs(a, WebUIApplication(), nil); len(pt) > 0 {
+			upd[str(a, "id")] = pt
 		}
 	}
-	if len(off) > 0 {
-		r, err := c.Set(ctx, "Application", nil, off, nil)
+	if len(upd) > 0 {
+		r, err := c.Set(ctx, "Application", nil, upd, nil)
 		if err := checkSet("Application", r, err); err != nil {
 			return res, err
 		}
@@ -298,6 +303,11 @@ func Apply(ctx context.Context, c *stalwart.Client, p Params, rotateKey bool, lo
 		return res, err
 	}
 	res.APIKey = key
+	// The admin view's account (contract §19.13): a new password on every
+	// plan run, handed to the job to write for the admin-view service.
+	if res.ViewerPassword, err = ensureViewer(ctx, c, ids["Domain"][ParkingDomain], ids["Role"][ViewerRole]); err != nil {
+		return res, err
+	}
 	if err := c.Action(ctx, "ReloadSettings"); err != nil {
 		return res, fmt.Errorf("ReloadSettings: %w", err)
 	}
@@ -397,6 +407,244 @@ func ensureAccount(ctx context.Context, c *stalwart.Client, domainID, roleID str
 		return "", err
 	}
 	return r.CreatedID("m"), nil
+}
+
+// ViewerName is the admin view account's login.
+const ViewerName = ViewerAccount + "@" + ParkingDomain
+
+// ensureViewer makes the admin view's account (contract §19.13) on the
+// parking domain with the viewer role only, and gives it a new random
+// password (returned, never logged). Only the recovery admin can: the
+// role holds reads mailctl's own role lacks.
+func ensureViewer(ctx context.Context, c *stalwart.Client, domainID, roleID string) (string, error) {
+	if domainID == "" || roleID == "" {
+		return "", errors.New("the parking domain or the viewer role has no id")
+	}
+	pw, err := randomSecret(32)
+	if err != nil {
+		return "", err
+	}
+	want := map[string]any{
+		"description": "Portcullis read-only mail admin view",
+		"credentials": list(map[string]any{"@type": "Password", "secret": pw}),
+		"roles":       map[string]any{"@type": "Custom", "roleIds": set(roleID)},
+		"permissions": map[string]any{"@type": "Inherit"},
+	}
+	id, err := viewerAccount(ctx, c, domainID)
+	if err != nil {
+		return "", err
+	}
+	var r stalwart.SetResult
+	if id != "" {
+		r, err = c.Set(ctx, "Account", nil, map[string]map[string]any{id: want}, nil)
+	} else {
+		want["@type"], want["name"], want["domainId"] = "User", ViewerAccount, domainID
+		r, err = c.Set(ctx, "Account", map[string]any{"v": want}, nil, nil)
+	}
+	if err := checkSet("Account", r, err); err != nil {
+		return "", err
+	}
+	return pw, nil
+}
+
+// viewerAccount is the admin view account's id on the parking domain
+// ("" when there is none).
+func viewerAccount(ctx context.Context, c *stalwart.Client, parking string) (string, error) {
+	accts, err := getAll(ctx, c, "Account")
+	if err != nil {
+		return "", err
+	}
+	for _, a := range accts {
+		if str(a, "name") == ViewerAccount && str(a, "domainId") == parking {
+			return str(a, "id"), nil
+		}
+	}
+	return "", nil
+}
+
+// ViewerReset is what ResetViewer did. Password is the admin view
+// account's new password ("" when the view stays unavailable: the store
+// has no parking domain); never logged.
+type ViewerReset struct {
+	Password string
+	// MadeRole, MadeAccount: the store predated the admin view (or lost
+	// these) and ResetViewer made them. FixedRole: the viewer role's
+	// permissions differed from the plan's and were set to them.
+	MadeRole, MadeAccount, FixedRole bool
+}
+
+// ResetViewer gives the admin view's account a new password on a marked
+// store whose viewer secret file is lost or empty (like MintKey: no other
+// object is touched). A store made before the admin view has no viewer
+// role or account: it makes exactly what is missing — the viewer role
+// with the base plan's permissions, the account on the parking domain
+// with that role alone — and corrects a viewer role whose permissions
+// drifted, so the view stays read-only. It never makes a domain: without
+// the parking domain it answers "" and writes nothing (the admin view
+// stays unavailable there, mail is unaffected).
+func ResetViewer(ctx context.Context, c *stalwart.Client) (ViewerReset, error) {
+	var out ViewerReset
+	doms, err := getAll(ctx, c, "Domain")
+	if err != nil {
+		return out, err
+	}
+	parking := ""
+	for _, d := range doms {
+		if strings.EqualFold(str(d, "name"), ParkingDomain) {
+			parking = str(d, "id")
+		}
+	}
+	if parking == "" {
+		return out, nil
+	}
+	roleID, made, fixed, err := ensureViewerRole(ctx, c)
+	if err != nil {
+		return out, err
+	}
+	out.MadeRole, out.FixedRole = made, fixed
+	id, err := viewerAccount(ctx, c, parking)
+	if err != nil {
+		return out, err
+	}
+	out.MadeAccount = id == ""
+	if out.Password, err = ensureViewer(ctx, c, parking, roleID); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// ensureViewerRole finds the viewer role (by its description, the role's
+// name) or makes it from the base plan's definition (viewerRole). A found
+// role whose permissions differ from the plan's gets the plan's, and one
+// that extends other roles stops extending them (it would inherit their
+// writes): that role only, no other field or role. Duplicates are left
+// alone (the account holds the first one only).
+func ensureViewerRole(ctx context.Context, c *stalwart.Client) (id string, made, fixed bool, err error) {
+	roles, err := getAll(ctx, c, "Role")
+	if err != nil {
+		return "", false, false, err
+	}
+	want := viewerRole()
+	for _, r := range roles {
+		if str(r, "description") != ViewerRole {
+			continue
+		}
+		id = str(r, "id")
+		patch := differs(r, want, map[string]bool{"description": true})
+		var ext map[string]bool
+		_ = json.Unmarshal(r["roleIds"], &ext)
+		if len(ext) > 0 {
+			patch["roleIds"] = set()
+		}
+		if len(patch) == 0 {
+			return id, false, false, nil
+		}
+		res, err := c.Set(ctx, "Role", nil, map[string]map[string]any{id: patch}, nil)
+		if err := checkSet("Role", res, err); err != nil {
+			return "", false, false, err
+		}
+		return id, false, true, nil
+	}
+	res, err := c.Set(ctx, "Role", map[string]any{"v": want}, nil, nil)
+	if err := checkSet("Role", res, err); err != nil {
+		return "", false, false, err
+	}
+	if id = res.CreatedID("v"); id == "" {
+		return "", false, false, errors.New("x:Role/set: no id for the new viewer role")
+	}
+	return id, true, false, nil
+}
+
+// AdminViewSetup is what EnsureAdminView did.
+type AdminViewSetup struct {
+	MadeListener  bool // the admin-view listener was missing: made
+	FixedListener bool // it differed from the plan's: corrected
+	SetRule       bool // Http.allowedEndpoints differed from the plan's: set
+	FixedApp      bool // a web admin Application differed: patched
+	NoApp         bool // no Application yet (Stalwart makes it at a start)
+}
+
+// Changed: EnsureAdminView wrote something.
+func (s AdminViewSetup) Changed() bool {
+	return s.MadeListener || s.FixedListener || s.SetRule || s.FixedApp
+}
+
+// EnsureAdminView gives a marked store the admin view's server side
+// (contract §19.13) exactly as the base plan has it, writing only what
+// differs: the admin-view listener (made or corrected; no other listener
+// is read for a change or destroyed), the access rule (Http.
+// allowedEndpoints, wholly the plan's: set to p.AllowedEndpoints() only
+// with a ViewerIP), and the web admin's Application settings (each
+// existing Application patched, as Apply does; none is made: Stalwart
+// makes the WebUI at every start, so a store without one gets it at the
+// next start and the next run patches it). A store made before the admin
+// view lacks all three. They take effect at the server's next start: the
+// job's normal start and the provider's server after it both read them.
+func EnsureAdminView(ctx context.Context, c *stalwart.Client, p Params) (AdminViewSetup, error) {
+	var out AdminViewSetup
+	ls, err := getAll(ctx, c, "NetworkListener")
+	if err != nil {
+		return out, err
+	}
+	want := adminViewListener()
+	var found object
+	for _, l := range ls {
+		if str(l, "name") == AdminViewListener {
+			found = l
+			break
+		}
+	}
+	if found == nil {
+		r, err := c.Set(ctx, "NetworkListener", map[string]any{"v": want}, nil, nil)
+		if err := checkSet("NetworkListener", r, err); err != nil {
+			return out, err
+		}
+		out.MadeListener = true
+	} else if pt := differs(found, want, map[string]bool{"name": true, "@type": true}); len(pt) > 0 {
+		r, err := c.Set(ctx, "NetworkListener", nil, map[string]map[string]any{str(found, "id"): pt}, nil)
+		if err := checkSet("NetworkListener", r, err); err != nil {
+			return out, err
+		}
+		out.FixedListener = true
+	}
+
+	if p.ViewerIP.IsValid() {
+		var got []object
+		if err := c.Get(ctx, "Http", []string{"singleton"}, nil, &got); err != nil {
+			return out, fmt.Errorf("x:Http/get: %w", err)
+		}
+		var have object
+		if len(got) == 1 {
+			have = got[0]
+		}
+		rule := map[string]any{"allowedEndpoints": p.AllowedEndpoints()}
+		if len(differs(have, rule, nil)) > 0 {
+			if err := updateSingleton(ctx, c, Singleton{"Http", rule}); err != nil {
+				return out, err
+			}
+			out.SetRule = true
+		}
+	}
+
+	apps, err := getAll(ctx, c, "Application")
+	if err != nil {
+		return out, err
+	}
+	out.NoApp = len(apps) == 0
+	upd := map[string]map[string]any{}
+	for _, a := range apps {
+		if pt := differs(a, WebUIApplication(), nil); len(pt) > 0 {
+			upd[str(a, "id")] = pt
+		}
+	}
+	if len(upd) > 0 {
+		r, err := c.Set(ctx, "Application", nil, upd, nil)
+		if err := checkSet("Application", r, err); err != nil {
+			return out, err
+		}
+		out.FixedApp = true
+	}
+	return out, nil
 }
 
 // ensureAPIKey makes mailctl's one API key (Inherit, pinned to the
@@ -533,8 +781,8 @@ func VerifyGone(ctx context.Context, url string, cr Credentials) error {
 // StoreEmpty (Ruling R-H2b): the document-less base plan runs only on a
 // store with no data — no account but mailctl's and no domain but the
 // plan's own (the parking domain, p.PrimaryDomain): a first plan that
-// failed half way may run again. mailctl's account counts only on the
-// parking domain. Anything else on an unmarked store (a lost marker)
+// failed half way may run again. mailctl's and the admin view's accounts
+// count only on the parking domain. Anything else on an unmarked store (a lost marker)
 // fails closed: the plan would downgrade a live server's settings.
 func StoreEmpty(ctx context.Context, c *stalwart.Client, p Params) error {
 	own := map[string]bool{}
@@ -556,7 +804,7 @@ func StoreEmpty(ctx context.Context, c *stalwart.Client, p Params) error {
 		return err
 	}
 	for _, a := range accts {
-		if str(a, "name") != MailctlAccount || parking == "" || str(a, "domainId") != parking {
+		if (str(a, "name") != MailctlAccount && str(a, "name") != ViewerAccount) || parking == "" || str(a, "domainId") != parking {
 			return errors.New("the store has accounts but no bootstrap marker: refusing the base plan (restore the marker or the store; Ruling R-H2b)")
 		}
 	}

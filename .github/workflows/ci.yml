@@ -442,7 +442,7 @@ jobs:
           jq -e '.uid == "portcullis-usage" and .title == "Portcullis usage" and (.panels | length) >= 5' monitoring/grafana/dashboards/usage.json >/dev/null
           jq -e '.uid == "portcullis-ha-cluster" and ([.panels[].title] | index("Replication Lag") == null and index("Failovers") != null and index("Sites") != null) and ([.panels[].targets[]?.expr] | any(test("increase\\(portcullis_failover_total\\[")))' monitoring/grafana/dashboards/cluster.json >/dev/null
           echo "PASS: prometheus config + rules (+ rule tests), alertmanager receivers, blackbox modules, dashboard"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           # Module + build cache handled below (saved on main only).
@@ -1355,7 +1355,7 @@ jobs:
                 keyFile: /certs/server.key
           EOF
           # Test app on portcullis-proxy: one router on the protected tier
-          # (cert required), one on authaware gated by group-gate. ci-gated has
+          # (cert required), one on default gated by group-gate. ci-gated has
           # no portcullis-auth (no browser login in this job) and no group
           # mapping (ALLOW-UNMAPPED): the tests send the identity headers
           # portcullis-auth would set themselves. group-gate denies requests
@@ -1376,14 +1376,14 @@ jobs:
                 traefik.http.routers.ci-mtls.service: ci-whoami
                 traefik.http.routers.ci-gated.rule: Host(`gated.portcullis.local`)
                 traefik.http.routers.ci-gated.entrypoints: websecure
-                traefik.http.routers.ci-gated.tls.options: authaware@file
+                traefik.http.routers.ci-gated.tls.options: default
                 traefik.http.routers.ci-gated.middlewares: client-headers@file,portcullis-groups@docker
                 traefik.http.routers.ci-gated.service: ci-whoami
                 # Public-exception stand-in: every path goes through the
                 # public guard only (the Hub's routers also restrict paths).
                 traefik.http.routers.ci-public.rule: Host(`public.portcullis.local`)
                 traefik.http.routers.ci-public.entrypoints: websecure
-                traefik.http.routers.ci-public.tls.options: authaware@file
+                traefik.http.routers.ci-public.tls.options: default
                 traefik.http.routers.ci-public.middlewares: portcullis-public-guard@docker
                 traefik.http.routers.ci-public.service: ci-whoami
           networks:
@@ -1466,8 +1466,8 @@ jobs:
           echo "PASS: protected tier rejects foreign-CA client cert"
 
           code=$(mtls gated.portcullis.local --cert /tmp/foreign.crt --key /tmp/foreign.key)
-          [ "$code" = 000 ] || { echo "FAIL: authaware tier accepted a cert from a foreign CA ($code)"; exit 1; }
-          echo "PASS: authaware tier rejects foreign-CA client cert"
+          [ "$code" = 000 ] || { echo "FAIL: default tier accepted a cert from a foreign CA ($code)"; exit 1; }
+          echo "PASS: default tier rejects foreign-CA client cert"
 
           code=$(mtls mtls.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key)
           [ "$code" = 200 ] || { echo "FAIL: valid client cert got $code"; cat /tmp/mtls.out; exit 1; }
@@ -1678,7 +1678,7 @@ jobs:
       - name: Test the MCP gate (non-root, pinned address, secrets, access log, MCP routes without forward-auth)
         run: bash .github/ci/build-and-test-mcp-gate.sh
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -1814,12 +1814,16 @@ jobs:
           RA=$(kc /authentication/required-actions/portcullis-impersonation-notice)
           echo "$RA" | jq -e '.enabled and (.defaultAction | not) and .providerId == "portcullis-impersonation-notice"' >/dev/null \
             || { echo "FAIL: the notice required action: $RA"; exit 1; }
+          # The "Let through" page (contract §8.1): enabled, last (1000), never a default action.
+          LT=$(kc /authentication/required-actions/portcullis-let-through)
+          echo "$LT" | jq -e '.enabled and (.defaultAction | not) and .priority == 1000 and .providerId == "portcullis-let-through"' >/dev/null \
+            || { echo "FAIL: the let-through required action: $LT"; exit 1; }
           # Idempotent: a second configure adds no second mapper.
           ./portcullis keycloak configure >/dev/null
           [ "$(kc "/client-scopes/$ACR/protocol-mappers/models" | jq '[.[] | select(.protocolMapper == "portcullis-impersonation")] | length')" = 1 ] \
             || { echo "FAIL: a second keycloak configure added another impersonation mapper"; exit 1; }
           rm -f "$TOK"
-          echo "PASS: the acr scope has amr and the impersonation mapper (access, ID, userinfo), once; the notice action is enabled"
+          echo "PASS: the acr scope has amr and the impersonation mapper (access, ID, userinfo), once; the notice and let-through actions are enabled"
 
       - name: Test users and groups deleted in LLDAP leave Keycloak
         run: bash .github/ci/build-and-test-users-groups-deleted-lldap-leave.sh
@@ -2861,7 +2865,7 @@ jobs:
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # imp_ai_refused: an AI token minted for alice before a start.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -4327,15 +4331,19 @@ jobs:
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
-          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
-          /tmp/e2e-venv/bin/playwright install chromium
+          # WebKit too: the admin view after mail.<d> (admin_view_end_to_end;
+          # WebKit reuses that connection and never retries a 421).
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium webkit
+          /tmp/e2e-venv/bin/playwright install chromium webkit
           sudo apt-get install -y -qq libnss3-tools >/dev/null
           mkdir -p "$HOME/.pki/nssdb"
           certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
           certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
 
-      - name: Run the mail scenarios (exchange, alias, spam, mail passwords, lists, postmaster, revocation, leave, re-created username)
+      - name: Run the mail scenarios (admin view, exchange, alias, spam, mail passwords, lists, postmaster, revocation, leave, re-created username)
         timeout-minutes: 30
+        env:
+          E2E_WEBKIT: "1"
         run: |
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET
@@ -4523,7 +4531,7 @@ jobs:
           # shellcheck disable=SC2016
           xargs -P 4 -I{} bash -c 'pull "$1"' _ {} < "$RUNNER_TEMP/app-images.txt"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -5316,7 +5324,7 @@ jobs:
       # handshake and a GET through the tunnel (userspace WireGuard, no TUN:
       # the people port goes through rootlessport / pasta). The reboot step
       # below then also brings wg back (restart: always).
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -5886,7 +5894,7 @@ jobs:
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -6041,6 +6049,9 @@ jobs:
       - name: The Hub on Kubernetes (e2e_k3s.py)
         timeout-minutes: 30
         run: bash .github/ci/e2e-k3s-phases.sh hub
+      - name: Sign out on Kubernetes (backend logout through kcinternal-logout, no id_token_hint logged)
+        timeout-minutes: 10
+        run: bash .github/ci/e2e-k3s-signout.sh
       - name: VPN on Kubernetes (vpn init, modes, break-glass)
         timeout-minutes: 20
         run: bash .github/ci/e2e-k3s-phases.sh vpn
@@ -6165,7 +6176,7 @@ jobs:
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -6234,7 +6245,7 @@ jobs:
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
