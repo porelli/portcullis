@@ -107,6 +107,22 @@ ha)
   rm -f "$RUNNER_TEMP/ha-main.json"
   printf 'tls:\n  certificates:\n    - certFile: /certs/ha-main.crt\n      keyFile: /certs/ha-main.key\n' > traefik/dynamic/ci-ha-main.yml
   t0=$(date +%s)
+  # k3d's replicated tier is a node-local class: each <pvc>-r is made
+  # where its copy helper lands (any main non-small node), so the Hub's
+  # three could end on three nodes and the Hub fit nowhere (seen in CI:
+  # "3 node(s) didn't match PersistentVolume's node affinity"). Longhorn's
+  # volumes follow the pod; here the volumes step runs with only the node
+  # of init's own volumes schedulable (hub-state's), so they stay together.
+  home="$(K get pv "$(K -n portcullis get pvc hub-state -o jsonpath='{.spec.volumeName}')" \
+    -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}')"
+  [ -n "$home" ] || { echo "FAIL: hub-state's node unknown" >&2; exit 1; }
+  lib 'set -euo pipefail
+    _ha_namespace longhorn "$KUBE_LONGHORN_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
+    ha_render longhorn "$(kube_apiserver_sources)" "$(kube_node_host_sources)" | python3 -c "$CRDS_ONLY" | _ha_apply
+    _ha_namespace fencing "$KUBE_FENCING_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"' 2>&1 | redact
+  for n in $(K get nodes -o jsonpath='{.items[*].metadata.name}'); do [ "$n" = "$home" ] || K cordon "$n" >/dev/null; done
+  lib 'set -euo pipefail; ha_enable_step_volumes' 2>&1 | redact
+  for n in $(K get nodes -o jsonpath='{.items[*].metadata.name}'); do K uncordon "$n" >/dev/null; done
   # ha enable's own steps (scripts/lib/ha.sh), its installs left out:
   # only the Longhorn and fencing namespaces they make (with their
   # NetworkPolicies, as ha_install_longhorn / _fencing do), where the HA
@@ -115,10 +131,6 @@ ha)
   # namespace exists; no Longhorn manager runs). Each step on its own under errexit (an
   # && list would ignore a failure inside one).
   lib 'set -euo pipefail
-    _ha_namespace longhorn "$KUBE_LONGHORN_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
-    ha_render longhorn "$(kube_apiserver_sources)" "$(kube_node_host_sources)" | python3 -c "$CRDS_ONLY" | _ha_apply
-    _ha_namespace fencing "$KUBE_FENCING_NS" "${PORTCULLIS_KUBE_API_ENDPOINTS:-}"
-    ha_enable_step_volumes
     ha_enable_step_switch
     ha_enable_step_postgres
     ha_enable_step_vault
