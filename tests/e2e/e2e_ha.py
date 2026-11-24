@@ -26,9 +26,12 @@ Scenarios (main):
                          earlier one is still readable by its serial.
   ha_hub_lease_handover  a second Hub pod (the Deployment at 2) never holds
                          the Lease portcullis-hub and answers 503 "standing
-                         by" to a write; the holder deleted, the second
-                         takes the Lease within LeaseDuration (15 s) + its
-                         retry, and then writes.
+                         by" to a write; the holder stopped, the second
+                         takes the Lease LeaseDuration (15 s) + its retries
+                         after the holder's last renewal, and the whole
+                         within the stopping Hub's 60 s grace + that
+                         (ruling: a stopping Hub renews while its background
+                         operations finish), and then writes.
   ha_published_docs      a group created and then deleted through the Hub:
                          the removal reaches every group-gate replica's
                          mounted policy (pub-group-gate-policy, a projected
@@ -599,10 +602,11 @@ def vault_leader_loss() -> None:
     t = time.time()
     K("-n", NS, "delete", "pod", a0, "--wait=false")
     try:
-        # Raft's own window: HeartbeatTimeout 15 s (Vault's default timing),
-        # randomized up to twice that when no leadership transfer happened,
-        # then the HA lock: 45 s.
-        a1 = wait_for("another active voter", lambda: (vault_active() not in ("", a0) and vault_active()), 45, 0.5)
+        # 30 s: the HA chart runs raft at performance_multiplier 1
+        # (controller ruling, Task 33): an election in 3–6 s even when the
+        # deleted leader handed nothing over (Vault's default timing took
+        # 15–30 s then, seen in CI).
+        a1 = wait_for("another active voter", lambda: (vault_active() not in ("", a0) and vault_active()), 30, 0.5)
     except AssertionError:
         for p in pods(NS, "portcullis.io/component=vault"):
             st = vault_status(p["metadata"]["name"])
@@ -737,6 +741,9 @@ def hub_lease_handover() -> None:
                 f.close()
         code, out = wait_for("the new holder writes", writes, 120, 3)
         assert code in (200, 201), f"the new holder's write: {code} {str(out)[:200]}"
+        # The bound (controller ruling, Task 33): LeaseDuration + the
+        # stopping Hub's 60 s grace (it renews while its background
+        # operations finish: those writes need the fence) + the start.
         # The Lease's own clock: the standby saw the last renewal within a
         # retry and takes the Lease LeaseDuration after it saw it (one more
         # retry). client-go jitters each retry up to RetryPeriod × (1 + 1.2):
@@ -1137,10 +1144,16 @@ def dns_failover() -> None:
     victim = next(n for n in sorted(ing) if n != fd_node)
     t = kill_node(victim)
     rest = sorted(a for n, a in ing.items() if n != victim)
-    wait_for(f"{victim}'s address removed", lambda: all(published().get(n) == rest for n in names), 180, 2)
-    d = time.time() - t
-    note(f"ha_dns_failover: ingress node {victim} killed → {ing[victim]} removed after {d:.0f} s; {rest} kept")
-    assert 25 <= d <= 120, f"removed after {d:.0f} s (want about 30 s: 3 failed rounds 10 s apart)"
+    # Counted from NotReady (controller ruling, as CNPG's: NodeDown covers
+    # the detection): 3 failed rounds 10 s apart, about 30 s; 45 s allows
+    # the round's alignment and the status write.
+    t_nr = not_ready_at(victim, t)
+    assert all(published().get(n) == sorted(ing.values()) for n in names), f"an address went before {victim} was NotReady: {published()}"
+    wait_for(f"{victim}'s address removed", lambda: all(published().get(n) == rest for n in names), 120, 1)
+    d, d_nr = time.time() - t, time.time() - t_nr
+    note(f"ha_dns_failover: ingress node {victim} cut → NotReady after {t_nr - t:.0f} s → {ing[victim]} removed {d_nr:.0f} s later "
+         f"({d:.0f} s after the cut); {rest} kept")
+    assert 15 <= d_nr <= 45, f"removed {d_nr:.0f} s after NotReady (want about 30 s: 3 failed rounds 10 s apart)"
     second = next(n for n in sorted(ing) if n not in (victim, fd_node))
     traefik_unready(second, True)
     try:

@@ -939,6 +939,11 @@ def vault_problems(docs, ha):
         want = [f"vault-{j}.vault-internal" for j in range(n) if j != i]
         if f'node_id = "{pod}"' not in hcl or joins != want:
             out.append(f"{tag}: {pod}: node_id / retry_join {joins} (want node_id {pod}, retry_join {want})")
+        # Controller ruling (Task 33): raft's performance_multiplier 1 in HA
+        # only (elections in 3–6 s); one voter keeps Vault's default.
+        perf = re.findall(r"^\s*performance_multiplier\s*=\s*(\S+)\s*$", hcl, re.M)
+        if perf != (["1"] if ha else []):
+            out.append(f"{tag}: {pod}: performance_multiplier {perf} (want {['1'] if ha else 'none'})")
         if f'api_addr     = "http://{pod}.vault-internal:8200"' not in hcl or f'cluster_addr = "http://{pod}.vault-internal:8201"' not in hcl \
                 or re.search(r"^\s*service_registration\b", hcl, re.M):
             out.append(f"{tag}: {pod}: api / cluster address on vault-internal, no service_registration")
@@ -971,6 +976,8 @@ def check_sessions_vault():
         (sessions_problems, lambda d: _wl(d, "Deployment", "forward-auth")["spec"]["template"]["spec"]["containers"][0]["args"].append("--redis-sentinel-password=x")),
         (vault_problems, lambda d: sts(d, "vault")["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "VAULT_RAFT_PEERS", "value": "vault-0.vault-internal"})),
         (vault_problems, lambda d: sts(d, "vault")["spec"].__setitem__("replicas", 2)),
+        (vault_problems, lambda d: next(e for e in sts(d, "vault")["spec"]["template"]["spec"]["containers"][0]["env"]
+                                        if e["name"] == "VAULT_RAFT_PERFORMANCE_MULTIPLIER").__setitem__("value", "")),
         (vault_problems, lambda d: sts(d, "vault")["spec"]["template"]["spec"].__setitem__("automountServiceAccountToken", True)),
     ]
     if sessions_problems(docs, True) or vault_problems(docs, True):

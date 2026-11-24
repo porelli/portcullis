@@ -39,6 +39,11 @@ log() { echo "portcullis-vault: $*" >&2; }
 #                       joined over https only, so it needs VAULT_JOIN_TLS_DIR
 #   VAULT_JOIN_TLS_DIR  ca.crt / tls.crt / tls.key: the join listener (:8202)
 #                       and the CA retry_join trusts
+#   VAULT_RAFT_PERFORMANCE_MULTIPLIER  raft's performance_multiplier (1–10;
+#                       unset = Vault's default, as compose's single node):
+#                       the HA chart sets 1 (controller ruling, Task 33:
+#                       elections in 3–6 s, not 15–30 s; the voters are at
+#                       one site)
 render() {
   node_id="${VAULT_RAFT_NODE_ID:-portcullis-vault-1}"
   api_addr="${VAULT_API_ADDR:-http://vault:8200}"
@@ -61,6 +66,12 @@ listener \"tcp\" {
 }
 "
   fi
+  perf=""
+  if [ -n "${VAULT_RAFT_PERFORMANCE_MULTIPLIER:-}" ]; then
+    printf '%s\n' "$VAULT_RAFT_PERFORMANCE_MULTIPLIER" | grep -Eqx '([1-9]|10)' || { log "VAULT_RAFT_PERFORMANCE_MULTIPLIER $VAULT_RAFT_PERFORMANCE_MULTIPLIER: 1-10 only"; return 1; }
+    perf="  performance_multiplier = $VAULT_RAFT_PERFORMANCE_MULTIPLIER
+"
+  fi
   joins=""
   for p in ${VAULT_RAFT_PEERS:-}; do
     printf '%s\n' "$p" | grep -Eqx '[a-z0-9][a-z0-9.-]{0,252}' || { log "VAULT_RAFT_PEERS entry $p: a host name only"; return 1; }
@@ -75,6 +86,7 @@ listener \"tcp\" {
   [ -r "$TEMPLATE" ] || { log "no template at $TEMPLATE"; return 1; }
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
+      @PERFORMANCE@) printf '%s' "$perf" ;;
       @RETRY_JOIN@) printf '%s' "$joins" ;;
       @JOIN_LISTENER@) printf '%s' "$jl" ;;
       *) printf '%s\n' "$line" | sed -e "s|@NODE_ID@|$node_id|g" -e "s|@API_ADDR@|$api_addr|g" -e "s|@CLUSTER_ADDR@|$cluster_addr|g" ;;

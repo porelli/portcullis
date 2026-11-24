@@ -6094,7 +6094,11 @@ jobs:
   #     or paused doesn't come back healthy; power loss is e2e-ha-vm's;
   #   - CNPG's node failover counts its 60 s from the node's NotReady (the
   #     detection is k3s' node-monitor grace, which stays; NodeDown covers
-  #     it);
+  #     it), and so does DNS failover's removal (about 30 s, ≤ 45 s);
+  #   - the Lease handover's bound is LeaseDuration + the stopping Hub's
+  #     60 s grace + its start (it renews while background operations end);
+  #   - a cut node whose k3s exits (k3d restarts its container, dropping
+  #     the cut) is cut again: a VM keeps its network across a restart;
   #   - the Lease handover runs against a second Hub pod of its own (its
   #     data on emptyDirs): two Hubs never share a data directory (the Hub's
   #     .hub.lock refuses the second);

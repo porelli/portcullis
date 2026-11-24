@@ -30,7 +30,8 @@ unsealed voter; a standby forwards to the leader). */ -}}
     (dict "name" "VAULT_API_ADDR" "value" "http://$(VAULT_RAFT_NODE_ID).vault-internal:8200")
     (dict "name" "VAULT_CLUSTER_ADDR" "value" "http://$(VAULT_RAFT_NODE_ID).vault-internal:8201")
     (dict "name" "VAULT_RAFT_PEERS" "value" (join " " $peers))
-    (dict "name" "VAULT_JOIN_TLS_DIR" "value" "/vault/tls"))
+    (dict "name" "VAULT_JOIN_TLS_DIR" "value" "/vault/tls")
+    (dict "name" "VAULT_RAFT_PERFORMANCE_MULTIPLIER" "value" (ternary "1" "" .Values.ha.enabled)))
   "mounts" (list
     (dict "name" "data" "mountPath" "/vault/file")
     (dict "name" "config" "mountPath" "/vault/portcullis" "readOnly" true)

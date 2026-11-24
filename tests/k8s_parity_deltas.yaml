@@ -58,6 +58,7 @@ env-extra:
   - {service: vault, item: VAULT_API_ADDR, reason: "Kubernetes (plan Task 25): <pod>.vault-internal:8200, each voter's own address; compose's default http://vault:8200"}
   - {service: vault, item: VAULT_CLUSTER_ADDR, reason: "Kubernetes (plan Task 25): <pod>.vault-internal:8201, raft's address; compose's default http://vault:8201"}
   - {service: vault, item: VAULT_JOIN_TLS_DIR, reason: "Kubernetes (plan Task 25 review M1): the join listener's certificate and the CA retry_join trusts (the CLI's private join CA, Secret secrets-vault-join-tls); compose has one node, no join"}
+  - {service: vault, item: VAULT_RAFT_PERFORMANCE_MULTIPLIER, reason: "Kubernetes HA (controller ruling, Task 33): raft's performance_multiplier 1 (elections in 3-6 s, the voters at one site); empty without HA and absent on compose (one node: Vault's default)"}
   - {service: vault, item: VAULT_RAFT_PEERS, reason: "Kubernetes (plan Task 25): the voters (1 without HA, 3 in HA), one retry_join per other voter; compose has one node, no retry_join"}
   - {service: keycloak, item: JAVA_OPTS_KC_HEAP, reason: "Task 19 review I2: the heap capped at 768 Mi on Kubernetes so the 1024 Mi request bounds it (Docker keeps the image's default share of mem_limit); re-measured in Task 33"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD, reason: "spec §5: the kubernetesCRD provider"}

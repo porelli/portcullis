@@ -9,6 +9,8 @@
 #                   vault-0, vault-1, vault-2)
 #   @API_ADDR@      VAULT_API_ADDR (default http://vault:8200)
 #   @CLUSTER_ADDR@  VAULT_CLUSTER_ADDR (default http://vault:8201)
+#   @PERFORMANCE@   performance_multiplier = VAULT_RAFT_PERFORMANCE_MULTIPLIER
+#                   (the HA chart's 1); nothing when unset (compose, one node)
 #   @RETRY_JOIN@    one retry_join block per peer in VAULT_RAFT_PEERS (space
 #                   separated host names; this node itself left out), over
 #                   https to the peer's join listener only, trusting just
@@ -55,6 +57,7 @@ cluster_addr = "@CLUSTER_ADDR@"
 storage "raft" {
   path    = "/vault/file"
   node_id = "@NODE_ID@"
+@PERFORMANCE@
 @RETRY_JOIN@
 }
 
