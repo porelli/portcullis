@@ -684,8 +684,9 @@ spec:
 # portcullis-node on the main domain's exact /node/ paths, rate-limit@file,
 # above every app route (10000 + 300, over people-cli's 200) and over the
 # apex's core-vpn-required / portal routers; websecure and vpnsecure (a
-# joining machine is outside the VPN), authaware@file (the apex's TLS
-# option: Traefik picks one per host). Its backend is a pinned ExternalName
+# joining machine is outside the VPN), Traefik's default TLS options (the
+# apex's, contract §5: no tls.options, which on an IngressRoute would name
+# a TLSOption of this namespace; Traefik picks one per host). Its backend is a pinned ExternalName
 # Service in the edge namespace (Traefik's only watched one: the
 # app-backend pattern of §5, owner=core so portcullis-edge-routes refuses
 # the Hub any change to it) to nodeadm's plain-HTTP :8080, which admits
@@ -710,9 +711,7 @@ spec:
         - name: portcullis-node
           kind: Service
           port: 8080
-  tls:
-    options:
-      name: authaware@file
+  tls: {}
 ---
 apiVersion: v1
 kind: Service

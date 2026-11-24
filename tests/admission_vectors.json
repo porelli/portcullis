@@ -1283,11 +1283,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -1459,11 +1455,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -1563,7 +1555,107 @@
   },
   "as": "hub",
   "want": "deny",
-  "reason_contains": "tls.options outside the four tiers, another reso"
+  "reason_contains": "tls.options other than none (Traefik's default) or a named tier"
+ },
+ {
+  "name": "tls.options naming authaware@file (no such option)",
+  "object": {
+   "apiVersion": "traefik.io/v1alpha1",
+   "kind": "IngressRoute",
+   "metadata": {
+    "name": "tlsx",
+    "namespace": "portcullis-edge",
+    "labels": {
+     "portcullis.io/instance": "app",
+     "portcullis.io/owner": "hub"
+    }
+   },
+   "spec": {
+    "entryPoints": [
+     "websecure"
+    ],
+    "routes": [
+     {
+      "match": "Host(`a.example.org`)",
+      "kind": "Rule",
+      "middlewares": [
+       {
+        "name": "portcullis-auth@file"
+       },
+       {
+        "name": "app--m-x",
+        "namespace": "portcullis-edge"
+       }
+      ],
+      "services": [
+       {
+        "name": "app--web",
+        "port": 80,
+        "kind": "Service"
+       }
+      ]
+     }
+    ],
+    "tls": {
+     "options": {
+      "name": "authaware@file"
+     }
+    }
+   }
+  },
+  "as": "hub",
+  "want": "deny",
+  "reason_contains": "tls.options other than none (Traefik's default) or a named tier"
+ },
+ {
+  "name": "tls.options naming public@file",
+  "object": {
+   "apiVersion": "traefik.io/v1alpha1",
+   "kind": "IngressRoute",
+   "metadata": {
+    "name": "tlsx",
+    "namespace": "portcullis-edge",
+    "labels": {
+     "portcullis.io/instance": "app",
+     "portcullis.io/owner": "hub"
+    }
+   },
+   "spec": {
+    "entryPoints": [
+     "websecure"
+    ],
+    "routes": [
+     {
+      "match": "Host(`a.example.org`)",
+      "kind": "Rule",
+      "middlewares": [
+       {
+        "name": "portcullis-auth@file"
+       },
+       {
+        "name": "app--m-x",
+        "namespace": "portcullis-edge"
+       }
+      ],
+      "services": [
+       {
+        "name": "app--web",
+        "port": 80,
+        "kind": "Service"
+       }
+      ]
+     }
+    ],
+    "tls": {
+     "options": {
+      "name": "public@file"
+     }
+    }
+   }
+  },
+  "as": "hub",
+  "want": "allow",
+  "reason_contains": ""
  },
  {
   "name": "a TLS secret",
@@ -1611,7 +1703,7 @@
   },
   "as": "hub",
   "want": "deny",
-  "reason_contains": "tls.options outside the four tiers, another reso"
+  "reason_contains": "tls.options other than none (Traefik's default) or a named tier"
  },
  {
   "name": "a forwardAuth Middleware",
@@ -2624,11 +2716,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -2674,11 +2762,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -2724,11 +2808,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -2774,11 +2854,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -2824,11 +2900,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -2874,11 +2946,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -2924,11 +2992,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -2974,11 +3038,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -3025,11 +3085,7 @@
       "priority": 100000
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -3075,11 +3131,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -3122,11 +3174,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -3172,11 +3220,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -3673,11 +3717,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "existing": {
@@ -3708,11 +3748,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "op": "update",
@@ -3749,11 +3785,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "existing": {
@@ -3784,11 +3816,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "op": "update",
@@ -3825,11 +3853,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "existing": {
@@ -3860,11 +3884,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "op": "delete",
@@ -3965,11 +3985,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "intruder",
@@ -4016,11 +4032,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4066,11 +4078,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4116,11 +4124,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4166,11 +4170,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4216,11 +4216,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4266,11 +4262,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4316,11 +4308,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4368,11 +4356,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4414,11 +4398,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4465,11 +4445,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -4515,11 +4491,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -5523,11 +5495,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -6328,11 +6296,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",
@@ -6378,11 +6342,7 @@
       ]
      }
     ],
-    "tls": {
-     "options": {
-      "name": "authaware@file"
-     }
-    }
+    "tls": {}
    }
   },
   "as": "hub",

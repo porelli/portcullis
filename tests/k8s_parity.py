@@ -571,7 +571,7 @@ def check_ha():
         r = irs[0]["spec"]["routes"][0]
         if r["match"] != want_rule or [m["name"] for m in r.get("middlewares", [])] != ["rate-limit@file"] \
                 or r["services"] != [{"name": "portcullis-node", "kind": "Service", "port": 8080}] \
-                or irs[0]["spec"]["entryPoints"] != ["websecure", "vpnsecure"] or irs[0]["spec"]["tls"] != {"options": {"name": "authaware@file"}}:
+                or irs[0]["spec"]["entryPoints"] != ["websecure", "vpnsecure"] or irs[0]["spec"].get("tls") != {}:
             F.add(f"{label}router portcullis-node: {irs[0]['spec']} (want {want_rule}, rate-limit@file, portcullis-node:8080)")
         es = [s for s in K.by_kind(docs, "Service") if s["metadata"]["name"] == "portcullis-node"]
         if len(es) != 1 or es[0]["metadata"]["namespace"] != K.EDGE_NS or es[0]["spec"].get("externalName") != "nodeadm.portcullis-nodeadm.svc.cluster.local":
