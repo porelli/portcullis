@@ -86,7 +86,7 @@ spec:
          this namespace. tls is never empty: every route keeps the domains
          (Traefik reads them only with a resolver), because Helm 4's
          server-side apply sends a tls emptied by an upgrade (e.g. the
-         dropped options: authaware@file) as tls: null, which the CRD
+         dropped TLS options name) as tls: null, which the CRD
          refuses; k8s_hardening.py checks it. */}}
   tls:
     {{- if $r.resolver }}
