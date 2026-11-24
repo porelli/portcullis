@@ -166,6 +166,62 @@ ISOLATE = "PCE2E"
 REJECT_API = ["INPUT", "-i", "eth0", "-p", "tcp", "--dport", "6443", "-j", "REJECT", "--reject-with", "tcp-reset"]
 
 
+ISOLATION_RULES = [["-t", "raw", "-N", ISOLATE], ["-t", "raw", "-A", ISOLATE, "-i", "lo", "-j", "RETURN"],
+                   ["-t", "raw", "-A", ISOLATE, "-o", "lo", "-j", "RETURN"],
+                   ["-t", "raw", "-A", ISOLATE, "-i", "eth0", "-p", "tcp", "--dport", "6443", "-j", "RETURN"],
+                   ["-t", "raw", "-A", ISOLATE, "-p", "tcp", "--tcp-flags", "RST", "RST", "--sport", "6443", "-j", "RETURN"],
+                   ["-t", "raw", "-A", ISOLATE, "-j", "DROP"],
+                   ["-t", "raw", "-I", "PREROUTING", "1", "-j", ISOLATE], ["-t", "raw", "-I", "OUTPUT", "1", "-j", ISOLATE],
+                   ["-I", *REJECT_API]]
+# The isolated nodes' container start times; the keeper re-isolates a node
+# whose container started again (see kill_node). Guarded by cut_lock.
+cut_started: dict[str, str] = {}
+cut_lock = threading.Lock()
+recut: list[str] = []
+
+
+def started_at(node: str) -> str:
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}} {{.State.StartedAt}}", node],
+                       capture_output=True, text=True, timeout=30)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def isolate(node: str) -> None:
+    for r in ISOLATION_RULES:
+        docker("exec", node, "iptables", "-w", *r)
+
+
+def keeper() -> None:
+    """A cut node stays cut: k3s on an isolated server exits (it loses its
+    controllers' leader election) and k3d restarts its container, whose
+    new network namespace has none of the rules: the node would heal
+    itself in the middle of the scenario (seen in CI: the victim back
+    Ready, its address never removed). A VM whose k3s restarts keeps its
+    network, so the cut is put back the moment the container runs again."""
+    while True:
+        time.sleep(1)
+        with cut_lock:
+            nodes = dict(cut_started)
+        for n, was in nodes.items():
+            now = started_at(n)
+            if not now.startswith("true ") or now == was:
+                continue
+            with cut_lock:
+                if n not in cut_started:
+                    continue
+                try:
+                    isolate(n)
+                except AssertionError as e:
+                    print(f"{n}: re-isolating after its container restarted: {e}", flush=True)
+                    continue
+                cut_started[n] = now
+                recut.append(n)
+            print(f"{n}: its container restarted while cut ({was} → {now}): isolated again", flush=True)
+
+
+keeper_on: list[threading.Thread] = []
+
+
 def kill_node(node: str) -> float:
     """The node cut off: its container's traffic dropped both ways in the
     raw table, in a chain of its own (kube-router rewrites the filter
@@ -175,23 +231,29 @@ def kill_node(node: str) -> float:
     the node at once (its reset leaves through OUTPUT). A node that stops
     answering, as a VM does; its processes run on and resume when it's
     healed (a restarted or paused k3d server container doesn't come back
-    healthy). The time it happened."""
-    rules = [["-t", "raw", "-N", ISOLATE], ["-t", "raw", "-A", ISOLATE, "-i", "lo", "-j", "RETURN"],
-             ["-t", "raw", "-A", ISOLATE, "-o", "lo", "-j", "RETURN"],
-             ["-t", "raw", "-A", ISOLATE, "-i", "eth0", "-p", "tcp", "--dport", "6443", "-j", "RETURN"],
-             ["-t", "raw", "-A", ISOLATE, "-p", "tcp", "--tcp-flags", "RST", "RST", "--sport", "6443", "-j", "RETURN"],
-             ["-t", "raw", "-A", ISOLATE, "-j", "DROP"],
-             ["-t", "raw", "-I", "PREROUTING", "1", "-j", ISOLATE], ["-t", "raw", "-I", "OUTPUT", "1", "-j", ISOLATE],
-             ["-I", *REJECT_API]]
-    for r in rules:
-        docker("exec", node, "iptables", "-w", *r)
+    healthy); a container that restarts while cut is cut again (keeper).
+    The time it happened."""
+    if not keeper_on:
+        keeper_on.append(threading.Thread(target=keeper, daemon=True))
+        keeper_on[0].start()
+    with cut_lock:
+        isolate(node)
+        cut_started[node] = started_at(node)
     killed.add(node)
     return time.time()
 
 
+def uncut(node: str) -> None:
+    """The keeper stops watching node; then heal() removes the rules."""
+    with cut_lock:
+        cut_started.pop(node, None)
+
+
 def heal(node: str) -> None:
     """Every rule of the isolation gone, checked: the jumps deleted until
-    none is left, the chain flushed and deleted, the API reset removed."""
+    none is left, the chain flushed and deleted, the API reset removed
+    (the keeper told first, so it never cuts the node again)."""
+    uncut(node)
     for _ in range(10):
         for chain in ("PREROUTING", "OUTPUT"):
             while subprocess.run(["docker", "exec", node, "iptables", "-w", "-t", "raw", "-D", chain, "-j", ISOLATE],
@@ -515,12 +577,39 @@ def vault_read_cert(pod: str, serial: str) -> bool:
     return bool(out) and "BEGIN CERTIFICATE" in out
 
 
+def vault_autopilot(pod: str) -> dict:
+    """Raft's autopilot view from pod (the root token on stdin)."""
+    root = json.load(open("secrets/vault-init.json"))["root_token"]
+    out = K("-n", NS, "exec", "-i", pod, "-c", "vault", "--", "sh", "-c",
+            'IFS= read -r t; VAULT_TOKEN="$t" VAULT_ADDR=http://127.0.0.1:8200 exec vault operator raft autopilot state -format=json',
+            inp=root + "\n", timeout=30)
+    return json.loads(out)
+
+
+def vault_healthy_voters(pod: str) -> bool:
+    st = vault_autopilot(pod)
+    st = st.get("data", st)
+    voters = [s for s in (st.get("servers") or {}).values() if s.get("status") == "voter" and s.get("healthy")]
+    return bool(st.get("healthy")) and len(voters) == 3
+
+
 def vault_leader_loss() -> None:
     a0 = wait_for("an active Vault voter", vault_active, 60)
+    # Three healthy voters first (a voter on a node healed just before may
+    # still be catching up: then the delete leaves no quorum to elect from).
+    wait_for("three healthy Vault voters (autopilot)", lambda: vault_healthy_voters(a0), 180, 5)
     s0 = vault_issue(a0, "e2e-ha-before")
     t = time.time()
     K("-n", NS, "delete", "pod", a0, "--wait=false")
-    a1 = wait_for("another active voter", lambda: (vault_active() not in ("", a0) and vault_active()), 30, 0.5)
+    try:
+        a1 = wait_for("another active voter", lambda: (vault_active() not in ("", a0) and vault_active()), 30, 0.5)
+    except AssertionError:
+        for p in pods(NS, "portcullis.io/component=vault"):
+            st = vault_status(p["metadata"]["name"])
+            print(f"{p['metadata']['name']}: " + json.dumps({k: st.get(k) for k in ("sealed", "ha_enabled", "is_self", "leader_address",
+                  "raft_committed_index", "raft_applied_index")}), flush=True)
+        print(K("-n", NS, "get", "pods", "-l", "portcullis.io/component=vault", "-o", "wide", ok=False), flush=True)
+        raise
     d = time.time() - t
     note(f"ha_vault_leader_loss: active {a0} deleted → {a1} active after {d:.1f} s")
     s1 = wait_for("a certificate issued by the new leader", lambda: vault_issue(a1, "e2e-ha-after"), 30, 2)
@@ -1182,6 +1271,8 @@ def sites_scenario() -> None:
 
 def report() -> int:
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if recut:
+        timings.append(f"node containers restarted while cut (k3s exited), cut again: {', '.join(recut)}")
     lines = [f"- {'✅' if ok else '❌'} {n.split(':')[0]}{': ' + why if why else ''}" for n, ok, why in results] + [f"  - {t}" for t in timings]
     if summary:
         with open(summary, "a") as f:

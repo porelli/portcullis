@@ -183,6 +183,7 @@ collect)
   # kubelet) and their firewall (a scenario's isolation chain).
   for n in $(docker ps -a --filter label=app=k3d --format '{{.Names}}'); do
     docker logs --tail 400 "$n" > "$a/node-$n.log" 2>&1 || true
+    docker inspect -f '{{.Name}} restarts={{.RestartCount}} started={{.State.StartedAt}}' "$n" >> "$a/node-restarts.txt" 2>&1 || true
     docker exec "$n" iptables -w -S > "$a/node-$n-iptables.txt" 2>&1 || true
   done
   ./portcullis ha status --json > "$a/ha-status.json" 2>&1 || true
