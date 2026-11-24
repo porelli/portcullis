@@ -129,11 +129,16 @@ SHIM
 sudo chmod 0755 /usr/local/bin/k3s
 
 # One cluster at a time.
+# The cluster first (its node containers hold both networks), then its
+# own networks: k3d leaves a network it didn't create, and the next
+# cluster's mesh is the same 10.215.0.0/24 (a left one: "Pool overlaps").
 for c in pk-ha pk-sites; do
-  docker network rm "$c-pub" >/dev/null 2>&1 || true
   if k3d cluster list -o json 2>/dev/null | jq -e --arg c "$c" 'any(.[]; .name == $c)' >/dev/null; then
     k3d cluster delete "$c" >/dev/null
   fi
+  for suf in pub mesh; do
+    if docker network inspect "$c-$suf" >/dev/null 2>&1; then docker network rm "$c-$suf" >/dev/null; fi
+  done
 done
 
 if [ "$mode" = main ]; then name=pk-ha ctx=ha servers=3 agents=1; else name=pk-sites ctx=sites servers=5 agents=0; fi

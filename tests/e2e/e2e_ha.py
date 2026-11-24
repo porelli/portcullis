@@ -208,15 +208,38 @@ def heal(node: str) -> None:
     raise AssertionError(f"{node}: the isolation rules didn't go: {left[-400:]}")
 
 
+def isolation_left(node: str) -> str:
+    """Any isolation rule still on node ("" = none)."""
+    left = docker("exec", node, "sh", "-c", "iptables -w -t raw -S; iptables -w -S | grep -- '--dport 6443 -j REJECT' || true")
+    return "\n".join(ln for ln in left.splitlines() if ISOLATE in ln or "REJECT" in ln)
+
+
 def start_node(node: str) -> None:
     heal(node)
     killed.discard(node)
+    back = []
+
+    def ready_again() -> bool:
+        # kube-router restores the filter table from its own snapshot: a
+        # rule it saved during the cut can come back after the heal.
+        left = isolation_left(node)
+        if left:
+            back.append(left)
+            heal(node)
+        return node_ready(node)
     try:
-        wait_for(f"node {node} Ready again", lambda: node_ready(node), 300, 5)
+        wait_for(f"node {node} Ready again", ready_again, 300, 5)
     except AssertionError:
-        r = subprocess.run(["docker", "logs", "--tail", "60", node], capture_output=True, text=True)
-        print(f"::group::{node}: its last k3s lines\n{(r.stdout + r.stderr)[-6000:]}\n::endgroup::", flush=True)
+        n = Kj("get", "node", node)
+        conds = [(c["type"], c["status"], c.get("reason"), c.get("message", "")[:160]) for c in n["status"]["conditions"]]
+        r = subprocess.run(["docker", "logs", "--since", "6m", node], capture_output=True, text=True)
+        lines = [ln for ln in (r.stdout + r.stderr).splitlines() if not ln.startswith('{"level"')]
+        fw = docker("exec", node, "sh", "-c", "iptables -w -t raw -S; iptables -w -S INPUT | head -20")
+        print(f"::group::{node}: not Ready after the heal\nconditions: {conds}\nrules seen back: {back}\n"
+              f"firewall:\n{fw[-3000:]}\nk3s (no etcd lines):\n" + "\n".join(lines[-80:])[-8000:] + "\n::endgroup::", flush=True)
         raise
+    if back:
+        note(f"{node}: isolation rules came back after the heal {len(back)}× (removed again): {back[0][:200]}")
 
 
 def not_ready_at(node: str, since: float, timeout: float = 180) -> float:
@@ -624,9 +647,11 @@ def hub_lease_handover() -> None:
         assert code in (200, 201), f"the new holder's write: {code} {str(out)[:200]}"
         # The Lease's own clock: the standby saw the last renewal within a
         # retry and takes the Lease LeaseDuration after it saw it (one more
-        # retry, 2 s of slack). The whole: the old Hub's grace on top.
-        assert lag <= LEASE_S + 2 * RETRY_S + 2, f"the Lease taken {lag:.1f} s after the last renewal (> LeaseDuration {LEASE_S} s + 2 retries {RETRY_S} s + 2 s)"
-        assert d <= grace + LEASE_S + 2 * RETRY_S + 10, f"handover took {d:.1f} s (> grace {grace} s + LeaseDuration {LEASE_S} s + 2 retries + 10 s)"
+        # retry). client-go jitters each retry up to RetryPeriod × (1 + 1.2):
+        # 2 × 4.4 s, plus 1 s of slack. The whole: the old Hub's grace on top.
+        retry = RETRY_S * (1 + 1.2)
+        assert lag <= LEASE_S + 2 * retry + 1, f"the Lease taken {lag:.1f} s after the last renewal (> LeaseDuration {LEASE_S} s + 2 jittered retries {retry:.1f} s + 1 s)"
+        assert d <= grace + LEASE_S + 2 * retry + 10, f"handover took {d:.1f} s (> grace {grace} s + LeaseDuration {LEASE_S} s + 2 jittered retries + 10 s)"
     finally:
         K("-n", NS, "delete", "pod", other, "--wait=false", ok=False)
         K("-n", NS, "scale", "deployment/hub", "--replicas=1")
