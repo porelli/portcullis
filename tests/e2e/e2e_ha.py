@@ -577,24 +577,16 @@ def vault_read_cert(pod: str, serial: str) -> bool:
     return bool(out) and "BEGIN CERTIFICATE" in out
 
 
-def vault_autopilot(pod: str) -> dict:
-    """Raft's autopilot view from pod (the root token on stdin)."""
-    root = json.load(open("secrets/vault-init.json"))["root_token"]
-    out = K("-n", NS, "exec", "-i", pod, "-c", "vault", "--", "sh", "-c",
-            'IFS= read -r t; VAULT_TOKEN="$t" VAULT_ADDR=http://127.0.0.1:8200 exec vault operator raft autopilot state -format=json',
-            inp=root + "\n", timeout=30)
-    return json.loads(out)
-
-
-def vault_healthy_voters(pod: str) -> bool:
-    """Autopilot healthy with three healthy voters (the leader's status is
-    "leader", the others' "voter"); otherwise the view, for the timeout."""
-    st = vault_autopilot(pod)
-    st = st.get("data", st)
-    servers = st.get("servers") or {}
-    voters = [s for s in servers.values() if s.get("status") in ("leader", "voter") and s.get("healthy")]
-    assert st.get("healthy") and len(voters) == 3, \
-        f"autopilot healthy={st.get('healthy')}: " + json.dumps({k: [v.get("status"), v.get("healthy"), v.get("last_index")] for k, v in servers.items()})
+def vault_voters_settled(_: str = "") -> bool:
+    """Every voter unsealed in HA mode, agreeing on one leader, its applied
+    raft index within 50 of the furthest (a voter on a node healed just
+    before may still be catching up: then a delete may leave no quorum)."""
+    sts = {p["metadata"]["name"]: vault_status(p["metadata"]["name"]) for p in pods(NS, "portcullis.io/component=vault")}
+    view = {n: [st.get("sealed"), st.get("leader_address"), st.get("raft_applied_index")] for n, st in sts.items()}
+    idx = [st.get("raft_applied_index") or 0 for st in sts.values()]
+    leaders = {st.get("leader_address") for st in sts.values()}
+    assert len(sts) == 3 and all(st.get("ha_enabled") and st.get("sealed") is False for st in sts.values()) \
+        and len(leaders) == 1 and "" not in leaders and None not in leaders and max(idx) - min(idx) <= 50, f"voters: {json.dumps(view)}"
     return True
 
 
@@ -602,7 +594,7 @@ def vault_leader_loss() -> None:
     a0 = wait_for("an active Vault voter", vault_active, 60)
     # Three healthy voters first (a voter on a node healed just before may
     # still be catching up: then the delete leaves no quorum to elect from).
-    wait_for("three healthy Vault voters (autopilot)", lambda: vault_healthy_voters(a0), 180, 5)
+    wait_for("three settled Vault voters", vault_voters_settled, 180, 5)
     s0 = vault_issue(a0, "e2e-ha-before")
     t = time.time()
     K("-n", NS, "delete", "pod", a0, "--wait=false")
@@ -749,6 +741,14 @@ def hub_lease_handover() -> None:
     finally:
         K("-n", NS, "delete", "pod", other, "--wait=false", ok=False)
         K("-n", NS, "scale", "deployment/hub", "--replicas=1")
+        # The Hub back and answering before the next scenario: it waits a
+        # LeaseDuration for the second pod's Lease, and only then listens.
+        def answers() -> bool:
+            try:
+                return hub("GET", "/api/directory/groups")[0] == 200
+            except (OSError, urllib.error.URLError, http.client.HTTPException, AssertionError) as e:
+                raise AssertionError(str(e))
+        wait_for("the Hub answering again", answers, 180, 3)
 
 
 def gate_policies() -> dict[str, str]:
@@ -915,6 +915,10 @@ def n_minus_1() -> None:
         # cluster, follows it); the check models Longhorn: left out.
         claims = [v["persistentVolumeClaim"]["claimName"] for v in p["spec"].get("volumes", []) if "persistentVolumeClaim" in v]
         if any(c.endswith("-r") for c in claims):
+            continue
+        # A bare pod (the CLI's NetworkPolicy probes) has no controller to
+        # start it again anywhere: the drain just ends it.
+        if not p["metadata"].get("ownerReferences"):
             continue
         if key not in unplaced:
             placeable.append((ns, name, p["metadata"].get("ownerReferences", [{}])[0].get("name", "")))
