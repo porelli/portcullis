@@ -302,11 +302,25 @@ func (j *Job) Run(ctx context.Context) (err error) {
 		if view.NoApp {
 			j.logf("bootstrap: the store has no web admin application yet: the mail server makes it at its start, the next run sets it")
 		}
+		// App mail senders (contract §19.14), on every start: a store made
+		// before them lacks the RCPT script's first rule (refuse a
+		// sender's address); it is put first, the other rules kept. Any
+		// other shape is left alone (x-sender_rcpt keeps reporting it).
+		rcpt, err := EnsureSenderRcpt(ctx, c)
+		if err != nil {
+			return res, err
+		}
+		if rcpt.Added {
+			j.logf("bootstrap: the RCPT script had no rule refusing mail to app mail senders: put it first (every other rule kept, in its order)")
+		}
+		if rcpt.Odd != "" {
+			j.logf("bootstrap: warning: the RCPT script isn't the expected shape (%s): left as it is, mail to app mail senders may be accepted (x-sender_rcpt; the by-hand step is on the stalwart app page)", rcpt.Odd)
+		}
 		// The admin view's password (contract §19.13): a lost or empty
 		// viewer secret file gets a new password only, like the key. A
 		// store from before the admin view gets exactly what it lacks
 		// (the viewer role, the viewer account) and nothing else.
-		healed := view.Changed()
+		healed := view.Changed() || rcpt.Added
 		if j.ViewerFile != "" && !viewerFileInPlace(j.ViewerFile) {
 			v, err := ResetViewer(ctx, c)
 			if err != nil {
@@ -338,7 +352,7 @@ func (j *Job) Run(ctx context.Context) (err error) {
 			// service.sh, e2e-podman-mail.sh): "; nothing to do" only when
 			// the run changed nothing.
 			if healed {
-				j.logf("bootstrap: the store is bootstrapped and its API key is in place; only the admin view's missing or differing pieces (above)")
+				j.logf("bootstrap: the store is bootstrapped and its API key is in place; only the missing or differing pieces (above)")
 			} else if res.ViewerPassword != "" {
 				j.logf("bootstrap: the store is bootstrapped and its API key is in place; a new admin view password only")
 			} else {

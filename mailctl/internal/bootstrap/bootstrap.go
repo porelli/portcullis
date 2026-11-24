@@ -647,6 +647,90 @@ func EnsureAdminView(ctx context.Context, c *stalwart.Client, p Params) (AdminVi
 	return out, nil
 }
 
+// SenderRcptHeal is what EnsureSenderRcpt did.
+type SenderRcptHeal struct {
+	Added bool   // the sender rule was missing: put first, ReloadSettings
+	Odd   string // the script isn't the expected shape: left as it is (why)
+}
+
+// senderRcptRule is the base plan's first RCPT rule (rcptScript's rule
+// 0, the one definition): an app mail sender's address is refused.
+func senderRcptRule() any {
+	return normalize(rcptScript()["match"].(map[string]any)["0"])
+}
+
+// EnsureSenderRcpt gives a marked store made before app mail senders
+// (contract §19.14) the RCPT script's first rule, the base plan's: only
+// when no rule touches the senders' namespace, it is put first and every
+// existing rule follows, unchanged and in its order ("else" kept). A
+// script of any other shape (not {match, else}, a rule not {if, then}, a
+// rule on the senders' namespace other than the plan's first) is never
+// written: Odd says why, and x-sender_rcpt keeps reporting a missing
+// refusal. mailctl's own key can't write MtaStageRcpt: the recovery
+// session (the job) does it.
+func EnsureSenderRcpt(ctx context.Context, c *stalwart.Client) (SenderRcptHeal, error) {
+	var out SenderRcptHeal
+	var got []object
+	if err := c.Get(ctx, "MtaStageRcpt", []string{"singleton"}, nil, &got); err != nil {
+		return out, fmt.Errorf("x:MtaStageRcpt/get: %w", err)
+	}
+	if len(got) != 1 {
+		out.Odd = "no MtaStageRcpt settings"
+		return out, nil
+	}
+	var script map[string]json.RawMessage
+	if err := json.Unmarshal(got[0]["script"], &script); err != nil || script == nil {
+		out.Odd = "the script isn't an expression object"
+		return out, nil
+	}
+	els, hasElse := script["else"]
+	var match map[string]json.RawMessage
+	if err := json.Unmarshal(script["match"], &match); err != nil || match == nil || !hasElse || len(script) != 2 {
+		out.Odd = "the script isn't {match, else}"
+		return out, nil
+	}
+	want := senderRcptRule()
+	rules := make([]json.RawMessage, len(match))
+	for i := range rules {
+		r, ok := match[fmt.Sprint(i)]
+		if !ok {
+			out.Odd = "the rules aren't numbered 0.." + fmt.Sprint(len(match)-1)
+			return out, nil
+		}
+		var rule map[string]any
+		if err := json.Unmarshal(r, &rule); err != nil || len(rule) != 2 {
+			out.Odd = fmt.Sprintf("rule %d isn't {if, then}", i)
+			return out, nil
+		}
+		cond, ok1 := rule["if"].(string)
+		then, ok2 := rule["then"].(string)
+		if !ok1 || !ok2 {
+			out.Odd = fmt.Sprintf("rule %d isn't {if, then}", i)
+			return out, nil
+		}
+		if i == 0 && reflect.DeepEqual(normalize(rule), want) {
+			return out, nil // in place
+		}
+		if strings.Contains(cond, NSSenders) || strings.Contains(then, NSSenders) {
+			out.Odd = fmt.Sprintf("rule %d is on %s but isn't the base plan's first rule", i, NSSenders)
+			return out, nil
+		}
+		rules[i] = r
+	}
+	next := map[string]any{"0": want}
+	for i, r := range rules {
+		next[fmt.Sprint(i+1)] = r
+	}
+	if err := updateSingleton(ctx, c, Singleton{"MtaStageRcpt", map[string]any{"script": map[string]any{"match": next, "else": els}}}); err != nil {
+		return out, err
+	}
+	if err := c.Action(ctx, "ReloadSettings"); err != nil {
+		return out, fmt.Errorf("ReloadSettings: %w", err)
+	}
+	out.Added = true
+	return out, nil
+}
+
 // ensureAPIKey makes mailctl's one API key (Inherit, pinned to the
 // adapter's address, no expiry) unless one exists; rotate replaces it.
 func ensureAPIKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr, rotate bool) (string, error) {
