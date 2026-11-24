@@ -94,15 +94,16 @@ init)
   echo "PASS: init --runtime kubernetes on k3d (nodeadm $ref)"
   ;;
 ha)
-  # The switch's served pair: <d> and *.<d> exactly (_ha_cert_ok), from
-  # core's CA (the root token on the vault pod's stdin; the key into a
+  # The switch's served pair: <d> and *.<d> exactly (_ha_cert_ok), the
+  # leaf and its intermediate (a chain a browser trusting core's root
+  # accepts), from core's CA (the root token on the vault pod's stdin; the key into a
   # 0600 file under certs/, never printed).
   root="$(jq -r .root_token secrets/vault-init.json)"; echo "::add-mask::$root"
   # shellcheck disable=SC2016  # expanded by the pod's sh
   printf '%s\n' "$root" | K -n portcullis exec -i pod/vault-0 -c vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" VAULT_ADDR=http://127.0.0.1:8200 exec vault write -format=json pki_int/issue/server-cert common_name="$1" alt_names="*.$1" ttl=2160h' _ "$E2E_DOMAIN" \
     > "$RUNNER_TEMP/ha-main.json"
   chmod 600 "$RUNNER_TEMP/ha-main.json"
-  (umask 077 && jq -r .data.certificate "$RUNNER_TEMP/ha-main.json" > certs/ha-main.crt && jq -r .data.private_key "$RUNNER_TEMP/ha-main.json" > certs/ha-main.key)
+  (umask 077 && jq -r '.data.certificate, .data.issuing_ca' "$RUNNER_TEMP/ha-main.json" > certs/ha-main.crt && jq -r .data.private_key "$RUNNER_TEMP/ha-main.json" > certs/ha-main.key)
   rm -f "$RUNNER_TEMP/ha-main.json"
   printf 'tls:\n  certificates:\n    - certFile: /certs/ha-main.crt\n      keyFile: /certs/ha-main.key\n' > traefik/dynamic/ci-ha-main.yml
   t0=$(date +%s)
@@ -136,8 +137,13 @@ ha)
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},
         volumeMounts: [{name: "d", mountPath: "/data"}]}], volumes: [{name: "d", persistentVolumeClaim: {claimName: "hub-state-r"}}]}}' | K create -f - >/dev/null
   K -n portcullis wait --for=condition=Ready "pod/$pod" --timeout=180s >/dev/null
+  # The sources list replaced by the CI one (the Hub's own default source
+  # dropped), the rest of state.yaml kept.
   tar -cf - -C tests/e2e/apps echo | K -n portcullis exec -i "$pod" -- sh -c 'mkdir -p /data/repos/ci && tar -C /data/repos/ci -xf - &&
-    { grep -q "^sources:" /data/state.yaml 2>/dev/null || printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" >> /data/state.yaml; } && chmod 600 /data/state.yaml'
+    { [ -f /data/state.yaml ] || : > /data/state.yaml; } &&
+    awk "/^sources:/ { skip = 1; next } skip && /^[^ -]/ { skip = 0 } !skip" /data/state.yaml > /data/state.yaml.new &&
+    printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" >> /data/state.yaml.new &&
+    mv /data/state.yaml.new /data/state.yaml && chmod 600 /data/state.yaml'
   K -n portcullis delete pod "$pod" --wait=false >/dev/null
   K -n portcullis scale deploy/hub --replicas=1 >/dev/null
   K -n portcullis rollout status deploy/hub --timeout=300s

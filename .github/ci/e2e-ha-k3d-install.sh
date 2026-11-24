@@ -47,7 +47,9 @@ KUBECTL_VERSION=v1.37.2
 HELM_VERSION=v4.3.1
 # k3s v1.37.2+k3s1, the version init pins (KUBE_K3S_VERSION).
 K3S_IMAGE="docker.io/rancher/k3s:v1.37.2-k3s1@sha256:21ea6e0fac4e3930c2ce8aa40ddd41a8b18cb3e9a0222c030dc005e7e88c4332"
-# k3d's helper (image import, host entries); no load balancer (--no-lb).
+# k3d's helper (image import, host entries) and its API load balancer (the
+# kubeconfig's server is the LB in front of every server: a scenario that
+# stops one server must not take the harness's own API endpoint with it).
 export K3D_IMAGE_TOOLS="ghcr.io/k3d-io/k3d-tools:5.9.0@sha256:c57abce697e66feeb826922718738fe186b47779312d49d4e51e6fb9b8a6f34d"
 export K3D_IMAGE_LOADBALANCER="ghcr.io/k3d-io/k3d-proxy:5.9.0@sha256:7be40abfeb6ac9a81d0d4157a7cbf3aacc68a64a1780ca2efb160f1aea915177"
 case "$(uname -m)" in
@@ -147,7 +149,7 @@ options:
   k3d:
     wait: true
     timeout: 360s
-    disableLoadbalancer: true
+    disableLoadbalancer: false
   kubeconfig:
     updateDefaultKubeconfig: false
     switchCurrentContext: false
