@@ -171,6 +171,7 @@ options:
       - {arg: --kube-controller-manager-arg=disable-force-detach-on-timeout=true, nodeFilters: [server:*]}
       - {arg: --kubelet-arg=pod-max-pids=1024, nodeFilters: [all]}
       - {arg: --kubelet-arg=sync-frequency=10s, nodeFilters: [all]}
+      - {arg: --node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule, nodeFilters: [all]}
 EOF
 k3d cluster create --config "$tmp/k3d.yaml"
 mkdir -p "$HOME/.kube"; touch "$HOME/.kube/config"; chmod 600 "$HOME/.kube/config"
@@ -199,6 +200,11 @@ for n in "${nodes[@]}"; do
   [ "$storage" = false ] || labels+=("portcullis.io/storage=true")
   K label node "$n" --overwrite "${labels[@]}" >/dev/null
   [ "$class" != small ] || K taint node "$n" --overwrite portcullis.io/small=true:NoSchedule >/dev/null
+  # Labelled: the registration taint off, as nodeadm / the CLI do (the
+  # flag stays, as on a real node: a kubelet that restarts registers again
+  # with it, the only Node create portcullis-node-labels admits; without
+  # it a node whose k3s restarted during a cut never came back Ready).
+  K taint node "$n" nodeadm.portcullis/unlabelled- >/dev/null 2>&1 || true
   pub[$n]="198.51.100.$((10 + i))"
 done
 docker network rm "$name-pub" >/dev/null 2>&1 || true
