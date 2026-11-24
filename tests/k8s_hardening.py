@@ -1504,15 +1504,18 @@ def check_edge(docs):
             if (d["metadata"].get("labels") or {}).get("portcullis.io/owner") != "core":
                 F.add(f"{d['kind']} {d['metadata']['name']}: no portcullis.io/owner=core (the Hub could change it)")
     # Keycloak reads the Hub's signin-keycloak.json / impersonation.json
-    # (0644) from hub-data: the PVC root is 0751 (traverse, no listing) and
-    # Keycloak gets no Hub group (10001) and no fsGroup, read-only mount.
+    # from /hub-data. HA (contract §4): that is its published documents (a
+    # projected volume, portcullis.published), never the Hub's PVC
+    # (hub-state, no hub-data PVC at all), so main's 0751 PVC root has no
+    # counterpart; Keycloak gets no Hub group (10001) and no fsGroup,
+    # read-only mount.
     pvcs = {d["metadata"]["name"]: d for d in K.by_kind(docs, "PersistentVolumeClaim")}
-    hd = pvcs.get("hub-data")
-    if not hd or hd["metadata"]["annotations"].get("portcullis.io/mode") != "0751":
-        F.add(f"PVC hub-data: mode {hd and hd['metadata']['annotations'].get('portcullis.io/mode')} (want 0751: Keycloak traverses, never lists)")
-    for dep in K.by_kind(docs, "Deployment"):
-        if dep["metadata"]["name"] != "keycloak":
-            continue
+    if "hub-data" in pvcs:
+        F.add("PVC hub-data: the Hub's data is hub-state; /hub-data is the published documents (projected)")
+    kcs = [d for d in K.by_kind(docs, "Deployment") + K.by_kind(docs, "StatefulSet") if d["metadata"]["name"] == "keycloak"]
+    if len(kcs) != 1:
+        F.add(f"keycloak: {len(kcs)} workloads rendered")
+    for dep in kcs:
         ps = dep["spec"]["template"]["spec"]
         sc = ps.get("securityContext") or {}
         if sc.get("fsGroup") is not None or 10001 in (sc.get("supplementalGroups") or []):
@@ -1520,6 +1523,9 @@ def check_edge(docs):
         mnt = [m for c in ps["containers"] for m in c.get("volumeMounts", []) if m["name"] == "hub-data"]
         if not mnt or not all(m.get("readOnly") for m in mnt):
             F.add("keycloak: hub-data isn't mounted read-only")
+        vol = [v for v in ps.get("volumes", []) if v["name"] == "hub-data"]
+        if len(vol) != 1 or "projected" not in vol[0]:
+            F.add(f"keycloak: /hub-data must be the projected published documents, got {vol}")
     # Sign out's backend logout (contract §5 "Sign out"): kcinternal-logout
     # = kcinternal's entrypoint, middleware and service on exactly the
     # logout path, with its access log off (the query carries the ID token),

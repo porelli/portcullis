@@ -132,7 +132,8 @@ spec:
 # kcinternal-logout (contract §5 "Sign out"): forward-auth's backend logout
 # (PORTCULLIS_BACKEND_LOGOUT_URL = keycloak-internal:8081/…/logout?
 # id_token_hint=…) on its own router, the same middleware and service as
-# kcinternal, with no access log: the query carries the session's ID token.
+# kcinternal (in HA also core-retry@file, last), with no access log: the
+# query carries the session's ID token.
 # Keycloak's 8080 stays Traefik-only (it trusts proxy headers from the pod
 # CIDR), so the call can't skip Traefik. Exactly the path; above
 # kcinternal's PathPrefix(`/`).
@@ -154,6 +155,9 @@ spec:
         accessLogs: false
       middlewares:
         - name: strip-forwarded@file
+        {{- if .Values.ha.enabled }}
+        - name: core-retry@file
+        {{- end }}
       services:
         - name: core-keycloak-8080@file
           kind: TraefikService
