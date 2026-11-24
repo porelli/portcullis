@@ -73,7 +73,15 @@ init)
     env_set DNS_PROVIDER fake; env_set FAKE_API_TOKEN ci-ha-fake-token-0123456789; env_set DNS_CAA false
     env_set PORTCULLIS_K3S_VERSION "$1"; env_set PORTCULLIS_NODEADM_IMAGE "$2"; env_set PORTCULLIS_TESTPROVIDER 1' _ "$K3S_VERSION" "$ref"
   printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+  # A real install starts on one node and the others join later (node
+  # add), so every core volume (local, RWO) starts on that node: init runs
+  # with the first server alone schedulable, the other nodes cordoned
+  # until it is done (a multi-node first install spreads the core volumes
+  # over nodes, and the Hub, which mounts several, can't be placed).
+  first="$(K get nodes -l node-role.kubernetes.io/control-plane=true -o jsonpath='{.items[0].metadata.name}')"
+  for n in $(K get nodes -o jsonpath='{.items[*].metadata.name}'); do [ "$n" = "$first" ] || K cordon "$n" >/dev/null; done
   ./portcullis init --runtime kubernetes --kube-context "$ctx" --non-interactive --no-config-repo 2>&1 | redact
+  for n in $(K get nodes -o jsonpath='{.items[*].metadata.name}'); do K uncordon "$n" >/dev/null; done
   ./portcullis status --json > /tmp/status.json 2>/dev/null || true
   jq -c '{runtime: .runtime.name, vault: .vault.active, netpol, admission}' /tmp/status.json || true
   echo "PASS: init --runtime kubernetes on k3d (nodeadm $ref)"
@@ -135,7 +143,10 @@ collect)
     kubectl --context "$c" get nodes -o wide > "$a/$c-nodes.txt" 2>&1 || continue
     kubectl --context "$c" get pods -A -o wide > "$a/$c-pods.txt" 2>&1 || true
     kubectl --context "$c" get events -A --sort-by=.lastTimestamp > "$a/$c-events.txt" 2>&1 || true
-    for ns in portcullis portcullis-ingress portcullis-nodeadm cnpg-system portcullis-e2e; do
+    kubectl --context "$c" get pods -A -o json 2>/dev/null | jq -r '.items[] | select(.status.phase == "Pending") | "\(.metadata.namespace) \(.metadata.name)"' \
+      | while read -r ns p; do kubectl --context "$c" -n "$ns" describe pod "$p" >> "$a/$c-pending.txt" 2>&1 || true; done
+    kubectl --context "$c" get pvc,pv -A -o wide > "$a/$c-volumes.txt" 2>&1 || true
+    for ns in portcullis portcullis-ingress portcullis-nodeadm cnpg-system portcullis-e2e portcullis-storage; do
       for p in $(kubectl --context "$c" -n "$ns" get pods -o name 2>/dev/null); do
         kubectl --context "$c" -n "$ns" logs "$p" --all-containers --tail=300 > "$a/$c-$ns-${p#pod/}.log" 2>&1 || true
       done
@@ -143,7 +154,7 @@ collect)
   done
   ./portcullis ha status --json > "$a/ha-status.json" 2>&1 || true
   # Never a setup link in an artifact.
-  grep -rlE '/invite/[A-Za-z0-9_-]{16,}' "$a" 2>/dev/null | xargs -r rm -f
+  { grep -rlE '/invite/[A-Za-z0-9_-]{16,}' "$a" 2>/dev/null || true; } | xargs -r rm -f
   ;;
 *) echo "usage: $0 images|init|ha|scenarios|sites|collect" >&2; exit 2 ;;
 esac

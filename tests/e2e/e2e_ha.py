@@ -339,6 +339,7 @@ def cnpg_failover() -> None:
     psql(p0, "DROP TABLE IF EXISTS e2e_ha_rows; CREATE TABLE e2e_ha_rows (n int PRIMARY KEY, at timestamptz DEFAULT now());")
     w = Writer()
     w.start()
+    node, d2 = "", -1.0
     try:
         wait_for("the writer's first rows", lambda: len(w.committed) >= 5, 60, 1)
         # 1: the primary's pod deleted.
@@ -360,7 +361,8 @@ def cnpg_failover() -> None:
     finally:
         w.stop.set()
         w.join(15)
-    start_node(node)
+    if node:
+        start_node(node)
     want = {n for n, _ in w.committed}
     got = {int(x) for x in psql(pg_primary(), "SELECT n FROM e2e_ha_rows;").split()}
     lost = sorted(want - got)
@@ -495,12 +497,18 @@ def published_policy() -> str:
 
 
 def published_docs() -> None:
-    """A group with a member (admin) in the policy's groups; deleted through
-    the Hub: the Hub publishes the new policy, and every group-gate
-    replica's mounted copy equals it within 20 s of the DELETE."""
-    g = f"e2e-ha-pub-{int(time.time()) % 100000}"
+    """A test person in a group until a time (the policy's `expiring`
+    list names the membership, so group-gate enforces it); the group
+    deleted through the Hub: the Hub publishes the policy without it, and
+    every group-gate replica's mounted copy equals it within 20 s of the
+    DELETE. (Never LLDAP's admin: a person of its own.)"""
+    from datetime import datetime, timedelta, timezone
+    u, g = "e2e-ha-pub", f"e2e-ha-pub-{int(time.time()) % 100000}"
+    if hub("GET", f"/api/directory/users/{u}")[0] != 200:
+        hub.ok("POST", "/api/directory/users", {"username": u, "email": f"{u}@{DOMAIN}", "display_name": "HA publish"})
     hub.ok("POST", "/api/directory/groups", {"name": g})
-    hub.ok("POST", f"/api/directory/groups/{g}/members", {"username": "admin"})
+    until = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    hub.ok("POST", f"/api/directory/groups/{g}/members", {"username": u, "until": until})
     wait_for(f"{g} in the published policy and every replica's copy",
              lambda: g in published_policy() and len(gate_policies()) >= 2 and all(v == published_policy() for v in gate_policies().values()), 180, 2)
     before = published_policy()
@@ -516,7 +524,7 @@ def published_docs() -> None:
             if v == new and n not in seen:
                 seen[n] = time.time() - t
         return len(seen) >= 2 and len(seen) == len(gate_policies())
-    wait_for(f"the new policy in every group-gate replica", arrived, 60, 0.5)
+    wait_for("the new policy in every group-gate replica", arrived, 60, 0.5)
     note(f"ha_published_docs: published {tp:.1f} s after the DELETE; reached " + ", ".join(f"{n} after {s:.1f} s" for n, s in sorted(seen.items())))
     worst = max(seen.values())
     assert worst <= 20, f"the removal took {worst:.1f} s (> 20) to reach a replica"
