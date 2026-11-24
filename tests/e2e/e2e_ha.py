@@ -601,13 +601,23 @@ def vault_leader_loss() -> None:
     s0 = vault_issue(a0, "e2e-ha-before")
     t = time.time()
     K("-n", NS, "delete", "pod", a0, "--wait=false")
+    timeline: list[str] = []
+
+    def another() -> str:
+        sts = {p["metadata"]["name"]: vault_status(p["metadata"]["name"]) for p in pods(NS, "portcullis.io/component=vault")}
+        timeline.append(f"{time.time() - t:5.1f} s " + " ".join(f"{n}:{'A' if st.get('is_self') else '-'}{'S' if st.get('sealed') else ''}"
+                                                          f"({(st.get('leader_address') or '?').split('//')[-1].split('.')[0]})" for n, st in sorted(sts.items())))
+        return next((n for n, st in sts.items() if n != a0 and st.get("is_self") and st.get("ha_enabled") and not st.get("sealed")), "")
     try:
         # 30 s: the HA chart runs raft at performance_multiplier 1
         # (controller ruling, Task 33): an election in 3–6 s even when the
         # deleted leader handed nothing over (Vault's default timing took
         # 15–30 s then, seen in CI).
-        a1 = wait_for("another active voter", lambda: (vault_active() not in ("", a0) and vault_active()), 30, 0.5)
+        a1 = wait_for("another active voter", another, 30, 0.5)
     except AssertionError:
+        print("vault status over the wait (A active, S sealed, (leader)):\n  " + "\n  ".join(timeline[::4] + timeline[-2:]), flush=True)
+        for p in pods(NS, "portcullis.io/component=vault"):
+            print(f"--- {p['metadata']['name']}:\n" + K("-n", NS, "logs", p["metadata"]["name"], "-c", "vault", "--tail", "30", ok=False)[-3000:], flush=True)
         for p in pods(NS, "portcullis.io/component=vault"):
             st = vault_status(p["metadata"]["name"])
             print(f"{p['metadata']['name']}: " + json.dumps({k: st.get(k) for k in ("sealed", "ha_enabled", "is_self", "leader_address",
@@ -758,14 +768,19 @@ def hub_lease_handover() -> None:
         # LeaseDuration for the second pod's Lease, and only then listens.
         def answers() -> bool:
             try:
-                return hub("GET", "/api/directory/groups")[0] == 200
+                code, out = hub("GET", "/api/directory/groups")
             except (OSError, urllib.error.URLError, http.client.HTTPException, AssertionError) as e:
                 raise AssertionError(str(e))
+            assert code == 200, f"GET /api/directory/groups: {code} {str(out)[:200]} (Lease holder {lease_holder()})"
+            return True
         t_back = time.time()
         try:
             wait_for("the Hub answering again", answers, 600, 3)
         except AssertionError:
-            print(K("-n", NS, "describe", "pods", "-l", "portcullis.io/component=hub", ok=False)[-5000:], flush=True)
+            print(f"Lease holder: {lease_holder()}", flush=True)
+            print(K("-n", NS, "get", "pods", "-l", "portcullis.io/component in (hub,hub-e2e-second)", "-o", "wide", ok=False), flush=True)
+            for p in pods(NS, "portcullis.io/component=hub"):
+                print(K("-n", NS, "logs", p["metadata"]["name"], "--tail", "40", ok=False)[-4000:], flush=True)
             raise
         note(f"ha_hub_lease_handover: the Hub (back at 1) answered {time.time() - t_back:.0f} s after the scale-up")
 
@@ -1148,7 +1163,10 @@ def dns_failover() -> None:
     # the detection): 3 failed rounds 10 s apart, about 30 s; 45 s allows
     # the round's alignment and the status write.
     t_nr = not_ready_at(victim, t)
-    assert all(published().get(n) == sorted(ing.values()) for n in names), f"an address went before {victim} was NotReady: {published()}"
+    # (An empty set is a front door that hasn't read the provider yet since
+    # its start: unknown, not a removal.)
+    pub = published()
+    assert all(not pub.get(n) or ing[victim] in pub[n] for n in names), f"{victim}'s address went before it was NotReady: {pub}"
     wait_for(f"{victim}'s address removed", lambda: all(published().get(n) == rest for n in names), 120, 1)
     d, d_nr = time.time() - t, time.time() - t_nr
     note(f"ha_dns_failover: ingress node {victim} cut → NotReady after {t_nr - t:.0f} s → {ing[victim]} removed {d_nr:.0f} s later "
