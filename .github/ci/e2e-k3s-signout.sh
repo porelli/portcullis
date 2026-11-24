@@ -41,10 +41,11 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 
-# testuser's YubiKey-CA certificate (the root token on the vault pod's stdin).
+# testuser's YubiKey-CA certificate (the root token on vault-0's stdin; HA: Vault
+# is the raft StatefulSet, vault-0 its first voter).
 root="$(jq -r .root_token secrets/vault-init.json)"; echo "::add-mask::$root"
 # shellcheck disable=SC2016  # expanded by the pod's sh
-printf '%s\n' "$root" | K -n "$NS" exec -i deploy/vault -c vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" VAULT_ADDR=http://127.0.0.1:8200 exec vault write -format=json pki_int/issue/client-cert common_name=testuser ttl=1h' > "$T/issue.json"
+printf '%s\n' "$root" | K -n "$NS" exec -i pod/vault-0 -c vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" VAULT_ADDR=http://127.0.0.1:8200 exec vault write -format=json pki_int/issue/client-cert common_name=testuser ttl=1h' > "$T/issue.json"
 jq -r .data.certificate "$T/issue.json" > "$T/c.crt"
 (umask 077; jq -r .data.private_key "$T/issue.json" > "$T/c.key")
 rm -f "$T/issue.json"
