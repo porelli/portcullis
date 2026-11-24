@@ -1344,8 +1344,7 @@ kube_build_local() {
     info "Building $img ($builder build)..."
     # The image builder on this host (not a runtime: k3s has none): docker,
     # else podman with --format docker (the OCI format drops HEALTHCHECK).
-    local -a fmt=()
-    [ "$builder" != podman ] || fmt=(--format docker)
+    local -a fmt=(); read -r -a fmt <<< "$(_kube_build_opts "$builder" "$svc")"  # ha.sh
     "$builder" build ${fmt[@]+"${fmt[@]}"} -t "$img" "$PORTCULLIS_HOME/$svc" >&2 || fail "$builder build of $svc failed"
     ref="$(_kube_local_import "$img" "$svc")" || fail "could not import $img into k3s (sudo k3s ctr images import)"
     _K_LOCAL="$(printf '%s' "$_K_LOCAL" | S="$svc" R="$ref" jq -c '.[env.S] = env.R')"

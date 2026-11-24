@@ -1048,6 +1048,16 @@ _kube_barman_ready() {
     && kube_ctl -n "$KUBE_BARMAN_NS" get deploy barman-cloud -o json 2>/dev/null | jq -e '(.status.availableReplicas // 0) >= 1' >/dev/null 2>&1
 }
 
+# _kube_build_opts <builder> <svc> — kube_build_local's extra build
+# options: podman's --format docker (the OCI format drops HEALTHCHECK) and,
+# CI only, the domains image's fake DNS provider (PORTCULLIS_TESTPROVIDER=1,
+# as _dns_automated; e2e-ha-k3d's front door): never a published build.
+_kube_build_opts() {
+  [ "$1" != podman ] || printf '%s ' --format docker
+  [ "$2" != domains ] || [ "${PORTCULLIS_TESTPROVIDER:-}" != 1 ] || printf '%s ' --build-arg GO_TAGS=testprovider
+  echo
+}
+
 # kube_backup_values <values file> — backup.* (see the header): destination
 # = the URL is set; cnpg.* only when the plugin is ready too.
 kube_backup_values() {

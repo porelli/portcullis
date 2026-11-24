@@ -5341,6 +5341,25 @@ OUT="$(kt "PATH='$KCT/bin':\$PATH; kube_params_timer_units '$KCT/p'; cat '$KCT/p
 expect_eq "kube params timer: a oneshot as the operator running kube params-sync, every 30 s from boot" \
   "$(printf '%s\n' "$OUT" | grep -cE '^(Type=oneshot|User=.+|ExecStart=.*/portcullis kube params-sync|OnBootSec=30s|OnUnitActiveSec=30s|WantedBy=timers.target)$')" 6
 expect_eq "init on kubernetes installs the params timer" "$(sed -n '/^init_run() {/,/^}/p' "$HERE"/../scripts/lib/stack.sh | grep -c '_rt_is_kube || kube_params_timer_install')" 1
+# up installs a timer a late init failure left out (controller ruling after
+# the VM rebuild: joins waited silently for the params), never one installed.
+KTE="$WORK/kte"; rm -rf "$KTE"; mkdir -p "$KTE/bin" "$KTE/run"
+printf '#!/bin/sh\necho "$*" >> "%s/calls"\ncase "$1 $2" in "cat portcullis-kube-params.timer") exit "${STUB_PARAMS_RC:-0}" ;; "cat portcullis-kube-check.timer") exit "${STUB_CHECK_RC:-0}" ;; esac\nexit 0\n' "$KTE" > "$KTE/bin/systemctl"; chmod +x "$KTE/bin/systemctl"
+kte() { rm -f "$KTE/calls"; kt "PATH='$KTE/bin':\$PATH; KUBE_SYSTEMD_RUN='$KTE/run'; $1; kube_check_timer_install() { echo INSTALL-check; }; kube_params_timer_install() { echo INSTALL-params; }; kube_timers_ensure"; }
+OUT="$(kte "export STUB_PARAMS_RC=1")"
+expect_eq "up: the params timer missing (init failed late) → installed; the check timer there → left alone" "$(printf '%s\n' "$OUT" | grep -c INSTALL-params):$(printf '%s\n' "$OUT" | grep -c INSTALL-check):$(printf '%s\n' "$OUT" | tail -n1)" "1:0:rc=0"
+OUT="$(kte "export STUB_PARAMS_RC=1 STUB_CHECK_RC=1")"
+expect_eq "up: both timers missing → both installed" "$(printf '%s\n' "$OUT" | grep -c 'INSTALL-')" 2
+OUT="$(kte ":")"
+expect_eq "up: both timers installed → nothing installed" "$(printf '%s\n' "$OUT" | grep -c 'INSTALL-')" 0
+OUT="$(kt "PATH='$KTE/bin':\$PATH; KUBE_SYSTEMD_RUN='$KTE/none'; kube_params_timer_install() { echo INSTALL-params; }; kube_timers_ensure")"
+expect_eq "up: no systemd → nothing (init's warning names the manual run)" "$(printf '%s\n' "$OUT" | grep -c 'INSTALL-'):$(printf '%s\n' "$OUT" | tail -n1)" "0:rc=0"
+expect_eq "up on kubernetes ensures the timers" "$(sed -n '/^stack_up() {/,/^}/p' "$HERE"/../scripts/lib/stack.sh | grep -c '_rt_is_kube || kube_timers_ensure')" 1
+# kube_build_local's options: podman's docker format; the fake DNS
+# provider's domains build only with PORTCULLIS_TESTPROVIDER=1 (CI).
+expect_eq "kube build options: docker domains → none; podman → --format docker; testprovider → GO_TAGS only for domains" \
+  "$(kt '_kube_build_opts docker domains' | head -n1)|$(kt '_kube_build_opts podman enroll' | head -n1)|$(kt 'PORTCULLIS_TESTPROVIDER=1 _kube_build_opts docker domains' | head -n1)|$(kt 'PORTCULLIS_TESTPROVIDER=1 _kube_build_opts docker enroll' | head -n1)" \
+  "|--format docker |--build-arg GO_TAGS=testprovider |"
 # nodeadm's objects: off unless init installed k3s and the image is known;
 # the server token reaches its Secret through --from-file only, once.
 expect_eq "kube_nodeadm_on: needs PORTCULLIS_K3S_VERSION and a nodeadm image by digest" \

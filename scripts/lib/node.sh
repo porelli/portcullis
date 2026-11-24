@@ -497,6 +497,19 @@ kube_params_timer_install() {
   rm -rf "$tmp"
 }
 
+# kube_timers_ensure — `up` on kubernetes (controller ruling after the VM
+# rebuild): init installs portcullis-kube-check.timer and
+# portcullis-kube-params.timer only at its very end, so an init that failed
+# late left them out and joins waited silently for params (waiting_admission,
+# no error). Each one systemd doesn't know is installed now, as init would;
+# an installed one is left alone. Without systemd: nothing (init's warning
+# says what to run by hand).
+kube_timers_ensure() {
+  command -v systemctl >/dev/null 2>&1 && [ -d "${KUBE_SYSTEMD_RUN:-/run/systemd/system}" ] || return 0
+  systemctl cat portcullis-kube-check.timer >/dev/null 2>&1 || kube_check_timer_install
+  systemctl cat portcullis-kube-params.timer >/dev/null 2>&1 || kube_params_timer_install
+}
+
 # ── per-node host checks (Task 17 ruling: nodeadm lifts the multi-node gate) ──
 
 # kube_multi_node_checks <nodes json> — a cluster of several nodes: the

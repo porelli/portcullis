@@ -557,6 +557,8 @@ stack_up() {
   link_cert_renew
   # Traefik is up: pin the main domain's CAA to its ACME account.
   dns_tighten_main
+  # init's timers when a late init failure left them out (node.sh).
+  ! _rt_is_kube || kube_timers_ensure
   # If the service account was created or its password changed, restart the Hub
   # (which may have started with a stale/missing password).
   lldap_service_account
