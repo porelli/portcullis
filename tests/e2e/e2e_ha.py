@@ -599,7 +599,10 @@ def vault_leader_loss() -> None:
     t = time.time()
     K("-n", NS, "delete", "pod", a0, "--wait=false")
     try:
-        a1 = wait_for("another active voter", lambda: (vault_active() not in ("", a0) and vault_active()), 30, 0.5)
+        # Raft's own window: HeartbeatTimeout 15 s (Vault's default timing),
+        # randomized up to twice that when no leadership transfer happened,
+        # then the HA lock: 45 s.
+        a1 = wait_for("another active voter", lambda: (vault_active() not in ("", a0) and vault_active()), 45, 0.5)
     except AssertionError:
         for p in pods(NS, "portcullis.io/component=vault"):
             st = vault_status(p["metadata"]["name"])
@@ -622,6 +625,9 @@ def lease_time(v: str) -> float:
     """A Lease MicroTime (2026-11-24T08:44:15.123456Z) as epoch seconds."""
     from datetime import datetime, timezone
     assert v, "a Lease time missing"
+    if "." in v:
+        whole, frac = v.rstrip("Z").split(".", 1)
+        v = f"{whole}.{frac[:6]}Z"  # RFC 3339 nanoseconds: %f takes 6 digits
     fmt = "%Y-%m-%dT%H:%M:%S.%fZ" if "." in v else "%Y-%m-%dT%H:%M:%SZ"
     return datetime.strptime(v, fmt).replace(tzinfo=timezone.utc).timestamp()
 
@@ -748,7 +754,13 @@ def hub_lease_handover() -> None:
                 return hub("GET", "/api/directory/groups")[0] == 200
             except (OSError, urllib.error.URLError, http.client.HTTPException, AssertionError) as e:
                 raise AssertionError(str(e))
-        wait_for("the Hub answering again", answers, 180, 3)
+        t_back = time.time()
+        try:
+            wait_for("the Hub answering again", answers, 600, 3)
+        except AssertionError:
+            print(K("-n", NS, "describe", "pods", "-l", "portcullis.io/component=hub", ok=False)[-5000:], flush=True)
+            raise
+        note(f"ha_hub_lease_handover: the Hub (back at 1) answered {time.time() - t_back:.0f} s after the scale-up")
 
 
 def gate_policies() -> dict[str, str]:
@@ -1117,6 +1129,10 @@ def dns_failover() -> None:
     finally:
         save("frontdoor-status-before.json", fd_status())
         print(json.dumps(fd_status())[:3000], flush=True)
+    # One change per name per 60 s: the cut starts a minute after the last
+    # add, so the removal measures the detection, not the rate limit.
+    last = max(lease_time(v["last_change"]) for v in fd_status()["names"].values() if v.get("last_change"))
+    time.sleep(max(0.0, last + 61 - time.time()))
     fd_node = Kj("-n", NS, "get", "pods", "-l", "portcullis.io/component=frontdoor")["items"][0]["spec"]["nodeName"]
     victim = next(n for n in sorted(ing) if n != fd_node)
     t = kill_node(victim)
