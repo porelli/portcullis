@@ -6117,6 +6117,10 @@ jobs:
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
           sudo /tmp/e2e-venv/bin/playwright install-deps chromium
           /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
       - name: HA scenarios (tests/e2e/e2e_ha.py)
         timeout-minutes: 45
         run: bash .github/ci/e2e-ha-k3d-phases.sh scenarios
