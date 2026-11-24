@@ -76,7 +76,7 @@ init)
     --email "ci@$E2E_DOMAIN" --dns-provider none
   # The fake provider's token: a CI test value (the testprovider build's
   # in-memory zone), in .env as any provider's credentials are.
-  bash -c 'source scripts/lib/common.sh; env_set PORTCULLIS_KUBE_IMAGES local; env_set PORTCULLIS_PUBLIC_IPV4 203.0.113.11
+  bash -c 'source scripts/lib/common.sh; env_set PORTCULLIS_KUBE_IMAGES local; env_set PORTCULLIS_PUBLIC_IPV4 198.51.100.11
     env_set DNS_PROVIDER fake; env_set FAKE_API_TOKEN ci-ha-fake-token-0123456789; env_set DNS_CAA false
     env_set PORTCULLIS_K3S_VERSION "$1"; env_set PORTCULLIS_NODEADM_IMAGE "$2"; env_set PORTCULLIS_TESTPROVIDER 1' _ "$K3S_VERSION" "$ref"
   printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
@@ -178,6 +178,12 @@ collect)
         kubectl --context "$c" -n "$ns" logs "$p" --all-containers --tail=300 > "$a/$c-$ns-${p#pod/}.log" 2>&1 || true
       done
     done
+  done
+  # The k3d node containers' own logs (k3s: the server's etcd, the
+  # kubelet) and their firewall (a scenario's isolation chain).
+  for n in $(docker ps -a --filter label=app=k3d --format '{{.Names}}'); do
+    docker logs --tail 400 "$n" > "$a/node-$n.log" 2>&1 || true
+    docker exec "$n" iptables -w -S > "$a/node-$n-iptables.txt" 2>&1 || true
   done
   ./portcullis ha status --json > "$a/ha-status.json" 2>&1 || true
   # Never a setup link in an artifact.

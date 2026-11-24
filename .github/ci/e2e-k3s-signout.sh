@@ -23,14 +23,17 @@ IP=198.51.100.1
 C=(curl -s --max-time 20 --cacert certs/ca-chain.crt --cert "$T/c.crt" --key "$T/c.key"
    --resolve "auth.$D:443:$IP" --resolve "$D:443:$IP" -c "$T/jar" -b "$T/jar")
 
-# Keycloak reads the Hub's sign-in file through hub-data (root 0751, the
-# mount read-only, no Hub group): it may open the file by name but never
-# list the volume (the Hub's other files stay out of reach).
+# Keycloak reads the Hub's sign-in file through /hub-data, read-only. HA
+# (contract §4): that is its published documents (a projected volume, no
+# Hub PVC), so a listing shows only Keycloak's own documents — never the
+# Hub's other files.
 K -n "$NS" exec deploy/keycloak -c keycloak -- test -r /hub-data/signin-keycloak.json \
   || fail "Keycloak can't read /hub-data/signin-keycloak.json (every sign-in method would be off)"
-if K -n "$NS" exec deploy/keycloak -c keycloak -- ls /hub-data >/dev/null 2>&1; then fail "Keycloak can list /hub-data"; fi
+others="$(K -n "$NS" exec deploy/keycloak -c keycloak -- ls -A /hub-data 2>/dev/null \
+  | grep -vxE 'signin-keycloak\.json|impersonation\.json|\.rev-[a-z-]+|\.\.data|\.\.[0-9_.]+' || true)"
+[ -z "$others" ] || fail "Keycloak's /hub-data holds more than its published documents: $others"
 if K -n "$NS" exec deploy/keycloak -c keycloak -- sh -c 'echo x > /hub-data/x' >/dev/null 2>&1; then fail "Keycloak can write /hub-data"; fi
-pass "Keycloak opens /hub-data/signin-keycloak.json read-only and can't list or write hub-data"
+pass "Keycloak opens /hub-data/signin-keycloak.json read-only, sees only its published documents and can't write there"
 # The extension re-reads the file when it changes; give it a moment after
 # the first readable look.
 for _ in $(seq 1 30); do

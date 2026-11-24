@@ -26,11 +26,14 @@
 # where k3s runs --node-ip on pcmesh (nodeadm reads the mesh address from
 # the InternalIP inside it; the WireGuard tunnel itself isn't in k3d).
 #
-# Every node has a TEST-NET-3 "public" address (203.0.113.1x/32 on its
-# eth0, a route to it on every other node and on the runner), written as
-# the node's portcullis.io/addresses annotation (nodeadm's shape): the
-# testprovider front door publishes documentation ranges only in that
-# build, and the nodeagent probes reach Traefik's hostPort there.
+# Every node has a second, "public" interface: the docker network
+# <cluster>-pub (TEST-NET-2, 198.51.100.0/24, the runner its gateway),
+# address 198.51.100.1x, written as the node's portcullis.io/addresses
+# annotation (nodeadm's shape). The node containers' own addresses: the
+# runner, every node's probes and Traefik's hostPort reach them with no
+# route of ours, and an uplink loss is that interface cut (eth1) while the
+# mesh (eth0) stays. Documentation ranges are publishable only in the
+# testprovider builds (the front door's, nodeadm's).
 #
 # The CLI imports the K1 local images with `sudo k3s ctr -n k8s.io images
 # import`: on a k3d runner /usr/local/bin/k3s is a CI-only shim (written
@@ -127,6 +130,7 @@ sudo chmod 0755 /usr/local/bin/k3s
 
 # One cluster at a time.
 for c in pk-ha pk-sites; do
+  docker network rm "$c-pub" >/dev/null 2>&1 || true
   if k3d cluster list -o json 2>/dev/null | jq -e --arg c "$c" 'any(.[]; .name == $c)' >/dev/null; then
     k3d cluster delete "$c" >/dev/null
   fi
@@ -190,20 +194,12 @@ for n in "${nodes[@]}"; do
   [ "$storage" = false ] || labels+=("portcullis.io/storage=true")
   K label node "$n" --overwrite "${labels[@]}" >/dev/null
   [ "$class" != small ] || K taint node "$n" --overwrite portcullis.io/small=true:NoSchedule >/dev/null
-  pub[$n]="203.0.113.$((10 + i))"
+  pub[$n]="198.51.100.$((10 + i))"
 done
-# The addresses on the node containers and the routes to them (the k3d
-# network's own addresses as next hops).
-declare -A lan=()
+docker network rm "$name-pub" >/dev/null 2>&1 || true
+docker network create --subnet 198.51.100.0/24 --gateway 198.51.100.254 "$name-pub" >/dev/null
 for n in "${nodes[@]}"; do
-  lan[$n]="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$(node_c "$n")")"
-done
-for n in "${nodes[@]}"; do
-  docker exec "$(node_c "$n")" ip addr add "${pub[$n]}/32" dev eth0 2>/dev/null || true
-  for m in "${nodes[@]}"; do
-    [ "$m" = "$n" ] || docker exec "$(node_c "$n")" ip route replace "${pub[$m]}/32" via "${lan[$m]}"
-  done
-  sudo ip route replace "${pub[$n]}/32" via "${lan[$n]}"
+  docker network connect --ip "${pub[$n]}" "$name-pub" "$(node_c "$n")"
   # nodeadm's annotation (its LAN and public addresses; the mesh address is
   # the InternalIP).
   A="$(PUB="${pub[$n]}" jq -cn '{lan: [], public: [env.PUB]}')"

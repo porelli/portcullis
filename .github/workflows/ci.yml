@@ -6087,6 +6087,28 @@ jobs:
   # tb). Real partitions, power, disks and fencing are e2e-ha-vm's (part B).
   # Thin: the steps are .github/ci/e2e-ha-k3d-*.sh. Failure artifacts: logs
   # and events only.
+  # Reviewed deviations from the plan (controller ruling, Task 33 part A):
+  #   - a node's loss is its isolation (the node container's network
+  #     dropped in its own iptables chain, the API port reset for the load
+  #     balancer), not a container kill: a k3d server container restarted
+  #     or paused doesn't come back healthy; power loss is e2e-ha-vm's;
+  #   - CNPG's node failover counts its 60 s from the node's NotReady (the
+  #     detection is k3s' node-monitor grace, which stays; NodeDown covers
+  #     it);
+  #   - the Lease handover runs against a second Hub pod of its own (its
+  #     data on emptyDirs): two Hubs never share a data directory (the Hub's
+  #     .hub.lock refuses the second);
+  #   - the nodeagent probes are a test DaemonSet (`nodeagent serve
+  #     --probes-only`) with the harness's probe targets: nodeadm pushes
+  #     targets only for a DNS provider with an egress host, and the fake
+  #     provider has none;
+  #   - N−1 against the scheduler leaves out pods on the replicated tier's
+  #     volumes: that tier is a local-path class in k3d (node-bound), where
+  #     Longhorn's would follow the pod;
+  #   - init runs with the first server alone schedulable (a real install
+  #     starts on one node), and the HA switch is ha enable's own steps
+  #     without its installs (no Longhorn or fencing in k3d: their
+  #     namespaces, and Longhorn's CRDs, only).
   e2e-ha-k3d:
     needs: jobs-input
     if: >-

@@ -186,7 +186,12 @@ def start_node(node: str) -> None:
     for r in (["-D", "INPUT", "-j", ISOLATE], ["-D", "OUTPUT", "-j", ISOLATE], ["-D", "FORWARD", "-j", ISOLATE], ["-F", ISOLATE], ["-X", ISOLATE]):
         subprocess.run(["docker", "exec", node, "iptables", "-w", *r], capture_output=True, timeout=30)
     killed.discard(node)
-    wait_for(f"node {node} Ready again", lambda: node_ready(node), 300, 5)
+    try:
+        wait_for(f"node {node} Ready again", lambda: node_ready(node), 300, 5)
+    except AssertionError:
+        r = subprocess.run(["docker", "logs", "--tail", "60", node], capture_output=True, text=True)
+        print(f"::group::{node}: its last k3s lines\n{(r.stdout + r.stderr)[-6000:]}\n::endgroup::", flush=True)
+        raise
 
 
 def not_ready_at(node: str, since: float, timeout: float = 180) -> float:
@@ -891,11 +896,10 @@ def dns_failover() -> None:
     import base64
     served = base64.b64decode(Kj("-n", NS, "get", "secret", "frontdoor-cert")["data"]["tls.crt"]).decode()
     want_fp = cert_fp(served)
-    mesh = {n["name"]: n["mesh"] for n in nodes}
     for n in sorted(ing):
         for sni in (f"auth.{DOMAIN}", ""):
-            got = served_fp(mesh[n], sni)
-            assert got == want_fp, f"{n} ({mesh[n]}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
+            got = served_fp(ing[n], sni)
+            assert got == want_fp, f"{n} ({ing[n]}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
     note(f"ha_dns_failover: every ingress node serves frontdoor-cert's certificate ({want_fp[:16]}…), with and without SNI")
     wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
     save("frontdoor-status-before.json", fd_status())
@@ -977,15 +981,15 @@ def sites_main() -> int:
 
 def uplink(nodes: list[str], down: bool, inbound: bool = True, outbound: bool = True) -> None:
     """A site's uplink (its public side) cut on its node containers: the
-    public range TEST-NET-3 dropped both ways (inbound: no other site reaches
+    public range TEST-NET-2 dropped both ways (inbound: no other site reaches
     its addresses; outbound: its probers reach nothing). The mesh range
     stays (the site's nodes still talk to the cluster)."""
     op = "-I" if down else "-D"
     for n in nodes:
         if inbound:
-            docker("exec", n, "iptables", "-t", "raw", op, "PREROUTING", "-d", "203.0.113.0/24", "-j", "DROP")
+            docker("exec", n, "iptables", "-t", "raw", op, "PREROUTING", "-d", "198.51.100.0/24", "-j", "DROP")
         if outbound:
-            docker("exec", n, "iptables", "-t", "raw", op, "OUTPUT", "-d", "203.0.113.0/24", "-j", "DROP")
+            docker("exec", n, "iptables", "-t", "raw", op, "OUTPUT", "-d", "198.51.100.0/24", "-j", "DROP")
 
 
 def quiet_for(what: str, fn, seconds: float) -> None:
