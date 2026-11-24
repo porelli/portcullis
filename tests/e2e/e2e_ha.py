@@ -509,6 +509,14 @@ def lease_holder() -> str:
     return Kj("-n", NS, "get", "lease", "portcullis-hub")["spec"].get("holderIdentity") or ""
 
 
+def lease_time(v: str) -> float:
+    """A Lease MicroTime (2026-11-24T08:44:15.123456Z) as epoch seconds."""
+    from datetime import datetime, timezone
+    assert v, "a Lease time missing"
+    fmt = "%Y-%m-%dT%H:%M:%S.%fZ" if "." in v else "%Y-%m-%dT%H:%M:%SZ"
+    return datetime.strptime(v, fmt).replace(tzinfo=timezone.utc).timestamp()
+
+
 def hub_pods() -> list[str]:
     return sorted(p["metadata"]["name"] for p in pods(NS, "portcullis.io/component=hub") if ready(p))
 
@@ -560,16 +568,47 @@ def hub_lease_handover() -> None:
                     raise
             time.sleep(3)
         # The holder gone (its Deployment at 0, so only the second is left).
+        # A stopping Hub keeps its Lease while it finishes its background
+        # operations, up to its grace period (the chart's 60 s), and never
+        # releases it: the successor takes it LeaseDuration after the last
+        # renewal. So the handover is judged on the Lease's own clock
+        # (acquireTime − the holder's last renewTime), and the whole within
+        # grace + LeaseDuration + retries. The old Hub's log is followed
+        # (it is gone afterwards) to show what its shutdown waited on.
+        live0 = Kj("-n", NS, "get", "pod", h0)
+        grace = int(live0["spec"].get("terminationGracePeriodSeconds", 30))
+        log0 = tempfile.TemporaryFile("w+")
+        follow = subprocess.Popen(["kubectl", "--context", CTX, "-n", NS, "logs", "-f", "--since=10s", h0,
+                                   "-c", live0["spec"]["containers"][0]["name"]], stdout=log0, stderr=subprocess.STDOUT)
         K("-n", NS, "scale", "deployment/hub", "--replicas=0")
         t = time.time()
+        last_renew, gone, spec = "", None, {}
         try:
-            wait_for(f"{other} takes the Lease", lambda: lease_holder() == other, LEASE_S + RETRY_S + 120, 0.5)
-        except AssertionError:
-            print(K("-n", NS, "get", "pods", "-l", "portcullis.io/component in (hub,hub-e2e-second)", "-o", "wide", ok=False), flush=True)
-            print(K("-n", NS, "logs", other, "--tail", "40", ok=False)[-4000:], flush=True)
-            raise
+            while True:
+                spec = Kj("-n", NS, "get", "lease", "portcullis-hub")["spec"]
+                if spec.get("holderIdentity") == other:
+                    break
+                if spec.get("holderIdentity") == h0:
+                    last_renew = spec.get("renewTime") or last_renew
+                if gone is None and not K("-n", NS, "get", "pod", h0, "--ignore-not-found", "-o", "name", ok=False).strip():
+                    gone = time.time() - t
+                if time.time() - t > grace + LEASE_S + 2 * RETRY_S + 60:
+                    print(K("-n", NS, "get", "pods", "-l", "portcullis.io/component in (hub,hub-e2e-second)", "-o", "wide", ok=False), flush=True)
+                    print(K("-n", NS, "logs", other, "--tail", "40", ok=False)[-4000:], flush=True)
+                    raise AssertionError(f"{other} didn't take the Lease within {time.time() - t:.0f} s (holder {spec.get('holderIdentity')}, last renewal {last_renew})")
+                time.sleep(0.5)
+        finally:
+            follow.terminate()
+            follow.wait(10)
+            log0.seek(0)
+            lines = [ln.rstrip() for ln in log0 if re.search(r"shutdown|leader|interrupted|background|signal|exit", ln, re.I)]
+            log0.close()
+            print(f"the old Hub {h0}'s shutdown lines:\n  " + "\n  ".join(lines[-30:] or ["(none)"]), flush=True)
         d = time.time() - t
-        note(f"ha_hub_lease_handover: holder {h0} stopped → {other} holds the Lease after {d:.1f} s")
+        lag = lease_time(spec.get("acquireTime", "")) - lease_time(last_renew)
+        gone_s = "still there" if gone is None else f"gone after {gone:.1f} s"
+        note(f"ha_hub_lease_handover: holder {h0} stopped ({gone_s}, grace {grace} s) → {other} holds the Lease after {d:.1f} s, "
+             f"{lag:.1f} s after {h0}'s last renewal")
         def writes():
             f = Forward(f"pod/{other}", 8888)
             try:
@@ -583,9 +622,11 @@ def hub_lease_handover() -> None:
                 f.close()
         code, out = wait_for("the new holder writes", writes, 120, 3)
         assert code in (200, 201), f"the new holder's write: {code} {str(out)[:200]}"
-        # The old holder stops on SIGTERM within its grace period; the
-        # Lease's own clock: LeaseDuration after its last renewal.
-        assert d <= LEASE_S + RETRY_S + 35, f"handover took {d:.1f} s (> LeaseDuration {LEASE_S} s + retry {RETRY_S} s + the 30 s grace)"
+        # The Lease's own clock: the standby saw the last renewal within a
+        # retry and takes the Lease LeaseDuration after it saw it (one more
+        # retry, 2 s of slack). The whole: the old Hub's grace on top.
+        assert lag <= LEASE_S + 2 * RETRY_S + 2, f"the Lease taken {lag:.1f} s after the last renewal (> LeaseDuration {LEASE_S} s + 2 retries {RETRY_S} s + 2 s)"
+        assert d <= grace + LEASE_S + 2 * RETRY_S + 10, f"handover took {d:.1f} s (> grace {grace} s + LeaseDuration {LEASE_S} s + 2 retries + 10 s)"
     finally:
         K("-n", NS, "delete", "pod", other, "--wait=false", ok=False)
         K("-n", NS, "scale", "deployment/hub", "--replicas=1")
