@@ -62,6 +62,9 @@ func baseDoc(t *testing.T) *state.Doc {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The people's document: the vector's senders left out (absent, an
+	// older Hub's); the senders' tests add their own.
+	d.Senders = nil
 	return d
 }
 

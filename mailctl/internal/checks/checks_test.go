@@ -86,6 +86,8 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Without the vector's senders (the senders' checks add their own).
+	doc.Senders = nil
 	st, _ := state.Open(t.TempDir())
 	st.Update(func(p *state.Persistent) error { p.Doc, p.Generation = doc, doc.Generation; return nil })
 	c := stalwart.New(f.URL(), stalwart.Bearer("API_k"))

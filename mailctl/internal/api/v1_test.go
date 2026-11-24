@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -67,13 +68,22 @@ func (e *v1env) do(method, path, body string) *httptest.ResponseRecorder {
 	return w
 }
 
+// vec is the contract's vector without its senders (an older Hub's
+// document: senders absent), at generation gen; senderVec is it whole.
 func vec(t *testing.T, gen int) string {
 	b, err := os.ReadFile("../state/testdata/mailstate_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.Replace(string(b), `"generation":12`, `"generation":`+itoa(gen), 1)
+	s := sendersRe.ReplaceAllString(string(b), "")
+	if s == string(b) {
+		t.Fatal("the vector has no senders to leave out")
+	}
+	return strings.Replace(s, `"generation":12`, `"generation":`+itoa(gen), 1)
 }
+
+// sendersRe is the vector's senders list (with its line's indent).
+var sendersRe = regexp.MustCompile(`(?s) "senders":\[.*?\],\n`)
 
 func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
 

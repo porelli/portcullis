@@ -15,7 +15,7 @@ const (
 )
 
 func senderVec(t *testing.T, gen int) string {
-	b, err := os.ReadFile("../state/testdata/mailstate_v2_senders.json")
+	b, err := os.ReadFile("../state/testdata/mailstate_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}

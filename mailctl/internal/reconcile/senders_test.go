@@ -22,7 +22,7 @@ const (
 // sendersDoc is the contract's vector with senders (§19.5, §19.14).
 func sendersDoc(t *testing.T) *state.Doc {
 	t.Helper()
-	b, err := os.ReadFile("../state/testdata/mailstate_v2_senders.json")
+	b, err := os.ReadFile("../state/testdata/mailstate_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}

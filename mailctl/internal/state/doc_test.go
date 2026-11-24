@@ -169,7 +169,7 @@ func TestLocalNetworkOK(t *testing.T) {
 
 func sendersVector(t *testing.T) []byte {
 	t.Helper()
-	b, err := os.ReadFile("testdata/mailstate_v2_senders.json")
+	b, err := os.ReadFile("testdata/mailstate_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,28 +198,33 @@ func TestMailStateV2SendersVector(t *testing.T) {
 	if string(ab) != string(zb) {
 		t.Fatalf("round trip differs:\n%s\n%s", ab, zb)
 	}
-	// The vector without senders is the older Hub's document, byte for
-	// byte (testdata/mailstate_v2.json, the Hub's current copy).
+}
+
+// noSenders is the vector without its senders: an older Hub's document.
+func noSenders(t *testing.T) []byte {
+	t.Helper()
+	b := vector(t)
 	old := strings.Replace(string(b), ` "senders":[{"username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com"},
             {"username":"portcullis-app-firefox-sync-fxa","uuid":"7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e","address":"portcullis-app-firefox-sync-fxa@example.com"}],
 `, "", 1)
-	if old != string(vector(t)) {
-		t.Fatal("mailstate_v2_senders.json minus its senders isn't mailstate_v2.json")
+	if old == string(b) {
+		t.Fatal("the vector's senders weren't found")
 	}
+	return []byte(old)
 }
 
 // senders is optional (ruling C1): absent = an older Hub (existing
 // senders left untouched), present and empty = remove every sender. Both
 // survive the store's round trip as they are.
 func TestSendersAbsentOrEmpty(t *testing.T) {
-	d, err := Parse(vector(t))
+	d, err := Parse(noSenders(t))
 	if err != nil {
 		t.Fatalf("absent: %v", err)
 	}
 	if d.SendersPresent() || d.Senders != nil {
 		t.Fatalf("absent senders read as present: %+v", d.Senders)
 	}
-	empty := strings.Replace(string(vector(t)), `"aliases":`, `"senders":[],"aliases":`, 1)
+	empty := strings.Replace(string(noSenders(t)), `"aliases":`, `"senders":[],"aliases":`, 1)
 	e, err := Parse([]byte(empty))
 	if err != nil {
 		t.Fatalf("empty: %v", err)
@@ -257,13 +262,13 @@ func TestParseRefusesSenders(t *testing.T) {
 	}
 	hub := `{"username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com"}`
 	cases := map[string]string{
-		"senders null":            strings.Replace(string(vector(t)), `"aliases":`, `"senders":null,"aliases":`, 1),
+		"senders null":            strings.Replace(string(noSenders(t)), `"aliases":`, `"senders":null,"aliases":`, 1),
 		"unknown key":             rep(hub, `{"username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com","label":"x"}`),
 		"missing address":         rep(hub, `{"username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"}`),
 		"missing uuid":            rep(hub, `{"username":"portcullis-hub-mail","address":"portcullis-hub-mail@example.com"}`),
 		"null username":           rep(hub, `{"username":null,"uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com"}`),
 		"duplicate key":           rep(hub, `{"username":"portcullis-hub-mail","username":"portcullis-hub-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-hub-mail@example.com"}`),
-		"not a list":              strings.Replace(string(vector(t)), `"aliases":`, `"senders":`+hub+`,"aliases":`, 1),
+		"not a list":              strings.Replace(string(noSenders(t)), `"aliases":`, `"senders":`+hub+`,"aliases":`, 1),
 		"senders twice":           rep(`"aliases":`, `"senders":[],"aliases":`),
 		"a person's username":     rep(hub, `{"username":"alice","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"alice@example.com"}`),
 		"another form":            rep(hub, `{"username":"portcullis-mail","uuid":"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d","address":"portcullis-mail@example.com"}`),
