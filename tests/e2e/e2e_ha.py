@@ -514,29 +514,40 @@ def hub_lease_handover() -> None:
         K("-n", NS, "wait", "--for=condition=Ready", f"pod/{other}", "--timeout=300s", timeout=320, ok=False)
         # Watched over 30 s: the second pod never holds the Lease and
         # refuses every write (the leader gate, before any handler).
-        f = Forward(f"pod/{other}", 8888)
-        try:
-            for _ in range(10):
-                assert lease_holder() == h0, f"the Lease moved to {lease_holder()} while {h0} runs"
-                code, out = hub_call(f.port, "POST", "/api/directory/groups", {"name": "e2e-ha-standby"})
+        # (A standby may not listen yet: its start waits on the fence; then
+        # a refused connection is no write either.)
+        for _ in range(10):
+            assert lease_holder() == h0, f"the Lease moved to {lease_holder()} while {h0} runs"
+            try:
+                f = Forward(f"pod/{other}", 8888)
+                try:
+                    code, out = _hub_call(f.port, "POST", "/api/directory/groups", {"name": "e2e-ha-standby"}, 10)
+                finally:
+                    f.close()
                 assert code == 503 and "standing by" in str(out), f"the standby {other} answered a write {code}: {str(out)[:200]}"
-                time.sleep(3)
-        finally:
-            f.close()
+            except (ConnectionError, urllib.error.URLError, http.client.RemoteDisconnected, AssertionError) as e:
+                if "answered a write" in str(e) or "Lease moved" in str(e):
+                    raise
+            time.sleep(3)
         # The holder gone (its Deployment at 0, so only the second is left).
         K("-n", NS, "scale", "deployment/hub", "--replicas=0")
         t = time.time()
         wait_for(f"{other} takes the Lease", lambda: lease_holder() == other, LEASE_S + RETRY_S + 60, 0.5)
         d = time.time() - t
         note(f"ha_hub_lease_handover: holder {h0} stopped → {other} holds the Lease after {d:.1f} s")
-        f = Forward(f"pod/{other}", 8888)
-        try:
-            code, out = wait_for("the new holder writes", lambda: (lambda r: r if r[0] != 503 else None)(
-                hub_call(f.port, "POST", "/api/directory/groups", {"name": "e2e-ha-lease"})), 30, 1)
-            assert code in (200, 201), f"the new holder's write: {code} {str(out)[:200]}"
-            hub_call(f.port, "DELETE", "/api/directory/groups/e2e-ha-lease", {"confirm": "e2e-ha-lease"})
-        finally:
-            f.close()
+        def writes():
+            f = Forward(f"pod/{other}", 8888)
+            try:
+                r = _hub_call(f.port, "POST", "/api/directory/groups", {"name": "e2e-ha-lease"}, 15)
+                if r[0] in (200, 201):
+                    _hub_call(f.port, "DELETE", "/api/directory/groups/e2e-ha-lease", {"confirm": "e2e-ha-lease"}, 15)
+                return r if r[0] != 503 else None
+            except (ConnectionError, urllib.error.URLError, http.client.RemoteDisconnected) as e:
+                raise AssertionError(str(e))
+            finally:
+                f.close()
+        code, out = wait_for("the new holder writes", writes, 120, 3)
+        assert code in (200, 201), f"the new holder's write: {code} {str(out)[:200]}"
         # The old holder stops on SIGTERM within its grace period; the
         # Lease's own clock: LeaseDuration after its last renewal.
         assert d <= LEASE_S + RETRY_S + 35, f"handover took {d:.1f} s (> LeaseDuration {LEASE_S} s + retry {RETRY_S} s + the 30 s grace)"
@@ -698,6 +709,12 @@ def n_minus_1() -> None:
     for p in on_node:
         ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
         key = name if ns == NS else f"{ns}/{name}"
+        # k3d only: the replicated tier is a local-path class here, so a pod
+        # on one of its volumes is bound to its node (Longhorn's, on a real
+        # cluster, follows it); the check models Longhorn: left out.
+        claims = [v["persistentVolumeClaim"]["claimName"] for v in p["spec"].get("volumes", []) if "persistentVolumeClaim" in v]
+        if any(c.endswith("-r") for c in claims):
+            continue
         if key not in unplaced:
             placeable.append((ns, name, p["metadata"].get("ownerReferences", [{}])[0].get("name", "")))
     note(f"ha_n_minus_1: {node} is {res[node]['level']}: unplaced {sorted(unplaced)}; {len(placeable)} placeable pods")
@@ -874,10 +891,11 @@ def dns_failover() -> None:
     import base64
     served = base64.b64decode(Kj("-n", NS, "get", "secret", "frontdoor-cert")["data"]["tls.crt"]).decode()
     want_fp = cert_fp(served)
-    for n, a in sorted(ing.items()):
+    mesh = {n["name"]: n["mesh"] for n in nodes}
+    for n in sorted(ing):
         for sni in (f"auth.{DOMAIN}", ""):
-            got = served_fp(a, sni)
-            assert got == want_fp, f"{n} ({a}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
+            got = served_fp(mesh[n], sni)
+            assert got == want_fp, f"{n} ({mesh[n]}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
     note(f"ha_dns_failover: every ingress node serves frontdoor-cert's certificate ({want_fp[:16]}…), with and without SNI")
     wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
     save("frontdoor-status-before.json", fd_status())
