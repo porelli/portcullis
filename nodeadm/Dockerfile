@@ -10,7 +10,10 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 COPY *.go join.sh ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /nodeadm .
+# CI-only: GO_TAGS=testprovider admits the documentation ranges as public
+# node addresses (e2e-ha-k3d's TEST-NET nodes; never a published image).
+ARG GO_TAGS=""
+RUN CGO_ENABLED=0 go build -trimpath -tags "$GO_TAGS" -ldflags="-s -w" -o /nodeadm .
 
 # alpine:3.24.3
 FROM docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a

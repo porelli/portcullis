@@ -93,6 +93,8 @@ func run(log *slog.Logger) error {
 		PodName:     os.Getenv("POD_NAME"),
 		Script:      joinScript,
 		AgentFiles:  map[string]string{}, AgentSHA256: map[string]string{},
+		// Only the testprovider build (testbuild.go): CI's TEST-NET nodes.
+		AllowDocAddrs: testProviderBuild,
 	}
 	if cfg.Domain == "" || cfg.PodName == "" || cfg.ClusterCIDR == "" || cfg.ServiceCIDR == "" {
 		return errors.New("PORTCULLIS_DOMAIN, POD_NAME, NODEADM_CLUSTER_CIDR and NODEADM_SERVICE_CIDR are required")
