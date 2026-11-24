@@ -571,7 +571,13 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "the account " + strings.ToLower(req.Username) + " belongs to another person", "error_kind": "account_mismatch"})
 	}
 	if _, sender := doc.Sender(req.Username); sender {
-		v.createSenderCred(ctx, w, doc, req, allowed, refuse)
+		// A sender's credential follows LAN-only like a person's and
+		// takes no allowed_ips (contract §19.14).
+		if ipsGiven {
+			writeErr(w, http.StatusBadRequest, "allowed_ips can't be set on an app mail sender's credential")
+			return
+		}
+		v.createSenderCred(ctx, w, doc, req, creds.AllowedIPs(doc.SubmissionLANOnly, reconcile.LocalNets(doc, doc.Rewritten())), refuse)
 		return
 	}
 	if _, known := doc.Account(req.Username); !known {
@@ -634,9 +640,8 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 
 // createSenderCred makes an app mail sender's credential (contract
 // §19.14): the sender's permissions only (authenticate, emailSend),
-// allowed_ips as asked (absent = anywhere; LAN-only and the client
-// address mode govern people's passwords, never a sender's). The caller
-// holds the pass lock and the one document snapshot.
+// allowed the networks LAN-only gives every mail password (nil = anywhere).
+// The caller holds the pass lock and the one document snapshot.
 func (v *V1) createSenderCred(ctx context.Context, w http.ResponseWriter, doc *state.Doc, req createReq, allowed []string, refuse func()) {
 	s, _ := doc.Sender(req.Username)
 	if s.UUID != strings.ToLower(req.UUID) {

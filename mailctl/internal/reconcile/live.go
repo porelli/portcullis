@@ -80,6 +80,8 @@ type Live struct {
 	// person, LAN-only). SenderKeys are the senders' lookup namespace.
 	Senders    []LiveSender
 	SenderKeys []LiveKey
+	// SenderThrottles are the senders' rate limits (DescSender*).
+	SenderThrottles []LiveSenderThrottle
 }
 
 type obj = map[string]json.RawMessage
@@ -211,6 +213,10 @@ func Read(ctx context.Context, c *stalwart.Client) (*Live, error) {
 	}
 	for _, t := range ths {
 		d := sval(t, "description")
+		if d == DescSenderMinute || d == DescSenderHour {
+			l.SenderThrottles = append(l.SenderThrottles, liveSenderThrottle(t))
+			continue
+		}
 		if d != DescLimitHour && d != DescLimitDay {
 			continue
 		}

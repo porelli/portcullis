@@ -772,6 +772,12 @@ func (s *Server) createCred(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 404, "no such account")
 		return
 	}
+	for _, x := range s.senders {
+		if x.Username == body.Username && body.AllowedIPs != nil {
+			errJSON(w, 400, "allowed_ips can't be set on an app mail sender's credential")
+			return
+		}
+	}
 	if body.UUID != s.uuidOf(body.Username) {
 		writeJSON(w, 409, map[string]string{"error": "the account has another uuid", "error_kind": "account_mismatch"})
 		return

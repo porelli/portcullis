@@ -138,7 +138,8 @@ func TestFirstApply(t *testing.T) {
 	if p := e.st.Get(); p.AppliedGeneration != 12 || len(p.Errors) != 0 {
 		t.Fatalf("state %+v", p)
 	}
-	if len(e.f.Objects("MtaInboundThrottle", "")) != 2 {
+	// The two per-account limits and the senders' two (contract §19.14).
+	if len(e.f.Objects("MtaInboundThrottle", "")) != 4 {
 		t.Fatal("limits not made")
 	}
 	// A second pass changes nothing.

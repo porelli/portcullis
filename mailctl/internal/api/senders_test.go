@@ -64,21 +64,21 @@ func TestPutStateSenders(t *testing.T) {
 	}
 }
 
-// A sender's credential (§19.14, §19.5): created with the sender's
-// permissions only (authenticate, emailSend) and allowed_ips as given,
-// never LAN-only's networks; listed and revoked by the sender's uuid; a
-// wrong uuid is account_mismatch; a malformed allowed_ips is 400.
+// A sender's credential (§19.14, §19.5): the sender's permissions only
+// (authenticate, emailSend); no allowed_ips (400); LAN-only applies to it
+// as to a person's (the Local networks at the create and on every pass);
+// listed and revoked by the sender's uuid; a wrong uuid is
+// account_mismatch.
 func TestSenderCredential(t *testing.T) {
 	e := newV1(t)
-	lan := strings.Replace(senderVec(t, 12), `"submission_lan_only":false`, `"submission_lan_only":true`, 1)
-	if w := e.do("PUT", "/v1/state", lan); w.Code != 202 {
+	if w := e.do("PUT", "/v1/state", senderVec(t, 12)); w.Code != 202 {
 		t.Fatalf("put: %d %s", w.Code, w.Body)
 	}
 	if err := e.v.Runner.Once(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	app := e.accountID("portcullis-app-firefox-sync-fxa")
-	body := `{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"firefox-sync-fxa","expires_at":null,"allowed_ips":["172.18.0.0/16","fd00:1::/64"]}`
+	body := `{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"firefox-sync-fxa","expires_at":null}`
 	w := e.do("POST", "/v1/credentials", body)
 	if w.Code != 201 || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("create: %d %s", w.Code, w.Body)
@@ -98,38 +98,37 @@ func TestSenderCredential(t *testing.T) {
 	if perms["@type"] != "Replace" || len(got) != 2 || got["authenticate"] != true || got["emailSend"] != true {
 		t.Fatalf("the sender's credential permissions %v", perms)
 	}
-	ips := pws[0]["allowedIps"].(map[string]any)
-	if len(ips) != 2 || ips["172.18.0.0/16"] != true || ips["fd00:1::/64"] != true {
-		t.Fatalf("allowedIps %v (want exactly the given subnets, never LAN-only's)", ips)
+	if pws[0]["allowedIps"] != nil {
+		t.Fatalf("allowedIps %v without LAN-only (want the field left out: anywhere)", pws[0]["allowedIps"])
 	}
-	// A pass under LAN-only leaves the sender's credential alone.
+	// LAN-only on: the pass restricts the sender's credential to the
+	// Local networks, and a new one is made with them.
+	lan := strings.Replace(senderVec(t, 13), `"submission_lan_only":false`, `"submission_lan_only":true`, 1)
+	if w := e.do("PUT", "/v1/state", lan); w.Code != 202 {
+		t.Fatalf("put LAN-only: %d %s", w.Code, w.Body)
+	}
 	_ = e.v.Runner.Once(context.Background())
-	if ips := e.f.Objects("AppPassword", app)[0]["allowedIps"].(map[string]any); len(ips) != 2 || ips["10.0.0.0/8"] != nil {
-		t.Fatalf("LAN-only rewrote the sender's credential: %v", ips)
+	if ips, _ := e.f.Objects("AppPassword", app)[0]["allowedIps"].(map[string]any); len(ips) != 1 || ips["10.0.0.0/8"] != true {
+		t.Fatalf("LAN-only left the sender's credential at %v (want the Local networks)", ips)
 	}
-	w = e.do("GET", "/v1/credentials?uuid="+uAppSender, "")
-	if w.Code != 200 || !strings.Contains(w.Body.String(), `"allowed_ips":["172.18.0.0/16","fd00:1::/64"]`) || strings.Contains(w.Body.String(), secret) {
-		t.Fatalf("list: %d %s", w.Code, w.Body)
-	}
-	// Absent allowed_ips: anywhere (Stalwart's field left out).
 	w = e.do("POST", "/v1/credentials", `{"username":"portcullis-hub-mail","uuid":"`+uHubSender+`","label":"Portcullis","expires_at":null}`)
 	if w.Code != 201 {
 		t.Fatalf("hub sender: %d %s", w.Code, w.Body)
 	}
-	if p := e.f.Objects("AppPassword", e.accountID("portcullis-hub-mail")); len(p) != 1 || p[0]["allowedIps"] != nil {
-		t.Fatalf("hub sender's password %v", p)
+	if p := e.f.Objects("AppPassword", e.accountID("portcullis-hub-mail")); len(p) != 1 || len(p[0]["allowedIps"].(map[string]any)) != 1 {
+		t.Fatalf("hub sender's password under LAN-only %v", p)
+	}
+	w = e.do("GET", "/v1/credentials?uuid="+uAppSender, "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"allowed_ips":["10.0.0.0/8"]`) || strings.Contains(w.Body.String(), secret) {
+		t.Fatalf("list: %d %s", w.Code, w.Body)
 	}
 	for b, code := range map[string]int{
 		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uHubSender + `","label":"x","expires_at":null}`:                                 409,
 		`{"username":"portcullis-app-other","uuid":"` + uAppSender + `","label":"x","expires_at":null}`:                                            404,
+		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":["10.0.0.0/8"]}`:    400,
+		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":["172.18.0.0/16"]}`: 400,
 		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":[]}`:                400,
 		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":null}`:              400,
-		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":["0.0.0.0/0"]}`:     400,
-		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":["::/0"]}`:          400,
-		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":["172.18.0.1/16"]}`: 400,
-		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":["11.0.0.0/8"]}`:    400,
-		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":["nope"]}`:          400,
-		`{"username":"portcullis-app-firefox-sync-fxa","uuid":"` + uAppSender + `","label":"x","expires_at":null,"allowed_ips":"172.18.0.0/16"}`:   400,
 	} {
 		if w := e.do("POST", "/v1/credentials", b); w.Code != code {
 			t.Errorf("%s: %d %s, want %d", b, w.Code, w.Body, code)

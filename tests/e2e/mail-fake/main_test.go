@@ -349,14 +349,15 @@ func TestHonestSenders(t *testing.T) {
 		t.Fatalf("PUT with senders: %d %s", c, b)
 	}
 	app := `"username":"portcullis-app-fxa","uuid":"10000000-0000-4000-8000-000000000002","label":"fxa","expires_at":null`
-	if c, b := call("POST", "/v1/credentials", `{`+app+`,"allowed_ips":["172.18.0.0/16"]}`); c != 201 {
+	if c, b := call("POST", "/v1/credentials", `{`+app+`}`); c != 201 {
 		t.Fatalf("sender credential: %d %s", c, b)
 	}
-	if c, b := call("GET", "/v1/credentials?uuid=10000000-0000-4000-8000-000000000002", ""); c != 200 || !bytes.Contains(b, []byte(`"allowed_ips":["172.18.0.0/16"]`)) {
+	if c, b := call("GET", "/v1/credentials?uuid=10000000-0000-4000-8000-000000000002", ""); c != 200 || !bytes.Contains(b, []byte(`"allowed_ips":[]`)) {
 		t.Fatalf("list: %d %s", c, b)
 	}
-	if c, b := call("POST", "/v1/credentials", `{`+app+`,"allowed_ips":[]}`); c != 400 {
-		t.Fatalf("empty allowed_ips: %d %s", c, b)
+	// A sender takes no allowed_ips (contract §19.14).
+	if c, b := call("POST", "/v1/credentials", `{`+app+`,"allowed_ips":["172.18.0.0/16"]}`); c != 400 {
+		t.Fatalf("a sender's allowed_ips: %d %s", c, b)
 	}
 	// Absent: kept.
 	if c, b := call("PUT", "/v1/state", doc(2, false, "alice")); c != 202 {

@@ -228,6 +228,52 @@ def check_sender_no_imap(ctx):
     return "an IMAP login with a sender's credential was accepted"
 
 
+def check_sender_rate_limit(ctx):
+    """Each sender is rate-limited (§19.14): 10 messages a minute, 60 an
+    hour. A fresh sender's first 10 messages in a row are accepted, the
+    eleventh refused with 452 4.4.5 (temporary, at MAIL FROM)."""
+    st, _, b = put(ctx, doc(ctx, ["alice"], senders=[3]))
+    if st != 202:
+        return "PUT a document with a fresh sender: HTTP %d %s" % (st, b[:200])
+    st, j = cred(ctx, SENDERS[3], SENDER_UUIDS[3], "rate")
+    if st != 201:
+        return "the sender's credential: HTTP %d" % st
+    addr = SENDERS[3] + "@conformance.test"
+    s = smtplib.SMTP(ctx.smtp_host, 587, timeout=20)
+    try:
+        s.starttls(context=CTX)
+        s.login(addr, j["secret"])
+        for n in range(1, 12):
+            stage = "MAIL FROM"
+            try:
+                c, m = s.mail(addr)
+                if c < 300:
+                    stage = "RCPT"
+                    c, m = s.rcpt("alice@conformance.test")
+                if c < 300:
+                    stage = "DATA"
+                    try:
+                        c, m = s.data(("From: %s\r\nTo: alice@conformance.test\r\nSubject: rate %d\r\n\r\nconformance\r\n" % (addr, n)).encode())
+                    except smtplib.SMTPDataError as e:
+                        c, m = e.smtp_code, e.smtp_error
+            except smtplib.SMTPServerDisconnected:
+                return "message %d: the server hung up at %s" % (n, stage)
+            if n <= 10 and c != 250:
+                s.rset()
+                return "message %d of the burst: %d %r at %s (want 250)" % (n, c, m[:80], stage)
+            if n == 11:
+                if c != 452 or b"4.4.5" not in m or stage != "MAIL FROM":
+                    return "the eleventh message: %d %r at %s (want 452 4.4.5 at MAIL FROM)" % (c, m[:80], stage)
+                return None
+    finally:
+        try:
+            s.quit()
+        except smtplib.SMTPException:
+            pass
+        put(ctx, doc(ctx, ["alice"], senders=[]))
+    return "unreachable"
+
+
 PROTO_CHECKS = [
     ("no_open_relay", check_no_open_relay),
     ("no_auth_on_25", check_no_auth_on_25),
@@ -240,4 +286,5 @@ PROTO_CHECKS = [
     ("sender_foreign_from_refused", check_sender_foreign_from),
     ("sender_inbound_550_5_1_1", check_sender_inbound_refused),
     ("sender_no_imap", check_sender_no_imap),
+    ("sender_rate_limit", check_sender_rate_limit),
 ]

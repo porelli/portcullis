@@ -373,6 +373,13 @@ func (r *Runner) lanOnly(ctx context.Context, l *Live, doc *state.Doc, p state.P
 			}
 		}
 	}
+	// App mail senders follow LAN-only too (contract §19.14): every live
+	// sender, listed or not (an absent list leaves senders, not LAN-only).
+	for _, ls := range l.Senders {
+		if _, err := creds.Restrict(ctx, r.C, ls.ID, allowed); err != nil {
+			errs = append(errs, fmt.Errorf("restricting the sender %s's credentials: %w", ls.Name, err))
+		}
+	}
 	return errors.Join(errs...)
 }
 

@@ -14,7 +14,11 @@ package reconcile
 //     base plan's RCPT script refuses with 550 5.1.1 (keys are written
 //     before the account, removed after it);
 //   - the standard per-account limits apply (MtaInboundThrottle keyed on
-//     authenticatedAs).
+//     authenticatedAs), and each sender has its own rate limit on top:
+//     10 messages a minute (the burst) and 60 an hour (SenderLimits), two
+//     MtaInboundThrottles matching only the senders' logins; a message
+//     over either is refused with a temporary reply (452 4.4.5);
+//   - its credentials follow submission_lan_only like a person's.
 // The list is declarative when present (a sender not in it is removed,
 // its credentials destroyed first), absent leaves every sender untouched
 // (an older Hub), and senders never count in the 50 % mass-removal rule.
@@ -38,6 +42,67 @@ const DescSenderPrefix = "portcullis-sender:"
 
 // NSSenders is the senders' lookup namespace (the base plan's RCPT rule).
 const NSSenders = bootstrap.NSSenders
+
+// The senders' rate limits (contract §19.14): per sender (keyed on the
+// login), only for the senders' logins (their addresses are the
+// NSSenders keys).
+const (
+	DescSenderMinute = "portcullis: sender messages per minute"
+	DescSenderHour   = "portcullis: sender messages per hour"
+)
+
+// SenderMatch selects the senders' sessions.
+var SenderMatch = fmt.Sprintf("key_exists('%s', authenticated_as)", NSSenders)
+
+// SenderLimit is one of the senders' rate limits.
+type SenderLimit struct {
+	Desc   string
+	Count  int
+	Period int64 // ms
+}
+
+// SenderLimits: the burst (10 a minute) and the hourly cap (60).
+var SenderLimits = []SenderLimit{{DescSenderMinute, 10, 60000}, {DescSenderHour, 60, 3600000}}
+
+// LiveSenderThrottle is one of the senders' MtaInboundThrottles.
+type LiveSenderThrottle struct {
+	ID, Desc string
+	OK       bool // count, period, key, match and enable as wanted
+	Count    int
+	Period   int64
+}
+
+func senderThrottleFields(t SenderLimit) map[string]any {
+	return map[string]any{"description": t.Desc, "enable": true, "key": set("authenticatedAs"),
+		"rate":  map[string]any{"count": t.Count, "period": t.Period},
+		"match": map[string]any{"match": map[string]any{}, "else": SenderMatch}}
+}
+
+func liveSenderThrottle(t obj) LiveSenderThrottle {
+	lt := LiveSenderThrottle{ID: sval(t, "id"), Desc: sval(t, "description")}
+	var rate struct {
+		Count  int   `json:"count"`
+		Period int64 `json:"period"`
+	}
+	_ = json.Unmarshal(t["rate"], &rate)
+	lt.Count, lt.Period = rate.Count, rate.Period
+	var en bool
+	_ = json.Unmarshal(t["enable"], &en)
+	var key map[string]bool
+	_ = json.Unmarshal(t["key"], &key)
+	var m struct {
+		Match map[string]any `json:"match"`
+		Else  string         `json:"else"`
+	}
+	_ = json.Unmarshal(t["match"], &m)
+	for _, w := range SenderLimits {
+		if w.Desc == lt.Desc {
+			lt.OK = en && rate.Count == w.Count && rate.Period == w.Period && trueSet(key, set("authenticatedAs")) &&
+				len(m.Match) == 0 && m.Else == SenderMatch
+		}
+	}
+	return lt
+}
 
 // LiveSender is one sender account in Stalwart.
 type LiveSender struct {
@@ -107,11 +172,15 @@ type SenderOps struct {
 	Accounts    []SenderSpec // to create or put back to the wanted shape
 	Keys        []string     // addresses to add to NSSenders
 	DestroyKeys []string     // NSSenders key ids
+	// Throttles to create (ID "") or put back; DestroyThrottles are
+	// duplicates of one limit.
+	Throttles        []LiveSenderThrottle
+	DestroyThrottles []string
 }
 
 // Empty reports no work.
 func (o SenderOps) Empty() bool {
-	return len(o.Destroy)+len(o.Accounts)+len(o.Keys)+len(o.DestroyKeys) == 0
+	return len(o.Destroy)+len(o.Accounts)+len(o.Keys)+len(o.DestroyKeys)+len(o.Throttles)+len(o.DestroyThrottles) == 0
 }
 
 // PlanSenders computes the senders' ops. An absent senders list (an older
@@ -119,6 +188,28 @@ func (o SenderOps) Empty() bool {
 // stay as they are.
 func PlanSenders(l *Live, want *state.Doc) SenderOps {
 	var ops SenderOps
+	// The rate limits are kept whatever the list (they only ever match a
+	// sender's login): an absent list leaves the senders, never their
+	// limits, unenforced.
+	for _, w := range SenderLimits {
+		found := false
+		for _, lt := range l.SenderThrottles {
+			if lt.Desc != w.Desc {
+				continue
+			}
+			if found {
+				ops.DestroyThrottles = append(ops.DestroyThrottles, lt.ID)
+				continue
+			}
+			found = true
+			if !lt.OK {
+				ops.Throttles = append(ops.Throttles, LiveSenderThrottle{ID: lt.ID, Desc: w.Desc})
+			}
+		}
+		if !found {
+			ops.Throttles = append(ops.Throttles, LiveSenderThrottle{Desc: w.Desc})
+		}
+	}
 	if !want.SendersPresent() {
 		return ops
 	}
@@ -203,6 +294,33 @@ func ApplySenders(ctx context.Context, c *stalwart.Client, l *Live, want *state.
 		if err := c.Action(ctx, "ReloadLookupStores"); err != nil {
 			return fmt.Errorf("ReloadLookupStores: %w", err)
 		}
+	}
+	if len(ops.Throttles)+len(ops.DestroyThrottles) > 0 {
+		create := map[string]any{}
+		update := map[string]map[string]any{}
+		for i, t := range ops.Throttles {
+			var f map[string]any
+			for _, w := range SenderLimits {
+				if w.Desc == t.Desc {
+					f = senderThrottleFields(w)
+				}
+			}
+			if t.ID == "" {
+				create[fmt.Sprintf("r%d", i)] = f
+			} else {
+				update[t.ID] = f
+			}
+		}
+		r, err := c.Set(ctx, "MtaInboundThrottle", create, update, ops.DestroyThrottles)
+		if err := setErr("MtaInboundThrottle", r, err); err != nil {
+			return fmt.Errorf("the senders' rate limits: %w", err)
+		}
+		if err := c.Action(ctx, "ReloadSettings"); err != nil {
+			return fmt.Errorf("ReloadSettings: %w", err)
+		}
+	}
+	if len(ops.Destroy)+len(ops.Keys)+len(ops.DestroyKeys)+len(ops.Accounts) == 0 {
+		return nil
 	}
 	primary := l.Domains[want.PrimaryDomain]
 	if primary == "" && len(ops.Accounts) > 0 {

@@ -368,3 +368,74 @@ func TestSenderPermissionsGrantable(t *testing.T) {
 		t.Errorf("SenderPermissions %v (want authenticate, emailSend)", stalwart.SenderPermissions)
 	}
 }
+
+// Each sender is rate-limited (§19.14): 10 messages a minute and 60 an
+// hour, keyed on the login, matching only the senders' logins (the
+// NSSenders keys); made on the first pass whatever the list (absent
+// included), put back after drift, a duplicate removed.
+func TestSenderRateLimit(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(baseDoc(t)) // senders absent: the limits are made anyway
+	limits := func() map[string]map[string]any {
+		out := map[string]map[string]any{}
+		for _, th := range e.f.Objects("MtaInboundThrottle", "") {
+			if d := th["description"].(string); d == DescSenderMinute || d == DescSenderHour {
+				if out[d] != nil {
+					t.Fatalf("%s twice", d)
+				}
+				out[d] = th
+			}
+		}
+		return out
+	}
+	want := map[string][2]float64{DescSenderMinute: {10, 60000}, DescSenderHour: {60, 3600000}}
+	check := func(when string) {
+		t.Helper()
+		got := limits()
+		if len(got) != 2 {
+			t.Fatalf("%s: sender limits %v", when, got)
+		}
+		for d, w := range want {
+			th := got[d]
+			r := th["rate"].(map[string]any)
+			m := th["match"].(map[string]any)
+			k := permSet(th["key"])
+			if r["count"] != w[0] || r["period"] != w[1] || th["enable"] != true || m["else"] != "key_exists('"+bootstrap.NSSenders+"', authenticated_as)" ||
+				len(m["match"].(map[string]any)) != 0 || len(k) != 1 || !k["authenticatedAs"] {
+				t.Errorf("%s: %s = %v", when, d, th)
+			}
+		}
+	}
+	check("first pass")
+	reload := false
+	for _, c := range e.f.Calls {
+		if c == "x:Action/set ReloadSettings" {
+			reload = true
+		}
+	}
+	if !reload {
+		t.Error("no ReloadSettings after the limits were made")
+	}
+	// Drift: a raised count, a widened match, a disabled limit, a duplicate.
+	got := limits()
+	if _, err := e.c.Set(context.Background(), "MtaInboundThrottle", map[string]any{"dup": senderThrottleFields(SenderLimits[1])},
+		map[string]map[string]any{
+			got[DescSenderMinute]["id"].(string): {"rate": map[string]any{"count": 1000, "period": 60000}, "match": map[string]any{"match": map[string]any{}, "else": "true"}},
+			got[DescSenderHour]["id"].(string):   {"enable": false},
+		}, nil); err != nil {
+		t.Fatal(err)
+	}
+	d := sendersDoc(t)
+	d.Generation = 13
+	e.mustApply(d)
+	check("after drift")
+	// Steady: nothing written.
+	e.f.ResetCalls()
+	d.Generation = 14
+	e.mustApply(d)
+	for _, c := range e.f.Calls {
+		if strings.HasPrefix(c, "x:MtaInboundThrottle/set") {
+			t.Errorf("steady pass wrote %s", c)
+		}
+	}
+}

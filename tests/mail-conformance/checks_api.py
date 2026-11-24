@@ -312,22 +312,21 @@ def check_senders_refused(ctx):
 
 
 def check_sender_credential(ctx):
-    """A sender's credential takes allowed_ips (optional, §19.5): listed
-    exactly as asked, even under LAN-only (a person's rule); an empty list
-    is refused."""
-    st, _, b = put(ctx, doc(ctx, ["alice"], lan_only=True, senders=[0]))
+    """A sender's credential (§19.14): no allowed_ips (400); under LAN-only
+    it is the Local networks, like a person's."""
+    nets = ["192.168.77.0/24", "10.20.0.0/16"]
+    st, _, b = put(ctx, doc(ctx, ["alice"], lan_only=True, local=nets, senders=[0]))
     if st != 202:
-        return "PUT a document with a sender: HTTP %d %s" % (st, b[:200])
-    nets = ["172.18.0.0/16"]
-    st, j = cred(ctx, SENDERS[0], SENDER_UUIDS[0], "sender", allowed_ips=nets)
+        return "PUT a LAN-only document with a sender: HTTP %d %s" % (st, b[:200])
+    st, j = cred(ctx, SENDERS[0], SENDER_UUIDS[0], "sender")
     if st != 201 or not (j or {}).get("secret"):
         return "the sender's credential: HTTP %d %r" % (st, (j or {}).get("error"))
     st, rows, _ = ctx.call("GET", "/v1/credentials?uuid=" + SENDER_UUIDS[0])
-    if st != 200 or not rows or any(sorted(r.get("allowed_ips") or []) != nets for r in rows):
-        return "the sender's credentials: HTTP %d %r (want allowed_ips %r)" % (st, rows, nets)
-    st, _ = cred(ctx, SENDERS[0], SENDER_UUIDS[0], "sender", allowed_ips=[])
+    if st != 200 or not rows or any(sorted(r.get("allowed_ips") or []) != sorted(nets) for r in rows):
+        return "the sender's credentials under LAN-only: HTTP %d %r (want allowed_ips %r)" % (st, rows, nets)
+    st, _ = cred(ctx, SENDERS[0], SENDER_UUIDS[0], "sender", allowed_ips=["172.18.0.0/16"])
     if st != 400:
-        return "allowed_ips []: HTTP %d (want 400)" % st
+        return "a sender's credential with allowed_ips: HTTP %d (want 400)" % st
     st, j = cred(ctx, SENDERS[0], SENDER_UUIDS[1], "sender")
     if st != 409 or (j or {}).get("error_kind") != "account_mismatch":
         return "the sender with another uuid: HTTP %d %r (want 409 account_mismatch)" % (st, j)

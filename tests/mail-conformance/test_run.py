@@ -116,12 +116,14 @@ class Recorded:
             ips = b.get("allowed_ips")
             if "allowed_ips" in b and not ips:
                 return 400, {"error": "allowed_ips must name 1-64 networks, or be left out"}
+            if "allowed_ips" in b and acct in self.senders and "sender_ips" not in self.d:
+                return 400, {"error": "allowed_ips can't be set on an app mail sender's credential"}
             # As mailctl: at most 5 active mail passwords per person.
             if len(self.creds.get(b["uuid"], [])) >= 5:
                 return 409, {"error": "the account has 5 active mail passwords", "error_kind": "limit"}
             self.n += 1
             row = {"id": str(self.n), "uuid": b["uuid"], "label": b["label"], "created_at": "2026-11-17T10:00:00Z", "expires_at": None,
-                   "last_used_at": None, "allowed_ips": list(ips or []) if "sender_ips" not in self.d else []}
+                   "last_used_at": None, "allowed_ips": list(ips or [])}
             self.creds.setdefault(b["uuid"], []).append(row)
             return 201, {"id": row["id"], "secret": "pw-%d" % self.n, "created_at": row["created_at"], "expires_at": None}
         if p == "/v1/credentials" and m == "GET":
@@ -129,7 +131,7 @@ class Recorded:
             out = []
             for r in self.creds.get(uuid, []):
                 r = dict(r)
-                if self.doc.get("submission_lan_only") and not any(x["uuid"] == uuid for x in self.senders):
+                if self.doc.get("submission_lan_only"):
                     r["allowed_ips"] = ["0.0.0.0/0"] if "lan" in self.d else list(self.doc["local_networks"])
                 if "uuid" in self.d:
                     r["uuid"] = "00000000-0000-4000-8000-000000000000"
