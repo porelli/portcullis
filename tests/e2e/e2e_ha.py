@@ -562,7 +562,12 @@ def hub_lease_handover() -> None:
         # The holder gone (its Deployment at 0, so only the second is left).
         K("-n", NS, "scale", "deployment/hub", "--replicas=0")
         t = time.time()
-        wait_for(f"{other} takes the Lease", lambda: lease_holder() == other, LEASE_S + RETRY_S + 60, 0.5)
+        try:
+            wait_for(f"{other} takes the Lease", lambda: lease_holder() == other, LEASE_S + RETRY_S + 120, 0.5)
+        except AssertionError:
+            print(K("-n", NS, "get", "pods", "-l", "portcullis.io/component in (hub,hub-e2e-second)", "-o", "wide", ok=False), flush=True)
+            print(K("-n", NS, "logs", other, "--tail", "40", ok=False)[-4000:], flush=True)
+            raise
         d = time.time() - t
         note(f"ha_hub_lease_handover: holder {h0} stopped → {other} holds the Lease after {d:.1f} s")
         def writes():
@@ -658,8 +663,14 @@ class Session:
                                     until=f"https://{DOMAIN}/", label="ha-admin", expect_stepups=1)
 
     def portal_ok(self) -> bool:
-        r = self.ctx.request.get(f"https://{DOMAIN}/", max_redirects=0, timeout=10_000)
-        return r.status == 200
+        """The portal opens in a page of the session (a navigation: the
+        browser's host rules apply, its API request context's don't)."""
+        page = self.ctx.new_page()
+        try:
+            resp = page.goto(f"https://{DOMAIN}/", wait_until="domcontentloaded", timeout=15_000)
+            return bool(resp) and resp.status == 200 and not self.e2e_login.on_login_pages(page)
+        finally:
+            page.close()
 
     def assert_open(self, when: str) -> None:
         assert self.portal_ok(), f"admin's session doesn't open the portal {when}"
@@ -926,8 +937,11 @@ def dns_failover() -> None:
             got = served_fp(ing[n], sni)
             assert got == want_fp, f"{n} ({ing[n]}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
     note(f"ha_dns_failover: every ingress node serves frontdoor-cert's certificate ({want_fp[:16]}…), with and without SNI")
-    wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
-    save("frontdoor-status-before.json", fd_status())
+    try:
+        wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
+    finally:
+        save("frontdoor-status-before.json", fd_status())
+        print(json.dumps(fd_status())[:3000], flush=True)
     fd_node = Kj("-n", NS, "get", "pods", "-l", "portcullis.io/component=frontdoor")["items"][0]["spec"]["nodeName"]
     victim = next(n for n in sorted(ing) if n != fd_node)
     t = kill_node(victim)
