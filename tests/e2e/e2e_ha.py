@@ -162,18 +162,29 @@ def ready(p: dict) -> bool:
 killed: set[str] = set()
 
 
+ISOLATE = "PCE2E"
+
+
 def kill_node(node: str) -> float:
-    """The node's container frozen (docker pause: the kubelet, containerd
-    and every pod on it stop at once, its address stays; a restarted k3d
-    server container may come back on another address, which its etcd
-    member can't follow); the time it happened."""
-    docker("pause", node)
+    """The node cut off (its container's eth0 dropped both ways in its own
+    chain: the kubelet's heartbeats, etcd, the pods' tunnels and its public
+    address all go silent; the API port answers a reset so the harness's
+    load balancer skips it at once). A node that stops answering, as on a
+    VM; its processes run on and resume when it's healed (a restarted k3d
+    server container didn't come back Ready in CI). The time it happened."""
+    rules = [["-N", ISOLATE], ["-A", ISOLATE, "-i", "lo", "-j", "RETURN"], ["-A", ISOLATE, "-o", "lo", "-j", "RETURN"],
+             ["-A", ISOLATE, "-i", "eth0", "-p", "tcp", "--dport", "6443", "-j", "REJECT", "--reject-with", "tcp-reset"],
+             ["-A", ISOLATE, "-j", "DROP"], ["-I", "INPUT", "1", "-j", ISOLATE], ["-I", "OUTPUT", "1", "-j", ISOLATE],
+             ["-I", "FORWARD", "1", "-j", ISOLATE]]
+    for r in rules:
+        docker("exec", node, "iptables", "-w", *r)
     killed.add(node)
     return time.time()
 
 
 def start_node(node: str) -> None:
-    docker("unpause", node)
+    for r in (["-D", "INPUT", "-j", ISOLATE], ["-D", "OUTPUT", "-j", ISOLATE], ["-D", "FORWARD", "-j", ISOLATE], ["-F", ISOLATE], ["-X", ISOLATE]):
+        subprocess.run(["docker", "exec", node, "iptables", "-w", *r], capture_output=True, timeout=30)
     killed.discard(node)
     wait_for(f"node {node} Ready again", lambda: node_ready(node), 300, 5)
 
@@ -377,8 +388,8 @@ def cnpg_failover() -> None:
         tn = not_ready_at(node, t)
         wait_for(f"writes resume after node {node} died", lambda: w.resumed_after(t) >= 0, 240, 1)
         d2 = w.resumed_after(tn)
-        note(f"ha_cnpg_failover: node {node} (primary {p1}) frozen → NotReady after {tn - t:.1f} s → writes resumed "
-             f"{w.resumed_after(t):.1f} s after the freeze, {d2:.1f} s after NotReady (new primary {pg_primary()})")
+        note(f"ha_cnpg_failover: node {node} (primary {p1}) cut off → NotReady after {tn - t:.1f} s → writes resumed "
+             f"{w.resumed_after(t):.1f} s after the cut, {d2:.1f} s after NotReady (new primary {pg_primary()})")
         time.sleep(5)
     finally:
         w.stop.set()
@@ -472,16 +483,39 @@ def hub_pods() -> list[str]:
     return sorted(p["metadata"]["name"] for p in pods(NS, "portcullis.io/component=hub") if ready(p))
 
 
+def second_hub(name: str) -> dict:
+    """A second Hub pod: the running Hub's own spec, its own pod name (the
+    Lease identity), its data volumes as emptyDirs (two Hubs never share
+    a data directory: the Hub's .hub.lock refuses the second), out of the
+    hub Service (component hub-e2e-second); created by the CLI's identity,
+    which the admission policies don't judge."""
+    live = next(p for p in pods(NS, "portcullis.io/component=hub") if ready(p))
+    spec = live["spec"]
+    for k in ("nodeName", "hostname", "subdomain"):
+        spec.pop(k, None)
+    vols = []
+    for v in spec.get("volumes", []):
+        if "persistentVolumeClaim" in v:
+            v = {"name": v["name"], "emptyDir": {}}
+        vols.append(v)
+    spec["volumes"] = vols
+    labels = dict(live["metadata"].get("labels", {}))
+    labels.pop("pod-template-hash", None)
+    labels["portcullis.io/component"] = "hub-e2e-second"
+    return {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": NS, "labels": labels,
+            "annotations": live["metadata"].get("annotations", {})}, "spec": spec}
+
+
 def hub_lease_handover() -> None:
     h0 = wait_for("the Lease held by a Hub pod", lambda: lease_holder() in hub_pods() and lease_holder(), 120)
-    K("-n", NS, "scale", "deployment/hub", "--replicas=2")
+    other = f"hub-e2e-second-{int(time.time()) % 10000}"
+    K("apply", "-f", "-", inp=json.dumps(second_hub(other)))
     try:
-        two = wait_for("two Hub pods ready", lambda: len(hub_pods()) == 2 and hub_pods(), 300, 3)
-        other = next(p for p in two if p != h0)
+        K("-n", NS, "wait", "--for=condition=Ready", f"pod/{other}", "--timeout=300s", timeout=320, ok=False)
+        # Watched over 30 s: the second pod never holds the Lease and
+        # refuses every write (the leader gate, before any handler).
         f = Forward(f"pod/{other}", 8888)
         try:
-            # Watched over 30 s: the second pod never holds the Lease and
-            # refuses every write (the leader gate, before any handler).
             for _ in range(10):
                 assert lease_holder() == h0, f"the Lease moved to {lease_holder()} while {h0} runs"
                 code, out = hub_call(f.port, "POST", "/api/directory/groups", {"name": "e2e-ha-standby"})
@@ -489,21 +523,25 @@ def hub_lease_handover() -> None:
                 time.sleep(3)
         finally:
             f.close()
+        # The holder gone (its Deployment at 0, so only the second is left).
+        K("-n", NS, "scale", "deployment/hub", "--replicas=0")
         t = time.time()
-        K("-n", NS, "delete", "pod", h0, "--wait=false")
-        wait_for(f"{other} takes the Lease", lambda: lease_holder() == other, LEASE_S + RETRY_S + 15, 0.5)
+        wait_for(f"{other} takes the Lease", lambda: lease_holder() == other, LEASE_S + RETRY_S + 60, 0.5)
         d = time.time() - t
-        note(f"ha_hub_lease_handover: holder {h0} deleted → {other} holds the Lease after {d:.1f} s")
-        assert d <= LEASE_S + RETRY_S + 5, f"handover took {d:.1f} s (> LeaseDuration {LEASE_S} s + retry {RETRY_S} s + 5 s)"
+        note(f"ha_hub_lease_handover: holder {h0} stopped → {other} holds the Lease after {d:.1f} s")
         f = Forward(f"pod/{other}", 8888)
         try:
             code, out = wait_for("the new holder writes", lambda: (lambda r: r if r[0] != 503 else None)(
                 hub_call(f.port, "POST", "/api/directory/groups", {"name": "e2e-ha-lease"})), 30, 1)
             assert code in (200, 201), f"the new holder's write: {code} {str(out)[:200]}"
+            hub_call(f.port, "DELETE", "/api/directory/groups/e2e-ha-lease", {"confirm": "e2e-ha-lease"})
         finally:
             f.close()
-        hub("DELETE", "/api/directory/groups/e2e-ha-lease", {"confirm": "e2e-ha-lease"})
+        # The old holder stops on SIGTERM within its grace period; the
+        # Lease's own clock: LeaseDuration after its last renewal.
+        assert d <= LEASE_S + RETRY_S + 35, f"handover took {d:.1f} s (> LeaseDuration {LEASE_S} s + retry {RETRY_S} s + the 30 s grace)"
     finally:
+        K("-n", NS, "delete", "pod", other, "--wait=false", ok=False)
         K("-n", NS, "scale", "deployment/hub", "--replicas=1")
 
 
@@ -886,6 +924,17 @@ def main() -> int:
     from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
         def signed_in():
+            # Keycloak reads the Hub's published sign-in settings
+            # (pub-signin-keycloak, projected at /hub-data): every replica
+            # holds the published copy first.
+            def kc_settings():
+                want = Kj("-n", NS, "get", "configmap", "pub-signin-keycloak").get("data", {}).get("signin-keycloak.json", "")
+                assert want, "pub-signin-keycloak is empty"
+                for p in pods(NS, "portcullis.io/component=keycloak"):
+                    got = K("-n", NS, "exec", p["metadata"]["name"], "-c", "keycloak", "--", "cat", "/hub-data/signin-keycloak.json", ok=False, timeout=15)
+                    assert got == want, f"{p['metadata']['name']} doesn't hold the published sign-in settings yet"
+                return True
+            wait_for("every Keycloak replica holding the sign-in settings", kc_settings, 300, 5)
             state["session"] = Session(pw, ingress_ips()[0])
             state["session"].assert_open("after the setup link")
         check("admin signs in (a setup link, a virtual passkey) through an ingress node", signed_in)
@@ -895,9 +944,9 @@ def main() -> int:
         check("ha_hub_lease_handover: a second Hub never writes; the handover within the Lease", hub_lease_handover)
         check("ha_published_docs: a group removal reaches group-gate within 20 s", published_docs)
         check("ha_signin_continuity: 300 sign-ins over a Keycloak and a gate kill, at most 5 failed", signin_continuity)
-        check("ha_n_minus_1: the N−1 page agrees with the scheduler", n_minus_1)
         check("ha_coredns_node_kill: CoreDNS keeps answering with a node dead", coredns_node_kill)
         check("ha_dns_failover: a dead ingress node's address removed after ~30 s, never the last", dns_failover)
+        check("ha_n_minus_1: the N−1 page agrees with the scheduler", n_minus_1)
         if "session" in state:
             state["session"].close()
     return report()
