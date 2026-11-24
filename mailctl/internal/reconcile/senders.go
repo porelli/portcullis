@@ -10,7 +10,9 @@ package reconcile
 //   - its permissions Replace every inherited one with
 //     stalwart.SenderPermissions (authenticate, emailSend): no
 //     emailReceive, IMAP, JMAP, POP3, DAV or Sieve — no mailbox access;
-//   - its address is a key of the senders' lookup namespace, which the
+//   - its address is a key of the senders' lookup namespace, and so is
+//     the glob <local>+*@<domain> (Stalwart's sub-addressing is on by
+//     default: portcullis-app-x+tag@d would reach the account), which the
 //     base plan's RCPT script refuses with 550 5.1.1 (keys are written
 //     before the account, removed after it);
 //   - the standard per-account limits apply (MtaInboundThrottle keyed on
@@ -170,12 +172,25 @@ type SenderSpec struct {
 type SenderOps struct {
 	Destroy     []LiveSender // their mail passwords first, then the account
 	Accounts    []SenderSpec // to create or put back to the wanted shape
-	Keys        []string     // addresses to add to NSSenders
+	Keys        []SenderKey  // keys to add to NSSenders
 	DestroyKeys []string     // NSSenders key ids
 	// Throttles to create (ID "") or put back; DestroyThrottles are
 	// duplicates of one limit.
 	Throttles        []LiveSenderThrottle
 	DestroyThrottles []string
+}
+
+// SenderKey is one NSSenders key: the address, or its sub-address glob.
+type SenderKey struct {
+	Key  string
+	Glob bool
+}
+
+// SenderKeys are a sender address's RCPT keys: the address itself and
+// <local>+*@<domain> (a sub-address of it).
+func SenderKeys(addr string) []SenderKey {
+	local, dom, _ := strings.Cut(addr, "@")
+	return []SenderKey{{Key: addr}, {Key: local + "+*@" + dom, Glob: true}}
 }
 
 // Empty reports no work.
@@ -239,21 +254,25 @@ func PlanSenders(l *Live, want *state.Doc) SenderOps {
 			ops.Accounts = append(ops.Accounts, SenderSpec{ID: ls.ID, Username: s.Username, UUID: s.UUID})
 		}
 	}
-	wantKeys := map[string]bool{}
+	wantKeys := map[SenderKey]bool{}
 	for _, s := range want.SenderList() {
-		wantKeys[s.Address] = true
+		for _, k := range SenderKeys(s.Address) {
+			wantKeys[k] = true
+		}
 	}
 	for _, k := range l.SenderKeys {
-		if wantKeys[k.Key] {
-			delete(wantKeys, k.Key)
+		sk := SenderKey{Key: k.Key, Glob: k.Glob}
+		if wantKeys[sk] {
+			delete(wantKeys, sk)
 		} else {
+			// Gone, a duplicate, or the glob flag drifted.
 			ops.DestroyKeys = append(ops.DestroyKeys, k.ID)
 		}
 	}
 	for k := range wantKeys {
 		ops.Keys = append(ops.Keys, k)
 	}
-	sort.Strings(ops.Keys)
+	sort.Slice(ops.Keys, func(i, j int) bool { return ops.Keys[i].Key < ops.Keys[j].Key })
 	return ops
 }
 
@@ -264,37 +283,7 @@ func ApplySenders(ctx context.Context, c *stalwart.Client, l *Live, want *state.
 	if ops.Empty() {
 		return nil
 	}
-	if len(ops.Destroy) > 0 {
-		var ids []string
-		for _, ls := range ops.Destroy {
-			if err := DestroyAppPasswords(ctx, c, ls.ID); err != nil {
-				return fmt.Errorf("removing the sender %s: %w", ls.Name, err)
-			}
-			ids = append(ids, ls.ID)
-		}
-		r, err := c.Set(ctx, "Account", nil, nil, ids)
-		if err := setErr("Account", r, err); err != nil {
-			return fmt.Errorf("removing senders: %w", err)
-		}
-		for _, id := range ids {
-			if _, still := r.NotDestroyed[id]; still {
-				return fmt.Errorf("removing senders: account %s not destroyed", id)
-			}
-		}
-	}
-	if len(ops.Keys)+len(ops.DestroyKeys) > 0 {
-		create := map[string]any{}
-		for i, k := range ops.Keys {
-			create[fmt.Sprintf("s%d", i)] = map[string]any{"namespace": NSSenders, "key": k, "isGlobPattern": false}
-		}
-		r, err := c.Set(ctx, "MemoryLookupKey", create, nil, ops.DestroyKeys)
-		if err := setErr("MemoryLookupKey", r, err); err != nil {
-			return fmt.Errorf("the senders' RCPT keys: %w", err)
-		}
-		if err := c.Action(ctx, "ReloadLookupStores"); err != nil {
-			return fmt.Errorf("ReloadLookupStores: %w", err)
-		}
-	}
+	// The rate limits first: a failing removal never holds them back.
 	if len(ops.Throttles)+len(ops.DestroyThrottles) > 0 {
 		create := map[string]any{}
 		update := map[string]map[string]any{}
@@ -317,6 +306,37 @@ func ApplySenders(ctx context.Context, c *stalwart.Client, l *Live, want *state.
 		}
 		if err := c.Action(ctx, "ReloadSettings"); err != nil {
 			return fmt.Errorf("ReloadSettings: %w", err)
+		}
+	}
+	if len(ops.Destroy) > 0 {
+		var ids []string
+		for _, ls := range ops.Destroy {
+			if err := DestroyAppPasswords(ctx, c, ls.ID); err != nil {
+				return fmt.Errorf("removing the sender %s: %w", ls.Name, err)
+			}
+			ids = append(ids, ls.ID)
+		}
+		r, err := c.Set(ctx, "Account", nil, nil, ids)
+		if err := setErr("Account", r, err); err != nil {
+			return fmt.Errorf("removing senders: %w", err)
+		}
+		for _, id := range ids {
+			if _, still := r.NotDestroyed[id]; still {
+				return fmt.Errorf("removing senders: account %s not destroyed", id)
+			}
+		}
+	}
+	if len(ops.Keys)+len(ops.DestroyKeys) > 0 {
+		create := map[string]any{}
+		for i, k := range ops.Keys {
+			create[fmt.Sprintf("s%d", i)] = map[string]any{"namespace": NSSenders, "key": k.Key, "isGlobPattern": k.Glob}
+		}
+		r, err := c.Set(ctx, "MemoryLookupKey", create, nil, ops.DestroyKeys)
+		if err := setErr("MemoryLookupKey", r, err); err != nil {
+			return fmt.Errorf("the senders' RCPT keys: %w", err)
+		}
+		if err := c.Action(ctx, "ReloadLookupStores"); err != nil {
+			return fmt.Errorf("ReloadLookupStores: %w", err)
 		}
 	}
 	if len(ops.Destroy)+len(ops.Keys)+len(ops.DestroyKeys)+len(ops.Accounts) == 0 {

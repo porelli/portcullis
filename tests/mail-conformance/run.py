@@ -30,6 +30,7 @@ def main(argv=None, opener=None, out=sys.stdout):
     ap.add_argument("--imap-host")
     ap.add_argument("--ca-file")
     ap.add_argument("--spki", help="the sha256 of the key the provider serves (hex); documents carry it")
+    ap.add_argument("--jmap-url", help="the provider's JMAP session URL, when it serves one (the full level's sender_no_jmap)")
     a = ap.parse_args(argv)
     if a.spki is not None and not (len(a.spki) == 64 and all(c in "0123456789abcdef" for c in a.spki)):
         ap.error("--spki must be 64 lowercase hex characters")
@@ -48,7 +49,7 @@ def main(argv=None, opener=None, out=sys.stdout):
         checks_proto.CTX = ssl.create_default_context(cafile=a.ca_file)
         checks_proto.CTX.check_hostname = False  # the mail host name isn't the address dialled
     ctx = checks_api.Ctx(a.api_url, secret, a.outside_url, opener)
-    ctx.smtp_host, ctx.imap_host = a.smtp_host, a.imap_host
+    ctx.smtp_host, ctx.imap_host, ctx.jmap_url = a.smtp_host, a.imap_host, a.jmap_url
     if a.spki:
         ctx.spki = a.spki
     checks = list(checks_api.API_CHECKS)
@@ -73,6 +74,10 @@ def main(argv=None, opener=None, out=sys.stdout):
             print("FAIL %s: %s" % (name, why), file=out)
         else:
             print("PASS %s" % name, file=out)
+        # What a check observed (the replies it judged), never a secret.
+        for note in ctx.notes:
+            print("NOTE %s: %s" % (name, note), file=out)
+        ctx.notes = []
     print("%d checks, %d failed" % (len(checks), failed), file=out)
     return 1 if failed else 0
 

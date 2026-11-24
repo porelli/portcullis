@@ -30,6 +30,8 @@ class Ctx:
         self.apply_wait = 180
         self.unavailable_wait = 90
         self.created = []  # (uuid, id, secret) of passwords made here
+        self.notes = []  # what the running check observed (run.py prints them)
+        self.smtp_host = self.imap_host = self.jmap_url = None
 
     def call(self, method, path, body=None, bearer="default", base=None, raw=None):
         """(status, parsed JSON or None, raw bytes). A 503 (the provider's

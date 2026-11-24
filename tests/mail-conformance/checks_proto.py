@@ -199,13 +199,18 @@ def check_sender_foreign_from(ctx):
 
 
 def check_sender_inbound_refused(ctx):
-    """Mail to a sender's address is refused at RCPT with 550 5.1.1."""
+    """Mail to a sender's address is refused at RCPT with 550 5.1.1: the
+    address, a sub-address of it (local+tag@domain) and case variants."""
     _, err = _sender(ctx)
     if err:
         return err
-    (c, m), _ = _rcpt(ctx.smtp_host, 25, SENDERS[0] + "@conformance.test")
-    if c != 550 or b"5.1.1" not in m:
-        return "a sender's address at RCPT: %d %r (want 550 5.1.1)" % (c, m[:80])
+    addr = SENDERS[0] + "@conformance.test"
+    local, dom = addr.split("@")
+    for a in (addr, local + "+tag@" + dom, addr.upper(), local.title() + "@" + dom.upper(), local.upper() + "+Tag@" + dom):
+        (c, m), _ = _rcpt(ctx.smtp_host, 25, a)
+        ctx.notes.append("RCPT %s: %d %s" % (a, c, m[:60].decode(errors="replace")))
+        if c != 550 or b"5.1.1" not in m:
+            return "%s at RCPT: %d %r (want 550 5.1.1)" % (a, c, m[:80])
     return None
 
 
@@ -228,21 +233,29 @@ def check_sender_no_imap(ctx):
     return "an IMAP login with a sender's credential was accepted"
 
 
-def check_sender_rate_limit(ctx):
-    """Each sender is rate-limited (§19.14): 10 messages a minute, 60 an
-    hour. A fresh sender's first 10 messages in a row are accepted, the
-    eleventh refused with 452 4.4.5 (temporary, at MAIL FROM)."""
-    st, _, b = put(ctx, doc(ctx, ["alice"], senders=[3]))
+def _rate_limit(ctx, idx, login):
+    """A fresh sender (SENDERS[idx]) logged in as login: its first 10
+    messages in a row accepted, the eleventh refused with 452 4.4.5 at
+    MAIL FROM (§19.14: 10 a minute, 60 an hour)."""
+    st, _, b = put(ctx, doc(ctx, ["alice"], senders=[idx]))
     if st != 202:
         return "PUT a document with a fresh sender: HTTP %d %s" % (st, b[:200])
-    st, j = cred(ctx, SENDERS[3], SENDER_UUIDS[3], "rate")
+    st, j = cred(ctx, SENDERS[idx], SENDER_UUIDS[idx], "rate")
     if st != 201:
         return "the sender's credential: HTTP %d" % st
-    addr = SENDERS[3] + "@conformance.test"
+    addr = SENDERS[idx] + "@conformance.test"
     s = smtplib.SMTP(ctx.smtp_host, 587, timeout=20)
     try:
         s.starttls(context=CTX)
-        s.login(addr, j["secret"])
+        try:
+            s.login(login, j["secret"])
+        except smtplib.SMTPAuthenticationError as e:
+            if login == addr:
+                return "the sender's login: %d %r" % (e.smtp_code, e.smtp_error[:80])
+            # A login in another case refused outright: no way around the
+            # limit by case.
+            ctx.notes.append("login %s refused: %d %s" % (login, e.smtp_code, e.smtp_error[:60].decode(errors="replace")))
+            return None
         for n in range(1, 12):
             stage = "MAIL FROM"
             try:
@@ -262,6 +275,7 @@ def check_sender_rate_limit(ctx):
                 s.rset()
                 return "message %d of the burst: %d %r at %s (want 250)" % (n, c, m[:80], stage)
             if n == 11:
+                ctx.notes.append("login %s, message 11: %d %s at %s" % (login, c, m[:60].decode(errors="replace"), stage))
                 if c != 452 or b"4.4.5" not in m or stage != "MAIL FROM":
                     return "the eleventh message: %d %r at %s (want 452 4.4.5 at MAIL FROM)" % (c, m[:80], stage)
                 return None
@@ -272,6 +286,72 @@ def check_sender_rate_limit(ctx):
             pass
         put(ctx, doc(ctx, ["alice"], senders=[]))
     return "unreachable"
+
+
+def check_sender_rate_limit(ctx):
+    return _rate_limit(ctx, 3, SENDERS[3] + "@conformance.test")
+
+
+def check_sender_rate_limit_mixed_case(ctx):
+    """The limit holds for a login in another case (it keys on the login)."""
+    login = "-".join(p.title() for p in SENDERS[2].split("-")) + "@Conformance.Test"
+    return _rate_limit(ctx, 2, login)
+
+
+def check_sender_no_jmap(ctx):
+    """A sender's credential opens no JMAP session: the provider's JMAP
+    session URL (--jmap-url) answers 401 / 403, or the mail host serves
+    none (https://<host>/.well-known/jmap: refused, 401, 403 or 404)."""
+    import base64
+    import urllib.error
+    import urllib.request
+    pw, err = _sender(ctx)
+    if err:
+        return err
+    tok = base64.b64encode(("%s@conformance.test:%s" % (SENDERS[0], pw)).encode()).decode()
+    urls = [ctx.jmap_url] if ctx.jmap_url else ["https://%s/.well-known/jmap" % ctx.smtp_host]
+    for url in urls:
+        req = urllib.request.Request(url, headers={"Authorization": "Basic " + tok})
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=CTX) as r:
+                st = r.status
+        except urllib.error.HTTPError as e:
+            st = e.code
+        except (urllib.error.URLError, OSError) as e:
+            ctx.notes.append("%s: no JMAP (%s)" % (url, getattr(e, "reason", e)))
+            continue
+        ctx.notes.append("%s: HTTP %d" % (url, st))
+        allowed = (401, 403) if ctx.jmap_url else (401, 403, 404, 421)
+        if st not in allowed:
+            return "%s with the sender's credential: HTTP %d (want %s)" % (url, st, "/".join(map(str, allowed)))
+    return None
+
+
+def check_sender_no_pop3(ctx):
+    """A sender's credential opens no POP3 session: 110 / 995 refuse the
+    connection or the login."""
+    import poplib
+    pw, err = _sender(ctx)
+    if err:
+        return err
+    for port, ssl_on in ((110, False), (995, True)):
+        try:
+            p = poplib.POP3_SSL(ctx.imap_host, port, context=CTX, timeout=10) if ssl_on else poplib.POP3(ctx.imap_host, port, timeout=10)
+        except OSError as e:
+            ctx.notes.append("POP3 %d: no listener (%s)" % (port, e.__class__.__name__))
+            continue
+        try:
+            p.user(SENDERS[0] + "@conformance.test")
+            p.pass_(pw)
+            return "POP3 %d accepted the sender's credential" % port
+        except poplib.error_proto:
+            ctx.notes.append("POP3 %d: the sender's login refused" % port)
+        finally:
+            try:
+                p.quit()
+            except (poplib.error_proto, OSError):
+                pass
+    return None
 
 
 PROTO_CHECKS = [
@@ -286,5 +366,8 @@ PROTO_CHECKS = [
     ("sender_foreign_from_refused", check_sender_foreign_from),
     ("sender_inbound_550_5_1_1", check_sender_inbound_refused),
     ("sender_no_imap", check_sender_no_imap),
+    ("sender_no_jmap", check_sender_no_jmap),
+    ("sender_no_pop3", check_sender_no_pop3),
     ("sender_rate_limit", check_sender_rate_limit),
+    ("sender_rate_limit_mixed_case", check_sender_rate_limit_mixed_case),
 ]

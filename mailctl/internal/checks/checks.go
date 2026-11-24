@@ -112,7 +112,7 @@ func Run(ctx context.Context, d Deps) Result {
 	out = append(out, reportChecks(ctx, d, p.Doc)...)
 	out = append(out, clientIP(d))
 	out = append(out, rateHeld(d, q, qerr, p.Doc)...)
-	out = append(out, dane(ctx, d), spamRulesCheck(p), lookupsCheck(p))
+	out = append(out, dane(ctx, d), spamRulesCheck(p), lookupsCheck(p), senderRcptCheck(ctx, d, p.Doc))
 	for i := range out {
 		if out[i].Steps == nil {
 			out[i].Steps = []string{}
@@ -296,7 +296,7 @@ type dnsTXT = dns.TXT
 var Catalog = []string{
 	"port25", "fcrdns_v4", "fcrdns_v6", "blocklist", "cert", "dane", "client_ip",
 	"dmarc_reports", "tlsrpt_reports", "dkim_selftest:", "dkim_stuck:", "rate_held:",
-	IDSpamRules, IDExternalLookups,
+	IDSpamRules, IDExternalLookups, IDSenderRcpt,
 }
 
 // neutral are the contract's fixed ids, prefixes ending in ":".

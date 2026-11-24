@@ -55,7 +55,10 @@ type LiveList struct {
 }
 
 // LiveKey is one MemoryLookupKey in mailctl's namespaces.
-type LiveKey struct{ ID, Namespace, Key string }
+type LiveKey struct {
+	ID, Namespace, Key string
+	Glob               bool // isGlobPattern
+}
 
 // LiveThrottle is one owned MtaInboundThrottle.
 type LiveThrottle struct {
@@ -199,7 +202,9 @@ func Read(ctx context.Context, c *stalwart.Client) (*Live, error) {
 			if sval(k, "namespace") != ns {
 				continue
 			}
-			lk := LiveKey{ID: sval(k, "id"), Namespace: ns, Key: sval(k, "key")}
+			var glob bool
+			_ = json.Unmarshal(k["isGlobPattern"], &glob)
+			lk := LiveKey{ID: sval(k, "id"), Namespace: ns, Key: sval(k, "key"), Glob: glob}
 			if ns == NSSenders {
 				l.SenderKeys = append(l.SenderKeys, lk)
 			} else {

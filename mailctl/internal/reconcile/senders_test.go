@@ -40,11 +40,12 @@ func withSenders(d *state.Doc, s ...state.Sender) *state.Doc {
 	return d
 }
 
+// senderKeys: key → isGlobPattern.
 func (e *env) senderKeys() map[string]bool {
 	out := map[string]bool{}
 	for _, k := range e.f.Objects("MemoryLookupKey", "") {
 		if k["namespace"] == bootstrap.NSSenders {
-			out[k["key"].(string)] = true
+			out[k["key"].(string)] = k["isGlobPattern"] == true
 		}
 	}
 	return out
@@ -191,8 +192,18 @@ func TestSenderFromRestricted(t *testing.T) {
 func TestSenderInboundRefused(t *testing.T) {
 	e := newEnv(t)
 	e.mustApply(sendersDoc(t))
+	// The address (exact) and its sub-addresses (a glob: Stalwart's
+	// sub-addressing is on by default, so local+tag@domain would reach the
+	// account).
 	keys := e.senderKeys()
-	if len(keys) != 2 || !keys[hubSender+"@example.com"] || !keys[appSender+"@example.com"] {
+	for _, s := range []string{hubSender, appSender} {
+		exact, ok1 := keys[s+"@example.com"]
+		glob, ok2 := keys[s+"+*@example.com"]
+		if !ok1 || exact || !ok2 || !glob {
+			t.Errorf("%s: keys %v", s, keys)
+		}
+	}
+	if len(keys) != 4 {
 		t.Fatalf("sender keys %v", keys)
 	}
 	// The keys are in place before the account exists (no window where
@@ -244,7 +255,7 @@ func TestSenderRemovedWithInstance(t *testing.T) {
 	absent.Generation = 13
 	e.f.ResetCalls()
 	e.mustApply(absent)
-	if e.account(appSender) == nil || e.account(hubSender) == nil || len(e.f.Objects("AppPassword", app)) != 1 || len(e.senderKeys()) != 2 {
+	if e.account(appSender) == nil || e.account(hubSender) == nil || len(e.f.Objects("AppPassword", app)) != 1 || len(e.senderKeys()) != 4 {
 		t.Fatal("an absent senders list touched the senders")
 	}
 	for _, c := range e.f.Calls {
@@ -264,7 +275,7 @@ func TestSenderRemovedWithInstance(t *testing.T) {
 	if len(e.f.Objects("AppPassword", app)) != 0 {
 		t.Fatal("its mail password survived")
 	}
-	if keys := e.senderKeys(); len(keys) != 1 || !keys[hubSender+"@example.com"] {
+	if keys := e.senderKeys(); len(keys) != 2 || !keys[hubSender+"+*@example.com"] {
 		t.Fatalf("keys after the removal %v", keys)
 	}
 	if e.account(hubSender) == nil || len(e.f.Objects("AppPassword", hubID)) != 1 {
@@ -437,5 +448,57 @@ func TestSenderRateLimit(t *testing.T) {
 		if strings.HasPrefix(c, "x:MtaInboundThrottle/set") {
 			t.Errorf("steady pass wrote %s", c)
 		}
+	}
+}
+
+// A glob key whose flag drifted (a hand edit) is replaced; an extra key
+// in the namespace goes.
+func TestSenderKeysDrift(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(sendersDoc(t))
+	for _, k := range e.f.Objects("MemoryLookupKey", "") {
+		if k["key"] == appSender+"+*@example.com" {
+			if _, err := e.c.Set(context.Background(), "MemoryLookupKey", nil, map[string]map[string]any{k["id"].(string): {"isGlobPattern": false}}, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	e.f.Put("MemoryLookupKey", "", map[string]any{"namespace": bootstrap.NSSenders, "key": "stray@example.com", "isGlobPattern": false})
+	d := sendersDoc(t)
+	d.Generation = 13
+	e.mustApply(d)
+	keys := e.senderKeys()
+	if len(keys) != 4 || !keys[appSender+"+*@example.com"] {
+		t.Fatalf("keys after drift %v", keys)
+	}
+	if _, stray := keys["stray@example.com"]; stray {
+		t.Fatal("a stray key stayed")
+	}
+}
+
+// The rate limits are applied before any removal: a removal that fails
+// never holds back their first creation.
+func TestSenderThrottlesBeforeRemovals(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(sendersDoc(t))
+	for _, th := range e.f.Objects("MtaInboundThrottle", "") {
+		if d := th["description"]; d == DescSenderMinute || d == DescSenderHour {
+			e.f.Delete("MtaInboundThrottle", "", th["id"].(string))
+		}
+	}
+	e.f.Fail("x:AppPassword/query", 100) // the removal destroys the sender's passwords first
+	empty := withSenders(sendersDoc(t))
+	empty.Generation = 13
+	if err := e.apply(empty); err == nil {
+		t.Fatal("the failing removal wasn't reported")
+	}
+	n := 0
+	for _, th := range e.f.Objects("MtaInboundThrottle", "") {
+		if d := th["description"]; d == DescSenderMinute || d == DescSenderHour {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("%d sender limits after a failing removal (want 2)", n)
 	}
 }
