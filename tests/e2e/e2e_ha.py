@@ -767,11 +767,15 @@ def hub_lease_handover() -> None:
         # The Hub back and answering before the next scenario: it waits a
         # LeaseDuration for the second pod's Lease, and only then listens.
         def answers() -> bool:
+            # Back = a pod of the Deployment holds the Lease (it writes) and
+            # the API answers (a person's lookup: 200 or 404, never a 5xx).
+            holder = lease_holder()
+            assert holder in hub_pods(), f"the Lease held by {holder!r}, not a Hub pod of the Deployment {hub_pods()}"
             try:
-                code, out = hub("GET", "/api/directory/groups")
+                code, out = hub("GET", "/api/directory/users/e2e-ha-pub")
             except (OSError, urllib.error.URLError, http.client.HTTPException, AssertionError) as e:
                 raise AssertionError(str(e))
-            assert code == 200, f"GET /api/directory/groups: {code} {str(out)[:200]} (Lease holder {lease_holder()})"
+            assert code in (200, 404), f"GET /api/directory/users/e2e-ha-pub: {code} {str(out)[:200]}"
             return True
         t_back = time.time()
         try:
