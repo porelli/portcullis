@@ -868,12 +868,22 @@ def published_docs() -> None:
     tp = time.time() - t
     seen: dict[str, float] = {}
 
+    # The removal has reached a replica once its copy no longer names the
+    # group (the Hub may publish again meanwhile: a later document, still
+    # without it, counts too).
     def arrived():
         for n, v in gate_policies().items():
-            if v == new and n not in seen:
+            if g not in v and n not in seen:
                 seen[n] = time.time() - t
         return len(seen) >= 2 and len(seen) == len(gate_policies())
-    wait_for("the new policy in every group-gate replica", arrived, 60, 0.5)
+    try:
+        wait_for("the removal in every group-gate replica", arrived, 60, 0.5)
+    except AssertionError:
+        cur = published_policy()
+        print(f"published now: {len(cur)} bytes, names {g}: {g in cur}, = the first after the DELETE: {cur == new}", flush=True)
+        for n, v in gate_policies().items():
+            print(f"  {n}: {len(v)} bytes, names {g}: {g in v}, = published: {v == cur}, = before: {v == before}", flush=True)
+        raise
     note(f"ha_published_docs: published {tp:.1f} s after the DELETE; reached " + ", ".join(f"{n} after {s:.1f} s" for n, s in sorted(seen.items())))
     worst = max(seen.values())
     assert worst <= 20, f"the removal took {worst:.1f} s (> 20) to reach a replica"
