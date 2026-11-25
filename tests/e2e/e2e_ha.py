@@ -1388,8 +1388,13 @@ def zone_a() -> dict[str, list[str]]:
     """The fake zone's A records by absolute name (sorted)."""
     req = urllib.request.Request(state["fakezone"], method="POST", headers={"Content-Type": "application/json"},
                                  data=json.dumps({"op": "get", "zone": f"{DOMAIN}.", "token": ZONE_READ_TOKEN, "records": []}).encode())
-    with urllib.request.urlopen(req, timeout=10) as r:
-        out = json.load(r)
+    # An unreachable zone is an AssertionError (wait_for retries it; the
+    # sampler records it as a sample, so it fails the comparison).
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            out = json.load(r)
+    except OSError as e:  # URLError, a refused or reset connection, a timeout
+        raise AssertionError(f"the fake zone at {state['fakezone']}: {e}") from e
     assert not out.get("error"), f"the fake zone: {out.get('error')}"
     by: dict[str, list[str]] = {}
     for rr in out.get("records") or []:
