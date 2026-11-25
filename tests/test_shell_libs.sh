@@ -8735,6 +8735,21 @@ hacli "" "need_env; ha_status true" status
 expect_eq "ha status --json: vault_active and vault null without HA" "$(jq -c '[.vault_active, .vault]' <<<"$OUT")" '[null,null]'
 rm -f "$HE/k/vault-active-vault-1" "$HE/view.json"; touch "$HE/k/vault-active-vault-0"
 
+# Task 33a review M1: vault/entrypoint.sh render's performance_multiplier:
+# unset (compose) → no line; 1 and 10 → the line in storage "raft"; 0, 11,
+# x, a value with a newline → refused (a whole-value check, never spliced).
+vr_render() { env -u VAULT_RAFT_PERFORMANCE_MULTIPLIER ${1:+VAULT_RAFT_PERFORMANCE_MULTIPLIER="$1"} PORTCULLIS_VAULT_TEMPLATE="$HERE/../vault/vault.hcl.tmpl" sh "$HERE/../vault/entrypoint.sh" render 2>/dev/null; }
+expect_eq "vault render: no performance_multiplier when unset" "$(vr_render "" | grep -c "^ *performance_multiplier ="):$(vr_render "" | grep -c 'storage "raft"')" "0:1"
+expect_eq "vault render: performance_multiplier = 1 inside storage \"raft\"" \
+  "$(vr_render 1 | sed -n '/^storage "raft"/,/^}/p' | grep -cx '  performance_multiplier = 1')" 1
+expect_eq "vault render: performance_multiplier = 10" "$(vr_render 10 | grep -cx '  performance_multiplier = 10')" 1
+for v in 0 11 x 01 ' 1' "1
+}
+listener \"tcp\" {"; do
+  expect_fail "vault render: performance_multiplier $(printf %s "$v" | head -c 6 | tr '\n' '~') refused" vr_render "$v"
+  expect_eq "vault render: nothing rendered for $(printf %s "$v" | head -c 6 | tr '\n' '~')" "$(vr_render "$v" | grep -c 'listener')" 0
+done
+
 # Fix round 2 (Vault, found live): vault/serving.sh, the HA voter's
 # readiness and liveness — 0 only when this voter is active or its
 # advertised leader (one of our voters) confirms it is; wget stubbed by URL

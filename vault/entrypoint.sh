@@ -68,7 +68,12 @@ listener \"tcp\" {
   fi
   perf=""
   if [ -n "${VAULT_RAFT_PERFORMANCE_MULTIPLIER:-}" ]; then
-    printf '%s\n' "$VAULT_RAFT_PERFORMANCE_MULTIPLIER" | grep -Eqx '([1-9]|10)' || { log "VAULT_RAFT_PERFORMANCE_MULTIPLIER $VAULT_RAFT_PERFORMANCE_MULTIPLIER: 1-10 only"; return 1; }
+    # The whole value (case, not grep's line by line: "1<newline><hcl>"
+    # must not pass and be spliced into storage "raft").
+    case "$VAULT_RAFT_PERFORMANCE_MULTIPLIER" in
+      [1-9] | 10) ;;
+      *) log "VAULT_RAFT_PERFORMANCE_MULTIPLIER: 1-10 only"; return 1 ;;
+    esac
     perf="  performance_multiplier = $VAULT_RAFT_PERFORMANCE_MULTIPLIER
 "
   fi
