@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,19 @@ func TestServableHAIncludesMain(t *testing.T) {
 	}
 	if doc.TLS.Certificates[0].CertFile != good {
 		t.Error("the main certificate isn't served first")
+	}
+	// The document's routers are exactly the two reviewed ones, with an
+	// added domain too (Task 33a review M8: core's k8s_hardening pins
+	// their fields; this pins the set).
+	var routers []string
+	if doc.HTTP != nil {
+		for k := range doc.HTTP.Routers {
+			routers = append(routers, k)
+		}
+	}
+	sort.Strings(routers)
+	if strings.Join(routers, ",") != IngressHealthRouter+","+MainCertReadyRouter {
+		t.Errorf("the document's routers %v, want only %s and %s", routers, MainCertReadyRouter, IngressHealthRouter)
 	}
 	_, otherKey := mkCert(t, []string{testMain, "*." + testMain}, nil, nb, na)
 	for name, c := range map[string][2]string{

@@ -815,9 +815,32 @@ def ingress_health_problems(src: str) -> list[str]:
     for k, v in want.items():
         if not re.search(re.escape(k) + r":\s*" + re.escape(v) + r"[,}]", body):
             out.append(f"domains/traefik.go: the ingress health route's {k} isn't {v}")
-    routers = re.findall(r"(\w+Router): (?:\{|ingressHealthRouter)", src)
-    if sorted(set(routers)) != ["IngressHealthRouter", "MainCertReadyRouter"]:
-        out.append(f"domains/traefik.go: the document's routers are {sorted(set(routers))} (only the readiness and ingress health routes are reviewed)")
+    # The router set (Task 33a review M8: any key form, not only
+    # <Name>Router): the one Routers literal's top-level keys, and no
+    # router added to the map anywhere else. domains' Go test
+    # TestServableHAIncludesMain pins the built document's set as well.
+    lits = [m.end() for m in re.finditer(r"Routers:\s*map\[string\]dynamicRouter\{", src)]
+    keys: list[str] = []
+    if len(lits) == 1:
+        depth, elem, i = 1, "", lits[0]
+        while i < len(src) and depth:
+            ch = src[i]
+            if ch in "{([":
+                depth += 1
+            elif ch in "})]":
+                depth -= 1
+            if depth == 1 and ch == ",":
+                keys.append(elem.split(":", 1)[0].strip())
+                elem = ""
+            elif depth >= 1:
+                elem += ch
+            i += 1
+        if elem.strip():
+            keys.append(elem.split(":", 1)[0].strip())
+    added = re.findall(r"Routers\[[^\]]*\]\s*=", src) + re.findall(r"Routers\s*=", src)
+    if len(lits) != 1 or sorted(keys) != ["IngressHealthRouter", "MainCertReadyRouter"] or added:
+        out.append(f"domains/traefik.go: the document's routers are {len(lits)} literal(s) {sorted(keys)}"
+                   + (f", added by {added}" if added else "") + " (only the readiness and ingress health routes are reviewed)")
     return out
 
 
@@ -829,7 +852,9 @@ def check_ingress_health() -> None:
                 lambda t: t.replace(" && (Method(`GET`) || Method(`HEAD`))", ""),
                 lambda t: t.replace('"rate-limit-auth@file", ', ""),
                 lambda t: t.replace("Priority: 10002", "Priority: 99999"),
-                lambda t: t.replace("IngressHealthRouter: ingressHealthRouter(main)}}", "IngressHealthRouter: ingressHealthRouter(main), ExtraRouter: {}}}")):
+                lambda t: t.replace("IngressHealthRouter: ingressHealthRouter(main)}}", "IngressHealthRouter: ingressHealthRouter(main), ExtraRouter: {}}}"),
+                lambda t: t.replace("IngressHealthRouter: ingressHealthRouter(main)}}", "IngressHealthRouter: ingressHealthRouter(main), \"x\": {Rule: \"PathPrefix(`/`)\"}}}"),
+                lambda t: t.replace("IngressHealthRouter: ingressHealthRouter(main)}}", "IngressHealthRouter: ingressHealthRouter(main)}}\n\t\t\tdoc.HTTP.Routers[\"x\"] = dynamicRouter{}")):
         if not ingress_health_problems(mut(src)):
             F.add("ingress_health_problems misses a mutated route (mutation test)")
 
