@@ -1286,6 +1286,10 @@ def sites_scenario() -> None:
     wait_for("every ingress address published", lambda: all(published().get(n) == every for n in names), 600, 5)
     edge = [n["name"] for n in by_site["edge"]]
     main_only = sorted(pub[n["name"]] for n in by_site["main"])
+    # One change per name per 60 s: the cut a minute after the last add
+    # (edge's two addresses then go at least 60 s apart, by the same rule).
+    last = max(lease_time(v["last_change"]) for v in fd_status()["names"].values() if v.get("last_change"))
+    time.sleep(max(0.0, last + 61 - time.time()))
     # 1: edge's uplink lost.
     t = time.time()
     uplink(edge, True)
@@ -1321,7 +1325,16 @@ def sites_scenario() -> None:
                 heal(n)
                 killed.discard(n)
     wait_for("the API back", lambda: K("get", "--raw", "/readyz", timeout=10, ok=False).strip() == "ok", 300, 5)
-    after = fd_status()
+    # The front door that lost its Lease during the quorum loss exits (fail
+    # closed) and starts again: its first status is written before it read
+    # the provider (no addresses, no last change). Compared once a leading
+    # front door has read the set.
+    def read_again():
+        st = fd_status()
+        assert st.get("state") == "leading" and st.get("snapshot_ok") and all((st.get("names") or {}).get(n, {}).get("addresses") for n in names), \
+            f"the front door's status: {json.dumps(st)[:400]}"
+        return st
+    after = wait_for("a leading front door that read the set", read_again, 300, 5)
     for n in names:
         b, a = before.get("names", {}).get(n, {}), after.get("names", {}).get(n, {})
         assert a.get("addresses") == b.get("addresses") and a.get("last_change") == b.get("last_change"), \
