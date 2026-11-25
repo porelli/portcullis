@@ -339,3 +339,37 @@ func TestNoObservationKeepsCounts(t *testing.T) {
 		}
 	}
 }
+
+// TestSeededLastChangeInEveryStatus: a front door that starts and can't
+// finish a round yet (no snapshot, or the provider unread) still writes a
+// status, from the engine's view before any Step. That status carries the
+// last change it was seeded with (Engine.Seed, from the earlier front
+// door's status): without it, a front door that dies again before a good
+// round leaves no last change, and the next leader could change a name
+// sooner than 60 s after the last one (seen in e2e-ha-k3d: after a quorum
+// loss, last_change null).
+func TestSeededLastChangeInEveryStatus(t *testing.T) {
+	at := time.Date(2026, 11, 25, 2, 32, 16, 0, time.UTC)
+	e := NewEngine([]string{"example.org", "*.example.org"})
+	e.Seed(map[string]time.Time{"example.org": at})
+	if got := e.View().LastChange["example.org"]; !got.Equal(at) {
+		t.Fatalf("the view before any Step: last change %v, want the seeded %v", got, at)
+	}
+	st := BuildStatus(false, []string{"example.org", "*.example.org"}, nil, time.Minute, Cluster{}, e.View())
+	b, err := marshalStatus(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := ParseLastChanges(string(b))
+	if err != nil || !last["example.org"].Equal(at) {
+		t.Fatalf("the status a new front door writes first: %v (%v), want example.org at %v", last, err, at)
+	}
+	if _, ok := last["*.example.org"]; ok {
+		t.Fatalf("a name never changed got a last change: %v", last)
+	}
+	// A later seed never moves it back.
+	e.Seed(map[string]time.Time{"example.org": at.Add(-time.Hour)})
+	if got := e.View().LastChange["example.org"]; !got.Equal(at) {
+		t.Fatalf("an older seed moved the last change to %v", got)
+	}
+}

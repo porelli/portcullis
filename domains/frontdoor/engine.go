@@ -199,10 +199,19 @@ func newEngine(names []string, r rules) *Engine {
 
 // Seed takes the last written change per name from an earlier front door
 // (frontdoor-status), so a new leader keeps the one change per 60 s.
+// The view carries it at once: a status written before the first Step (a
+// round without a snapshot or a provider read) keeps it for the next
+// front door.
 func (e *Engine) Seed(last map[string]time.Time) {
+	if e.view.LastChange == nil {
+		e.view.LastChange = map[string]time.Time{}
+	}
 	for n, t := range last {
 		if t.After(e.applied[n]) {
 			e.applied[n] = t
+		}
+		if l, ok := e.applied[n]; ok {
+			e.view.LastChange[n] = l
 		}
 	}
 }
