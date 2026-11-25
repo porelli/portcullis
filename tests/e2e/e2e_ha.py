@@ -631,6 +631,14 @@ def vault_leader_loss() -> None:
         a1 = wait_for("another active voter", another, 30, 0.5)
     except AssertionError:
         print("vault status over the wait (A active, S sealed, (leader)):\n  " + "\n  ".join(timeline[::4] + timeline[-2:]), flush=True)
+        # The failure stays at 30 s; how long Vault had no active node is
+        # the finding (upstream hashicorp/vault#10361's signature: the
+        # standbys keep the deleted active's address): watched up to 5 min.
+        try:
+            late = wait_for("an active voter after the 30 s", another, 300, 2)
+            note(f"ha_vault_leader_loss: no active voter for {time.time() - t:.0f} s after the delete, then {late} (bound 30 s: failed)")
+        except AssertionError:
+            note("ha_vault_leader_loss: no active voter 330 s after the delete")
         try:
             print(f"raft leader (from vault-1's view): {vault_raft_leader('vault-1')}", flush=True)
         except (AssertionError, ValueError, subprocess.TimeoutExpired) as e:
