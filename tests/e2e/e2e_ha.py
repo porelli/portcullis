@@ -732,12 +732,15 @@ def hub_lease_handover() -> None:
         # refuses every write (the leader gate, before any handler).
         # (A standby may not listen yet: its start waits on the fence; then
         # a refused connection is no write either.)
-        # At least one 503 must be seen (a standby that never answered
-        # proves nothing): up to 60 s more for the first.
-        refused, t_watch = 0, time.time()
-        for i in range(30):
-            if i >= 10 and refused:
-                break
+        # A standby Hub doesn't listen at all until it leads (contract
+        # §20.5 start order: the lock, the write gate, waiting to lead,
+        # then hub.New and the listeners), so a write to it is refused at
+        # the connection; one that lost the Lease answers 503 "standing
+        # by". Anything else is a write. Each attempt counted, and the
+        # standby's own log must say it waits for the Lease.
+        refused = standing = 0
+        t_watch = time.time()
+        for _ in range(10):
             assert lease_holder() == h0, f"the Lease moved to {lease_holder()} while {h0} runs"
             try:
                 f = Forward(f"pod/{other}", 8888)
@@ -746,13 +749,18 @@ def hub_lease_handover() -> None:
                 finally:
                     f.close()
                 assert code == 503 and "standing by" in str(out), f"the standby {other} answered a write {code}: {str(out)[:200]}"
-                refused += 1
+                standing += 1
             except (ConnectionError, urllib.error.URLError, http.client.RemoteDisconnected, AssertionError) as e:
                 if "answered a write" in str(e) or "Lease moved" in str(e):
                     raise
+                refused += 1
             time.sleep(3)
-        assert refused, f"the standby {other} never answered (no 503 \"standing by\" in {time.time() - t_watch:.0f} s)"
-        note(f"ha_hub_lease_handover: the standby answered {refused} writes 503 \"standing by\" over {time.time() - t_watch:.0f} s, the Lease never moved")
+        c2 = Kj("-n", NS, "get", "pod", other)["spec"]["containers"][0]["name"]
+        log2 = K("-n", NS, "logs", other, "-c", c2, ok=False)
+        assert "leader: waiting for the Lease" in log2 and "Hub listening on" not in log2, \
+            f"the standby {other}'s log doesn't show it waiting for the Lease (or it listens): {log2[-600:]}"
+        note(f"ha_hub_lease_handover: the standby over {time.time() - t_watch:.0f} s: {refused} writes refused at the connection "
+             f"(it doesn't listen before it leads), {standing} answered 503 \"standing by\", the Lease never moved; its log waits for the Lease")
         # The holder gone (its Deployment at 0, so only the second is left).
         # A stopping Hub keeps its Lease while it finishes its background
         # operations, up to its grace period (the chart's 60 s), and never
