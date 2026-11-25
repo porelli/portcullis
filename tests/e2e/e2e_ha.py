@@ -51,6 +51,11 @@ Scenarios (main):
                          availability view of a CI echo instance) against
                          the scheduler: that node cordoned and drained,
                          every pod of it the check placed starts elsewhere.
+  ha_dns_failover_nodeadm_node  the ingress node running nodeadm cut: the
+                         front door waits for nodeadm (its snapshot) to be
+                         Ready elsewhere, then removes the address within
+                         45 s of that and within 150 s of NotReady (ruling:
+                         accepted for now; a second nodeadm is a follow-up).
   ha_coredns_node_kill   (carry) the node of a CoreDNS replica killed: a
                          pod on another node keeps resolving the cluster
                          names (k3s' CoreDNS spread over two nodes and
@@ -1298,6 +1303,66 @@ def dns_failover() -> None:
     save("frontdoor-status-after.json", fd_status())
 
 
+def dns_failover_nodeadm_node() -> None:
+    """The ingress node running nodeadm cut off (ruling, fix round 2: a
+    slower failover when nodeadm itself dies is accepted for now; a second
+    nodeadm is a follow-up). The front door judges readiness from nodeadm's
+    snapshot, so it changes nothing until nodeadm is rescheduled and Ready
+    again; then the dead node's address goes within 45 s of that, and
+    within 150 s of NotReady overall. Never the last; the front door that
+    leads before the cut still leads (its zone kept). Both times noted."""
+    probes_up()
+    nodes = node_facts()
+    ing = {n["name"]: n["public"][0] for n in nodes if n["ingress"] and n["public"]}
+    names = [DOMAIN, f"*.{DOMAIN}"]
+    want = sorted(ing.values())
+    wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
+
+    def fd_node() -> str:
+        return Kj("-n", NS, "get", "pods", "-l", "portcullis.io/component=frontdoor")["items"][0]["spec"]["nodeName"]
+
+    def nodeadm_pods() -> list[dict]:
+        return pods("portcullis-nodeadm", "portcullis.io/component=nodeadm")
+    na = wait_for("nodeadm Ready", lambda: (lambda r: r[0] if len(r) == 1 else None)([p for p in nodeadm_pods() if ready(p)]), 300, 5)
+    # nodeadm and the front door on one node: nodeadm moved first (cordon,
+    # delete, Ready elsewhere, uncordon), so the cut takes nodeadm only.
+    if na["spec"]["nodeName"] == fd_node():
+        n0 = na["spec"]["nodeName"]
+        K("cordon", n0)
+        try:
+            K("-n", "portcullis-nodeadm", "delete", "pod", na["metadata"]["name"], "--wait=false")
+            na = wait_for("nodeadm Ready off the front door's node", lambda: next(
+                (p for p in nodeadm_pods() if ready(p) and p["spec"].get("nodeName") != n0), None), 300, 5)
+        finally:
+            K("uncordon", n0)
+    victim, old_uid = na["spec"]["nodeName"], na["metadata"]["uid"]
+    assert victim in ing, f"nodeadm runs on {victim}, not an ingress node ({sorted(ing)})"
+    assert victim != fd_node(), f"the front door runs on nodeadm's node {victim}"
+    wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
+    leader = fd_status().get("leader")
+    last = max(lease_time(v["last_change"]) for v in fd_status()["names"].values() if v.get("last_change"))
+    time.sleep(max(0.0, last + 61 - time.time()))
+    rest = sorted(a for n, a in ing.items() if n != victim)
+    t = kill_node(victim)
+    t_nr = not_ready_at(victim, t)
+    pub = published()
+    assert all(not pub.get(n) or ing[victim] in pub[n] for n in names), f"{victim}'s address went before it was NotReady: {pub}"
+    na2 = wait_for("nodeadm rescheduled and Ready on another node", lambda: next(
+        (p for p in nodeadm_pods() if ready(p) and p["metadata"]["uid"] != old_uid and p["spec"].get("nodeName") != victim), None), 150, 1)
+    t_na = time.time()
+    removed_early = all(published().get(n) == rest for n in names)
+    wait_for(f"{victim}'s address removed", lambda: all(published().get(n) == rest for n in names), max(5.0, t_nr + 200 - time.time()), 1)
+    t_rm = time.time()
+    note(f"ha_dns_failover_nodeadm_node: {victim} (nodeadm's node) cut → NotReady after {t_nr - t:.0f} s → nodeadm Ready on "
+         f"{na2['spec']['nodeName']} {t_na - t_nr:.0f} s after NotReady → {ing[victim]} removed {t_rm - t_na:.0f} s after nodeadm was Ready, "
+         f"{t_rm - t_nr:.0f} s after NotReady ({t_rm - t:.0f} s after the cut); {rest} kept"
+         + ("; (removed before nodeadm was seen Ready)" if removed_early else ""))
+    st = fd_status()
+    assert st.get("leader") == leader, f"the front door's leader changed ({leader} → {st.get('leader')}): its zone may have restarted empty"
+    assert t_rm - t_na <= 45, f"removed {t_rm - t_na:.0f} s after nodeadm was Ready again (want ≤ 45 s)"
+    assert t_rm - t_nr <= 150, f"removed {t_rm - t_nr:.0f} s after NotReady (want ≤ 150 s)"
+
+
 def helper_image() -> str:
     out = subprocess.run(["bash", "-c", 'source scripts/lib/common.sh >/dev/null 2>&1; printf "%s" "$PORTCULLIS_HELPER_IMAGE"'],
                          capture_output=True, text=True, check=True).stdout
@@ -1334,6 +1399,8 @@ def main() -> int:
         check("ha_signin_continuity: 300 sign-ins over a Keycloak and a gate kill, at most 5 failed", signin_continuity)
         check("ha_coredns_node_kill: CoreDNS keeps answering with a node dead", coredns_node_kill)
         check("ha_dns_failover: a dead ingress node's address removed after ~30 s, never the last", dns_failover)
+        check("ha_dns_failover_nodeadm_node: nodeadm's own node cut; its address removed within 45 s of nodeadm back, 150 s of NotReady",
+              dns_failover_nodeadm_node)
         check("ha_n_minus_1: the N−1 page agrees with the scheduler", n_minus_1)
         if "session" in state:
             state["session"].close()

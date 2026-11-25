@@ -130,7 +130,7 @@ class Cli(unittest.TestCase):
         names = scenarios.known([HERE / "e2e" / "e2e_ha.py"])["e2e_ha.py"]
         for n in ("ha_cnpg_failover", "ha_signin_continuity", "ha_sentinel_promotion", "ha_vault_leader_loss",
                   "ha_hub_lease_handover", "ha_dns_failover", "ha_n_minus_1", "ha_published_docs",
-                  "ha_dns_failover_sites", "ha_coredns_node_kill"):
+                  "ha_dns_failover_sites", "ha_coredns_node_kill", "ha_dns_failover_nodeadm_node"):
             self.assertIn(n, names)
         ok = cli("check", "--jobs", "e2e-ha-k3d", "--scenarios", "ha_cnpg_failover")
         self.assertEqual(ok.returncode, 0, ok.stderr)
