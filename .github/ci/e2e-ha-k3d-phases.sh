@@ -191,6 +191,8 @@ collect)
       done
     done
   done
+  # The sites scenario's fake zone (e2e_ha.py fakezone_up): its change log.
+  docker logs pce2e-fakezone > "$a/sites-fakezone.log" 2>&1 || true
   # The k3d node containers' own logs (k3s: the server's etcd, the
   # kubelet) and their firewall (a scenario's isolation chain).
   for n in $(docker ps -a --filter label=app=k3d --format '{{.Names}}'); do

@@ -6108,7 +6108,12 @@ jobs:
   #   - the nodeagent probes are a test DaemonSet (`nodeagent serve
   #     --probes-only`) with the harness's probe targets: nodeadm pushes
   #     targets only for a DNS provider with an egress host, and the fake
-  #     provider has none;
+  #     provider has none; `serve --probes-only` answers only the health
+  #     and probe routes (every other route 404);
+  #   - the sites front door writes into a fake zone outside the cluster
+  #     (`domains fakezone` on the runner, DOMAINS_FAKEDNS_REMOTE): its
+  #     own in-memory zone would start empty after every restart, and the
+  #     harness reads the zone and its change log across the quorum loss;
   #   - N−1 against the scheduler leaves out pods on the replicated tier's
   #     volumes: that tier is a local-path class in k3d (node-bound), where
   #     Longhorn's would follow the pod;

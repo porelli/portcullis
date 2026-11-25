@@ -132,6 +132,8 @@ sudo chmod 0755 /usr/local/bin/k3s
 # The cluster first (its node containers hold both networks), then its
 # own networks: k3d leaves a network it didn't create, and the next
 # cluster's mesh is the same 10.215.0.0/24 (a left one: "Pool overlaps").
+# e2e_ha.py's fake zone container (sites) sits on the mesh network.
+docker rm -f pce2e-fakezone >/dev/null 2>&1 || true
 for c in pk-ha pk-sites; do
   if k3d cluster list -o json 2>/dev/null | jq -e --arg c "$c" 'any(.[]; .name == $c)' >/dev/null; then
     k3d cluster delete "$c" >/dev/null

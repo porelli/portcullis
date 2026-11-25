@@ -4,10 +4,11 @@ part A; spec §19.2 — the logic, not the storage).
 
 Runs against core in HA on the k3d cluster `ha` (.github/ci/e2e-ha-k3d-
 install.sh main: 3 servers + 1 small agent on 10.215.0.0/24, every server
-at site main and an ingress node; e2e-ha-k3d-phases.sh init + ha). Node
-"failures" are `docker kill` of a node container and `docker start` after:
-the kubelet and everything on the node stop at once (not a power loss or a
-partition: those are e2e-ha-vm's, part B).
+at site main and an ingress node; e2e-ha-k3d-phases.sh init + ha). A node
+"failure" is the node container's isolation (every packet dropped both
+ways in its raw table but the API port, reset; see kill_node) and the heal
+deletes it: the node stops answering as a VM does while its processes run
+on (a power loss and a real partition are e2e-ha-vm's, part B).
 
     e2e_ha.py main    the scenarios on `ha`
     e2e_ha.py sites   ha_dns_failover_sites on `sites` (install.sh sites)
@@ -103,10 +104,15 @@ def check(name: str, fn) -> None:
         print(f"FAIL: {name}: {e}", flush=True)
         traceback.print_exc()
     finally:
+        # Full redundancy back after the scenario is itself an HA property:
+        # a cluster that didn't settle is a failed result of its own.
         try:
             settle()
-        except Exception as e:  # noqa: BLE001 — a cluster that didn't come back fails the next one
-            print(f"::warning::after {name.split(':')[0]}: the cluster didn't settle: {e}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            short = name.split(':')[0]
+            print(f"::warning::after {short}: the cluster didn't settle: {e}", flush=True)
+            print(f"FAIL: {short} settle: {e}", flush=True)
+            results.append((f"{short} settle: the cluster back at full redundancy", False, f"{type(e).__name__}: {e}"))
 
 
 def needs(*keys: str) -> None:
@@ -726,7 +732,12 @@ def hub_lease_handover() -> None:
         # refuses every write (the leader gate, before any handler).
         # (A standby may not listen yet: its start waits on the fence; then
         # a refused connection is no write either.)
-        for _ in range(10):
+        # At least one 503 must be seen (a standby that never answered
+        # proves nothing): up to 60 s more for the first.
+        refused, t_watch = 0, time.time()
+        for i in range(30):
+            if i >= 10 and refused:
+                break
             assert lease_holder() == h0, f"the Lease moved to {lease_holder()} while {h0} runs"
             try:
                 f = Forward(f"pod/{other}", 8888)
@@ -735,10 +746,13 @@ def hub_lease_handover() -> None:
                 finally:
                     f.close()
                 assert code == 503 and "standing by" in str(out), f"the standby {other} answered a write {code}: {str(out)[:200]}"
+                refused += 1
             except (ConnectionError, urllib.error.URLError, http.client.RemoteDisconnected, AssertionError) as e:
                 if "answered a write" in str(e) or "Lease moved" in str(e):
                     raise
             time.sleep(3)
+        assert refused, f"the standby {other} never answered (no 503 \"standing by\" in {time.time() - t_watch:.0f} s)"
+        note(f"ha_hub_lease_handover: the standby answered {refused} writes 503 \"standing by\" over {time.time() - t_watch:.0f} s, the Lease never moved")
         # The holder gone (its Deployment at 0, so only the second is left).
         # A stopping Hub keeps its Lease while it finishes its background
         # operations, up to its grace period (the chart's 60 s), and never
@@ -1012,21 +1026,50 @@ def n_minus_1() -> None:
         if not p["metadata"].get("ownerReferences"):
             continue
         if key not in unplaced:
-            placeable.append((ns, name, p["metadata"].get("ownerReferences", [{}])[0].get("name", "")))
-    note(f"ha_n_minus_1: {node} is {res[node]['level']}: unplaced {sorted(unplaced)}; {len(placeable)} placeable pods")
-    K("drain", node, "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=300s", timeout=330, ok=False)
+            o = p["metadata"]["ownerReferences"][0]
+            placeable.append({"ns": ns, "name": name, "uid": p["metadata"]["uid"], "kind": o.get("kind", ""), "owner": o.get("name", "")})
+    assert placeable, f"no pod on {node} the check placed (unplaced {sorted(unplaced)}): nothing to prove"
+    note(f"ha_n_minus_1: {node} is {res[node]['level']}: unplaced {sorted(unplaced)}; {len(placeable)} placeable pods: "
+         + ", ".join(f"{x['ns']}/{x['name']}" for x in placeable))
+
+    def owned(ns: str, kind: str, owner: str) -> list[dict]:
+        return [p for p in Kj("-n", ns, "get", "pods")["items"]
+                if any(o.get("kind") == kind and o.get("name") == owner for o in p["metadata"].get("ownerReferences") or [])]
+    # Every pod of the placeable pods' owners before the drain: a pod
+    # judged started elsewhere must be NEW (a UID not seen here), not a
+    # sibling replica that already ran on another node.
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for x in placeable:
+        groups.setdefault((x["ns"], x["kind"], x["owner"]), []).append(x)
+    seen = {g: {p["metadata"]["uid"] for p in owned(*g)} for g in groups}
     try:
+        r = subprocess.run(["kubectl", "--context", CTX, "drain", node, "--ignore-daemonsets", "--delete-emptydir-data", "--force",
+                            "--timeout=300s"], capture_output=True, text=True, timeout=330)
+        assert r.returncode == 0, f"the drain of {node} failed (exit {r.returncode}): {r.stderr.strip()[-600:]}"
+
         def started():
             missing = []
-            for ns, name, owner in placeable:
-                live = [p for p in Kj("-n", ns, "get", "pods")["items"]
-                        if any(o.get("name") == owner for o in p["metadata"].get("ownerReferences") or [])
-                        and p["spec"].get("nodeName") not in (None, node) and ready(p)] if owner else []
-                if not live:
-                    missing.append(f"{ns}/{name}")
-            assert not missing, f"not started elsewhere: {missing}"
+            for (ns, kind, owner), evicted in groups.items():
+                live = owned(ns, kind, owner)
+                fresh = [p for p in live if p["metadata"]["uid"] not in seen[(ns, kind, owner)]
+                         and p["spec"].get("nodeName") not in (None, node) and ready(p)]
+                if kind == "StatefulSet":
+                    # The same name, a new UID, Running and Ready off the node.
+                    for x in evicted:
+                        if not any(p["metadata"]["name"] == x["name"] for p in fresh):
+                            missing.append(f"{ns}/{x['name']}")
+                elif len(fresh) < len(evicted):
+                    missing.append(f"{ns}/{kind}/{owner}: {len(fresh)} new of {len(evicted)} evicted")
+            if missing:
+                raise AssertionError(f"not started elsewhere as new pods: {missing}")
             return True
-        wait_for(f"every pod the check placed off {node} running elsewhere", started, 420, 10)
+        try:
+            wait_for(f"every pod the check placed off {node} running elsewhere as a new pod", started, 420, 10)
+        except AssertionError:
+            print(K("get", "pods", "-A", "-o", "wide", "--field-selector", "status.phase!=Running", ok=False)[-4000:], flush=True)
+            for p in Kj("get", "pods", "-A", "--field-selector", "status.phase=Pending")["items"]:
+                print(K("-n", p["metadata"]["namespace"], "describe", "pod", p["metadata"]["name"], ok=False)[-1500:], flush=True)
+            raise
     finally:
         K("uncordon", node)
 
@@ -1170,15 +1213,6 @@ def traefik_unready(node: str, on: bool) -> None:
     docker("exec", node, "iptables", "-w", "-t", "raw", "-I" if on else "-D", "OUTPUT", "-d", ip, "-p", "tcp", "--dport", "8080", "-j", "DROP")
 
 
-def block_443(addr: str, on: bool, ctx_nodes: list[str]) -> None:
-    """Traefik unreachable at addr (TCP 443 dropped in the raw table, before
-    the hostPort DNAT, on every node: the probers' and the node's own)."""
-    for n in ctx_nodes:
-        op = "-I" if on else "-D"
-        docker("exec", n, "iptables", "-t", "raw", op, "PREROUTING", "-d", addr, "-p", "tcp", "--dport", "443", "-j", "DROP")
-        docker("exec", n, "iptables", "-t", "raw", op, "OUTPUT", "-d", addr, "-p", "tcp", "--dport", "443", "-j", "DROP")
-
-
 def dns_failover() -> None:
     """The front door (testprovider: the fake DNS zone), its probers (the
     probes DaemonSet): every ingress node's public address published for
@@ -1310,6 +1344,68 @@ def uplink(nodes: list[str], down: bool, inbound: bool = True, outbound: bool = 
             docker("exec", n, "iptables", "-t", "raw", op, "OUTPUT", "-d", "198.51.100.0/24", "-j", "DROP")
 
 
+FAKEZONE = "pce2e-fakezone"
+ZONE_READ_TOKEN = "e2e-harness-read"  # the fake provider takes any token but bad-token-0000: not a secret
+
+
+def fakezone_up() -> str:
+    """The front door's DNS zone outside the cluster: `domains fakezone`
+    (the testprovider image the CLI built, portcullis-domains:kube-local)
+    in a container on the cluster's mesh network, and the front door on it
+    (DOMAINS_FAKEDNS_REMOTE; a NetworkPolicy of ours admits its egress to
+    :8054). Its records outlive every front-door restart (the front door's
+    own in-memory zone starts empty each time) and it logs every change
+    (fakedns.ChangeLog); the runner reads both. Its URL."""
+    net = f"pk-{CTX}-mesh"
+    subprocess.run(["docker", "rm", "-f", FAKEZONE], capture_output=True, timeout=60)
+    docker("run", "-d", "--name", FAKEZONE, "--network", net, "--read-only", "--cap-drop", "ALL",
+           "--security-opt", "no-new-privileges", "-e", "DOMAINS_FAKEDNS_API_ADDR=:8054",
+           "--entrypoint", "domains", "portcullis-domains:kube-local", "fakezone")
+    ip = docker("inspect", "-f", "{{(index .NetworkSettings.Networks \"" + net + "\").IPAddress}}", FAKEZONE).strip()
+    assert re.fullmatch(r"10\.215\.0\.\d+", ip), f"the fake zone's address {ip!r}"
+    url = f"http://{ip}:8054"
+    state["fakezone"] = url
+    wait_for("the fake zone answering", lambda: zone_a() is not None, 60, 2)
+    K("apply", "-f", "-", inp=json.dumps({
+        "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+        "metadata": {"name": "e2e-frontdoor-fakezone", "namespace": NS},
+        "spec": {"podSelector": {"matchLabels": {"portcullis.io/component": "frontdoor"}}, "policyTypes": ["Egress"],
+                 "egress": [{"to": [{"ipBlock": {"cidr": f"{ip}/32"}}], "ports": [{"protocol": "TCP", "port": 8054}]}]}}))
+    K("-n", NS, "set", "env", "deployment/frontdoor", f"DOMAINS_FAKEDNS_REMOTE={url}")
+    K("-n", NS, "rollout", "status", "deployment/frontdoor", "--timeout=300s", timeout=320)
+    return url
+
+
+def zone_a() -> dict[str, list[str]]:
+    """The fake zone's A records by absolute name (sorted)."""
+    req = urllib.request.Request(state["fakezone"], method="POST", headers={"Content-Type": "application/json"},
+                                 data=json.dumps({"op": "get", "zone": f"{DOMAIN}.", "token": ZONE_READ_TOKEN, "records": []}).encode())
+    with urllib.request.urlopen(req, timeout=10) as r:
+        out = json.load(r)
+    assert not out.get("error"), f"the fake zone: {out.get('error')}"
+    by: dict[str, list[str]] = {}
+    for rr in out.get("records") or []:
+        if rr["type"] != "A":
+            continue
+        n = rr["name"].rstrip(".")
+        n = DOMAIN if n in ("@", "") else (n if n.endswith(DOMAIN) else f"{n}.{DOMAIN}")
+        by.setdefault(n, []).append(rr["data"])
+    return {n: sorted(v) for n, v in by.items()}
+
+
+def zone_changes() -> list[tuple[float, str]]:
+    """The fake zone's change history (its log: `fakezone: <UTC time> <op>
+    <zone> <name> <type> <data>`), as (epoch seconds, the line's rest)."""
+    out = []
+    r = subprocess.run(["docker", "logs", FAKEZONE], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"docker logs {FAKEZONE}: {r.stderr.strip()[-300:]}"
+    for ln in (r.stdout + r.stderr).splitlines():
+        m = re.search(r"fakezone: (\S+) (.*)$", ln)
+        if m:
+            out.append((lease_time(m.group(1)), m.group(2)))
+    return sorted(set(out))
+
+
 def quiet_for(what: str, fn, seconds: float) -> None:
     t = time.time()
     first = fn()
@@ -1325,7 +1421,20 @@ def sites_scenario() -> None:
     edge: only edge's addresses go, main's stay; a blind site (edge's
     probers cut off, its addresses still reachable) changes nothing;
     stopping tb keeps quorum (4/5) and the set; stopping edge and tb loses
-    quorum (2/5) and nothing is changed."""
+    quorum (2/5) and nothing is changed: the zone (outside the cluster,
+    fakezone_up) sampled every 2 s from before the cut to the API's return
+    equals the full set throughout, and its change log has nothing then."""
+    fakezone_up()
+    try:
+        sites_steps()
+    finally:
+        try:
+            save(f"e2e-ha-{CTX}-fakezone.log", "\n".join(f"{t:.6f} {c}" for t, c in zone_changes()))
+        except Exception as e:  # noqa: BLE001
+            print(f"the fake zone's log: {e}", flush=True)
+
+
+def sites_steps() -> None:
     probes_up()
     nodes = node_facts()
     by_site: dict[str, list[dict]] = {}
@@ -1336,7 +1445,10 @@ def sites_scenario() -> None:
     pub = {n["name"]: n["public"][0] for n in nodes if n["ingress"]}
     names = [DOMAIN, f"*.{DOMAIN}"]
     every = sorted(pub.values())
-    wait_for("every ingress address published", lambda: all(published().get(n) == every for n in names), 600, 5)
+    # The zone starts empty (the front door just moved onto it): it adds
+    # the set again, one change per name per 60 s.
+    wait_for("every ingress address published (the status and the zone)",
+             lambda: all(published().get(n) == every for n in names) and all(zone_a().get(n) == every for n in names), 900, 5)
     edge = [n["name"] for n in by_site["edge"]]
     main_only = sorted(pub[n["name"]] for n in by_site["main"])
     # One change per name per 60 s: the cut a minute after the last add
@@ -1366,8 +1478,16 @@ def sites_scenario() -> None:
         wait_for("the API answering with tb down", lambda: K("get", "--raw", "/readyz", timeout=10) .strip() == "ok", 60, 3)
         quiet_for("the published set (tb down)", published, 60)
         note("ha_dns_failover_sites: tb stopped → quorum kept (API ready), the set unchanged")
-        # 4: edge and tb down: 2/5, no quorum; nothing changes.
-        before = fd_status()
+        # 4: edge and tb down: 2/5, no quorum; nothing changes. The zone
+        # sampled every 2 s from here to the API's return (the runner reads
+        # it: outside the cluster, it outlives every front-door restart).
+        before = zone_a()
+        assert all(before.get(n) == every for n in names), f"the zone before the quorum loss: {before}, want {every} for {names}"
+        assert all(published().get(n) == every for n in names), f"the front door's status before the quorum loss: {published()}"
+        t_before = time.time()
+        sampling.set()
+        sampler = threading.Thread(target=sample_zone, daemon=True)
+        sampler.start()
         for n in edge:
             kill_node(n)
         t_loss = time.time()
@@ -1378,43 +1498,45 @@ def sites_scenario() -> None:
             if n in killed:
                 heal(n)
                 killed.discard(n)
-    wait_for("the API back", lambda: K("get", "--raw", "/readyz", timeout=10, ok=False).strip() == "ok", 300, 5)
-    t_back = time.time()
-    # The front door that lost its Lease during the quorum loss exits (fail
-    # closed) and starts again: its first status is written before it read
-    # the provider (no addresses, no last change). Compared once a leading
-    # front door has read the set.
-    def read_again():
-        st = fd_status()
-        assert st.get("state") == "leading" and st.get("snapshot_ok") and all((st.get("names") or {}).get(n, {}).get("addresses") for n in names), \
-            f"the front door's status: {json.dumps(st)[:400]}"
-        return st
-    after = wait_for("a leading front door that read the set", read_again, 300, 5)
-    # Nothing changed DURING the loss: no change the front door logged
-    # (kubectl's timestamps; every front door pod, its previous container
-    # too) between the cut and the API's return, and each name's last change
-    # is the one before or one after the return. After it, the recovering
-    # nodes (k3s restarted on the cut servers, Traefik not Ready yet) may be
-    # judged and removed as usual (never the last): noted, not a failure.
-    during, later = [], []
-    for p in Kj("-n", NS, "get", "pods", "-l", "portcullis.io/component=frontdoor")["items"]:
-        for prev in ([], ["--previous"]):
-            for ln in K("-n", NS, "logs", p["metadata"]["name"], "--timestamps", *prev, ok=False).splitlines():
-                m = re.match(r"(\S+) .*frontdoor: (add|remove) (\S+) (\S+)$", ln)
-                if not m:
-                    continue
-                at = lease_time(m.group(1))
-                if t_loss <= at <= t_back:
-                    during.append(ln[:200])
-                elif at > t_back:
-                    later.append(f"{m.group(2)} {m.group(3)} {m.group(4)}")
-    assert not during, f"the front door changed DNS during the quorum loss: {during}"
-    for n in names:
-        b, a = before.get("names", {}).get(n, {}), after.get("names", {}).get(n, {})
-        assert a.get("last_change") == b.get("last_change") or (a.get("last_change") and lease_time(a["last_change"]) >= t_back), \
-            f"{n}'s last change {a.get('last_change')} falls in the quorum loss ({b} → {a})"
-    note("ha_dns_failover_sites: edge + tb stopped (2/5) for 90 s → nothing changed during the loss"
-         + (f"; after the API's return: {', '.join(sorted(set(later)))}" if later else ""))
+    try:
+        wait_for("the API back", lambda: K("get", "--raw", "/readyz", timeout=10, ok=False).strip() == "ok", 300, 5)
+        t_back = time.time()
+        at_back = zone_a()
+    finally:
+        sampling.clear()
+        sampler.join(30)
+    # Up to the API's return (a change after it is the recovery's, noted).
+    samples[:] = [(t, z) for t, z in samples if t <= t_back]
+    bad = [(round(t - t_loss, 1), z) for t, z in samples if z != before]
+    assert samples and not bad, f"the zone changed across the quorum loss ({len(samples)} samples; before {before}): {bad[:5]}"
+    assert at_back == before, f"the zone at the API's return {at_back} != before the loss {before}"
+    gaps = [b - a for (a, _), (b, _) in zip(samples, samples[1:])]
+    assert samples[0][0] <= t_loss and samples[-1][0] >= t_back - 10 and max(gaps, default=0) < 30, \
+        f"the zone wasn't sampled across the loss: {samples[0][0] - t_loss:.0f}..{samples[-1][0] - t_back:.0f} s, largest gap {max(gaps, default=0):.0f} s"
+    changes = zone_changes()
+    during = [f"{t - t_loss:+.1f} s {c}" for t, c in changes if t_before <= t <= t_back]
+    assert not during, f"the zone's log has changes during the quorum loss: {during}"
+    later = [f"{t - t_back:+.0f} s {c}" for t, c in changes if t > t_back]
+    note(f"ha_dns_failover_sites: edge + tb stopped (2/5) for 90 s → the zone unchanged ({len(samples)} samples over "
+         f"{t_back - t_before:.0f} s, equal to the full set at the cut and at the API's return; no change logged)"
+         + (f"; after the API's return: {'; '.join(later)}" if later else "; no change after the return"))
+
+
+sampling = threading.Event()
+samples: list[tuple[float, dict]] = []
+
+
+def sample_zone() -> None:
+    """While `sampling` is set: the zone's A records every 2 s (an error
+    is a sample of its own, so it fails the comparison)."""
+    samples.clear()
+    while sampling.is_set():
+        try:
+            z: dict = zone_a()
+        except Exception as e:  # noqa: BLE001
+            z = {"error": [f"{type(e).__name__}: {e}"]}
+        samples.append((time.time(), z))
+        time.sleep(2)
 
 
 def report() -> int:
