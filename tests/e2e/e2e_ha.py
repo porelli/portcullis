@@ -1255,7 +1255,13 @@ def dns_failover() -> None:
     last = max(lease_time(v["last_change"]) for v in fd_status()["names"].values() if v.get("last_change"))
     time.sleep(max(0.0, last + 61 - time.time()))
     fd_node = Kj("-n", NS, "get", "pods", "-l", "portcullis.io/component=frontdoor")["items"][0]["spec"]["nodeName"]
-    victim = next(n for n in sorted(ing) if n != fd_node)
+    # Not nodeadm's node either: the front door judges readiness from
+    # nodeadm's snapshot, and a nodeadm cut off with its node holds every
+    # change until it is evicted and leads again elsewhere (R23: 65 s after
+    # NotReady; the 45 s bound is the detection with nodeadm up).
+    na_nodes = {p["spec"].get("nodeName") for p in pods("portcullis-nodeadm", "portcullis.io/component=nodeadm")}
+    victim = next((n for n in sorted(ing) if n != fd_node and n not in na_nodes), None)
+    assert victim, f"no ingress node without the front door ({fd_node}) or nodeadm ({sorted(na_nodes)})"
     t = kill_node(victim)
     rest = sorted(a for n, a in ing.items() if n != victim)
     # Counted from NotReady (controller ruling, as CNPG's: NodeDown covers
