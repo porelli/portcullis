@@ -11,10 +11,14 @@ package main
 // production image.
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/portcullis/domains/internal/fakedns"
@@ -22,7 +26,6 @@ import (
 
 func startTestProvider(logger *log.Logger) error {
 	zone := fakedns.NewZone()
-	accept := func(t string) bool { return t != "bad-token-0000" }
 	// DOMAINS_FAKEDNS_REMOTE (a one-shot: dns-tool, mail-cert): provider
 	// "fake" writes into the domains service's zone at that URL, so the
 	// records outlive the one-shot. DOMAINS_FAKEDNS_API_ADDR (the
@@ -32,14 +35,14 @@ func startTestProvider(logger *log.Logger) error {
 		if remote != "" {
 			return &fakedns.Remote{URL: remote, Token: c["api_token"]}, nil
 		}
-		return &fakedns.Provider{Zone: zone, Token: c["api_token"], Accept: accept}, nil
+		return &fakedns.Provider{Zone: zone, Token: c["api_token"], Accept: fakeAccept}, nil
 	}}
 	if api := os.Getenv("DOMAINS_FAKEDNS_API_ADDR"); api != "" {
 		ln, err := net.Listen("tcp", api)
 		if err != nil {
 			return err
 		}
-		go (&http.Server{Handler: fakedns.APIHandler(zone, accept), ReadHeaderTimeout: 10 * time.Second}).Serve(ln)
+		go (&http.Server{Handler: fakedns.APIHandler(zone, fakeAccept), ReadHeaderTimeout: 10 * time.Second}).Serve(ln)
 		logger.Printf("WARNING: test build — the fake zone's provider API on %s", ln.Addr())
 	}
 	addr := os.Getenv("DOMAINS_FAKEDNS_ADDR")
@@ -52,6 +55,61 @@ func startTestProvider(logger *log.Logger) error {
 	}
 	logger.Printf("WARNING: test build — provider \"fake\" enabled, fake DNS on %s (never use this image in production)", srv.Addr)
 	return nil
+}
+
+// fakeAccept: the fake provider's token check ("bad-token-0000" refused:
+// the backoff tests).
+func fakeAccept(t string) bool { return t != "bad-token-0000" }
+
+// runTestCommand runs the test build's own commands; ok false for any
+// other (the production build has none). `domains fakezone`: a fake zone
+// alone, its provider API on DOMAINS_FAKEDNS_API_ADDR (required) and its
+// DNS on DOMAINS_FAKEDNS_ADDR (only when set), every accepted change
+// logged (fakedns.ChangeLog), until SIGTERM. CI's e2e-ha-k3d runs it
+// outside the cluster as the front door's zone (DOMAINS_FAKEDNS_REMOTE):
+// the records outlive every front-door restart, and the harness reads
+// them and their history.
+func runTestCommand(args []string) (int, bool) {
+	if len(args) == 0 || args[0] != "fakezone" {
+		return 0, false
+	}
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: domains fakezone")
+		return 2, true
+	}
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+	api := os.Getenv("DOMAINS_FAKEDNS_API_ADDR")
+	if api == "" {
+		logger.Print("refusing to start: DOMAINS_FAKEDNS_API_ADDR is required")
+		return exitFailure, true
+	}
+	zone := fakedns.NewZone()
+	if addr := os.Getenv("DOMAINS_FAKEDNS_ADDR"); addr != "" {
+		srv, err := fakedns.Serve(zone, addr)
+		if err != nil {
+			logger.Print(err)
+			return exitFailure, true
+		}
+		defer srv.Close()
+	}
+	ln, err := net.Listen("tcp", api)
+	if err != nil {
+		logger.Print(err)
+		return exitFailure, true
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	srv := &http.Server{Handler: fakedns.ChangeLog(fakedns.APIHandler(zone, fakeAccept), logger.Printf), ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
+	logger.Printf("WARNING: test build — a fake zone alone, its provider API on %s (never use this image in production)", ln.Addr())
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		logger.Print(err)
+		return exitFailure, true
+	}
+	return 0, true
 }
 
 // testProviderBuild: the test build (CI's fake zone) publishes the

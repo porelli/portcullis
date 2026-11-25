@@ -174,3 +174,58 @@ func (p *Remote) FindZone(fqdn string) (string, error) {
 
 // SkipPropagationCheck: as the local provider.
 func (p *Remote) SkipPropagationCheck() bool { return true }
+
+// ChangeLog serves h and logs every append, set or delete call that h
+// accepted (one line per record: the time in UTC with microseconds, the
+// op, the zone, the record's name, type and data; never the token).
+// CI's `domains fakezone` (e2e-ha-k3d's zone outside the cluster, which
+// outlives every front-door restart) keeps the zone's change history in
+// its log this way.
+func ChangeLog(h http.Handler, logf func(format string, args ...any)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		rec := &statusRecorder{ResponseWriter: w}
+		h.ServeHTTP(rec, r)
+		var req apiReq
+		if json.Unmarshal(body, &req) != nil || req.Op == "get" || rec.failed() {
+			return
+		}
+		at := time.Now().UTC().Format("2006-01-02T15:04:05.000000Z07:00")
+		for _, x := range req.Records {
+			logf("fakezone: %s %s %s %s %s %q", at, req.Op, req.Zone, x.Name, x.Type, x.Data)
+		}
+	})
+}
+
+// statusRecorder keeps the answer's status and whether it was an error
+// (APIHandler answers a refused call 200 with "error" set).
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+	body bytes.Buffer
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.code = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.body.Len() < 4<<20 {
+		s.body.Write(b)
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusRecorder) failed() bool {
+	if s.code != 0 && s.code != http.StatusOK {
+		return true
+	}
+	var out apiResp
+	return json.Unmarshal(s.body.Bytes(), &out) != nil || out.Error != ""
+}

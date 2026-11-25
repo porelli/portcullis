@@ -61,6 +61,9 @@ func envBool(k string, def bool) (bool, error) {
 }
 
 func main() {
+	if code, ok := runTestCommand(os.Args[1:]); ok { // the test build's (testprovider.go)
+		os.Exit(code)
+	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "keygen":

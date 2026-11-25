@@ -16,6 +16,9 @@ func TestNoTestProviderInProduction(t *testing.T) {
 	if err := startTestProvider(log.New(io.Discard, "", 0)); err != nil {
 		t.Fatal(err)
 	}
+	if _, ok := runTestCommand([]string{"fakezone"}); ok {
+		t.Fatal("domains fakezone in a build without the testprovider tag")
+	}
 	if _, ok := providers["fake"]; ok {
 		t.Fatal("provider fake registered in a build without the testprovider tag")
 	}

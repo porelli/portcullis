@@ -3,6 +3,7 @@ package fakedns
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -277,5 +278,46 @@ func TestServesPTR(t *testing.T) {
 	}
 	if p, ok := m.Answer[0].(*dns.PTR); !ok || p.Ptr != "mx.remote.test." {
 		t.Fatalf("PTR %v", m.Answer[0])
+	}
+}
+
+// ChangeLog logs each accepted append / set / delete record (never a
+// get, a refused call or the token) and leaves the answers as they are.
+func TestChangeLog(t *testing.T) {
+	z := NewZone()
+	var lines []string
+	srv := httptest.NewServer(ChangeLog(APIHandler(z, func(tok string) bool { return tok != "bad-token-0000" }),
+		func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) }))
+	defer srv.Close()
+	ctx := context.Background()
+	p := &Remote{URL: srv.URL, Token: "good-token-1234"}
+	a := libdns.RR{Name: "@", Type: "A", TTL: time.Minute, Data: "198.51.100.11"}
+	if _, err := p.AppendRecords(ctx, "example.test.", []libdns.Record{a}); err != nil {
+		t.Fatal(err)
+	}
+	if recs, err := p.GetRecords(ctx, "example.test."); err != nil || len(recs) != 1 {
+		t.Fatalf("get = %v %v", recs, err)
+	}
+	if _, err := p.DeleteRecords(ctx, "example.test.", []libdns.Record{a}); err != nil {
+		t.Fatal(err)
+	}
+	bad := &Remote{URL: srv.URL, Token: "bad-token-0000"}
+	if _, err := bad.AppendRecords(ctx, "example.test.", []libdns.Record{a}); !errors.Is(err, ErrAuth) {
+		t.Fatalf("bad token = %v", err)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("lines %q", lines)
+	}
+	for i, op := range []string{"append", "delete"} {
+		f := strings.Fields(lines[i])
+		if len(f) != 7 || f[0] != "fakezone:" || f[2] != op || f[3] != "example.test." || f[4] != "@" || f[5] != "A" || f[6] != `"198.51.100.11"` {
+			t.Errorf("line %d: %q", i, lines[i])
+		}
+		if _, err := time.Parse(time.RFC3339Nano, f[1]); err != nil {
+			t.Errorf("line %d's time: %v", i, err)
+		}
+		if strings.Contains(lines[i], "token") {
+			t.Errorf("line %d names the token: %q", i, lines[i])
+		}
 	}
 }
