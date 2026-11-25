@@ -1370,6 +1370,7 @@ def sites_scenario() -> None:
         before = fd_status()
         for n in edge:
             kill_node(n)
+        t_loss = time.time()
         time.sleep(90)
     finally:
         # kill_node isolates (the node container keeps running): heal it.
@@ -1378,6 +1379,7 @@ def sites_scenario() -> None:
                 heal(n)
                 killed.discard(n)
     wait_for("the API back", lambda: K("get", "--raw", "/readyz", timeout=10, ok=False).strip() == "ok", 300, 5)
+    t_back = time.time()
     # The front door that lost its Lease during the quorum loss exits (fail
     # closed) and starts again: its first status is written before it read
     # the provider (no addresses, no last change). Compared once a leading
@@ -1388,11 +1390,31 @@ def sites_scenario() -> None:
             f"the front door's status: {json.dumps(st)[:400]}"
         return st
     after = wait_for("a leading front door that read the set", read_again, 300, 5)
+    # Nothing changed DURING the loss: no change the front door logged
+    # (kubectl's timestamps; every front door pod, its previous container
+    # too) between the cut and the API's return, and each name's last change
+    # is the one before or one after the return. After it, the recovering
+    # nodes (k3s restarted on the cut servers, Traefik not Ready yet) may be
+    # judged and removed as usual (never the last): noted, not a failure.
+    during, later = [], []
+    for p in Kj("-n", NS, "get", "pods", "-l", "portcullis.io/component=frontdoor")["items"]:
+        for prev in ([], ["--previous"]):
+            for ln in K("-n", NS, "logs", p["metadata"]["name"], "--timestamps", *prev, ok=False).splitlines():
+                m = re.match(r"(\S+) .*frontdoor: (add|remove) (\S+) (\S+)$", ln)
+                if not m:
+                    continue
+                at = lease_time(m.group(1))
+                if t_loss <= at <= t_back:
+                    during.append(ln[:200])
+                elif at > t_back:
+                    later.append(f"{m.group(2)} {m.group(3)} {m.group(4)}")
+    assert not during, f"the front door changed DNS during the quorum loss: {during}"
     for n in names:
         b, a = before.get("names", {}).get(n, {}), after.get("names", {}).get(n, {})
-        assert a.get("addresses") == b.get("addresses") and a.get("last_change") == b.get("last_change"), \
-            f"{n} changed during the quorum loss: {b} → {a}"
-    note("ha_dns_failover_sites: edge + tb stopped (2/5) for 90 s → nothing changed (addresses, last change)")
+        assert a.get("last_change") == b.get("last_change") or (a.get("last_change") and lease_time(a["last_change"]) >= t_back), \
+            f"{n}'s last change {a.get('last_change')} falls in the quorum loss ({b} → {a})"
+    note("ha_dns_failover_sites: edge + tb stopped (2/5) for 90 s → nothing changed during the loss"
+         + (f"; after the API's return: {', '.join(sorted(set(later)))}" if later else ""))
 
 
 def report() -> int:
