@@ -580,6 +580,16 @@ def vault_read_cert(pod: str, serial: str) -> bool:
     return bool(out) and "BEGIN CERTIFICATE" in out
 
 
+def vault_raft_leader(pod: str) -> str:
+    """The raft leader's node id from pod (list-peers, the root token on stdin)."""
+    root = json.load(open("secrets/vault-init.json"))["root_token"]
+    out = K("-n", NS, "exec", "-i", pod, "-c", "vault", "--", "sh", "-c",
+            'IFS= read -r t; VAULT_TOKEN="$t" VAULT_ADDR=http://127.0.0.1:8200 exec vault operator raft list-peers -format=json',
+            inp=root + "\n", timeout=30)
+    peers = json.loads(out).get("data", {}).get("config", {}).get("servers") or []
+    return next((p.get("node_id", "") for p in peers if p.get("leader")), "")
+
+
 def vault_voters_settled(_: str = "") -> bool:
     """Every voter unsealed in HA mode, agreeing on one leader, its applied
     raft index within 50 of the furthest (a voter on a node healed just
@@ -590,6 +600,11 @@ def vault_voters_settled(_: str = "") -> bool:
     leaders = {st.get("leader_address") for st in sts.values()}
     assert len(sts) == 3 and all(st.get("ha_enabled") and st.get("sealed") is False for st in sts.values()) \
         and len(leaders) == 1 and "" not in leaders and None not in leaders and max(idx) - min(idx) <= 50, f"voters: {json.dumps(view)}"
+    # Vault's active node is the raft leader (seen split in CI: the raft
+    # leader never took the HA lock after the active one was deleted).
+    active = next((n for n, st in sts.items() if st.get("is_self")), "")
+    leader = vault_raft_leader(active) if active else ""
+    assert active and leader == active, f"the active node {active!r} isn't the raft leader {leader!r}"
     return True
 
 
@@ -616,6 +631,10 @@ def vault_leader_loss() -> None:
         a1 = wait_for("another active voter", another, 30, 0.5)
     except AssertionError:
         print("vault status over the wait (A active, S sealed, (leader)):\n  " + "\n  ".join(timeline[::4] + timeline[-2:]), flush=True)
+        try:
+            print(f"raft leader (from vault-1's view): {vault_raft_leader('vault-1')}", flush=True)
+        except (AssertionError, ValueError, subprocess.TimeoutExpired) as e:
+            print(f"raft leader unreadable: {e}", flush=True)
         for p in pods(NS, "portcullis.io/component=vault"):
             print(f"--- {p['metadata']['name']}:\n" + K("-n", NS, "logs", p["metadata"]["name"], "-c", "vault", "--tail", "30", ok=False)[-3000:], flush=True)
         for p in pods(NS, "portcullis.io/component=vault"):
