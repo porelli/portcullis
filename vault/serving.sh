@@ -14,7 +14,8 @@
 # (Vault v2.2.1 http/handler.go: never forwarded), so the probe needs no
 # token, writes nothing and never seals or steps anything down. The
 # active node answers is_self from its own state, so it always passes:
-# the liveness restart (kubelet, after its grace) only ever hits a voter
+# the liveness restart (kubelet, after its 60 s grace: the chart's
+# liveGrace) only ever hits a voter
 # that can't serve, and a restart is what clears that state (the
 # entrypoint unseals again). Each call waits 1 s at most (two fit the
 # probe's 3 s timeout). VAULT_SERVING_ADDR is the local API (tests).

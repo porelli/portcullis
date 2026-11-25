@@ -55,13 +55,18 @@ unsealed voter; a standby forwards to the leader). */ -}}
 three voters Ready): readiness and liveness are vault/serving.sh — Ready
 only while this voter serves (it is active, or a standby whose advertised
 active node confirms it), so nodeadm's Vault count, the Service and the PDB
-see a Vault that answers; and a voter that can't serve for 3 minutes is
+see a Vault that answers; and a voter that can't serve for 60 s is
 restarted (liveness: the entrypoint unseals it again), which clears a voter
-stuck unable to become active. The active node always passes; the probe
-reads only sys/leader and never seals or steps down. The 3 minutes are
-well past an ordinary failover (Raft's 15 s election timeout and the lock). */ -}}
+stuck unable to become active (Task 33, controller ruling: seen in
+e2e-ha-k3d in about half the deletes of the active voter, a raft leader
+that never took the HA lock while every standby kept the deleted active's
+address, hashicorp/vault#10361's signature; 3 minutes before). The active
+node always passes; the probe reads only sys/leader and never seals or
+steps down. 60 s is well past an ordinary failover (raft at
+performance_multiplier 1: an election in 3–6 s, then the lock); the
+startup probe (vault status) still guards the unseal. */ -}}
 {{- if .Values.ha.enabled }}
-{{- $_ := set $s "health" (merge (dict "serving" (list "/bin/sh" "/vault/portcullis/serving.sh") "liveGrace" 180) $s.health) }}
+{{- $_ := set $s "health" (merge (dict "serving" (list "/bin/sh" "/vault/portcullis/serving.sh") "liveGrace" 60) $s.health) }}
 {{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---

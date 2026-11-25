@@ -21,9 +21,13 @@ Scenarios (main):
                          promote the replica within 30 s, the old pod comes
                          back as a replica, and a signed-in session (its
                          ticket in Valkey) still opens the portal.
-  ha_vault_leader_loss   the active Vault voter is deleted: another voter is
-                         active within 30 s and issues a certificate; the
-                         earlier one is still readable by its serial.
+  ha_vault_leader_loss   the active Vault voter is deleted: a voter is active
+                         again (a recreated pod counts) within 30 s by the
+                         handover, or within 90 s by the watchdog (a voter
+                         restarted by serving.sh's 60 s liveness: Vault's
+                         stuck-standby, hashicorp/vault#10361), the path
+                         noted; it issues, and the earlier certificate is
+                         still readable by its serial.
   ha_hub_lease_handover  a second Hub pod (the Deployment at 2) never holds
                          the Lease portcullis-hub and answers 503 "standing
                          by" to a write; the holder stopped, the second
@@ -608,51 +612,63 @@ def vault_voters_settled(_: str = "") -> bool:
     return True
 
 
+VAULT_HANDOVER_S = 30   # the normal path: the deleted active's raft leadership handed over
+VAULT_WATCHDOG_S = 90   # the watchdog path (controller ruling, Task 33): liveGrace 60 s + restart + election
+
+
 def vault_leader_loss() -> None:
+    """The active voter deleted: an active voter again (any voter, a
+    recreated pod of the deleted one's name included: a new UID), and it
+    issues; the earlier certificate is still readable. Two paths pass
+    (controller ruling, Task 33): the normal handover within 30 s, or the
+    watchdog within 90 s: Vault's raft leader sometimes never takes the HA
+    lock while every standby keeps the deleted active's address
+    (hashicorp/vault#10361's signature); serving.sh's liveness restarts a
+    voter that can't serve for 60 s, which clears it. The path is noted."""
     a0 = wait_for("an active Vault voter", vault_active, 60)
     # Three healthy voters first (a voter on a node healed just before may
     # still be catching up: then the delete leaves no quorum to elect from).
     wait_for("three settled Vault voters", vault_voters_settled, 180, 5)
     s0 = vault_issue(a0, "e2e-ha-before")
+    before = {p["metadata"]["name"]: p for p in pods(NS, "portcullis.io/component=vault")}
+    uid0 = before[a0]["metadata"]["uid"]
+    restarts0 = {n: sum(c.get("restartCount", 0) for c in p["status"].get("containerStatuses") or []) for n, p in before.items()}
     t = time.time()
     K("-n", NS, "delete", "pod", a0, "--wait=false")
     timeline: list[str] = []
 
-    def another() -> str:
-        sts = {p["metadata"]["name"]: vault_status(p["metadata"]["name"]) for p in pods(NS, "portcullis.io/component=vault")}
+    def active_again() -> str:
+        live = {p["metadata"]["name"]: p for p in pods(NS, "portcullis.io/component=vault")}
+        sts = {n: vault_status(n) for n in live}
         timeline.append(f"{time.time() - t:5.1f} s " + " ".join(f"{n}:{'A' if st.get('is_self') else '-'}{'S' if st.get('sealed') else ''}"
                                                           f"({(st.get('leader_address') or '?').split('//')[-1].split('.')[0]})" for n, st in sorted(sts.items())))
-        return next((n for n, st in sts.items() if n != a0 and st.get("is_self") and st.get("ha_enabled") and not st.get("sealed")), "")
+        return next((n for n, st in sts.items() if st.get("is_self") and st.get("ha_enabled") and not st.get("sealed")
+                     and (n != a0 or live[n]["metadata"]["uid"] != uid0)), "")
     try:
-        # 30 s: the HA chart runs raft at performance_multiplier 1
-        # (controller ruling, Task 33): an election in 3–6 s even when the
-        # deleted leader handed nothing over (Vault's default timing took
-        # 15–30 s then, seen in CI).
-        a1 = wait_for("another active voter", another, 30, 0.5)
+        a1 = wait_for("an active voter again", active_again, VAULT_WATCHDOG_S, 0.5)
     except AssertionError:
-        print("vault status over the wait (A active, S sealed, (leader)):\n  " + "\n  ".join(timeline[::4] + timeline[-2:]), flush=True)
-        # The failure stays at 30 s; how long Vault had no active node is
-        # the finding (upstream hashicorp/vault#10361's signature: the
-        # standbys keep the deleted active's address): watched up to 5 min.
-        try:
-            late = wait_for("an active voter after the 30 s", another, 300, 2)
-            note(f"ha_vault_leader_loss: no active voter for {time.time() - t:.0f} s after the delete, then {late} (bound 30 s: failed)")
-        except AssertionError:
-            note("ha_vault_leader_loss: no active voter 330 s after the delete")
+        print("vault status over the wait (A active, S sealed, (leader)):\n  " + "\n  ".join(timeline[::8] + timeline[-2:]), flush=True)
         try:
             print(f"raft leader (from vault-1's view): {vault_raft_leader('vault-1')}", flush=True)
         except (AssertionError, ValueError, subprocess.TimeoutExpired) as e:
             print(f"raft leader unreadable: {e}", flush=True)
         for p in pods(NS, "portcullis.io/component=vault"):
             print(f"--- {p['metadata']['name']}:\n" + K("-n", NS, "logs", p["metadata"]["name"], "-c", "vault", "--tail", "30", ok=False)[-3000:], flush=True)
-        for p in pods(NS, "portcullis.io/component=vault"):
-            st = vault_status(p["metadata"]["name"])
-            print(f"{p['metadata']['name']}: " + json.dumps({k: st.get(k) for k in ("sealed", "ha_enabled", "is_self", "leader_address",
-                  "raft_committed_index", "raft_applied_index")}), flush=True)
         print(K("-n", NS, "get", "pods", "-l", "portcullis.io/component=vault", "-o", "wide", ok=False), flush=True)
         raise
     d = time.time() - t
-    note(f"ha_vault_leader_loss: active {a0} deleted → {a1} active after {d:.1f} s")
+    after = {p["metadata"]["name"]: p for p in pods(NS, "portcullis.io/component=vault")}
+    restarted = sorted(n for n, p in after.items() if n != a0
+                       and sum(c.get("restartCount", 0) for c in p["status"].get("containerStatuses") or []) > restarts0.get(n, 0))
+    if d <= VAULT_HANDOVER_S:
+        path = "handover"
+    else:
+        # Past 30 s only the watchdog's path counts: a voter restarted by
+        # serving.sh's liveness, then an election.
+        print("vault status over the wait (A active, S sealed, (leader)):\n  " + "\n  ".join(timeline[::8] + timeline[-2:]), flush=True)
+        assert restarted, f"an active voter after {d:.0f} s with no voter restarted: neither the handover (≤ {VAULT_HANDOVER_S} s) nor the watchdog"
+        path = f"watchdog (liveness restarted {', '.join(restarted)})"
+    note(f"ha_vault_leader_loss: active {a0} deleted → {a1}{' (recreated)' if a1 == a0 else ''} active after {d:.1f} s: path {path}")
     s1 = wait_for("a certificate issued by the new leader", lambda: vault_issue(a1, "e2e-ha-after"), 30, 2)
     assert vault_read_cert(a1, s0), f"the certificate {s0} issued before isn't readable"
     note(f"ha_vault_leader_loss: issued {s1}; {s0} (before) still readable")

@@ -8774,8 +8774,10 @@ vs_answer "$LOC" '{"ha_enabled":true,"is_self":false,"leader_address":"http://va
 expect_eq "vault serving: the advertised leader unreachable → not serving" "$(vs_run)" "1:$LOC http://vault-2.vault-internal:8200/v1/sys/leader "
 rm -f "$VS/r/"*
 expect_eq "vault serving: the local API not answering (sealed, starting) → not serving" "$(vs_run)" "1:$LOC "
-# The chart: only the HA voters use it, liveness with a 3-minute grace,
-# startup still vault status; one voter (no HA) unchanged.
+# The chart: only the HA voters use it, liveness with a 60 s grace
+# (controller ruling, Task 33: the watchdog for a raft leader stuck as a
+# standby, hashicorp/vault#10361's signature, was 3 minutes), startup
+# still vault status; one voter (no HA) unchanged.
 vprobes() { helm template portcullis "$HERE/../charts/portcullis" -n portcullis -f "$HERE/k8s-ci-values.yaml" -f "$VS/img.yaml" "$@" 2>/dev/null \
   | python3 -c 'import sys, yaml, json
 for d in yaml.safe_load_all(sys.stdin):
@@ -8783,8 +8785,8 @@ for d in yaml.safe_load_all(sys.stdin):
         c = d["spec"]["template"]["spec"]["containers"][0]
         print(json.dumps([c["readinessProbe"]["exec"]["command"], c["livenessProbe"]["exec"]["command"], c["livenessProbe"]["periodSeconds"] * c["livenessProbe"]["failureThreshold"], c["startupProbe"]["exec"]["command"]]))'; }
 if command -v helm >/dev/null && python3 -c 'import sys; sys.path.insert(0, "'"$HERE"'"); import k8s_lib, yaml; print(yaml.safe_dump(k8s_lib.images_values()))' > "$VS/img.yaml" 2>/dev/null; then
-  expect_eq "vault chart: HA readiness and liveness = serving.sh, liveness grace 180 s, startup vault status" "$(vprobes -f "$HERE/k8s-ci-values-ha.yaml")" \
-    '[["/bin/sh", "/vault/portcullis/serving.sh"], ["/bin/sh", "/vault/portcullis/serving.sh"], 180, ["vault", "status"]]'
+  expect_eq "vault chart: HA readiness and liveness = serving.sh, liveness grace 60 s, startup vault status" "$(vprobes -f "$HERE/k8s-ci-values-ha.yaml")" \
+    '[["/bin/sh", "/vault/portcullis/serving.sh"], ["/bin/sh", "/vault/portcullis/serving.sh"], 60, ["vault", "status"]]'
   expect_eq "vault chart: one voter (no HA) keeps vault status everywhere" "$(vprobes)" '[["vault", "status"], ["vault", "status"], 50, ["vault", "status"]]'
 else
   t_fail "vault chart probes: helm or the images values not available"

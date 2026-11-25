@@ -6099,6 +6099,9 @@ jobs:
   #     60 s grace + its start (it renews while background operations end);
   #   - a cut node whose k3s exits (k3d restarts its container, dropping
   #     the cut) is cut again: a VM keeps its network across a restart;
+  #   - Vault's leader loss passes by the handover (≤ 30 s) or the watchdog
+  #     (≤ 90 s: serving.sh's 60 s liveness clears a raft leader stuck as a
+  #     standby, hashicorp/vault#10361's signature), the path noted;
   #   - the Lease handover runs against a second Hub pod of its own (its
   #     data on emptyDirs): two Hubs never share a data directory (the Hub's
   #     .hub.lock refuses the second);
