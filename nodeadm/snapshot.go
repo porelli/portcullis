@@ -132,7 +132,12 @@ func (s *Server) takeSnapshot(ctx context.Context) (*Snapshot, error) {
 			fencing[p.Spec.NodeName] = true
 		}
 	}
+	ca, err := s.claimAffinities(ctx)
+	if err != nil {
+		return nil, err
+	}
 	selected := selectedLabelKeys(pods.Items)
+	volumeLabelKeys(pods.Items, ca, selected)
 	names := map[string]bool{}
 	for _, c := range cl {
 		names[c.Name] = true
@@ -200,7 +205,9 @@ func (s *Server) takeSnapshot(ctx context.Context) (*Snapshot, error) {
 		if p.Spec.NodeName == "" || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		snap.Pods = append(snap.Pods, snapPod(p, mins))
+		sp := snapPod(p, mins)
+		withVolumeAffinity(&sp, volumeTerms(p, ca))
+		snap.Pods = append(snap.Pods, sp)
 		if p.Namespace == s.cfg.CoreNS && (ownedBy(p, "StatefulSet", "sessions") || ownedBy(p, "StatefulSet", sentinelSet)) {
 			if msg := sessionsError(p); msg != "" {
 				snap.Errors = append(snap.Errors, fmt.Sprintf("pod %s: %s", p.Name, msg))

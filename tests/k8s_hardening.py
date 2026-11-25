@@ -1030,6 +1030,8 @@ NODEADM_CLUSTER_RULES = [
     {"apiGroups": [""], "resources": ["nodes"], "verbs": ["get", "list", "watch", "patch", "delete"]},
     {"apiGroups": [""], "resources": ["pods"], "verbs": ["list", "watch"]},
     {"apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"]},
+    # Task 33a fix round 1: the volumes' node affinity (the snapshot's N−1 input).
+    {"apiGroups": [""], "resources": ["persistentvolumeclaims", "persistentvolumes"], "verbs": ["list"]},
     {"apiGroups": ["postgresql.cnpg.io"], "resources": ["clusters"], "verbs": ["get", "list"]},
     {"apiGroups": ["longhorn.io"], "resources": ["volumes", "nodes", "replicas"], "verbs": ["get", "list"]},
     {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["get", "list"]},

@@ -9,7 +9,8 @@ while it holds the Lease portcullis-nodeadm.
 
 Its rights (the security delta of hardening.md):
   - ClusterRole: nodes get / list / watch / patch / delete; pods list /
-    watch; pods/eviction create; the CNPG, Longhorn and Self Node
+    watch; pods/eviction create; persistentvolumeclaims and
+    persistentvolumes list (their node affinity); the CNPG, Longhorn and Self Node
     Remediation status objects get / list; NO admission object at all
     (R-ADM: the API server applies no policy to them);
   - Role in kube-system: secrets create (bootstrap tokens only, judged by
@@ -69,6 +70,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods/eviction"]
     verbs: ["create"]
+  # The pods' volumes' node affinity in the snapshot (N−1, §20.2: a pod on
+  # a local volume can't move; Task 33a fix round 1).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "persistentvolumes"]
+    verbs: ["list"]
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters"]
     verbs: ["get", "list"]
