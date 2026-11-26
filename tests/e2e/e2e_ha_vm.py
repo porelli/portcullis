@@ -835,11 +835,19 @@ def ha_vm_pebble_issue_sni() -> None:
     want_fp = cert_fp_pem(pem)
     by = ingress_public()
     assert len(by) >= 3, f"ingress addresses: {by}"
+    # By SNI at once (the domains provider); without SNI once the front
+    # door's 1-minute loop mirrored the pair as Traefik's default
+    # certificate (§20.8): converged within 3 min, the time noted.
+    t0 = time.time()
     for node, _site, addr in by:
         for sni in (f"auth.{DOMAIN}", ""):
-            got = e2e_ha.served_fp(addr, sni)
-            assert got == want_fp, f"{node} ({addr}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
-    note(f"ha_vm_pebble_issue_sni: every ingress node serves frontdoor-cert ({want_fp[:16]}…) by SNI and without")
+            def serves(addr=addr, sni=sni):
+                got = e2e_ha.served_fp(addr, sni)
+                assert got == want_fp, f"{node} ({addr}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
+                return True
+            wait_for(f"{node} serving frontdoor-cert (SNI {sni or 'none'})", serves, 180, 5)
+    note(f"ha_vm_pebble_issue_sni: every ingress node serves frontdoor-cert ({want_fp[:16]}…) by SNI and without "
+         f"(converged {time.time() - t0:.0f} s after the first check)")
 
 
 def fd_pod() -> dict:
@@ -889,37 +897,40 @@ def ha_vm_cert_renew_leader_move() -> None:
 
 
 def ha_vm_same_site_reach() -> None:
-    # Same-site probes never count (§20.8): the front door judges a node
-    # from the outside vantage (another site's probers). Confirm vm4 (edge)
-    # probes main's addresses and main probes edge's, and that with the only
-    # same-site view (one node) nothing is decided. Read the nodeagents'
-    # probe rounds through nodeadm's cluster snapshot.
-    snap = wait_for("the cluster snapshot with probe rounds", lambda: _cluster_snapshot(), 180, 5)
-    rounds = snap.get("probes") or snap.get("probe_rounds") or []
-    save("probe-rounds.json", rounds)
-    # Cross-site reach: an edge prober reaching a main target, and a main
-    # prober reaching the edge target (reached_any true on both, by site).
-    by_site_prober: dict[str, bool] = {}
-    for r in rounds:
-        by_site_prober[r.get("site", "")] = by_site_prober.get(r.get("site", ""), False) or bool(r.get("reached_any"))
-    note(f"ha_vm_same_site_reach: probers by site reached_any = {by_site_prober}")
-    assert by_site_prober.get("main") and by_site_prober.get("edge"), \
-        f"a site's probers reached nothing cross-site: {by_site_prober}"
+    """Same-site probes never count (§20.8, D12): with two sites, each
+    ingress node is judged by the OTHER site's probers. In the front door's
+    status every ingress node is ok, healthy, not blind and not
+    internal_only (an outside vantage judged it), and the checklist's
+    site_gateway ("a reachable node at every site", the mesh reach of
+    ruling N1) is ok."""
+    def judged():
+        pr = fd_status().get("probes") or {}
+        ing = sorted(n for n, _s, _a in ingress_public())
+        missing = [n for n in ing if n not in pr]
+        assert not missing, f"no probe verdict for {missing}: {pr}"
+        bad = {n: v for n, v in pr.items() if n in ing and not (v.get("ok") and v.get("verdict") == "healthy"
+               and v.get("blind") is False and v.get("internal_only") is False)}
+        assert not bad, f"probe verdicts not healthy from another site: {bad}"
+        return pr
+    pr = wait_for("every ingress node judged healthy by the other site's probers", judged, 300, 10)
+    save("frontdoor-probes.json", pr)
+    st = json.loads(pc("ha", "status", "--json"))
+    items = {i["id"]: i for i in st.get("ha", {}).get("checklist", [])}
+    if not items:
+        items = {i["id"]: i for i in _walk_items(st)}
+    assert items.get("site_gateway", {}).get("ok") is True, f"site_gateway not ok: {items.get('site_gateway')}"
+    note(f"ha_vm_same_site_reach: {sorted(pr)} judged healthy, none internal-only or blind; site_gateway ok")
 
 
-def _cluster_snapshot() -> dict | None:
-    # The Hub's view of nodeadm's snapshot (it includes the probe rounds the
-    # front door reads). GET /api/ha has the sites/gateway; the raw probe
-    # rounds come from frontdoor-status.
-    st = fd_status()
-    pr = st.get("probes") or st.get("probe_rounds")
-    if pr:
-        return {"probes": pr}
-    # Fall back to the nodes' reach in the front-door status.
-    nodes = st.get("nodes")
-    if nodes:
-        return {"probes": [{"site": v.get("site"), "reached_any": bool(v.get("reachable"))} for v in nodes.values()]} if isinstance(nodes, dict) else None
-    return None
+def _walk_items(o):
+    if isinstance(o, dict):
+        if "id" in o and "ok" in o:
+            yield o
+        for v in o.values():
+            yield from _walk_items(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _walk_items(v)
 
 
 def ha_vm_etcd_remove_member() -> None:
@@ -1277,6 +1288,7 @@ def ha_vm_revoke_restarts() -> None:
 
 def main() -> int:
     e2e_ha.SECRET = _hub_secret()  # masked by secret_read
+    retarget_api()  # kubectl over an SSH tunnel to a server that answers
     state["alpine"] = helper_image()
     from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
