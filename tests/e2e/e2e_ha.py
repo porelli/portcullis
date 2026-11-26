@@ -1340,6 +1340,14 @@ def dns_failover_nodeadm_node() -> None:
     assert victim != fd_node(), f"the front door runs on nodeadm's node {victim}"
     wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
     leader = fd_status().get("leader")
+    # The front door's container restarts (review N3): a front door that
+    # loses its Lease exits and restarts in the SAME pod (the Lease identity
+    # is the pod name), which the leader check alone can't see; its
+    # in-memory zone would restart empty.
+    def fd_restarts() -> dict[str, int]:
+        return {p["metadata"]["name"]: sum(c.get("restartCount", 0) for c in p["status"].get("containerStatuses") or [])
+                for p in pods(NS, "portcullis.io/component=frontdoor")}
+    restarts0 = fd_restarts()
     last = max(lease_time(v["last_change"]) for v in fd_status()["names"].values() if v.get("last_change"))
     time.sleep(max(0.0, last + 61 - time.time()))
     rest = sorted(a for n, a in ing.items() if n != victim)
@@ -1347,18 +1355,48 @@ def dns_failover_nodeadm_node() -> None:
     t_nr = not_ready_at(victim, t)
     pub = published()
     assert all(not pub.get(n) or ing[victim] in pub[n] for n in names), f"{victim}'s address went before it was NotReady: {pub}"
+
+    # Review N2: from NotReady until the new nodeadm container has started,
+    # the front door has no snapshot and must change nothing (fail static,
+    # §20.8): the victim's address still there and every other kept, checked
+    # throughout (a removal while blind is a failure, not a note).
+    def started_new() -> dict | None:
+        for p in nodeadm_pods():
+            if p["metadata"]["uid"] == old_uid or p["spec"].get("nodeName") == victim:
+                continue
+            for c in p["status"].get("containerStatuses") or []:
+                if (c.get("state") or {}).get("running", {}).get("startedAt"):
+                    return p
+        return None
+
+    def unchanged_while_blind() -> dict | None:
+        pub = published()
+        for n in names:
+            got = pub.get(n) or []
+            assert not got or set(want) <= set(got), f"{n} changed before the new nodeadm started: {got} (want all of {want})"
+        return started_new()
+    wait_for("the new nodeadm container started (the set unchanged until then)", unchanged_while_blind, 150, 1)
     na2 = wait_for("nodeadm rescheduled and Ready on another node", lambda: next(
         (p for p in nodeadm_pods() if ready(p) and p["metadata"]["uid"] != old_uid and p["spec"].get("nodeName") != victim), None), 150, 1)
     t_na = time.time()
-    removed_early = all(published().get(n) == rest for n in names)
-    wait_for(f"{victim}'s address removed", lambda: all(published().get(n) == rest for n in names), max(5.0, t_nr + 200 - time.time()), 1)
+
+    # After that, only the victim's address may go: the others are kept in
+    # every sample until it is removed.
+    def removed_others_kept() -> bool:
+        pub = published()
+        for n in names:
+            got = pub.get(n) or []
+            assert not got or set(rest) <= set(got), f"{n} lost a live node's address: {got} (want {rest} kept)"
+        return all(published().get(n) == rest for n in names)
+    wait_for(f"{victim}'s address removed (the others kept throughout)", removed_others_kept, max(5.0, t_nr + 200 - time.time()), 1)
     t_rm = time.time()
     note(f"ha_dns_failover_nodeadm_node: {victim} (nodeadm's node) cut → NotReady after {t_nr - t:.0f} s → nodeadm Ready on "
          f"{na2['spec']['nodeName']} {t_na - t_nr:.0f} s after NotReady → {ing[victim]} removed {t_rm - t_na:.0f} s after nodeadm was Ready, "
-         f"{t_rm - t_nr:.0f} s after NotReady ({t_rm - t:.0f} s after the cut); {rest} kept"
-         + ("; (removed before nodeadm was seen Ready)" if removed_early else ""))
+         f"{t_rm - t_nr:.0f} s after NotReady ({t_rm - t:.0f} s after the cut); {rest} kept throughout")
     st = fd_status()
     assert st.get("leader") == leader, f"the front door's leader changed ({leader} → {st.get('leader')}): its zone may have restarted empty"
+    restarts1 = fd_restarts()
+    assert restarts1 == restarts0, f"the front door's container restarted ({restarts0} → {restarts1}): its zone may have restarted empty"
     assert t_rm - t_na <= 45, f"removed {t_rm - t_na:.0f} s after nodeadm was Ready again (want ≤ 45 s)"
     assert t_rm - t_nr <= 150, f"removed {t_rm - t_nr:.0f} s after NotReady (want ≤ 150 s)"
 
