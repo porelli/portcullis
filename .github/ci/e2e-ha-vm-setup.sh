@@ -73,6 +73,29 @@ each() { # each <fn> <vm>…: fn on every VM in parallel, every failure named
   return $rc
 }
 
+# tools — what the runner needs (the builder's job image has no SSH
+# client): openssh-client and jq from apt, kubectl at e2e-ha-k3d's pin
+# (sha256-checked; the drills reach the API through an SSH tunnel).
+KUBECTL_VERSION=v1.37.2
+KUBECTL_SHA256_AMD64=c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
+tools() {
+  local missing="" t
+  for t in ssh:openssh-client jq:jq openssl:openssl curl:curl; do command -v "${t%%:*}" >/dev/null 2>&1 || missing="$missing ${t#*:}"; done
+  if [ -n "$missing" ]; then
+    sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing >/dev/null || fail "couldn't install$missing"
+  fi
+  if ! { command -v kubectl >/dev/null 2>&1 && kubectl version --client 2>/dev/null | grep -q -- "$KUBECTL_VERSION"; }; then
+    [ "$(uname -m)" = x86_64 ] || fail "no pinned kubectl for $(uname -m)"
+    local tmp; tmp="$(mktemp -d)"
+    curl -fsSL --retry 3 -o "$tmp/kubectl" "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+    echo "$KUBECTL_SHA256_AMD64  $tmp/kubectl" | sha256sum -c --quiet - || fail "kubectl doesn't match its pinned sha256"
+    sudo /usr/bin/install -m 0755 "$tmp/kubectl" /usr/local/bin/kubectl
+    rm -rf "$tmp"
+  fi
+  for t in ssh ssh-keygen jq openssl curl kubectl docker git python3; do command -v "$t" >/dev/null 2>&1 || fail "$t is missing on the runner"; done
+  echo "PASS: the runner's tools (ssh, jq, openssl, curl, kubectl $KUBECTL_VERSION, docker, git, python3)"
+}
+
 access() {
   : "${E2E_HA_VM_INVENTORY:?the VM inventory (secret E2E_HA_VM_INVENTORY)}" "${E2E_HA_VM_SSH_KEY:?the VM SSH key (secret E2E_HA_VM_SSH_KEY)}" \
     "${E2E_HA_VM_KNOWN_HOSTS:?the VM host keys (secret E2E_HA_VM_KNOWN_HOSTS)}"
@@ -488,6 +511,7 @@ status() {
 }
 
 case "${1:-}" in
+  tools) tools ;;
   access) access ;;
   reset) reset ;;
   prep) prep ;;
@@ -497,5 +521,5 @@ case "${1:-}" in
   cluster) cluster ;;
   status) status ;;
   cleanup) cleanup ;;
-  *) echo "usage: $0 access|reset|prep|images|install|init|cluster|status|cleanup" >&2; exit 2 ;;
+  *) echo "usage: $0 tools|access|reset|prep|images|install|init|cluster|status|cleanup" >&2; exit 2 ;;
 esac

@@ -6237,6 +6237,9 @@ jobs:
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
+      - name: The runner's tools (SSH client, jq, kubectl at its pin)
+        timeout-minutes: 10
+        run: bash .github/ci/e2e-ha-vm-setup.sh tools
       - name: Access the VMs (inventory, SSH key, host keys from the job's secrets)
         timeout-minutes: 5
         env:
