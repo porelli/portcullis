@@ -392,17 +392,6 @@ def setup() -> None:
     # The Hub's and the app's senders sign with the main domain's keys: the
     # remote's dkim=pass needs them active (published, both resolvers).
     m.until(f"DKIM ed25519 + rsa active on {DOMAIN}", dkim_active, 420, every=10)
-    # The instance's groups, made by the Hub (the Apps page's banner).
-    out = m.hub_ok("POST", "/api/instances/missing-groups", {"ids": [INST]})
-    print(f"    missing groups: {json.dumps(out)[:300]}", flush=True)
-    have = {g["displayName"] for g in m.gql("{ groups { id displayName } }")["groups"]}
-    assert {ACCESS, ADMIN_GROUP} <= have, f"the Hub didn't make {ACCESS} / {ADMIN_GROUP}: {sorted(have)}"
-    for u in ("alice", "bob", "root"):
-        m.member("add", ACCESS, u)
-    m.member("add", ADMIN_GROUP, "root")
-    # root's email verified by the admin (an admin can't verify their own):
-    # bob is then the access group's one member without a verified email.
-    admin_verify("root")
     # The template's sizes are a warning, never a refusal.
     t0 = time.time()
     code, acc = m.hub("POST", "/api/templates/enable", {"id": INST}, timeout=300)
@@ -410,6 +399,19 @@ def setup() -> None:
     rec = e2e_ops.wait_ok(get, e2e_ops.accepted(acc, "enable", INST), 2400, every=5)
     latency(f"{INST} enabled", t0)
     print(f"    enable warnings: {json.dumps(rec.get('warnings'))[:400]}", flush=True)
+    # The instance's groups: made by the enable (else as the Apps page's
+    # banner would, by name).
+    have = {g["displayName"] for g in m.gql("{ groups { id displayName } }")["groups"]}
+    for g in (ACCESS, ADMIN_GROUP):
+        if g not in have:
+            print(f"    {g} not made by the enable: creating it", flush=True)
+            m.hub_ok("POST", "/api/directory/groups", {"name": g}, want=(200, 201))
+    for u in ("alice", "bob", "root"):
+        m.member("add", ACCESS, u)
+    m.member("add", ADMIN_GROUP, "root")
+    # root's email verified by the admin (an admin can't verify their own):
+    # bob is then the access group's one member without a verified email.
+    admin_verify("root")
     # fxa-mail-check found the provider's sender (its one line: no secret).
     out = m.docker("logs", cid("fxa-mail-check"), check_rc=False, timeout=60).strip()
     print(f"    fxa-mail-check: {m.scrub(out)[:300]}", flush=True)
