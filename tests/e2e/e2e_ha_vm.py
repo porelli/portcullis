@@ -841,9 +841,15 @@ def ha_vm_pebble_issue_sni() -> None:
     t0 = time.time()
     for node, _site, addr in by:
         for sni in (f"auth.{DOMAIN}", ""):
-            def serves(addr=addr, sni=sni):
+            def serves(addr=addr, sni=sni, node=node):
+                # The current pair each time: Pebble's 30 d + 12 min validity
+                # makes the front door renew about every 12 minutes.
+                cur = served_pair()
+                assert "Pebble" in subprocess.run(["openssl", "x509", "-noout", "-issuer"], input=cur, capture_output=True, text=True).stdout, \
+                    "frontdoor-cert isn't Pebble's"
+                want = cert_fp_pem(cur)
                 got = e2e_ha.served_fp(addr, sni)
-                assert got == want_fp, f"{node} ({addr}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want_fp}"
+                assert got == want, f"{node} ({addr}) serves {got} for SNI {sni or '(none)'}, not frontdoor-cert's {want}"
                 return True
             wait_for(f"{node} serving frontdoor-cert (SNI {sni or 'none'})", serves, 180, 5)
     note(f"ha_vm_pebble_issue_sni: every ingress node serves frontdoor-cert ({want_fp[:16]}…) by SNI and without "
@@ -904,7 +910,8 @@ def ha_vm_same_site_reach() -> None:
     site_gateway ("a reachable node at every site", the mesh reach of
     ruling N1) is ok."""
     def judged():
-        pr = fd_status().get("probes") or {}
+        # Only the per-node verdicts (the map also holds flags).
+        pr = {n: v for n, v in (fd_status().get("probes") or {}).items() if isinstance(v, dict)}
         ing = sorted(n for n, _s, _a in ingress_public())
         missing = [n for n in ing if n not in pr]
         assert not missing, f"no probe verdict for {missing}: {pr}"
