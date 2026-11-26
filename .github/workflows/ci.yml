@@ -4329,8 +4329,8 @@ jobs:
   # Stalwart remote.test where every person's mailbox is) plus the
   # templates repo's firefox-sync-fxa (same-named templates branch) as a
   # local source, enabled through the Hub with mail through the provider.
-  # Containers resolve the e2e names to the runner (.github/ci/e2e-fxa-dns.sh:
-  # fxa-auth and the Hub submit to mail.<d>:587 as on a server) and trust
+  # Containers resolve *.<d> to the runner (.github/ci/e2e-fxa-dns.sh, CoreDNS
+  # as Docker's DNS: fxa-auth and the Hub submit to mail.<d>:587 as on a server) and trust
   # Pebble's root through certs/ca-bundle.crt (.github/ci/e2e-fxa-trust.sh).
   # tests/e2e/e2e_fxa.py (PyFxA from tests/e2e/requirements-fxa.txt,
   # hashed; Playwright for the admin UI): the Hub's email code, the
@@ -4363,7 +4363,7 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/.ghcup "${AGENT_TOOLSDIRECTORY:-/nonexistent}"
           df -h /
 
-      - name: Containers resolve the e2e hostnames to the runner (systemd-resolved, Docker's DNS)
+      - name: Containers resolve the e2e hostnames to the runner (CoreDNS as Docker's DNS)
         timeout-minutes: 5
         run: bash .github/ci/e2e-fxa-dns.sh
 
@@ -4589,7 +4589,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f e2e-remote 2>/dev/null || true
+          docker rm -f e2e-remote e2e-fxa-dns 2>/dev/null || true
           docker volume rm e2e-remote-data 2>/dev/null || true
           docker compose -p portcullis-firefox-sync-fxa down -v 2>/dev/null || true
           docker compose down -v
