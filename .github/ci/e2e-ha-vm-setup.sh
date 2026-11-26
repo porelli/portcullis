@@ -494,6 +494,15 @@ cluster() {
   pc ha status 2>&1 | redact | tee "$ART/ha-status-after-enable.txt" | grep -i -E "n.1|yellow|red|green|ha enable" | head -20 || true
   pc ha status --json > "$ART/ha-status-after-enable.json" 2>/dev/null || true
   [ "$rc" = 0 ] || fail "ha enable failed (exit $rc): its last lines above, the N−1 result in $ART/ha-status-after-enable.txt"
+  # The harness's own pairs out of traefik/dynamic (the pre-HA server
+  # certificate and the switch's <d> / *.<d> pair): in HA the front door's
+  # certificate is the only one for the main domain, and a file pair for the
+  # same names competes with it (seen: node-1 serving the switch's pair by
+  # SNI after step 9). A real install has none (step 9 deletes Traefik's
+  # ACME storage); then an up so every Traefik replica reloads.
+  vm vm1 'rm -f ~/portcullis/traefik/dynamic/ci-certs.yml ~/portcullis/traefik/dynamic/ci-ha-main.yml'
+  pc up 2>&1 | redact | tail -3
+  hub_ready
   echo "PASS: installed: init on vm1, $(role_vms server | xargs) servers, vm4 at $(field vm4 site), HA on"
 }
 

@@ -551,6 +551,10 @@ def marker_pod(name: str, node: str | None = None, mode: str = "sleep") -> dict:
                           "securityContext": {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]}},
                           "volumeMounts": [{"name": "d", "mountPath": "/data"}]}],
           "volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": MARKER_PVC}}]}
+    # On the storage nodes only, as the replicated tier's own pods: Longhorn
+    # has no disk or CSI topology elsewhere (run 2: scheduled on the edge
+    # agent, "no topology key found for node vm4", the claim never bound).
+    sp["nodeSelector"] = {"portcullis.io/storage": "true"}
     if node:
         sp["nodeName"] = node
     return {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": MARKER_NS,
@@ -897,18 +901,38 @@ def mesh_ping(src_vm: str, dst_mesh: str) -> bool:
     return vm(src_vm, f"ping -c 2 -W 2 {dst_mesh} >/dev/null 2>&1 && echo ok", check=False, timeout=20).strip() == "ok"
 
 
+def wg_route(src_vm: str, mesh_ip: str) -> str:
+    """The pcmesh peer on src_vm whose allowed IPs carry mesh_ip: that
+    peer's own mesh address (direct when it is mesh_ip itself)."""
+    for ln in vm(src_vm, "sudo wg show pcmesh allowed-ips", timeout=20).splitlines():
+        parts = ln.split()
+        nets = parts[1:]
+        if f"{mesh_ip}/32" in nets:
+            own = next((n.split("/")[0] for n in nets if n.endswith("/32") and n.split("/")[0] in MESH.values() and n != f"{mesh_ip}/32"), mesh_ip)
+            return own if len(nets) > 1 else mesh_ip
+    return ""
+
+
 def ha_vm_nat_relay() -> None:
+    """vm2's mesh port closed to the other sites (inbound UDP 51830 from
+    outside its LAN dropped: vm2 behind a NAT; vm1 stays the site's
+    gateway): the Hub's mesh finds vm2's public endpoint unreachable (its
+    proof re-checked once 5 min stale, then 2 min to confirm,
+    MeshReachableStale + MeshConfirmWait) and vm4 reaches vm2 through vm1:
+    vm4's WireGuard carries vm2's mesh address on vm1's peer. Pings both
+    ways and sign-in keep working; the time is noted (≤ 10 min)."""
     s: Session = state["session"]
-    # vm2 is NATed at main (vm1 the gateway): its inbound mesh port closed
-    # to the other sites, kept to its own LAN.
     assert mesh_ping("vm2", MESH["vm4"]), "vm2 can't reach vm4 over pcmesh before the cut"
-    note(f"ha_vm_nat_relay: closing vm2's inbound UDP 51830 to the other sites (LAN {LAN_CIDR} kept)")
+    before = wg_route("vm4", MESH["vm2"])
+    note(f"ha_vm_nat_relay: before the cut vm4 reaches vm2 via {before or '?'}; closing vm2's inbound UDP 51830 to the other sites (LAN {LAN_CIDR} kept)")
+    t = time.time()
     host("vm2", "net", "set", f"dropmesh:{LAN_CIDR}")
     try:
-        # vm2 ↔ vm4 keeps working through vm1 (the mesh gateway relay).
-        wait_for("vm2 ↔ vm4 relays through vm1", lambda: mesh_ping("vm2", MESH["vm4"]) and mesh_ping("vm4", MESH["vm2"]), 120, 3)
+        via = wait_for("vm4 routing vm2's mesh address through vm1", lambda: wg_route("vm4", MESH["vm2"]) == MESH["vm1"], 600, 10)
+        d = time.time() - t
+        wait_for("vm2 ↔ vm4 pings over the relay", lambda: mesh_ping("vm2", MESH["vm4"]) and mesh_ping("vm4", MESH["vm2"]), 120, 5)
         assert s.signin(), "sign-in failed during the NAT relay"
-        note("ha_vm_nat_relay: vm2 ↔ vm4 relays through vm1 and sign-in is unaffected")
+        note(f"ha_vm_nat_relay: vm4 → vm2 through {via} (vm1) {d:.0f} s after the cut; pings both ways and sign-in work")
     finally:
         host("vm2", "net", "clear", check=False)
     settle()
