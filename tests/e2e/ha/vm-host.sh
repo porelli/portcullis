@@ -15,8 +15,9 @@
 #   net set <spec>...   network faults in the raw table's own chain E2EHA
 #                       (kube-router rewrites the filter table, never raw),
 #                       kept in /etc/e2e-ha/net and applied again at boot:
-#                         partition  every packet but loopback and SSH
-#                                    (port 22) dropped both ways
+#                         partition  every packet but loopback, SSH (port
+#                                    22), the cloud metadata / link-local
+#                                    range and DHCP dropped both ways
 #                         drop443    inbound TCP 443 not from pcmesh (the
 #                                    public ingress; the mesh stays)
 #                         dropmesh:<cidr>  inbound UDP 51830 from outside
@@ -65,6 +66,14 @@ net_rules() {
       partition)
         ipt -A "$CHAIN" -p tcp --dport 22 -j RETURN
         ipt -A "$CHAIN" -p tcp --sport 22 -j RETURN
+        # The machine's own platform stays (a cut node still has its cloud
+        # metadata, link-local DNS and DHCP): with the metadata service
+        # dropped at boot, cloud-init fell back to DataSourceNone, took the
+        # boot for a new instance and regenerated the SSH host keys (seen
+        # on vm1 and vm3, run 45892504006).
+        ipt -A "$CHAIN" -d 169.254.0.0/16 -j RETURN
+        ipt -A "$CHAIN" -s 169.254.0.0/16 -j RETURN
+        ipt -A "$CHAIN" -p udp --sport 67:68 --dport 67:68 -j RETURN
         ipt -A "$CHAIN" -j DROP ;;
       drop443) ipt -A "$CHAIN" ! -i pcmesh -p tcp --dport 443 -m addrtype --dst-type LOCAL -j DROP ;;
       dropmesh:*) ipt -A "$CHAIN" ! -i pcmesh ! -s "${spec#dropmesh:}" -p udp --dport 51830 -j DROP ;;

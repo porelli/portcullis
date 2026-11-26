@@ -193,6 +193,9 @@ for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
 if [ -n "$missing" ]; then apt-get update -qq; apt-get install -y -qq $missing >/dev/null; fi
 [ "$h" != vm1 ] || usermod -aG docker "${SUDO_USER:-ubuntu}"
 printf 'softdog\niscsi_tcp\ndm_mod\n' > /etc/modules-load.d/e2e-ha.conf
+# The host keys are pinned (E2E_HA_VM_KNOWN_HOSTS): cloud-init never
+# deletes or regenerates them, even on a boot it takes for a new instance.
+printf 'ssh_deletekeys: false\n' > /etc/cloud/cloud.cfg.d/99-e2e-ha-keep-host-keys.cfg
 modprobe softdog; modprobe iscsi_tcp; modprobe dm_mod
 systemctl enable --now iscsid >/dev/null 2>&1 || true
 if [ -e /etc/multipath.conf ] && ! grep -q '^blacklist' /etc/multipath.conf; then

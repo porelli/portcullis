@@ -159,33 +159,54 @@ def pc(*args: str, timeout: float = 600, check: bool = True) -> str:
 
 # ── kubectl over an SSH tunnel to a surviving API server ──
 
-_tunnel: dict = {"proc": None, "server": "", "kubeconfig": ""}
+_tunnel: dict = {"proc": None, "server": "", "port": 0}
+OPERATOR_VM = "vm1"  # the first node: the CLI, Pebble, S3 and the fake zone live there; never cut
+CONN_ERRORS = ("connection to the server", "Unable to connect to the server", "connection refused", "EOF",
+               "ServiceUnavailable", "unable to handle the request", "TLS handshake timeout", "i/o timeout",
+               "no route to host", "context deadline exceeded", "http2: client connection lost")
+
+
+def _kubeconfig() -> str:
+    kc = os.path.join(D, "kubeconfig")
+    if not os.path.exists(kc):
+        raw = secret_read("vm1", "cat ~/portcullis/secrets/kube/kubeconfig")
+        raw = re.sub(r"server: https://[0-9.]+:6443", "server: https://127.0.0.1:16443", raw)
+        with open(kc, "w") as f:
+            f.write(raw)
+        os.chmod(kc, 0o600)
+    return kc
+
+
+def _api_ok() -> bool:
+    """The API itself answers through the tunnel (/readyz), not just kubectl."""
+    r = subprocess.run(["kubectl", "--context", "portcullis", "--server", f"https://127.0.0.1:{_tunnel['port']}",
+                        "--request-timeout=6s", "get", "--raw", "/readyz"], capture_output=True, text=True, timeout=15)
+    return r.returncode == 0 and r.stdout.strip() == "ok"
 
 
 def _start_tunnel(server_vm: str) -> None:
     _stop_tunnel()
-    local = 6443
-    proc = subprocess.Popen([*SSH, "-N", "-L", f"127.0.0.1:{local}:{MESH[server_vm]}:6443", server_vm],
+    port = 16440 + int(server_vm[-1])  # one local port per server: a dying tunnel never holds the next one's
+    proc = subprocess.Popen([*SSH, "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                             "-L", f"127.0.0.1:{port}:{MESH[server_vm]}:6443", server_vm],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    kc = os.path.join(D, "kubeconfig")
-    if not os.path.exists(kc):
-        raw = secret_read("vm1", "cat ~/portcullis/secrets/kube/kubeconfig")
-        raw = re.sub(r"server: https://[0-9.]+:6443", f"server: https://127.0.0.1:{local}", raw)
-        with open(kc, "w") as f:
-            f.write(raw)
-        os.chmod(kc, 0o600)
-    _tunnel.update(proc=proc, server=server_vm, kubeconfig=kc)
+    kc = _kubeconfig()
     os.environ["KUBECONFIG"] = kc
-    import e2e_ha
+    _tunnel.update(proc=proc, server=server_vm, port=port)
+    cl = subprocess.run(["kubectl", "config", "view", "-o", "jsonpath={.contexts[?(@.name==\"portcullis\")].context.cluster}"],
+                        capture_output=True, text=True, timeout=15, check=True).stdout.strip()
+    assert cl, "the kubeconfig has no context portcullis"
+    subprocess.run(["kubectl", "config", "set-cluster", cl, f"--server=https://127.0.0.1:{port}"],
+                   capture_output=True, timeout=15, check=True)
     e2e_ha.CTX = "portcullis"
-    for _ in range(60):
-        try:
-            if e2e_ha.K("version", "--request-timeout=5s", ok=False, timeout=10):
-                return
-        except Exception:  # noqa: BLE001
-            pass
+    for _ in range(30):
+        if proc.poll() is not None:
+            break
+        if _api_ok():
+            return
         time.sleep(1)
-    raise AssertionError(f"the API tunnel to {server_vm} didn't answer")
+    _stop_tunnel()
+    raise AssertionError(f"the API tunnel to {server_vm} didn't answer /readyz")
 
 
 def _stop_tunnel() -> None:
@@ -199,16 +220,34 @@ def _stop_tunnel() -> None:
     _tunnel["proc"] = None
 
 
+def tunnel_node() -> str:
+    return VM_NODE.get(_tunnel.get("server", ""), "")
+
+
 def retarget_api(avoid: set[str] | None = None) -> None:
-    """Point kubectl at a server whose API answers (not in `avoid`)."""
-    avoid = avoid or set()
-    for h in ["vm1", "vm2", "vm3"]:
-        if h in avoid:
-            continue
-        if vm(h, "sudo k3s kubectl --request-timeout=5s get --raw /readyz >/dev/null 2>&1 && echo ok", check=False, timeout=15).strip() == "ok":
-            _start_tunnel(h)
-            return
-    raise AssertionError(f"no API server answers (avoiding {sorted(avoid)})")
+    """kubectl through a server whose API answers /readyz, never one in
+    `avoid` (node names or VM names). The current tunnel is kept when it
+    still answers and isn't avoided."""
+    av = set(avoid or set())
+    av |= {NODE_VM[n] for n in list(av) if n in NODE_VM}
+    if _tunnel.get("proc") and _tunnel["proc"].poll() is None and _tunnel["server"] not in av:
+        try:
+            if _api_ok():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+    last = ""
+    for _ in range(3):
+        for h in ["vm1", "vm2", "vm3"]:
+            if h in av:
+                continue
+            try:
+                _start_tunnel(h)
+                return
+            except AssertionError as e:
+                last = str(e)
+        time.sleep(10)
+    raise AssertionError(f"no API server answers (avoiding {sorted(av)}): {last}")
 
 
 # e2e_ha's helpers run against the tunnel; its docker-based node kill is
@@ -218,6 +257,25 @@ from e2e_ha import (  # noqa: E402
     K, Kj, pods, ready, node_ready, not_ready_at, pg_primary, psql, Writer,
     published, fd_status, lease_time, lease_holder, hub, note, save,
 )
+
+_K_raw = e2e_ha.K
+
+
+def _K_failover(*argv: str, inp: str | None = None, timeout: float = 120, ok: bool = True, ctx: str | None = None) -> str:
+    """e2e_ha.K that moves the tunnel to another answering server once when
+    the API connection itself failed (a server going down mid-drill)."""
+    try:
+        return _K_raw(*argv, inp=inp, timeout=timeout, ok=ok, ctx=ctx)
+    except (AssertionError, subprocess.TimeoutExpired) as e:
+        if not any(c in str(e) for c in CONN_ERRORS):
+            raise
+        print(f"  (the API through {_tunnel.get('server')} failed: moving the tunnel)", flush=True)
+        retarget_api(avoid={_tunnel.get("server", "")})
+        return _K_raw(*argv, inp=inp, timeout=timeout, ok=ok, ctx=ctx)
+
+
+e2e_ha.K = _K_failover
+K = _K_failover
 
 results = e2e_ha.results
 state = e2e_ha.state
@@ -230,6 +288,7 @@ def check(name: str, fn) -> None:
         return
     t0 = time.time()
     try:
+        retarget_api()
         fn()
         results.append((name, True, ""))
         print(f"PASS: {name} ({time.time() - t0:.0f} s)", flush=True)
@@ -268,6 +327,8 @@ def partition(node: str) -> float:
     """Every packet but SSH dropped both ways on the node: a real
     partition, so it loses the API and its peers and self-fences."""
     h = node_vm(node)
+    assert h != OPERATOR_VM, f"refusing to cut {node}: vm1 is the operator and fixture host"
+    retarget_api(avoid={node})
     host(h, "net set partition")
     cut[node] = "partition"
     return time.time()
@@ -275,6 +336,8 @@ def partition(node: str) -> float:
 
 def power_off(node: str) -> float:
     h = node_vm(node)
+    assert h != OPERATOR_VM, f"refusing to power off {node}: vm1 is the operator and fixture host"
+    retarget_api(avoid={node})
     b0 = boot_id(h)
     host(h, "dark", check=False)  # it reboots at once; the SSH call may not return cleanly
     cut[node] = "dark"
@@ -289,11 +352,25 @@ def power_off(node: str) -> float:
 
 def heal(node: str) -> None:
     h = node_vm(node)
-    kind = cut.pop(node, "")
-    if kind == "dark":
-        vm(h, "sudo e2e-ha-host light", check=False, timeout=60, mux=False)
-    else:
-        host(h, "net clear", check=False)
+    kind = cut.get(node, "")
+    # Never silent: a heal that didn't happen leaves the node cut and every
+    # later drill on a broken cluster (run 45892504006: SSH to vm1 refused,
+    # the heal ignored, two servers left dark, etcd without quorum).
+    last = ""
+    for _ in range(10):
+        try:
+            if kind == "dark":
+                vm(h, "sudo e2e-ha-host light", timeout=60, mux=False)
+            else:
+                host(h, "net clear")
+            st = host_state(h)
+            assert not st["dark"] and not st["net"] and st["live_rules"] == 0, f"{h} still cut: {st}"
+            cut.pop(node, None)
+            return
+        except (AssertionError, subprocess.TimeoutExpired) as e:
+            last = str(e)
+            time.sleep(10)
+    raise AssertionError(f"couldn't heal {node} ({h}): {last}")
 
 
 def self_fenced(h: str, b0: str, timeout: float) -> float:
@@ -518,7 +595,7 @@ def storage_servers() -> list[str]:
 
 def victim_server(avoid: set[str]) -> str:
     """A main storage server not in `avoid` and not the kubectl tunnel's."""
-    avoid = set(avoid) | {VM_NODE[_tunnel["server"]]}
+    avoid = set(avoid) | {VM_NODE[OPERATOR_VM]}
     for n in storage_servers():
         if n not in avoid:
             return n
@@ -568,36 +645,65 @@ def ha_vm_partition() -> None:
     psql(pg_primary(), "DROP TABLE e2e_ha_rows;")
 
 
+def marker_app(prefer: str) -> dict:
+    """The stateful test app: a Deployment (1 replica, Recreate) on the
+    marker's replicated-tier claim, preferring `prefer`, never on vm1's
+    node (the operator host stays up), tolerating a dead node for 30 s like
+    the HA pods (§3.4)."""
+    pod = marker_pod("x")["spec"]
+    pod.pop("nodeName", None)
+    pod["restartPolicy"] = "Always"
+    pod["affinity"] = {"nodeAffinity": {
+        "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [
+            {"key": "kubernetes.io/hostname", "operator": "NotIn", "values": [VM_NODE[OPERATOR_VM]]},
+            {"key": "node-role.kubernetes.io/control-plane", "operator": "In", "values": ["true"]}]}]},
+        "preferredDuringSchedulingIgnoredDuringExecution": [{"weight": 100, "preference": {"matchExpressions": [
+            {"key": "kubernetes.io/hostname", "operator": "In", "values": [prefer]}]}}]}}
+    pod["tolerations"] = [{"key": k, "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 30}
+                          for k in ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")]
+    return {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "marker-app", "namespace": MARKER_NS},
+            "spec": {"replicas": 1, "strategy": {"type": "Recreate"}, "selector": {"matchLabels": {"app": "e2e-marker-app"}},
+                     "template": {"metadata": {"labels": {"app": "e2e-marker-app"}}, "spec": pod}}}
+
+
+def marker_app_pod() -> dict | None:
+    return next((p for p in Kj("-n", MARKER_NS, "get", "pods", "-l", "app=e2e-marker-app")["items"]
+                 if not p["metadata"].get("deletionTimestamp")), None)
+
+
 def ha_vm_power_off() -> None:
+    marker_setup()
+    victim = victim_server(set())
+    K("apply", "-f", "-", inp=json.dumps(marker_app(victim)))
+    p0 = wait_for(f"the stateful app Ready on {victim}", lambda: (lambda p: p if p and ready(p) and p["spec"].get("nodeName") == victim else None)(marker_app_pod()), 300, 5)
     psql(pg_primary(), "DROP TABLE IF EXISTS e2e_ha_rows; CREATE TABLE e2e_ha_rows (n int PRIMARY KEY, at timestamptz DEFAULT now());")
     w = Writer()
     w.start()
-    victim = ""
     try:
         wait_for("the writer's first rows", lambda: len(w.committed) >= 5, 60, 1)
-        p0 = pg_primary()
-        victim = Kj("-n", PG_NS, "get", "pod", p0)["spec"]["nodeName"]
-        if victim == VM_NODE[_tunnel["server"]]:
-            retarget_api(avoid={victim})
-        note(f"ha_vm_power_off: powering off {victim} ({node_vm(victim)}), the CNPG primary {p0}'s node")
+        note(f"ha_vm_power_off: powering off {victim} ({node_vm(victim)}), the stateful app's node")
         t = power_off(victim)
         tn = not_ready_at(victim, t, timeout=120)
-        wait_for("the stateful app runs elsewhere (writes resume)", lambda: w.resumed_after(t) >= 0, 300, 2)
-        p1 = pg_primary()
+
+        def elsewhere():
+            p = marker_app_pod()
+            return p if p and p["metadata"]["uid"] != p0["metadata"]["uid"] and ready(p) and p["spec"].get("nodeName") != victim else None
+        p1 = wait_for("the stateful app Running elsewhere", elsewhere, 330, 3)
         d = time.time() - t
-        note(f"ha_vm_power_off: {victim} off → NotReady after {tn - t:.0f} s → new primary {p1}, writes resumed "
-             f"{w.resumed_after(t):.0f} s after the power-off ({w.resumed_after(tn):.0f} s after NotReady)")
-        assert p1 != p0, "the primary didn't move"
+        md5 = K("-n", MARKER_NS, "exec", p1["metadata"]["name"], "--", "md5sum", "/data/marker").split()[0]
+        note(f"ha_vm_power_off: {victim} off → NotReady after {tn - t:.0f} s → the stateful app Ready on "
+             f"{p1['spec']['nodeName']} {d:.0f} s after the power-off; marker {'equal' if md5 == state['marker_md5'] else 'CHANGED'}")
+        assert md5 == state["marker_md5"], f"the stateful app's data changed: {md5} != {state['marker_md5']}"
         assert d <= 240, f"the stateful app took {d:.0f} s to run elsewhere (> 4 min)"
     finally:
         w.stop.set()
         w.join(15)
-        if victim:
-            heal(victim)
+        heal(victim)
+        K("-n", MARKER_NS, "delete", "deployment", "marker-app", "--wait=false", ok=False)
     settle()
     want = {n for n, _ in w.committed}
     got = {int(x) for x in psql(pg_primary(), "SELECT n FROM e2e_ha_rows;").split()}
-    assert not (want - got), f"rows lost: {sorted(want - got)[:20]}"
+    assert not (want - got), f"committed rows lost: {sorted(want - got)[:20]}"
     psql(pg_primary(), "DROP TABLE e2e_ha_rows;")
 
 
@@ -673,8 +779,6 @@ def ha_vm_lose_small() -> None:
     # The third server / third voter (vm3 here; the arm64 small node in the
     # D9 design, cloud in this bundle): lost, quorum holds (2/3).
     small = next((v["node"] for v in INV["vms"] if v.get("vm") == "vm3"), SERVERS[-1])
-    if VM_NODE[_tunnel["server"]] == small:
-        retarget_api(avoid={small})
     s: Session = state["session"]
     note(f"ha_vm_lose_small: powering off {small} ({node_vm(small)})")
     t = power_off(small)
@@ -922,9 +1026,8 @@ def ha_vm_same_site_reach() -> None:
     pr = wait_for("every ingress node judged healthy by the other site's probers", judged, 300, 10)
     save("frontdoor-probes.json", pr)
     st = json.loads(pc("ha", "status", "--json"))
-    items = {i["id"]: i for i in st.get("ha", {}).get("checklist", [])}
-    if not items:
-        items = {i["id"]: i for i in _walk_items(st)}
+    # (Its top-level "ha" is a flag, not an object: the items are found by shape.)
+    items = {i["id"]: i for i in _walk_items(st)}
     assert items.get("site_gateway", {}).get("ok") is True, f"site_gateway not ok: {items.get('site_gateway')}"
     note(f"ha_vm_same_site_reach: {sorted(pr)} judged healthy, none internal-only or blind; site_gateway ok")
 
@@ -1011,82 +1114,106 @@ def ha_vm_interrupted_removal() -> None:
     _rejoin_server(node)
 
 
+SINGLETONS = {"frontdoor": (NS, "portcullis.io/component=frontdoor"),
+              "nodeadm": ("portcullis-nodeadm", "portcullis.io/component=nodeadm")}
+
+
+def singleton(kind: str) -> dict | None:
+    ns, sel = SINGLETONS[kind]
+    return next((p for p in pods(ns, sel) if ready(p)), None)
+
+
+def place(target: str, kinds: list[str]) -> None:
+    """Each singleton of `kinds` Ready on `target` (the other servers
+    cordoned while its pod is deleted, then uncordoned)."""
+    others = [n for n in SERVERS if n != target]
+    for kind in kinds:
+        cur = singleton(kind)
+        if cur and cur["spec"].get("nodeName") == target:
+            continue
+        for n in others:
+            K("cordon", n)
+        try:
+            ns, sel = SINGLETONS[kind]
+            if cur:
+                K("-n", ns, "delete", "pod", cur["metadata"]["name"], "--wait=false")
+            wait_for(f"{kind} Ready on {target}", lambda kind=kind: (lambda p: p and p["spec"].get("nodeName") == target)(singleton(kind)), 300, 5)
+        finally:
+            for n in others:
+                K("uncordon", n)
+
+
+def away(node: str, kinds: list[str]) -> None:
+    """Each singleton of `kinds` off `node` (onto another non-vm1 server)."""
+    for kind in kinds:
+        cur = singleton(kind)
+        if cur and cur["spec"].get("nodeName") == node:
+            place(next(n for n in SERVERS if n not in (node, VM_NODE[OPERATOR_VM])), [kind])
+
+
 def ha_vm_front_door_node() -> None:
-    # (33a N1) the front door's own node cut: a new front door takes the
-    # Lease elsewhere, then DNS failover still removes a dead node's address.
+    """(33a N1) The front door's own node cut: a new front door takes the
+    Lease on another server and DNS failover still works: the cut node's
+    address goes, the others stay, never the last."""
+    victim = victim_server(set())
+    place(victim, ["frontdoor"])
+    away(victim, ["nodeadm"])  # this drill is the front door alone; nodeadm's case is the next one
     by = ingress_public()
     names = [DOMAIN, f"*.{DOMAIN}"]
     want = sorted(a for _, _, a in by)
     wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
-    fdn = fd_pod()["spec"]["nodeName"]
-    if fdn not in SERVERS:
-        note(f"ha_vm_front_door_node: the front door is on {fdn} (not a cuttable server); skipped")
-        return
-    if VM_NODE[_tunnel["server"]] == fdn:
-        retarget_api(avoid={fdn})
     leader0 = fd_status().get("leader")
-    note(f"ha_vm_front_door_node: cutting the front door's own node {fdn}")
-    t = partition(fdn)
+    rest = sorted(a for node, _s, a in by if node != victim)
+    note(f"ha_vm_front_door_node: cutting {victim}, the front door's own node (leader {leader0})")
+    t = partition(victim)
     try:
-        self_fenced(node_vm(fdn), boot_id(node_vm(fdn)), 240)
-    except AssertionError:
-        pass
-    try:
-        # A new front door leads elsewhere.
-        wait_for("a new front door leads", lambda: fd_status().get("leader") not in ("", None, leader0)
-                 and fd_pod()["spec"]["nodeName"] != fdn, 300, 5)
-        leader1 = fd_status().get("leader")
-        # And it removes the cut node's address (its own, if it was an
-        # ingress node), keeping the rest / never the last.
-        rest = sorted(a for node, _s, a in by if node != fdn)
-        if rest:
-            wait_for("the cut front-door node's address removed", lambda: all(set(published().get(n) or []) <= set(rest) for n in names)
-                     and all(published().get(n) for n in names), 300, 3)
-        note(f"ha_vm_front_door_node: front door moved {leader0} → {leader1}; the address set recovered to the live nodes")
+        wait_for("a new front door leads on another node", lambda: (lambda p: p and p["spec"].get("nodeName") != victim
+                 and fd_status().get("leader") == p["metadata"]["name"] != leader0)(singleton("frontdoor")), 300, 5)
+        t_lead = time.time()
+
+        def removed():
+            pub = published()
+            for n in names:
+                got = pub.get(n) or []
+                assert not got or set(rest) <= set(got), f"{n} lost a live node's address: {got}"
+            return all(published().get(n) == rest for n in names)
+        wait_for(f"{victim}'s address removed by the new front door, the others kept", removed, 300, 3)
+        note(f"ha_vm_front_door_node: new front door {fd_status().get('leader')} led {t_lead - t:.0f} s after the cut; "
+             f"the address went {time.time() - t:.0f} s after the cut; {rest} kept")
     finally:
-        heal(fdn)
+        heal(victim)
     settle()
 
 
 def ha_vm_front_door_nodeadm_one_node() -> None:
-    # (33a N1) the front door and nodeadm on one node, that node cut: the
-    # slower failover (DNS waits for nodeadm) under a real node loss. Move
-    # the front door onto nodeadm's node first, then cut it.
-    na = next(p for p in pods("portcullis-nodeadm", "portcullis.io/component=nodeadm") if ready(p))
-    na_node = na["spec"]["nodeName"]
-    if na_node not in SERVERS:
-        note(f"ha_vm_front_door_nodeadm_one_node: nodeadm on {na_node} (not cuttable); skipped")
-        return
-    # Pin the front door to nodeadm's node (delete its pod until it lands
-    # there is unreliable; instead cordon the others briefly).
-    others = [n for n in SERVERS if n != na_node]
-    for n in others:
-        K("cordon", n)
-    try:
-        K("-n", NS, "delete", "pod", fd_pod()["metadata"]["name"], "--wait=false")
-        wait_for("the front door on nodeadm's node", lambda: fd_pod()["spec"]["nodeName"] == na_node, 300, 5)
-    finally:
-        for n in others:
-            K("uncordon", n)
+    """(33a N1) The front door and nodeadm on one node (about one install
+    in three, both singletons on the servers), that node cut: both come
+    back elsewhere, then the dead node's address goes; the others are kept
+    throughout (fail static while there is no snapshot)."""
+    victim = victim_server(set())
+    place(victim, ["frontdoor", "nodeadm"])
     by = ingress_public()
     names = [DOMAIN, f"*.{DOMAIN}"]
     want = sorted(a for _, _, a in by)
     wait_for("every ingress address published", lambda: all(published().get(n) == want for n in names), 420, 5)
-    if VM_NODE[_tunnel["server"]] == na_node:
-        retarget_api(avoid={na_node})
-    leader0 = fd_status().get("leader")
-    note(f"ha_vm_front_door_nodeadm_one_node: cutting {na_node} (front door + nodeadm)")
-    t = partition(na_node)
+    rest = sorted(a for node, _s, a in by if node != victim)
+    note(f"ha_vm_front_door_nodeadm_one_node: cutting {victim} (front door + nodeadm)")
+    t = partition(victim)
     try:
-        wait_for("nodeadm Ready elsewhere", lambda: any(ready(p) and p["spec"]["nodeName"] != na_node
-                 for p in pods("portcullis-nodeadm", "portcullis.io/component=nodeadm")), 300, 5)
-        wait_for("a new front door leads", lambda: fd_pod()["spec"]["nodeName"] != na_node, 300, 5)
-        rest = sorted(a for node, _s, a in by if node != na_node)
-        if rest:
-            wait_for("the dead node's address removed", lambda: all(set(published().get(n) or []) <= set(rest) and published().get(n) for n in names), 300, 3)
-        note(f"ha_vm_front_door_nodeadm_one_node: both rescheduled, the address recovered (leader {leader0} → {fd_status().get('leader')})")
+        def others_kept_until_back():
+            pub = published()
+            for n in names:
+                got = pub.get(n) or []
+                assert not got or set(rest) <= set(got), f"{n} lost a live node's address: {got}"
+            fd, na = singleton("frontdoor"), singleton("nodeadm")
+            return fd and na and fd["spec"].get("nodeName") != victim and na["spec"].get("nodeName") != victim
+        wait_for("the front door and nodeadm both Ready elsewhere (the others kept meanwhile)", others_kept_until_back, 360, 3)
+        t_back = time.time()
+        wait_for(f"{victim}'s address removed", lambda: all(published().get(n) == rest for n in names), 300, 3)
+        note(f"ha_vm_front_door_nodeadm_one_node: both back elsewhere {t_back - t:.0f} s after the cut, "
+             f"the address removed {time.time() - t:.0f} s after the cut; {rest} kept")
     finally:
-        heal(na_node)
+        heal(victim)
     settle()
 
 
@@ -1253,7 +1380,7 @@ def ha_vm_revoke_restarts() -> None:
         return True
     wait_for("the k3s tokens rotated (old 401, new 200)", creds_rotated, 300, 5)
     survivors2 = [h for h in survivors]  # all three servers survive an agent revoke
-    restart_cycle(survivors2, survivors2[1], expect_ready=3)
+    restart_cycle(survivors2, next(h for h in survivors2 if h != OPERATOR_VM), expect_ready=3)
     # The revoked agent can't come back with what it holds.
     vm(EDGE_VM, "sudo systemctl restart k3s-agent 2>/dev/null; true", check=False, timeout=30, mux=False)
     time.sleep(20)
@@ -1282,7 +1409,7 @@ def ha_vm_revoke_restarts() -> None:
         return True
     wait_for("the server revoke's rotations (old 401, new 200)", creds_rotated2, 400, 5)
     survivors3 = [h for h in survivors if h != "vm3"]
-    restart_cycle(survivors3, survivors3[0], expect_ready=2)
+    restart_cycle(survivors3, next(h for h in survivors3 if h != OPERATOR_VM), expect_ready=2)
     assert s.signin(), "sign-in failed after the server revoke"
     note(f"ha_vm_revoke_restarts: server {srv_id} revoked, two rotations, both survivors restart/reboot healthy")
 
