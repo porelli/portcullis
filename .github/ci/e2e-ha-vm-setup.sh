@@ -14,9 +14,11 @@
 #            hosts lines), then rebooted and back
 #   prep     packages, modules, the harness's host side
 #            (tests/e2e/ha/vm-host.sh: faults, the Longhorn test disk on the
-#            servers), vm1's fixtures (Docker: Pebble on vm1's private
-#            address with its own TLS CA, an S3 server for the backup
-#            destination), vm1's key for its peers (the local images)
+#            servers), vm1's fixtures (Docker, host network: Pebble on vm1's
+#            private address with its own TLS CA, an S3 server for the backup
+#            destination; never a published port: Docker's DNAT would hide
+#            the address the pods' egress policies name), vm1's key for its
+#            peers (the local images)
 #   images   the nodeagent, nodeadm and Self Node Remediation images built
 #            here (the Hub's from the hub-image action), loaded into vm1's
 #            Docker (a checked tarball)
@@ -199,7 +201,7 @@ fixtures() {
   openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$p" -keyout "$w/key.pem" -out "$w/csr.pem" 2>/dev/null
   printf 'subjectAltName=IP:%s\nextendedKeyUsage=serverAuth\n' "$p" > "$w/ext"
   openssl x509 -req -in "$w/csr.pem" -CA "$w/ca.crt" -CAkey "$w/ca.key" -CAcreateserial -days 30 -extfile "$w/ext" -out "$w/cert.pem" 2>/dev/null
-  jq -n --argjson v "$PEBBLE_VALIDITY" '{pebble: {listenAddress: "0.0.0.0:14000", managementListenAddress: "0.0.0.0:15000",
+  jq -n --argjson v "$PEBBLE_VALIDITY" --arg l "$p:14443" '{pebble: {listenAddress: $l, managementListenAddress: "127.0.0.1:15443",
     certificate: "/p/cert.pem", privateKey: "/p/key.pem", httpPort: 5002, tlsPort: 5001, ocspResponderURL: "",
     externalAccountBindingRequired: false, retryAfter: {authz: 3, order: 5}, keyAlgorithm: "ecdsa",
     profiles: {default: {description: "e2e-ha-vm: renewed 12 min after issue", validityPeriod: $v}}}}' > "$w/pebble.json"
@@ -210,10 +212,11 @@ fixtures() {
   rm -rf "$w"
   # shellcheck disable=SC2029  # the images and addresses are expanded here
   vm vm1 "set -e; docker pull -q '$PEBBLE_IMG' >/dev/null; docker pull -q '$RCLONE_IMG' >/dev/null
-    docker run -d --name e2e-pebble --restart no -p '$priv:14443:14000' -p 127.0.0.1:15443:15000 \
+    docker rm -f e2e-pebble e2e-s3 >/dev/null 2>&1 || true
+    docker run -d --name e2e-pebble --restart no --network host \
       -e PEBBLE_VA_ALWAYS_VALID=1 -e PEBBLE_VA_NOSLEEP=1 -v ~/e2e-ha/pebble:/p:ro '$PEBBLE_IMG' -config /p/pebble.json >/dev/null
-    docker run -d --name e2e-s3 --restart no -p '$priv:9100:9100' --env-file ~/e2e-ha/s3.env -v ~/e2e-ha/s3/data:/data \
-      --user \"\$(id -u):\$(id -g)\" '$RCLONE_IMG' serve s3 --addr :9100 /data >/dev/null
+    docker run -d --name e2e-s3 --restart no --network host --env-file ~/e2e-ha/s3.env -v ~/e2e-ha/s3/data:/data \
+      --user \"\$(id -u):\$(id -g)\" '$RCLONE_IMG' serve s3 --addr '$priv:9100' /data >/dev/null
     for i in \$(seq 1 30); do curl -fsk https://127.0.0.1:15443/roots/0 -o ~/e2e-ha/pebble-root.crt 2>/dev/null && break; sleep 1; done
     test -s ~/e2e-ha/pebble-root.crt"
   vm vm1 'cat ~/e2e-ha/pebble-root.crt' > "$D/pebble-root.crt"
@@ -410,7 +413,7 @@ s = s.replace('''\"defaultMode\" 288 \"optional\" true)))''', '''\"defaultMode\"
   # images by digest, then the whole init.
   pc init --env-only --runtime kubernetes --non-interactive --domain "$d" --email "admin@$d" --dns-provider none --no-config-repo 2>&1 | redact | tail -20
   vm vm1 'cd ~/portcullis && bash -c "source scripts/lib/common.sh
-    env_set DNS_PROVIDER fake; env_set FAKE_API_TOKEN e2e-ha-vm-fake-token-0123456789; env_set DNS_CAA false
+    env_set DNS_PROVIDER fake; env_set FAKE_API_TOKEN e2e-ha-vm-fake-token-0123456789; env_set DNS_CAA false; env_set DNS_CAA_ISSUER pebble.letsencrypt.org
     env_set PORTCULLIS_KUBE_IMAGES local; env_set PORTCULLIS_TESTPROVIDER 1
     n=\$(_kube_local_import portcullis-nodeadm:ci nodeadm) && s=\$(_kube_local_import portcullis-snr:ci snr) || exit 1
     [[ \$n =~ ^localhost/portcullis-nodeadm@sha256:[0-9a-f]{64}\$ && \$s =~ ^localhost/portcullis-snr@sha256:[0-9a-f]{64}\$ ]] || exit 1
@@ -424,14 +427,15 @@ s = s.replace('''\"defaultMode\" 288 \"optional\" true)))''', '''\"defaultMode\"
   core_trust
 
   # shellcheck disable=SC2029
-  vm vm1 "docker run -d --name e2e-fakezone --restart no --read-only --cap-drop ALL --security-opt no-new-privileges \
-    -p '$priv:8054:8054' -e DOMAINS_FAKEDNS_API_ADDR=:8054 --entrypoint domains portcullis-domains:kube-local fakezone >/dev/null"
+  vm vm1 "docker rm -f e2e-fakezone >/dev/null 2>&1; docker run -d --name e2e-fakezone --restart no --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --network host -e DOMAINS_FAKEDNS_API_ADDR='$priv:8054' --entrypoint domains portcullis-domains:kube-local fakezone >/dev/null"
   K -n portcullis create configmap e2e-ha-pebble-ca --from-file=ca.crt=/dev/stdin < "$D/pebble-tls-ca.crt" >/dev/null
   jq -n --arg ip "$priv/32" '{apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: {name: "e2e-ha-frontdoor-fixtures", namespace: "portcullis"},
     spec: {podSelector: {matchLabels: {"portcullis.io/component": "frontdoor"}}, policyTypes: ["Egress"],
       egress: [{to: [{ipBlock: {cidr: $ip}}], ports: [{protocol: "TCP", port: 14443}, {protocol: "TCP", port: 8054}]}]}}' | K apply -f - >/dev/null
   vm vm1 'cat ~/e2e-ha/s3.env' | sed -E 's/^RCLONE_AUTH_KEY=([^,]*),(.*)$/AWS_ACCESS_KEY_ID=\1\nAWS_SECRET_ACCESS_KEY=\2/' \
-    | pc backup destination set "http://$priv:9100/e2e-bucket/portcullis" 2>&1 | tail -5
+    | pc backup destination set "http://$priv:9100/e2e-bucket/portcullis" > "$D/dest.log" 2>&1 || { tail -5 "$D/dest.log"; fail "backup destination set"; }
+  tail -3 "$D/dest.log"
   echo "PASS: init on vm1"
 }
 
@@ -450,6 +454,10 @@ cluster() {
   vm vm1 'cd ~/portcullis && set -e; jq -r .root_token secrets/vault-init.json | sudo k3s kubectl -n portcullis exec -i pod/vault-0 -c vault -- sh -c "IFS= read -r t; VAULT_TOKEN=\"\$t\" VAULT_ADDR=http://127.0.0.1:8200 exec vault write -format=json pki_int/issue/server-cert common_name=\"\$1\" alt_names=\"*.\$1\" ttl=2160h" _ "$(. ~/e2e-ha/env; echo "$PORTCULLIS_DOMAIN")" > /tmp/e2e-main.json
     (umask 077 && jq -r ".data.certificate, .data.issuing_ca" /tmp/e2e-main.json > certs/ha-main.crt && jq -r .data.private_key /tmp/e2e-main.json > certs/ha-main.key); rm -f /tmp/e2e-main.json
     printf "tls:\n  certificates:\n    - certFile: /certs/ha-main.crt\n      keyFile: /certs/ha-main.key\n" > traefik/dynamic/ci-ha-main.yml'
+  # The backup destination reaches the Hub (HUB_BACKUP_DESTINATION, the
+  # checklist's backup_destination) only through an up; then the Hub Ready.
+  pc up 2>&1 | redact | tail -5
+  hub_ready
   t0=$(date +%s)
   local rc=0
   pc ha enable --yes 2>&1 | redact | tee "$D/ha-enable.log" | tail -60 || rc=$?
