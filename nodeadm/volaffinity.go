@@ -66,9 +66,11 @@ func podClaims(p *corev1.Pod) []string {
 }
 
 // volumeTerms: one pod's volume constraints, each volume's terms (any one
-// must match). Fail closed: a claim whose volume nodeadm can't see, or a
-// volume term it can't express, pins the pod to its current node (lost
-// with it: unplaced, never placed where the scheduler may refuse it).
+// must match). Fail closed: a claim whose volume nodeadm can't see, a
+// volume term it can't express, or a volume whose every term is empty (the
+// scheduler matches an empty term against no node) pins the pod to its
+// current node (lost with it: unplaced, never placed where the scheduler
+// may refuse it); an empty term beside others is dropped.
 func volumeTerms(p *corev1.Pod, ca claimAffinity) [][][]Expr {
 	pin := [][]Expr{{{Key: "kubernetes.io/hostname", Operator: "In", Values: []string{p.Spec.NodeName}}}}
 	var out [][][]Expr
@@ -99,7 +101,17 @@ func volumeTerms(p *corev1.Pod, ca claimAffinity) [][][]Expr {
 				}
 				term = append(term, Expr{Key: "kubernetes.io/hostname", Operator: "In", Values: append([]string{}, f.Values...)})
 			}
+			// An empty term matches no node for the scheduler; here it
+			// would AND nothing and match every node (fail open): dropped.
+			if len(term) == 0 {
+				continue
+			}
 			alts = append(alts, term)
+		}
+		if len(alts) == 0 {
+			// Every term empty: the volume matches no node at all. Pinned.
+			out = append(out, pin)
+			continue
 		}
 		out = append(out, alts)
 	}
