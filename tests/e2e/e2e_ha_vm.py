@@ -102,10 +102,20 @@ MESH = {"vm1": "10.215.0.1", "vm2": "10.215.0.2", "vm3": "10.215.0.3", "vm4": "1
 SSH = ["ssh", "-F", os.path.join(D, "ssh_config")]
 
 
+REDACT = [(re.compile(r"(/invite/)[A-Za-z0-9_-]+"), r"\1<redacted>"), (re.compile(r"pcj[0-9]\.[A-Za-z0-9_-]{16,}"), "<join code>")]
+
+
+def redact(text: str) -> str:
+    """Setup links and join codes out of anything printed or raised."""
+    for rx, to in REDACT:
+        text = rx.sub(to, text)
+    return text
+
+
 def sh(*argv: str, inp: str | None = None, timeout: float = 120, check: bool = True) -> str:
     r = subprocess.run(list(argv), input=inp, capture_output=True, text=True, timeout=timeout)
     if check and r.returncode != 0:
-        raise AssertionError(f"{' '.join(argv[:4])}: exit {r.returncode}: {(r.stderr or r.stdout).strip()[-400:]}")
+        raise AssertionError(redact(f"{' '.join(argv[:4])}: exit {r.returncode}: {(r.stderr or r.stdout).strip()[-400:]}"))
     return r.stdout
 
 
@@ -120,6 +130,27 @@ def host(h: str, *args: str, timeout: float = 60, check: bool = True) -> str:
 
 def host_state(h: str) -> dict:
     return json.loads(host(h, "state"))
+
+
+def mask(*values: str) -> None:
+    """::add-mask:: for each credential value (and each of its lines) the
+    moment it is read, so no later log line can show it."""
+    for v in values:
+        for part in {v.strip(), *v.strip().splitlines()}:
+            if len(part) >= 4:
+                print(f"::add-mask::{part}", flush=True)
+
+
+def secret_read(h: str, command: str, timeout: float = 30) -> str:
+    """A credential read on a VM: its output masked at once and never put
+    in an error (a failed read says only which command failed)."""
+    r = subprocess.run([*SSH, h, command], capture_output=True, text=True, timeout=timeout)
+    out = r.stdout
+    if out:
+        mask(out)
+    if r.returncode != 0:
+        raise AssertionError(f"a credential read on {h} failed (exit {r.returncode}; its output withheld)")
+    return out
 
 
 def pc(*args: str, timeout: float = 600, check: bool = True) -> str:
@@ -138,7 +169,7 @@ def _start_tunnel(server_vm: str) -> None:
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     kc = os.path.join(D, "kubeconfig")
     if not os.path.exists(kc):
-        raw = vm("vm1", "cat ~/portcullis/secrets/kube/kubeconfig")
+        raw = secret_read("vm1", "cat ~/portcullis/secrets/kube/kubeconfig")
         raw = re.sub(r"server: https://[0-9.]+:6443", f"server: https://127.0.0.1:{local}", raw)
         with open(kc, "w") as f:
             f.write(raw)
@@ -900,7 +931,7 @@ def ha_vm_etcd_remove_member() -> None:
     node = "vm2"  # a server we can rejoin afterwards
     note(f"ha_vm_etcd_remove_member: removing server {VM_NODE[node]} cooperatively")
     out = pc("node", "remove", VM_NODE[node], inp=VM_NODE[node] + "\n", timeout=900)
-    print(out[-1500:], flush=True)
+    print(redact(out[-1500:]), flush=True)
     wait_for("etcd down to 2 members", lambda: len(etcd_members()) == 2, 300, 5)
     note(f"ha_vm_etcd_remove_member: etcd members {sorted(before)} → {sorted(etcd_members())}")
     # Rejoin it (settle expects 3 servers).
@@ -924,14 +955,13 @@ def _rejoin_server(vmn: str) -> None:
     v = VMS[vmn]
     id_ = v["node"]
     out = pc("node", "add", id_, "--role", "server", "--class", "cloud", "--site", "main", timeout=120)
-    code = out.strip().splitlines()[-1] if out.strip() else ""
-    # The code goes to a 0600 file on the node and join.sh runs it.
-    with tempfile.NamedTemporaryFile("w", dir=D, delete=False) as f:
-        f.write([ln for ln in out.splitlines() if ln.startswith("pcj")][0] + "\n")
-        codefile = f.name
-    os.chmod(codefile, 0o600)
-    vm(vmn, "sudo install -m 0600 -o root -g root /dev/stdin /root/e2e-join-code", inp=open(codefile).read())
-    os.unlink(codefile)
+    codes = [ln.strip() for ln in out.splitlines() if ln.startswith("pcj")]
+    assert codes, f"node add {id_} printed no join code"
+    mask(codes[0])
+    # The code onto the node's root 0600 file through stdin (join.sh
+    # --code-file); never argv, never a file here, never printed.
+    vm(vmn, "sudo install -m 0600 -o root -g root /dev/stdin /root/e2e-join-code", inp=codes[0] + "\n")
+    del out, codes
     vm(vmn, f"curl -fsSL https://{DOMAIN}/node/join.sh -o /tmp/join.sh && sudo sh /tmp/join.sh --code-file /root/e2e-join-code; "
             "sudo rm -f /root/e2e-join-code /tmp/join.sh", timeout=600, check=False)
     wait_for(f"{id_} Ready again", lambda: node_ready(id_), 450, 5)
@@ -957,7 +987,7 @@ def ha_vm_interrupted_removal() -> None:
         p.kill()
     note(f"ha_vm_interrupted_removal: interrupted; resuming")
     out = pc("node", "remove", id_, inp=id_ + "\n", timeout=900)
-    print(out[-1500:], flush=True)
+    print(redact(out[-1500:]), flush=True)
     wait_for(f"{id_} gone", lambda: not any(n["metadata"]["name"] == id_ for n in Kj("get", "nodes")["items"]), 300, 5)
     note(f"ha_vm_interrupted_removal: {id_} removed cleanly after the interruption")
     _rejoin_server(node)
@@ -1061,19 +1091,27 @@ def live_server_vms() -> list[str]:
     return sorted(out)
 
 
-def passwd_of(h: str) -> str:
-    return vm(h, f"sudo cat {PASSWD}", check=False, timeout=20)
+def passwd_lines(h: str) -> dict[str, str]:
+    """passwd's credential per user (node, server, …); every credential masked."""
+    out = {}
+    for ln in secret_read(h, f"sudo cat {PASSWD}").splitlines():
+        parts = ln.split(",")
+        if len(parts) >= 2:
+            mask(parts[0])
+            out[parts[1]] = parts[0]
+    return out
+
+
+def passwd_digest(h: str) -> str:
+    """sha256 of the whole passwd file, 12 hex: what is compared and
+    reported (never the content)."""
+    import hashlib
+    return hashlib.sha256(secret_read(h, f"sudo cat {PASSWD}").encode()).hexdigest()[:12]
 
 
 def passwd_node_eq_server(h: str) -> bool:
     """passwd's node line credential equals the server line's (one token)."""
-    out = vm(h, f"sudo awk -F, '{{print $2, $1}}' {PASSWD}", check=False, timeout=20)
-    # Each line: "<cred>,<user>,<user>,..."; node and server lines.
-    lines = {}
-    for ln in vm(h, f"sudo cat {PASSWD}", check=False, timeout=20).splitlines():
-        parts = ln.split(",")
-        if len(parts) >= 2:
-            lines[parts[1]] = parts[0]
+    lines = passwd_lines(h)
     return bool(lines.get("node")) and lines.get("node") == lines.get("server")
 
 
@@ -1083,16 +1121,12 @@ def no_agent_token_file(h: str) -> bool:
 
 
 def server_token(h: str) -> str:
-    return vm(h, "sudo cat /var/lib/rancher/k3s/server/token", check=False, timeout=20).strip()
+    return secret_read(h, "sudo cat /var/lib/rancher/k3s/server/token").strip()
 
 
 def node_cred(h: str) -> str:
-    """The node credential derived from passwd's node line."""
-    for ln in vm(h, f"sudo cat {PASSWD}", check=False, timeout=20).splitlines():
-        p = ln.split(",")
-        if len(p) >= 2 and p[1] == "node":
-            return p[0]
-    return ""
+    """The node credential derived from passwd's node line (masked)."""
+    return passwd_lines(h).get("node", "")
 
 
 def k3s_bootstrap_status(h: str, cred_user: str, cred_pw: str, path: str = "server-bootstrap") -> int:
@@ -1163,8 +1197,9 @@ def restart_cycle(survivor_vms: list[str], reboot_vm: str, expect_ready: int) ->
     retarget_api()
     cluster_healthy(expect_ready)
     # passwd byte-equal, node == server, no agent-token-file.
-    pws = {h: passwd_of(h) for h in survivor_vms}
-    assert len(set(pws.values())) == 1 and all(pws.values()), f"passwd differs across servers: {[(h, p[:12]) for h, p in pws.items()]}"
+    pws = {h: passwd_digest(h) for h in survivor_vms}
+    assert len(set(pws.values())) == 1, f"passwd differs across servers (sha256 prefixes): {pws}"
+    note(f"  passwd byte-equal on {sorted(pws)} (sha256 {next(iter(pws.values()))})")
     for h in survivor_vms:
         assert passwd_node_eq_server(h), f"{h}: passwd node != server"
         assert no_agent_token_file(h), f"{h}: an agent-token file is configured"
@@ -1224,7 +1259,7 @@ def ha_vm_revoke_restarts() -> None:
     def creds_rotated2():
         new_token = server_token(ref2)
         assert k3s_bootstrap_status(ref2, "server", old_token2) == 401, "the old server token still answers (want 401)"
-        assert k3s_bootstrap_status(ref2, "server", node_cred_from(old_node)) in (401, 0), "the old node credential still answers"
+        assert k3s_bootstrap_status(ref2, "server", old_node) in (401, 0), "the old node credential still answers"
         assert k3s_bootstrap_status(ref2, "server", new_token) == 200, "the new server token doesn't answer 200"
         return True
     wait_for("the server revoke's rotations (old 401, new 200)", creds_rotated2, 400, 5)
@@ -1240,13 +1275,8 @@ def ha_vm_revoke_restarts() -> None:
     note(f"ha_vm_revoke_restarts: a new server joined with a fresh code; cluster back to 3")
 
 
-def node_cred_from(cred: str) -> str:
-    return cred
-
-
 def main() -> int:
-    e2e_ha.SECRET = _hub_secret()
-    print(f"::add-mask::{e2e_ha.SECRET}", flush=True)
+    e2e_ha.SECRET = _hub_secret()  # masked by secret_read
     state["alpine"] = helper_image()
     from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
@@ -1288,7 +1318,7 @@ def helper_image() -> str:
 
 
 def _hub_secret() -> str:
-    return vm("vm1", "grep '^HUB_PROXY_SECRET=' ~/portcullis/.env | cut -d= -f2-", check=False).strip()
+    return secret_read("vm1", "grep '^HUB_PROXY_SECRET=' ~/portcullis/.env | cut -d= -f2-").strip()
 
 
 if __name__ == "__main__":
