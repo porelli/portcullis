@@ -160,20 +160,29 @@ def pc(*args: str, timeout: float = 600, check: bool = True) -> str:
 # ── kubectl over an SSH tunnel to a surviving API server ──
 
 _tunnel: dict = {"proc": None, "server": "", "port": 0}
+import atexit  # noqa: E402
+atexit.register(lambda: _stop_tunnel())  # no tunnel outlives the run (a leftover holds its port)
 OPERATOR_VM = "vm1"  # the first node: the CLI, Pebble, S3 and the fake zone live there; never cut
 CONN_ERRORS = ("connection to the server", "Unable to connect to the server", "connection refused", "EOF",
                "ServiceUnavailable", "unable to handle the request", "TLS handshake timeout", "i/o timeout",
                "no route to host", "context deadline exceeded", "http2: client connection lost")
 
 
+_kc_fetched: list[bool] = []
+
+
 def _kubeconfig() -> str:
+    """The CLI's kubeconfig, fetched once per run (a copy from an earlier
+    install carries another cluster CA: TLS fails)."""
     kc = os.path.join(D, "kubeconfig")
-    if not os.path.exists(kc):
+    if not _kc_fetched:
         raw = secret_read("vm1", "cat ~/portcullis/secrets/kube/kubeconfig")
         raw = re.sub(r"server: https://[0-9.]+:6443", "server: https://127.0.0.1:16443", raw)
-        with open(kc, "w") as f:
+        fd = os.open(kc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(raw)
         os.chmod(kc, 0o600)
+        _kc_fetched.append(True)
     return kc
 
 
