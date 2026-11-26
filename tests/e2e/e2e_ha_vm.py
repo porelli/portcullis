@@ -394,6 +394,18 @@ def self_fenced(h: str, b0: str, timeout: float) -> float:
     raise AssertionError(f"{h} didn't self-fence within {timeout:.0f} s (boot id unchanged {b0})")
 
 
+def fixtures_ok() -> None:
+    """vm1's fixtures answer (the fake zone, Pebble, the S3 server): a dead
+    one fails every drill in confusing ways (run 2: the zone down, every
+    front-door round skipped, every probe verdict "none")."""
+    priv = VMS[OPERATOR_VM]["private"]
+    out = vm(OPERATOR_VM, f"curl -s -o /dev/null -w '%{{http_code}} ' -X POST -d '{{}}' http://{priv}:8054/; "
+             f"curl -sk -o /dev/null -w '%{{http_code}} ' https://{priv}:14443/dir; curl -s -o /dev/null -w '%{{http_code}}' http://{priv}:9100/",
+             check=False, timeout=40).split()
+    assert len(out) == 3 and out[0] != "000" and out[1] == "200" and out[2] != "000", \
+        f"vm1's fixtures don't all answer (fake zone, Pebble, S3: {out}): `docker ps -a` on vm1"
+
+
 def settle(timeout: float = 900) -> None:
     """Between scenarios: every cut healed, the API reachable, every node
     Ready and schedulable, core workloads at their replicas, CNPG healthy,
@@ -402,6 +414,7 @@ def settle(timeout: float = 900) -> None:
         heal(node)
     # The node mesh and k3s take a moment after a fenced node reboots.
     retarget_api()
+    fixtures_ok()
 
     def ok():
         nodes = Kj("get", "nodes")["items"]
@@ -1456,6 +1469,7 @@ def ha_vm_revoke_restarts() -> None:
 def main() -> int:
     e2e_ha.SECRET = _hub_secret()  # masked by secret_read
     retarget_api()  # kubectl over an SSH tunnel to a server that answers
+    fixtures_ok()
     state["alpine"] = helper_image()
     from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
