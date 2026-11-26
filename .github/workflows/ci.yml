@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests snr-build domains-tests nodeadm-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-ha-k3d e2e-mail e2e-servers e2e-servers-podman"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests snr-build domains-tests nodeadm-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-ha-k3d e2e-ha-vm e2e-mail e2e-servers e2e-servers-podman"
         type: string
         default: all
       # `-f scenarios="4 members_only_list"`: only those scenarios of the e2e
@@ -6181,6 +6181,108 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-ha-k3d-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+  # High availability on the real test VMs (plan Task 33 part B, D9; spec
+  # §19.2). The four D9 VMs (three servers at site main, one agent at site
+  # edge) exist only for these tests and are deleted at goal end, so the
+  # destructive drills are approved there and ONLY there — never the builder
+  # host. workflow_dispatch with `-f runner=builder` only (it needs the
+  # builder's network to the VMs and its secrets; push / PR / workflow_call
+  # never reach it). Thin: the steps are .github/ci/e2e-ha-vm-*.sh.
+  # tests/e2e/e2e_ha_vm.py runs the physical drills the k3d job can't: real
+  # partitions (the minority self-fences through softdog), power loss, a
+  # dead disk, a full disk, losing the third server, a rolling upgrade under
+  # the sign-in loop, the site uplink / NAT / power drills, and the agent-
+  # token revoke/restart proof; plus the carries (Pebble issue → SNI,
+  # renewal across a Lease move, same-site reachability, etcd remove-member,
+  # the interrupted removal, the front-door-node cuts).
+  #   setup.sh: access (the VMs from the job's secrets), reset (k3s +
+  #   Portcullis uninstalled, a reboot), prep (packages, the harness host
+  #   side, the Longhorn test disk, vm1's Pebble + S3 fixtures), images (the
+  #   nodeagent / nodeadm / SNR / Hub images into vm1's Docker), install
+  #   (init on vm1, the joins, ha enable; its last step's N−1 recorded).
+  #   Reviewed harness-only patches of the copy on vm1 (never shipped): the
+  #   ACME CA is Pebble, the fake DNS provider gets a probe egress host, and
+  #   the front door trusts Pebble and reads the fake zone on vm1 (ci.yml's
+  #   e2e-ha-k3d comment lists the same deviations' k3d forms).
+  # Secrets (the VM inventory, SSH key, host keys) are repository secrets,
+  # referenced only in this job's access step: written by setup.sh into a
+  # 0700 dir as 0600 files, removed by the always() cleanup step; never
+  # printed, every address derived from them masked, nothing of them in an
+  # artifact. The job runs only for workflow_dispatch with runner=builder:
+  # workflow_call (release.yml) has no `runner` input and passes no secrets,
+  # and push / pull_request never reach it.
+  e2e-ha-vm:
+    needs: jobs-input
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.runner == 'builder'
+      && (inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ha-vm,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ha-vm ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ha-vm,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ha-vm '))
+    runs-on: ${{ fromJSON('["self-hosted","linux","x64","pc-builder"]') }}
+    timeout-minutes: 300
+    env:
+      E2E_DOMAIN: ha.portcullis.test
+      E2E_ARTIFACTS: e2e-artifacts
+      ACME_STAGING: "true"
+      COMPOSE_FILE: docker-compose.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The harness directory (runner.temp isn't a job-env context)
+        run: echo "E2E_HA_VM_DIR=$RUNNER_TEMP/ha-vm" >> "$GITHUB_ENV"
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+      - name: Access the VMs (inventory, SSH key, host keys from the job's secrets)
+        timeout-minutes: 5
+        env:
+          E2E_HA_VM_INVENTORY: ${{ secrets.E2E_HA_VM_INVENTORY }}
+          E2E_HA_VM_SSH_KEY: ${{ secrets.E2E_HA_VM_SSH_KEY }}
+          E2E_HA_VM_KNOWN_HOSTS: ${{ secrets.E2E_HA_VM_KNOWN_HOSTS }}
+        run: bash .github/ci/e2e-ha-vm-setup.sh access
+      - name: Reset the VMs (k3s + Portcullis uninstalled, a reboot)
+        timeout-minutes: 20
+        run: bash .github/ci/e2e-ha-vm-setup.sh reset
+      - name: Prepare the VMs (packages, the harness host side, the test disk, vm1's fixtures)
+        timeout-minutes: 20
+        run: bash .github/ci/e2e-ha-vm-setup.sh prep
+      - name: The nodeagent, nodeadm, SNR and Hub images into vm1
+        timeout-minutes: 20
+        env:
+          HUB_SRC: ${{ runner.temp }}/portcullis-hub
+        run: bash .github/ci/e2e-ha-vm-setup.sh images
+      - name: Install (init on vm1, the joins, ha enable)
+        timeout-minutes: 90
+        run: bash .github/ci/e2e-ha-vm-setup.sh install
+      - name: Install Playwright (pinned)
+        timeout-minutes: 10
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          /tmp/e2e-venv/bin/playwright install chromium
+      - name: The HA VM drills (tests/e2e/e2e_ha_vm.py)
+        timeout-minutes: 180
+        run: bash .github/ci/e2e-ha-vm-chaos.sh scenarios
+      - name: ha status
+        if: always()
+        timeout-minutes: 5
+        run: bash .github/ci/e2e-ha-vm-setup.sh status
+      - name: Collect logs and events
+        if: failure()
+        run: bash .github/ci/e2e-ha-vm-chaos.sh collect
+      - name: Remove the VM credentials (always)
+        if: always()
+        run: bash .github/ci/e2e-ha-vm-setup.sh cleanup
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-ha-vm-artifacts
           path: e2e-artifacts/
           retention-days: 7
 

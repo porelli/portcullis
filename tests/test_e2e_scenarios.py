@@ -136,6 +136,23 @@ class Cli(unittest.TestCase):
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertEqual(cli("check", "--jobs", "e2e-k3s", "--scenarios", "ha_cnpg_failover").returncode, 1)
 
+    def test_ha_vm_scenarios(self):
+        # Task 33 part B: the e2e-ha-vm job runs tests/e2e/e2e_ha_vm.py (the
+        # physical drills), which knows every ha_vm_* scenario (each check
+        # gated by scenarios.skip).
+        per_job = scenarios.job_runners(HERE.parent / ".github/workflows/ci.yml")
+        self.assertIn(HERE / "e2e" / "e2e_ha_vm.py", per_job.get("e2e-ha-vm", []))
+        names = scenarios.known([HERE / "e2e" / "e2e_ha_vm.py"])["e2e_ha_vm.py"]
+        for n in ("ha_vm_partition", "ha_vm_power_off", "ha_vm_disk_kill", "ha_vm_disk_full",
+                  "ha_vm_lose_small", "ha_vm_rolling_upgrade", "ha_vm_site_uplink_down", "ha_vm_site_down",
+                  "ha_vm_nat_relay", "ha_vm_revoke_restarts", "ha_vm_pebble_issue_sni",
+                  "ha_vm_cert_renew_leader_move", "ha_vm_same_site_reach", "ha_vm_etcd_remove_member",
+                  "ha_vm_interrupted_removal", "ha_vm_front_door_node", "ha_vm_front_door_nodeadm_one_node"):
+            self.assertIn(n, names)
+        ok = cli("check", "--jobs", "e2e-ha-vm", "--scenarios", "ha_vm_partition")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(cli("check", "--jobs", "e2e-ha-k3d", "--scenarios", "ha_vm_partition").returncode, 1)
+
     def test_import_refuses_unknown(self):
         r = subprocess.run([sys.executable, "-c", "import scenarios"], cwd=HERE / "e2e", capture_output=True,
                            text=True, env=dict(os.environ, E2E_SCENARIOS="no_such_scenario"))
