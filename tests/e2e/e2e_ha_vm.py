@@ -26,7 +26,7 @@ Scenarios (brief Task 33):
                           on it fails; a test app's data checksums equal the
                           majority's afterwards.
   ha_vm_power_off         a node powered off: its stateful app runs elsewhere
-                          within 4 min.
+                          within 5 min of the crash.
   ha_vm_disk_kill         a storage node's Longhorn disk killed: its volumes
                           rebuild on the others, the data intact.
   ha_vm_disk_full         a storage node's Longhorn disk filled: Longhorn
@@ -692,8 +692,10 @@ def marker_app(prefer: str) -> dict:
 
 def ha_vm_power_off() -> None:
     """A node powered off (sysrq reboot held dark): its stateful app runs
-    elsewhere within 4 min, its data one history and the marker unchanged;
-    Postgres' committed rows all there."""
+    elsewhere within 5 min of the crash (the contract's budget; the bound is
+    on that measure, not on the drill's total time, which adds the writers'
+    setup, the node's return and the settle), its data one history and the
+    marker unchanged; Postgres' committed rows all there."""
     victim = fresh_victim()
     p0 = writer_start(victim)
     psql(pg_primary(), "DROP TABLE IF EXISTS e2e_ha_rows; CREATE TABLE e2e_ha_rows (n int PRIMARY KEY, at timestamptz DEFAULT now());")
@@ -752,7 +754,19 @@ def ha_vm_disk_kill() -> None:
     app_node = fresh_victim(need_fence=False)
     p0 = writer_start(app_node)
     vol = lh_volume_of_claim(MARKER_NS, MARKER_PVC)
-    reps = wait_for("the volume's replicas running", lambda: (lambda r: r if len(r) >= 2 and all(x.get("status", {}).get("currentState") == "running" for x in r) else None)(lh_replicas(vol)), 300, 5)
+    # A settled volume first (VM run 8: power_off's replenishment was still
+    # rebuilding a third replica when the disk died, so "rebuilt" held 10 s
+    # later without any rebuild): healthy, exactly numberOfReplicas
+    # replicas, all running and none failed. The kill must force a rebuild.
+    def settled():
+        v = lh("get", "volumes.longhorn.io", vol)
+        want = int(v.get("spec", {}).get("numberOfReplicas") or 0)
+        r = lh_replicas(vol)
+        ok = (v.get("status", {}).get("robustness") == "healthy" and want >= 2 and len(r) == want
+              and all(x.get("status", {}).get("currentState") == "running" and not x["spec"].get("failedAt") for x in r))
+        return r if ok else None
+    reps = wait_for("the volume settled (healthy, exactly its replica count, all running)", settled, 900, 10)
+    before = {r["metadata"]["name"] for r in reps}
     nodes = [r["spec"]["nodeID"] for r in reps]
     # A replica off vm1, preferably not the app's node (the app's own node
     # is fine: its root disk and the engine stay up, only Longhorn's disk dies).
@@ -781,12 +795,15 @@ def ha_vm_disk_kill() -> None:
         def rebuilt():
             rs = lh_replicas(vol)
             live = [r for r in rs if r["spec"]["nodeID"] != victim and r.get("status", {}).get("currentState") == "running" and not r["spec"].get("failedAt")]
-            return len(live) >= 2 and lh("get", "volumes.longhorn.io", vol).get("status", {}).get("robustness") == "healthy"
+            new = [r for r in live if r["metadata"]["name"] not in before]
+            return len(live) >= 2 and bool(new) and lh("get", "volumes.longhorn.io", vol).get("status", {}).get("robustness") == "healthy"
         wait_for("the dead disk's replica rebuilt on another node, the volume healthy", rebuilt, 900, 15)
         d_rebuilt = time.time() - t
         rows = writer_log(writer_pod()["metadata"]["name"])
         log_consistent(rows)
-        assert rows[-1][1] >= int(t) + 60, "the app stopped writing after the disk died"
+        # Still writing now (VM run 8 asserted t + 60 s, which a rebuild
+        # quicker than 60 s can't meet): a line from the last 15 s.
+        assert rows[-1][1] >= int(time.time()) - 15, f"the app stopped writing after the disk died (its last line at {rows[-1][1]}, now {int(time.time())})"
         note(f"ha_vm_disk_kill: noticed {d_notice:.0f} s after the kill (the replica failed, the disk not Ready); rebuilt on another node, "
              f"the volume healthy {d_rebuilt:.0f} s after; the app kept writing ({len(rows)} lines, one history)")
     finally:
@@ -799,6 +816,31 @@ def ha_vm_disk_kill() -> None:
     settle()
     md5 = marker_read()
     assert md5 == state["marker_md5"], f"the marker changed: {md5} != {state['marker_md5']}"
+
+
+def ha_vm_disk_full() -> None:
+    marker_setup()
+    victim = victim_server(set())
+    h = node_vm(victim)
+    note(f"ha_vm_disk_full: filling {victim}'s Longhorn disk ({h})")
+    host(h, "fill")
+    try:
+        def reported():
+            ds = lh_node_disks(victim)
+            for d in ds:
+                if any(c.get("type") == "Schedulable" and c.get("status") != "True" for c in (d.get("conditions") or [])):
+                    return True
+                if d.get("storageAvailable", 1 << 60) < 2 * (1 << 30):
+                    return True
+            return False
+        wait_for(f"Longhorn reports {victim}'s disk full", reported, 240, 5)
+        longhorn_healthy(600)
+        md5 = marker_read()
+        note(f"ha_vm_disk_full: Longhorn reported {victim}'s disk full; volumes stay healthy; marker {('equal' if md5 == state['marker_md5'] else 'CHANGED')}")
+        assert md5 == state["marker_md5"], "the marker changed"
+    finally:
+        host(h, "unfill", check=False)
+    settle()
 
 
 def ha_vm_lose_small() -> None:
@@ -1656,7 +1698,7 @@ def main() -> int:
         check("ha_vm_pebble_issue_sni: the front door issues from Pebble; every ingress node serves it by SNI", ha_vm_pebble_issue_sni)
         check("ha_vm_same_site_reach: same-site probes don't count; cross-site probers do", ha_vm_same_site_reach)
         check("ha_vm_partition: the minority self-fences, a writer on it fails, checksums equal the majority's", ha_vm_partition)
-        check("ha_vm_power_off: the stateful app runs elsewhere within 4 min", ha_vm_power_off)
+        check("ha_vm_power_off: the stateful app runs elsewhere within 5 min of the crash", ha_vm_power_off)
         check("ha_vm_disk_kill: a storage node's disk killed, volumes rebuild, data intact", ha_vm_disk_kill)
         check("ha_vm_disk_full: a storage node's disk filled, Longhorn reports it, volumes healthy", ha_vm_disk_full)
         check("ha_vm_lose_small: the third server lost, quorum holds, sign-in works", ha_vm_lose_small)

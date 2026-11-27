@@ -129,5 +129,91 @@ class FreshVictim(unittest.TestCase):
         self.assertEqual(self.slept, [])
 
 
+
+class ScenarioSelection(unittest.TestCase):
+    """main() under E2E_SCENARIOS: every check() it names is defined (VM run 8
+    died on a NameError, ha_vm_disk_full deleted by an edit, after the two
+    drills before it), and each subset runs exactly its drills plus the ones
+    their needs() pull in. main() runs with the cluster, the browser and
+    check() stubbed: check() records what would run."""
+
+    ALL = ["ha_vm_pebble_issue_sni", "ha_vm_same_site_reach", "ha_vm_partition", "ha_vm_power_off",
+           "ha_vm_disk_kill", "ha_vm_disk_full", "ha_vm_lose_small", "ha_vm_rolling_upgrade",
+           "ha_vm_site_uplink_down", "ha_vm_site_down", "ha_vm_nat_relay", "ha_vm_front_door_node",
+           "ha_vm_front_door_nodeadm_one_node", "ha_vm_cert_renew_leader_move", "ha_vm_interrupted_removal",
+           "ha_vm_revoke_restarts", "ha_vm_etcd_remove_member"]
+    PULLED = {"ha_vm_etcd_remove_member": {"ha_vm_revoke_restarts"}}
+
+    def run_main(self, subset):
+        import contextlib
+        import types
+        ran = []
+        saved = {k: getattr(m, k) for k in ("check", "_hub_secret", "retarget_api", "fixtures_ok", "helper_image")}
+        saved_report = m.e2e_ha.report
+        pw = types.ModuleType("playwright.sync_api")
+        pw.sync_playwright = lambda: contextlib.nullcontext(object())
+        mods = {"playwright": types.ModuleType("playwright"), "playwright.sync_api": pw}
+        old_mods = {k: sys.modules.get(k) for k in mods}
+        old_env = os.environ.get(m.scenarios.ENV)
+        try:
+            sys.modules.update(mods)
+            if subset:
+                os.environ[m.scenarios.ENV] = ",".join(subset)
+            else:
+                os.environ.pop(m.scenarios.ENV, None)
+            m.scenarios._WANT = None
+
+            def check(name, fn):
+                self.assertTrue(callable(fn), name)
+                key = name.split(":")[0]
+                if key.startswith("ha_vm_"):
+                    self.assertEqual(fn.__name__, key, f"check {key!r} runs {fn.__name__}")
+                if not m.scenarios.skip(name):
+                    ran.append(key)
+            m.check = check
+            m._hub_secret = lambda: "x"
+            m.retarget_api = lambda *a, **k: None
+            m.fixtures_ok = lambda: None
+            m.helper_image = lambda: "img@sha256:" + "0" * 64
+            m.e2e_ha.report = lambda: 0
+            with open(os.devnull, "w") as dn, contextlib.redirect_stdout(dn):
+                self.assertEqual(m.main(), 0)
+        finally:
+            for k, v in saved.items():
+                setattr(m, k, v)
+            m.e2e_ha.report = saved_report
+            for k, v in old_mods.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+            if old_env is None:
+                os.environ.pop(m.scenarios.ENV, None)
+            else:
+                os.environ[m.scenarios.ENV] = old_env
+            m.scenarios._WANT = None
+        return ran
+
+    def expect(self, subset):
+        want = set(subset)
+        for s in subset:
+            want |= self.PULLED.get(s, set())
+        return ["admin signs in (a setup link, a virtual passkey) through a main ingress node"] + [n for n in self.ALL if n in want]
+
+    def test_all(self):
+        self.assertEqual(self.run_main([]), ["admin signs in (a setup link, a virtual passkey) through a main ingress node"] + self.ALL)
+
+    def test_each_single(self):
+        for n in self.ALL:
+            with self.subTest(n):
+                self.assertEqual(self.run_main([n]), self.expect([n]))
+
+    def test_run_8_subset_and_prefixes(self):
+        six = ["ha_vm_power_off", "ha_vm_disk_kill", "ha_vm_front_door_nodeadm_one_node",
+               "ha_vm_interrupted_removal", "ha_vm_revoke_restarts", "ha_vm_etcd_remove_member"]
+        for k in range(1, len(six) + 1):
+            with self.subTest(k=k):
+                self.assertEqual(self.run_main(six[:k]), self.expect(six[:k]))
+
 if __name__ == "__main__":
     unittest.main()
