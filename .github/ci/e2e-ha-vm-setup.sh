@@ -63,7 +63,27 @@ vm() { local h="$1"; shift; ssh -F "$D/ssh_config" "$h" "$@"; }
 vmq() { local h="$1"; shift; ssh -F "$D/ssh_config" -o ControlMaster=no -o ControlPath=none "$h" "$@"; }
 # shellcheck disable=SC2088  # the remote shell expands ~
 pc() { vm vm1 "~/e2e-ha/pc $*"; }
-K() { vm vm1 "sudo k3s kubectl $*"; }
+# K — kubectl on vm1; an API server that is (re)starting (k3s answers
+# "apiserver not ready", or the connection is refused) is waited for on
+# /readyz and the call retried, for at most 3 min (VM run 4: needrestart
+# from unattended-upgrades restarted k3s 5 s after init). Any other error
+# fails at once.
+K() {
+  local out rc i
+  for i in $(seq 1 36); do
+    rc=0; out="$(vm vm1 "sudo k3s kubectl $*" 2>&1)" || rc=$?
+    if [ "$rc" = 0 ]; then printf '%s\n' "$out"; return 0; fi
+    case "$out" in
+      *"apiserver not ready"*|*"connection refused"*|*"ServiceUnavailable"*|*"the server is currently unable"*|*"TLS handshake timeout"*) ;;
+      *) printf '%s\n' "$out" >&2; return "$rc" ;;
+    esac
+    [ "$i" = 1 ] && echo "  (the API server isn't ready: waiting on /readyz, then retrying)" >&2
+    vm vm1 'for j in $(seq 1 10); do sudo k3s kubectl get --raw /readyz >/dev/null 2>&1 && exit 0; sleep 2; done; exit 0' || true
+    sleep 3
+  done
+  printf '%s\n' "$out" >&2
+  return "$rc"
+}
 each() { # each <fn> <vm>…: fn on every VM in parallel, every failure named
   local fn="$1" pids=() names=() rc=0 i; shift
   for h in "$@"; do "$fn" "$h" > "$D/log-$fn-$h" 2>&1 & pids+=($!); names+=("$h"); done
@@ -188,9 +208,22 @@ prep_one() {
 set -euo pipefail
 h="$1"; shift
 export DEBIAN_FRONTEND=noninteractive
+# No package upgrades during the run (VM run 4: unattended-upgrades'
+# needrestart restarted k3s 5 s after init): the timers off for good on
+# these harness-owned VMs, and a run already going is waited for (never
+# killed mid-dpkg), at most 15 min.
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+systemctl disable unattended-upgrades.service >/dev/null 2>&1 || true
+for _ in $(seq 1 90); do
+  busy=""
+  for u in apt-daily.service apt-daily-upgrade.service; do systemctl is-active --quiet "$u" && busy=1; done
+  pgrep -f "/usr/bin/unattended-upgrade" >/dev/null 2>&1 && busy=1
+  [ -n "$busy" ] || break
+  sleep 10
+done
 missing=""
 for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
-if [ -n "$missing" ]; then apt-get update -qq; apt-get install -y -qq $missing >/dev/null; fi
+if [ -n "$missing" ]; then apt-get -o DPkg::Lock::Timeout=600 update -qq; apt-get -o DPkg::Lock::Timeout=600 install -y -qq $missing >/dev/null; fi
 [ "$h" != vm1 ] || usermod -aG docker "${SUDO_USER:-ubuntu}"
 printf 'softdog\niscsi_tcp\ndm_mod\n' > /etc/modules-load.d/e2e-ha.conf
 # The host keys are pinned (E2E_HA_VM_KNOWN_HOSTS): cloud-init never

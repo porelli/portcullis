@@ -165,7 +165,7 @@ _tunnel: dict = {"proc": None, "server": "", "port": 0}
 import atexit  # noqa: E402
 atexit.register(lambda: _stop_tunnel())  # no tunnel outlives the run (a leftover holds its port)
 OPERATOR_VM = "vm1"  # the first node: the CLI, Pebble, S3 and the fake zone live there; never cut
-CONN_ERRORS = ("connection to the server", "Unable to connect to the server", "connection refused", "EOF",
+CONN_ERRORS = ("connection to the server", "apiserver not ready", "Unable to connect to the server", "connection refused", "EOF",
                "ServiceUnavailable", "unable to handle the request", "TLS handshake timeout", "i/o timeout",
                "no route to host", "context deadline exceeded", "http2: client connection lost")
 
