@@ -687,7 +687,8 @@ def mail_unwired_refuses() -> None:
                     continue
                 st = m.docker("inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", c, check_rc=False).split()
                 if st and st[0] == "exited":
-                    seen[c] = (st[1], m.docker("logs", c, check_rc=False, timeout=60).strip())
+                    lg = m.run("docker", "logs", c, timeout=60, check_rc=False)  # its line is on stderr
+                    seen[c] = (st[1], (lg.stdout + lg.stderr).strip())
             stop.wait(0.5)
     w = threading.Thread(target=watch, daemon=True)
     w.start()
