@@ -6211,6 +6211,22 @@ jobs:
   #   ACME CA is Pebble, the fake DNS provider gets a probe egress host, and
   #   the front door trusts Pebble and reads the fake zone on vm1 (ci.yml's
   #   e2e-ha-k3d comment lists the same deviations' k3d forms).
+  # Reviewed deviations (controller rulings, Task 33 part B):
+  #   - a power-off is a sysrq reboot held dark (k3s, its agent and the
+  #     nodeagent kept from starting, the network cut) until the harness
+  #     powers it on: no cloud credentials in CI;
+  #   - vm1 (the CLI and the fixtures: Pebble, S3, the fake zone) is never
+  #     cut; a fencing drill never reuses a node fenced within nodeadm's
+  #     20 min remediation back-off (the run waits);
+  #   - ha_vm_nat_relay asserts vm2 ↔ vm4 keeps working behind real NATs
+  #     (vm2, then both) with sign-in unaffected; the relay through vm1 is
+  #     the meshplan unit vectors' (the Hub keeps proving vm4's endpoint by
+  #     vm4's own handshakes, so it never plans that relay here);
+  #   - the interrupted removal is the agent's (a server removal below 3
+  #     servers is refused by design); etcd remove-member is judged on the
+  #     real member list around revoke_restarts' server revoke;
+  #   - ha_vm_lose_small takes the third server (this bundle has no small
+  #     node: D9's small third voter is a cloud server here).
   # Secrets (the VM inventory, SSH key, host keys) are repository secrets,
   # referenced only in this job's access step: written by setup.sh into a
   # 0700 dir as 0600 files, removed by the always() cleanup step; never

@@ -942,27 +942,37 @@ def wg_route(src_vm: str, mesh_ip: str) -> str:
 
 
 def ha_vm_nat_relay() -> None:
-    """vm2's mesh port closed to the other sites (inbound UDP 51830 from
-    outside its LAN dropped: vm2 behind a NAT; vm1 stays the site's
-    gateway): the Hub's mesh finds vm2's public endpoint unreachable (its
-    proof re-checked once 5 min stale, then 2 min to confirm,
-    MeshReachableStale + MeshConfirmWait) and vm4 reaches vm2 through vm1:
-    vm4's WireGuard carries vm2's mesh address on vm1's peer. Pings both
-    ways and sign-in keep working; the time is noted (≤ 10 min)."""
+    """(controller ruling, run 3 triage: the product as designed.) vm2
+    behind a real NAT (NEW inbound UDP 51830 from outside its LAN dropped,
+    replies kept: vm-host.sh natmesh), then vm4 too: vm2 ↔ vm4 keeps working
+    in both directions at every check over 3 min each (the mesh plan has
+    vm2 dial vm4 directly; behind two NATs the fixed ports punch through),
+    the path vm4 uses to reach vm2 is recorded, and sign-in is unaffected.
+    Reviewed deviation: the relay through vm1 (the plan's NAT↔NAT pair) is
+    the meshplan unit vectors': on this layout the Hub keeps proving vm4's
+    endpoint by vm4's own handshakes, so it never plans that relay."""
     s: Session = state["session"]
-    assert mesh_ping("vm2", MESH["vm4"]), "vm2 can't reach vm4 over pcmesh before the cut"
-    before = wg_route("vm4", MESH["vm2"])
-    note(f"ha_vm_nat_relay: before the cut vm4 reaches vm2 via {before or '?'}; closing vm2's inbound UDP 51830 to the other sites (LAN {LAN_CIDR} kept)")
-    t = time.time()
-    host("vm2", "net", "set", f"dropmesh:{LAN_CIDR}")
+    assert mesh_ping("vm2", MESH["vm4"]) and mesh_ping("vm4", MESH["vm2"]), "vm2 ↔ vm4 don't ping before the cut"
+    paths = {"before": wg_route("vm4", MESH["vm2"])}
     try:
-        via = wait_for("vm4 routing vm2's mesh address through vm1", lambda: wg_route("vm4", MESH["vm2"]) == MESH["vm1"], 600, 10)
-        d = time.time() - t
-        wait_for("vm2 ↔ vm4 pings over the relay", lambda: mesh_ping("vm2", MESH["vm4"]) and mesh_ping("vm4", MESH["vm2"]), 120, 5)
-        assert s.signin(), "sign-in failed during the NAT relay"
-        note(f"ha_vm_nat_relay: vm4 → vm2 through {via} (vm1) {d:.0f} s after the cut; pings both ways and sign-in work")
+        for step, nodes in (("vm2 behind a NAT", ["vm2"]), ("vm2 and vm4 behind a NAT", ["vm2", "vm4"])):
+            for h in nodes:
+                host(h, "net", "set", f"natmesh:{LAN_CIDR}")
+            t = time.time()
+            fails = 0
+            while time.time() - t < 180:
+                if not (mesh_ping("vm2", MESH["vm4"]) and mesh_ping("vm4", MESH["vm2"])):
+                    fails += 1
+                time.sleep(15)
+            paths[step] = wg_route("vm4", MESH["vm2"])
+            assert fails == 0, f"{step}: vm2 ↔ vm4 failed {fails} checks over 3 min"
+            assert s.signin(), f"{step}: sign-in failed"
+            note(f"ha_vm_nat_relay: {step}: vm2 ↔ vm4 kept working for 3 min (vm4 reaches vm2 via "
+                 f"{'direct' if paths[step] == MESH['vm2'] else paths[step] or '?'}); sign-in unaffected")
     finally:
-        host("vm2", "net", "clear", check=False)
+        for h in ("vm2", "vm4"):
+            host(h, "net", "clear", check=False)
+    note(f"ha_vm_nat_relay: paths {paths}")
     settle()
 
 
@@ -1656,7 +1666,7 @@ def main() -> int:
         check("ha_vm_rolling_upgrade: a rolling restart under the sign-in loop, ≤ 5 of 300 fail", ha_vm_rolling_upgrade)
         check("ha_vm_site_uplink_down: edge's uplink lost then main's; the other site keeps serving", ha_vm_site_uplink_down)
         check("ha_vm_site_down: edge powered off, quorum holds, its address removed but never the last", ha_vm_site_down)
-        check("ha_vm_nat_relay: vm2's mesh port closed cross-site, vm2 ↔ vm4 relays through vm1, sign-in unaffected", ha_vm_nat_relay)
+        check("ha_vm_nat_relay: vm2, then vm4 too, behind a real NAT: vm2 ↔ vm4 keeps working, sign-in unaffected", ha_vm_nat_relay)
         check("ha_vm_front_door_node: the front door's own node cut, a new front door leads, failover recovers", ha_vm_front_door_node)
         check("ha_vm_front_door_nodeadm_one_node: the front door and nodeadm on one node, cut", ha_vm_front_door_nodeadm_one_node)
         check("ha_vm_cert_renew_leader_move: the front door's certificate renewed across a Lease move", ha_vm_cert_renew_leader_move)
