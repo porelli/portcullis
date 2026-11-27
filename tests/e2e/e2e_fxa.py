@@ -41,8 +41,8 @@ Scenarios (in this order):
   leave_disables_via_hub       alice removed through the Hub: within 180 s
                                her session token answers 401
   rejoin_enables_via_hub       alice added again: within 180 s she signs in
-  email_change_disables        alice's email changed in LLDAP: within the
-                               periodic run (10 min) her account is
+  email_change_disables        alice's email changed in LLDAP: within 10 min
+                               (the periodic run) her account is
                                disabled and neither address is listed; the
                                new one shows as unverified
   email_changed_in_fxa_before_block  SKIPPED until porelli/firefox-sync
@@ -275,11 +275,16 @@ def wait_from(user: str, seen: set[int], sender: str, seconds: float):
 
 
 def dkim_pass(msg, domain: str) -> str:
-    """The remote's Authentication-Results: dkim=pass for header.d=domain."""
-    ar = " ".join(msg.get_all("Authentication-Results") or [])
+    """The remote MX's own Authentication-Results (authserv-id under
+    remote.test, never a header the sender could have added): dkim=pass
+    for header.d=domain."""
+    all_ar = msg.get_all("Authentication-Results") or []
+    mine = [a for a in all_ar if a.split(";", 1)[0].strip().lower().endswith("remote.test")]
+    assert mine, f"no Authentication-Results by the remote (authserv-ids {[a.split(';', 1)[0].strip() for a in all_ar]})"
+    ar = " ".join(mine)
     passes = [p for p in re.findall(r"dkim=pass[^;]*", ar) if f"header.d={domain}" in p]
     assert passes, f"no dkim=pass for {domain}: {ar[:600]}"
-    return passes[0]
+    return mine[0].split(";", 1)[0].strip() + ": " + passes[0]
 
 
 def no_message_from(user: str, seen: set[int], sender: str, seconds: float) -> None:
@@ -527,8 +532,9 @@ def email_change_disables() -> None:
     set_lldap_email("alice", "alice2@remote.test")
     # The Hub sees the LLDAP change, drops the verification and the
     # periodic membership run (10 min) delivers her absence.
-    m.until("alice's session token answers 401", lambda: session_status(s) == 401, 660, every=10)
+    m.until("alice's session token answers 401", lambda: session_status(s) == 401, 600, every=10)
     latency("LLDAP email change → 401", t0)
+    assert time.time() - t0 <= 600, f"disabled after {time.time() - t0:.0f} s (want ≤ 10 min)"
     assert account("alice@remote.test").split(":")[1] == "1", f"alice's account: {account('alice@remote.test')}"
     lst = allowlist()
     assert "alice@remote.test" not in lst and "alice2@remote.test" not in lst, f"listed: {lst}"
