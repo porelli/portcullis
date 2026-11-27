@@ -163,11 +163,16 @@ type Snapshot struct {
 	TakenAt   string          `json:"taken_at"`
 	Nodes     []SnapNode      `json:"nodes"`
 	Enrolling []SnapEnrolling `json:"enrolling"`
-	Pods      []SnapPod       `json:"pods"`
-	Quorum    Quorum          `json:"quorum"`
-	Postgres  Postgres        `json:"postgres"`
-	Volumes   []Volume        `json:"volumes"`
-	Errors    []string        `json:"errors"`
+	// ReservedMeshIPs: the mesh addresses of removed nodes whose records
+	// nodeadm still holds (until the admission params let them go,
+	// dropRemoved), sorted: code issue refuses them, so the Hub's allocator
+	// skips them.
+	ReservedMeshIPs []string  `json:"reserved_mesh_ips"`
+	Pods            []SnapPod `json:"pods"`
+	Quorum          Quorum    `json:"quorum"`
+	Postgres        Postgres  `json:"postgres"`
+	Volumes         []Volume  `json:"volumes"`
+	Errors          []string  `json:"errors"`
 	// pressure: node → condition (pressureConditions) → True; metrics only.
 	pressure map[string]map[string]bool
 }

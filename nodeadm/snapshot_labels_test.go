@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -70,5 +71,43 @@ func TestSnapshotKeepsLabelsPodsSelectOn(t *testing.T) {
 	}
 	if labels["kubernetes.io/hostname"] == "" {
 		t.Errorf("keepLabel's kubernetes.io/hostname dropped: %v", labels)
+	}
+}
+
+// TestSnapshotReservedMeshIPs (Task 33 part B, VM run 6): a cooperatively
+// removed node's record keeps its mesh address until the admission params
+// let it go (dropRemoved), and code issue refuses that address meanwhile
+// ("mesh ip … is used by …"), so the snapshot names it: the Hub's
+// allocator skips it instead of offering it to the next node (seen: node
+// add right after node remove got the removed node's address and a 409).
+// Its LAN-reported address wins over the record's when set, as in
+// dropRemoved; a live or enrolling node's address isn't listed here.
+func TestSnapshotReservedMeshIPs(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["gone"] = &nodeRecord{Role: "agent", Removed: true, MeshIP: "10.215.0.4"}
+		st.Nodes["gone2"] = &nodeRecord{Role: "agent", Removed: true, MeshIP: "10.215.0.7", Addrs: &NodeAddresses{Mesh: "10.215.0.8"}}
+		st.Nodes["new"] = &nodeRecord{Role: "agent", MeshIP: "10.215.0.9"}
+	})
+	snap, err := h.s.takeSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"10.215.0.4", "10.215.0.8"}; !reflect.DeepEqual(snap.ReservedMeshIPs, want) {
+		t.Fatalf("reserved_mesh_ips %v, want %v", snap.ReservedMeshIPs, want)
+	}
+	for _, e := range snap.Enrolling {
+		if e.ID == "gone" || e.ID == "gone2" {
+			t.Fatalf("a removed record listed as enrolling: %+v", e)
+		}
+	}
+	h.putState(t, func(st *nodeadmState) { delete(st.Nodes, "gone"); delete(st.Nodes, "gone2") })
+	snap, err = h.s.takeSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.ReservedMeshIPs == nil || len(snap.ReservedMeshIPs) != 0 {
+		t.Fatalf("reserved_mesh_ips %#v after the drop, want []", snap.ReservedMeshIPs)
 	}
 }

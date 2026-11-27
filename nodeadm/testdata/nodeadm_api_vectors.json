@@ -455,6 +455,7 @@
        "etcd_member": true
       }
      ],
+     "reserved_mesh_ips": [],
      "enrolling": [
       {
        "id": "n4",
@@ -648,6 +649,7 @@
        "etcd_member": true
       }
      ],
+     "reserved_mesh_ips": [],
      "enrolling": [
       {
        "id": "n4",
@@ -841,6 +843,7 @@
        "etcd_member": true
       }
      ],
+     "reserved_mesh_ips": [],
      "enrolling": [
       {
        "id": "n4",

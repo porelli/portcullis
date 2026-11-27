@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -102,7 +103,7 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 
 func (s *Server) takeSnapshot(ctx context.Context) (*Snapshot, error) {
 	now := s.now()
-	snap := &Snapshot{V: 1, TakenAt: rfc3339(now), Nodes: []SnapNode{}, Enrolling: []SnapEnrolling{}, Pods: []SnapPod{},
+	snap := &Snapshot{V: 1, TakenAt: rfc3339(now), Nodes: []SnapNode{}, Enrolling: []SnapEnrolling{}, ReservedMeshIPs: []string{}, Pods: []SnapPod{},
 		Volumes: []Volume{}, Errors: []string{}, pressure: map[string]map[string]bool{}}
 	cl, err := s.clusterNodes(ctx)
 	if err != nil {
@@ -193,12 +194,25 @@ func (s *Server) takeSnapshot(ctx context.Context) (*Snapshot, error) {
 		if rec.JoinState == joinWaitAdmission && rec.WaitingSince != nil && now.Sub(*rec.WaitingSince) > 5*time.Minute {
 			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s has waited for the admission params for more than 5 min (is portcullis-kube-params.timer running on the install host?)", id))
 		}
-		if names[id] || rec.Removed {
+		if rec.Removed {
+			// Its mesh address stays taken until the record goes
+			// (dropRemoved's address: the reported one when set).
+			mesh := rec.MeshIP
+			if rec.Addrs != nil && rec.Addrs.Mesh != "" {
+				mesh = rec.Addrs.Mesh
+			}
+			if mesh != "" && !slices.Contains(snap.ReservedMeshIPs, mesh) {
+				snap.ReservedMeshIPs = append(snap.ReservedMeshIPs, mesh)
+			}
+			continue
+		}
+		if names[id] {
 			continue
 		}
 		snap.Enrolling = append(snap.Enrolling, SnapEnrolling{ID: id, Role: rec.Role, Class: rec.Class, Site: rec.Site,
 			MeshIP: rec.MeshIP, Mesh: rec.Mesh, EnrolledAt: rfc3339(rec.EnrolledAt)})
 	}
+	sort.Strings(snap.ReservedMeshIPs)
 	mins := s.setMinimums(ctx, pods.Items)
 	for i := range pods.Items {
 		p := &pods.Items[i]

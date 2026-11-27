@@ -198,7 +198,8 @@ type snapshotBody struct {
 		} `json:"mesh"`
 		EnrolledAt string `json:"enrolled_at"`
 	} `json:"enrolling"`
-	Pods []struct {
+	ReservedMeshIPs []string `json:"reserved_mesh_ips"`
+	Pods            []struct {
 		Name             string    `json:"name"`
 		Namespace        string    `json:"namespace"`
 		Node             string    `json:"node"`
