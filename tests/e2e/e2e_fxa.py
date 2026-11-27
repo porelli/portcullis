@@ -41,12 +41,17 @@ Scenarios (in this order):
   leave_disables_via_hub       alice removed through the Hub: within 180 s
                                her session token answers 401
   rejoin_enables_via_hub       alice added again: within 180 s she signs in
+  email_changed_in_fxa_before_block  alice's primary email changed behind
+                               fxa-gate's back (stand-in: root updates her
+                               fxa.emails row; fxa.accounts keeps the
+                               sign-up email): the settings Retry runs the
+                               hook, whose sweep (ffs.disable_accounts_not_
+                               allowed) disables her (401) while she stays
+                               listed; put back, enabled again, signed in
   email_change_disables        alice's email changed in LLDAP: within 10 min
                                (the periodic run) her account is
                                disabled and neither address is listed; the
                                new one shows as unverified
-  email_changed_in_fxa_before_block  SKIPPED until porelli/firefox-sync
-                               publishes ffs.disable_accounts_not_allowed
   admin_disable_survives_routine_run  bob admin-verified and signed up; the
                                admin UI (root: Portcullis sign-in, its OIDC
                                sign-in) disables him; the settings Retry
@@ -108,9 +113,6 @@ HUB_SENDER = f"portcullis-hub-mail@{DOMAIN}"
 APP_SENDER = f"portcullis-app-{INST}@{DOMAIN}"
 REMOTE_IP = m.REMOTE_IP
 MAILBOXES = ("alice", "bob", "carol", "alice2")
-SWEEP_SKIP = ("waits for porelli/firefox-sync's ffs.disable_accounts_not_allowed(p_max) (an image with it isn't "
-              "published yet): an account whose email was changed inside FxA before the gate refused it is "
-              "disabled by the sweep only")
 
 state: dict = m.state  # e2e_mail's helpers (hub_ip, lldap token) read the same dict
 needs = m.needs
@@ -506,22 +508,39 @@ def rejoin_enables_via_hub() -> None:
     m.until("alice's account enabled and listed again",
             lambda: account("alice@remote.test") == "1:0:1" and "alice@remote.test" in allowlist(), 180, every=3)
 
+    s = alice_signs_in(max(30, 180 - (time.time() - t0)))
+    latency("rejoin → signed in", t0)
+    assert time.time() - t0 <= 180, f"signed in after {time.time() - t0:.0f} s (want ≤ 180)"
+    state["fxa_alice"] = s
+    state["alice_back"] = True
+
+
+def alice_signs_in(seconds: float):
+    """alice signs in (within seconds) and confirms the new session with the
+    sign-in code, if one came: the live session."""
     def sign_in():
         seen = inbox_uids("alice")
         s = fxa().login("alice@remote.test", state["fxapw_alice"])
         assert session_status(s) == 200, "the new session isn't live"
         return s, seen
-    s, seen = m.until("alice signs in", sign_in, max(30, 180 - (time.time() - t0)), every=15)
-    latency("rejoin → signed in", t0)
-    assert time.time() - t0 <= 180, f"signed in after {time.time() - t0:.0f} s (want ≤ 180)"
+    s, seen = m.until("alice signs in", sign_in, seconds, every=15)
     if not s.verified:
         # A new session of a verified account: the sign-in code, if one came.
         for msg in new_messages("alice", seen):
             if from_addr(msg) == APP_SENDER and any(msg.get(h) for h in ("X-Signin-Verify-Code", "X-Signin-Verify-Short-Code")):
                 verify_session(s, msg)
                 break
-    state["fxa_alice"] = s
-    state["alice_back"] = True
+    return s
+
+
+def retry_hook() -> None:
+    """The instance's settings Retry (POST /api/instances/<id>/settings/retry):
+    it runs the access-sync hook, which must succeed."""
+    rep = m.hub_ok("POST", f"/api/instances/{INST}/settings/retry", {}, timeout=300)
+    units = {u.get("unit"): u for u in (rep.get("units") or [])}
+    hook = units.get("hook:access-sync") or {}
+    assert hook.get("ok") is True and not hook.get("skipped"), f"the retry's access-sync hook: {json.dumps(hook)[:400]} (units {sorted(units)})"
+    print("    retry: " + ", ".join(f"{k} ok={v.get('ok')}" for k, v in sorted(units.items())), flush=True)
 
 
 def email_change_disables() -> None:
@@ -542,8 +561,46 @@ def email_change_disables() -> None:
     assert directory_user("alice").get("email_verified") is False, "alice's new email is verified"
 
 
+def primary_email(uid: str) -> str:
+    return sql(f"SELECT COALESCE(GROUP_CONCAT(normalizedEmail), '') FROM fxa.emails WHERE uid = UNHEX('{uid}') AND isPrimary = 1;")
+
+
+def set_primary_email(uid: str, addr: str) -> None:
+    assert re.fullmatch(r"[a-z0-9.]+@[a-z0-9.]+", addr), addr
+    got = sql(f"UPDATE fxa.emails SET email = '{addr}', normalizedEmail = '{addr}' WHERE uid = UNHEX('{uid}') AND isPrimary = 1; "
+              "SELECT ROW_COUNT();")
+    assert got == "1", f"the primary email row of alice: {got!r} rows changed"
+    assert primary_email(uid) == addr, f"alice's primary email is {primary_email(uid)!r}"
+
+
 def email_changed_in_fxa_before_block() -> None:
-    raise Skipped(SWEEP_SKIP)
+    """An account email changed inside FxA before fxa-gate refused those
+    routes (or by another path): the procedures by email still find the
+    account by its sign-up email (fxa.accounts), so only the sweep
+    (porelli/firefox-sync's ffs.disable_accounts_not_allowed, by the current
+    primary email) catches it, on the hook's next run."""
+    needs("alice_back")
+    s = state["fxa_alice"]
+    uid = s.uid
+    assert re.fullmatch(r"[0-9a-f]{32}", uid or ""), "alice's session has no uid"
+    assert session_status(s) == 200, "alice's session isn't live before the change"
+    assert account("alice@remote.test") == "1:0:1" and "alice@remote.test" in allowlist(), \
+        f"alice before: {account('alice@remote.test')}, listed {'alice@remote.test' in allowlist()}"
+    # The stand-in: the primary email changed behind the gate, as root.
+    set_primary_email(uid, "alice.fxa@remote.test")
+    t0 = time.time()
+    retry_hook()
+    m.until("alice's session token answers 401 (the sweep)", lambda: session_status(s) == 401, 60, every=3)
+    latency("primary changed → swept (401)", t0)
+    assert account("alice@remote.test") == "1:1:1", f"alice's account after the sweep: {account('alice@remote.test')}"
+    assert "alice@remote.test" in allowlist(), "alice (still a member) was taken off the sign-up list"
+    # Put back: her primary email listed again, enabled (the admin UI's
+    # Enable asks the same rule), and the next run's sweep keeps her.
+    set_primary_email(uid, "alice@remote.test")
+    sql(f"CALL ffs.enable_account(UNHEX('{uid}'));")
+    retry_hook()
+    assert account("alice@remote.test") == "1:0:1", f"alice's account after the next run: {account('alice@remote.test')}"
+    state["fxa_alice"] = alice_signs_in(180)
 
 
 def admin_ui_overview(page) -> None:
@@ -601,11 +658,7 @@ def admin_disable_survives_routine_run(browser) -> None:
     admin_disable(browser, s.uid)
     m.until("bob's session token answers 401 after the admin UI's disable", lambda: session_status(s) == 401, 60, every=3)
     assert account("bob@remote.test") == "1:1:1", f"bob's account: {account('bob@remote.test')}"
-    rep = m.hub_ok("POST", f"/api/instances/{INST}/settings/retry", {}, timeout=300)
-    units = {u.get("unit"): u for u in (rep.get("units") or [])}
-    hook = units.get("hook:access-sync") or {}
-    assert hook.get("ok") is True and not hook.get("skipped"), f"the retry's access-sync hook: {json.dumps(hook)[:400]} (units {sorted(units)})"
-    print("    retry: " + ", ".join(f"{k} ok={v.get('ok')}" for k, v in sorted(units.items())), flush=True)
+    retry_hook()
     assert "bob@remote.test" in allowlist(), "the retry took bob off the list"
     assert account("bob@remote.test") == "1:1:1", f"after the retry bob's account: {account('bob@remote.test')}"
     assert session_status(s) == 401, "bob's session is live again after the retry"
@@ -619,8 +672,8 @@ HOST_REASONS = {
     f"{INST}-profile": "Firefox loads account profiles and avatars in the background, without cookies.",
     f"{INST}-pairing": "An encrypted relay for pairing a phone by QR code; it can't read what it relays.",
 }
-ACCOUNTS_REASON = ("Firefox reads the accounts configuration and opens the start and change-password pages without "
-                   "cookies; everything else on this host is behind sign-in.")
+ACCOUNTS_REASON = ("Firefox reads the accounts configuration and a flow id (/metrics-flow) and opens the start and "
+                   "change-password pages without cookies; everything else on this host is behind sign-in.")
 ACCOUNTS_PATHS = {f"{INST}-accounts-root": "/", f"{INST}-accounts-change-password": "/.well-known/change-password",
                   f"{INST}-accounts-config": "/.well-known/fxa-client-configuration", f"{INST}-accounts-metrics": "/metrics-flow"}
 PATH_ROUTERS = {f"{INST}-signup": (f"{INST}-api", "/v1/account/create", "exact"), f"{INST}-token": (INST, "/1.0/", "prefix")}
@@ -733,8 +786,8 @@ def main() -> int:
             check("nonmember_refused", nonmember_refused)
             check("leave_disables_via_hub", leave_disables_via_hub)
             check("rejoin_enables_via_hub", rejoin_enables_via_hub)
-            check("email_change_disables", email_change_disables)
             check("email_changed_in_fxa_before_block", email_changed_in_fxa_before_block)
+            check("email_change_disables", email_change_disables)
             check("admin_disable_survives_routine_run", lambda: admin_disable_survives_routine_run(browser))
             check("bypass_badges", bypass_badges)
             check("mail_unwired_refuses", mail_unwired_refuses)
