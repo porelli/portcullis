@@ -280,11 +280,14 @@ fixtures() {
     test -s ~/e2e-ha/pebble-root.crt"
   vm vm1 'cat ~/e2e-ha/pebble-root.crt' > "$D/pebble-root.crt"
   openssl x509 -noout -in "$D/pebble-root.crt" || fail "Pebble's root didn't come"
-  # Pebble's issuing root on the main hosts' trust (the CA bundle the CLI
-  # builds for forward-auth from the host's store: the served certificate
-  # is Pebble's after ha enable's step 9).
+  # Pebble's issuing root on every host's trust: the CA bundle the CLI
+  # builds for forward-auth from the host's store, and every join's `curl
+  # https://<domain>/node/join.sh` (the served certificate is Pebble's after
+  # ha enable's step 9; production's is a public CA's). VM run 9: only the
+  # main hosts had it, so vm4's (edge) rejoin after its removal failed
+  # "unable to get local issuer certificate"; its first join had come
+  # before step 9, under core's certificate.
   for h in $(vms); do
-    [ "$(field "$h" site)" = main ] || continue
     vm "$h" 'sudo install -m 0644 /dev/stdin /usr/local/share/ca-certificates/e2e-ha-pebble-root.crt && sudo update-ca-certificates >/dev/null 2>&1' < "$D/pebble-root.crt"
   done
   echo "PASS: Pebble (validity $PEBBLE_VALIDITY s) and the S3 server on vm1"
