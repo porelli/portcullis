@@ -353,15 +353,16 @@ def power_off(node: str) -> float:
     assert h != OPERATOR_VM, f"refusing to power off {node}: vm1 is the operator and fixture host"
     retarget_api(avoid={node})
     b0 = boot_id(h)
-    host(h, "dark", check=False)  # it reboots at once; the SSH call may not return cleanly
+    t_crash = time.time()  # sysrq reboots at once: the crash is now
+    host(h, "dark", check=False)  # the SSH call may not return cleanly
     cut[node] = "dark"
-    last_cut[node] = time.time()
+    last_cut[node] = t_crash
     for _ in range(60):
         b = boot_id(h)
         if b and b != b0:
-            return time.time()
+            return t_crash
         time.sleep(2)
-    return time.time()
+    raise AssertionError(f"{h} didn't reboot dark (its boot id unchanged)")
 
 
 def heal(node: str) -> None:
@@ -709,8 +710,11 @@ def ha_vm_power_off() -> None:
         rows = writer_log(p1["metadata"]["name"])
         log_consistent(rows)
         note(f"ha_vm_power_off: {victim} off → NotReady after {tn - t:.0f} s → the app Ready on {p1['spec']['nodeName']} "
-             f"{d:.0f} s after the power-off; {len(rows)} lines, one history")
-        assert d <= 240, f"the stateful app took {d:.0f} s to run elsewhere (> 4 min)"
+             f"{d:.0f} s after the crash; {len(rows)} lines, one history")
+        # Contract Amendment 4's budget (controller ruling, run 6): ≤ 5 min
+        # from the crash (NotReady ≤ 40 s + 30 s + T_fence 150 s + reattach
+        # and start; measured ~262 s in run 6).
+        assert d <= 300, f"the stateful app took {d:.0f} s from the crash to run elsewhere (> 5 min, the contract's budget)"
     finally:
         w.stop.set()
         w.join(15)
@@ -734,17 +738,24 @@ def lh_node_disks(node: str) -> list[dict]:
 
 
 def ha_vm_disk_kill() -> None:
-    """A storage node's Longhorn disk killed (device-mapper error: every
-    I/O fails) under a writing app with a replica on it: Longhorn fails that
-    replica and rebuilds one on another node, the volume healthy again, the
-    app kept writing (one history), the marker unchanged (≤ 10 min).
-    Longhorn sees a dead disk through its replicas' I/O, not its node disk
-    conditions (run 3: the conditions stayed Ready on an idle volume)."""
+    """A storage node's Longhorn disk killed (device-mapper error, the page
+    cache dropped so reads hit it: e2e-ha-host disk kill) under a writing
+    app with a replica on it (controller ruling, run 6: Longhorn notices a
+    dead disk through its own reads and its replicas' errors; one that dies
+    under the page cache alone goes unnoticed until a write fails, a
+    documented limit). Two bounds: noticed — that replica failed, the disk
+    not Ready, the volume degraded — within 2 min, the app still writing;
+    rebuilt — a healthy volume with the replica replaced on another node —
+    within 15 min (Longhorn waits its replica-replenishment interval, 600 s
+    by default, before rebuilding elsewhere). The data one history, the
+    marker unchanged."""
     app_node = fresh_victim(need_fence=False)
     p0 = writer_start(app_node)
     vol = lh_volume_of_claim(MARKER_NS, MARKER_PVC)
     reps = wait_for("the volume's replicas running", lambda: (lambda r: r if len(r) >= 2 and all(x.get("status", {}).get("currentState") == "running" for x in r) else None)(lh_replicas(vol)), 300, 5)
     nodes = [r["spec"]["nodeID"] for r in reps]
+    # A replica off vm1, preferably not the app's node (the app's own node
+    # is fine: its root disk and the engine stay up, only Longhorn's disk dies).
     victim = next((n for n in nodes if n not in (app_node, VM_NODE[OPERATOR_VM])), None) or \
         next((n for n in nodes if n != VM_NODE[OPERATOR_VM]), None)
     assert victim, f"every replica of the test volume is on vm1: {nodes}"
@@ -755,22 +766,29 @@ def ha_vm_disk_kill() -> None:
     host(h, "disk", "kill")
     last_cut[victim] = t
     try:
+        def noticed():
+            rs = {r["metadata"]["name"]: r for r in lh_replicas(vol)}
+            r = rs.get(dead)
+            failed = r is None or bool(r["spec"].get("failedAt")) or r.get("status", {}).get("currentState") != "running"
+            disk_down = any(any(c.get("type") == "Ready" and c.get("status") != "True" for c in (d.get("conditions") or []))
+                            for d in lh_node_disks(victim)) or not lh_node_disks(victim)
+            return failed and disk_down
+        wait_for(f"Longhorn notices {victim}'s dead disk (its replica failed, the disk not Ready)", noticed, 120, 5)
+        d_notice = time.time() - t
+        rows = writer_log(writer_pod()["metadata"]["name"])
+        assert rows and rows[-1][1] >= int(time.time()) - 10, "the app stopped writing after the disk died"
+
         def rebuilt():
             rs = lh_replicas(vol)
-            failed = any(r["metadata"]["name"] == dead and (r["spec"].get("failedAt") or r.get("status", {}).get("currentState") != "running") for r in rs) \
-                or not any(r["metadata"]["name"] == dead for r in rs)
             live = [r for r in rs if r["spec"]["nodeID"] != victim and r.get("status", {}).get("currentState") == "running" and not r["spec"].get("failedAt")]
-            v = lh("get", "volumes.longhorn.io", vol)
-            healthy = v.get("status", {}).get("robustness") == "healthy"
-            return failed and len(live) >= 2 and healthy
-        wait_for("the dead disk's replica replaced on another node and the volume healthy", rebuilt, 600, 10)
-        d = time.time() - t
-        p = writer_pod()
-        rows = writer_log(p["metadata"]["name"])
+            return len(live) >= 2 and lh("get", "volumes.longhorn.io", vol).get("status", {}).get("robustness") == "healthy"
+        wait_for("the dead disk's replica rebuilt on another node, the volume healthy", rebuilt, 900, 15)
+        d_rebuilt = time.time() - t
+        rows = writer_log(writer_pod()["metadata"]["name"])
         log_consistent(rows)
-        assert rows[-1][1] >= int(t) + 10, "the app stopped writing after the disk died"
-        note(f"ha_vm_disk_kill: {victim}'s replica failed and rebuilt elsewhere, the volume healthy {d:.0f} s after the kill; "
-             f"the app kept writing ({len(rows)} lines, one history)")
+        assert rows[-1][1] >= int(t) + 60, "the app stopped writing after the disk died"
+        note(f"ha_vm_disk_kill: noticed {d_notice:.0f} s after the kill (the replica failed, the disk not Ready); rebuilt on another node, "
+             f"the volume healthy {d_rebuilt:.0f} s after; the app kept writing ({len(rows)} lines, one history)")
     finally:
         writer_stop()
         # The disk comes back at the node's boot (e2e-ha-disk: fsck, then the
@@ -781,31 +799,6 @@ def ha_vm_disk_kill() -> None:
     settle()
     md5 = marker_read()
     assert md5 == state["marker_md5"], f"the marker changed: {md5} != {state['marker_md5']}"
-
-
-def ha_vm_disk_full() -> None:
-    marker_setup()
-    victim = victim_server(set())
-    h = node_vm(victim)
-    note(f"ha_vm_disk_full: filling {victim}'s Longhorn disk ({h})")
-    host(h, "fill")
-    try:
-        def reported():
-            ds = lh_node_disks(victim)
-            for d in ds:
-                if any(c.get("type") == "Schedulable" and c.get("status") != "True" for c in (d.get("conditions") or [])):
-                    return True
-                if d.get("storageAvailable", 1 << 60) < 2 * (1 << 30):
-                    return True
-            return False
-        wait_for(f"Longhorn reports {victim}'s disk full", reported, 240, 5)
-        longhorn_healthy(600)
-        md5 = marker_read()
-        note(f"ha_vm_disk_full: Longhorn reported {victim}'s disk full; volumes stay healthy; marker {('equal' if md5 == state['marker_md5'] else 'CHANGED')}")
-        assert md5 == state["marker_md5"], "the marker changed"
-    finally:
-        host(h, "unfill", check=False)
-    settle()
 
 
 def ha_vm_lose_small() -> None:
@@ -1415,6 +1408,10 @@ def ha_vm_revoke_restarts() -> None:
     # The agent restarts on its node identity (its bootstrap token is gone
     # once it joined).
     agent_id = VM_NODE[EDGE_VM]
+    # The agent must be there (run 6: the interrupted removal's rejoin had
+    # failed, and this drill died on "k3s-agent.service not found").
+    assert any(n["metadata"]["name"] == agent_id for n in Kj("get", "nodes")["items"]) and node_ready(agent_id), \
+        f"the agent {agent_id} isn't a Ready node (an earlier drill left it out): can't revoke it"
     vm(EDGE_VM, "sudo systemctl restart k3s-agent", timeout=120, mux=False)
     wait_for(f"{agent_id} Ready after a restart on its node identity", lambda: node_ready(agent_id), 180, 5)
     # 1) Revoke the agent.

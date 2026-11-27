@@ -9,7 +9,8 @@
 #   disk up|kill|state  the test disk: a sparse file → loop → device-mapper
 #                       e2e-lh (linear) → ext4 at /var/lib/longhorn (Longhorn's
 #                       default disk). kill: the table swapped for `error`
-#                       (every I/O fails, as a dead disk); a boot sets it up
+#                       (every I/O fails, as a dead disk; the caches dropped so
+#                       reads hit it); a boot sets it up
 #                       again (fsck first)
 #   fill | unfill       the test disk filled (fallocate up to 1 MiB free) / freed
 #   net set <spec>...   network faults in the raw table's own chain E2EHA
@@ -125,6 +126,13 @@ disk_kill() {
   dmsetup suspend --noflush "$DM"
   dmsetup load "$DM" --table "0 $n error"
   dmsetup resume "$DM"
+  # The caches dropped: reads go to the dead device. Longhorn's disk
+  # monitor reads its disk config file, which the page cache kept
+  # answering (VM runs 3 and 6: the disk stayed Ready for 10 min while
+  # buffered writes were lost); with the caches gone it fails within
+  # seconds, and Longhorn fails the disk's replicas.
+  sync 2>/dev/null || true
+  echo 3 > /proc/sys/vm/drop_caches
 }
 
 disk_state() {
