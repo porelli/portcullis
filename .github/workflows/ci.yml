@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail e2e-servers e2e-servers-podman"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail e2e-fxa e2e-servers e2e-servers-podman"
         type: string
         default: all
       # `-f scenarios="4 members_only_list"`: only those scenarios of the e2e
@@ -4322,6 +4322,278 @@ jobs:
           docker volume rm e2e-remote-data 2>/dev/null || true
           docker compose down -v
           sudo rm -rf /tmp/e2e-remote /tmp/e2e-mail-state.json
+
+  # Firefox Sync + own accounts end to end (plan 2026-11-24, Task 18): e2e-mail's
+  # stack (the Hub from the same-named Hub branch, the stalwart template
+  # wired for ci.example.org, Pebble, the shared fake zone, the remote
+  # Stalwart remote.test where every person's mailbox is) plus the
+  # templates repo's firefox-sync-fxa (same-named templates branch) as a
+  # local source, enabled through the Hub with mail through the provider.
+  # Containers resolve *.<d> to the runner (.github/ci/e2e-fxa-dns.sh, CoreDNS
+  # as Docker's DNS: fxa-auth and the Hub submit to mail.<d>:587 as on a server) and trust
+  # Pebble's root through certs/ca-bundle.crt (.github/ci/e2e-fxa-trust.sh).
+  # tests/e2e/e2e_fxa.py (PyFxA from tests/e2e/requirements-fxa.txt,
+  # hashed; Playwright for the admin UI): the Hub's email code, the
+  # unverified member, the sign-up code through the provider (dkim=pass at
+  # the remote), the non-member, leave / rejoin / an LLDAP email change
+  # through the Hub, the admin UI's disable kept by the settings Retry, the
+  # bypass badges, and the provider unwired. 16 GB hosted runner (the
+  # template asks for 4 GB; about 5 GB of accounts image).
+  e2e-fxa:
+    needs: jobs-input
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-fxa,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-fxa ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-fxa,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-fxa ')
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 150
+    env:
+      E2E_DOMAIN: ci.example.org
+      # As e2e-mail: the shell's values win over .env.
+      PORTCULLIS_DOMAIN: ci.example.org
+      PORTCULLIS_PUBLIC_IPV4: 172.30.88.2
+      PORTCULLIS_PUBLIC_IPV6: ""
+      E2E_EXTRA: team-b.test
+      E2E_ARTIFACTS: e2e-artifacts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free disk space (preinstalled toolchains this job doesn't use; the accounts image is about 5 GB)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/.ghcup "${AGENT_TOOLSDIRECTORY:-/nonexistent}"
+          df -h /
+
+      - name: Containers resolve the e2e hostnames to the runner (CoreDNS as Docker's DNS)
+        timeout-minutes: 5
+        run: bash .github/ci/e2e-fxa-dns.sh
+
+      - name: Generate .env and the CI override (Pebble, the shared fake zone, pinned egress networks)
+        run: |
+          ./portcullis init --env-only --runtime docker --non-interactive --domain "$E2E_DOMAIN" \
+            --email "ci@$E2E_DOMAIN" --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          # The CI-only fake provider for the main domain (records into the
+          # shared zone), mail-cert against Pebble, the public address =
+          # stalwart's pinned address on the template's egress network
+          # (the CI checkout pins it: SPF / the remote's MX target).
+          # (init wrote DNS_PROVIDER=none: the first line of a key wins.)
+          sed -i '/^DNS_PROVIDER=/d' .env
+          cat >> .env <<'ENV'
+          DNS_PROVIDER=fake
+          FAKE_API_TOKEN=ci-fake-token-0123456789
+          PORTCULLIS_TESTPROVIDER=1
+          MAIL_ACME_CA_SERVER=https://pebble:14000/dir
+          MAIL_CAA_ISSUER=pebble.test
+          PORTCULLIS_PUBLIC_IPV4=172.30.88.2
+          ENV
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - ./tests/e2e/fixtures/virtual-authenticators.json:/run/portcullis/signin/extra-authenticators.json:ro
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            domains:
+              build:
+                args:
+                  GO_TAGS: testprovider
+              environment:
+                ACME_CA_SERVER: https://pebble:14000/dir
+                LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
+                DNS_CAA_ISSUER: pebble.test
+                # The fake zone's provider API for the one-shots below.
+                DOMAINS_FAKEDNS_API_ADDR: ":8054"
+              volumes:
+                - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+              # The fake zone for the mail template's resolver (its egress
+              # network reaches the runner, never domains-egress).
+              ports:
+                - "8053:8053/udp"
+                - "8053:8053/tcp"
+              networks:
+                domains-egress:
+                  ipv4_address: 172.30.87.53
+            pebble:
+              image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+              command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "172.30.87.53:8053"]
+              environment:
+                PEBBLE_VA_NOSLEEP: "1"
+                PEBBLE_WFE_NONCEREJECT: "0"
+              networks: [domains-egress]
+            dns-tool:
+              environment:
+                DOMAINS_RESOLVERS: 172.30.87.53:8053
+                DOMAINS_FAKEDNS_REMOTE: http://172.30.87.53:8054
+            mail-cert:
+              environment:
+                LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
+                DOMAINS_RESOLVERS: 172.30.87.53:8053
+                DOMAINS_FAKEDNS_REMOTE: http://172.30.87.53:8054
+              volumes:
+                - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+          networks:
+            domains-egress:
+              ipam:
+                config:
+                  - subnet: 172.30.87.0/24
+          YML
+          docker compose config -q
+          docker compose config --format json | jq -e '.services.domains.networks["domains-egress"].ipv4_address == "172.30.87.53"' >/dev/null \
+            || { echo "FAIL: the egress pin isn't applied"; exit 1; }
+
+      - name: List the images this job runs (e2e-mail's and firefox-sync-fxa's; the templates checkout)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: bash .github/ci/e2e-fxa-images.sh "$RUNNER_TEMP/images.txt"
+      - name: Load images (cached, verified)
+        timeout-minutes: 25
+        uses: ./.github/actions/cached-images
+        with:
+          images: ${{ runner.temp }}/images.txt
+          name: e2e-fxa
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: enroll
+          tags: portcullis-enroll
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=enroll
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ""
+      - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          build-args: GO_TAGS=testprovider
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
+          cache-to: ""
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+
+      - name: Build the mail adapter and mail-fake (P2; the CI-only provider)
+        timeout-minutes: 15
+        run: |
+          docker build -q -t portcullis-mailctl:ci mailctl >/dev/null
+          docker build -q -t portcullis-mail-fake:ci tests/e2e/mail-fake >/dev/null
+      - name: Start the whole stack, team-b.test, mail on (the stalwart template wired), firefox-sync-fxa in the Hub's source
+        timeout-minutes: 25
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+          MAIL_CI_EXTRA_TEMPLATES: firefox-sync-fxa
+        run: |
+          d="$E2E_DOMAIN"
+          export E2E_HOSTS_IP="$RUNNER_IP"
+          export E2E_HOSTS_EXTRA="firefox-sync-fxa.$d firefox-sync-fxa-accounts.$d firefox-sync-fxa-api.$d firefox-sync-fxa-profile.$d firefox-sync-fxa-admin.$d firefox-sync-fxa-pairing.$d"
+          bash .github/ci/e2e-mail-start-stack.sh
+
+      - name: The remote mail server (remote.test)
+        timeout-minutes: 10
+        run: bash .github/ci/e2e-mail-remote.sh
+
+      - name: Mail's certificate trusted like a public one (Pebble's root, certs/ca-bundle.crt)
+        timeout-minutes: 5
+        run: bash .github/ci/e2e-fxa-trust.sh
+
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
+      - name: Restore the pip / Playwright browser cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+
+      - name: Install Playwright (pinned), PyFxA (hashed) and trust core's CA
+        timeout-minutes: 10
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          /tmp/e2e-venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r tests/e2e/requirements-fxa.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+
+      - name: Run the Firefox Sync + own accounts scenarios
+        timeout-minutes: 75
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET
+          REQUESTS_CA_BUNDLE="$PWD/certs/ca-chain.crt" NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_fxa.py
+
+      - name: Collect logs
+        if: failure()
+        run: bash .github/ci/e2e-fxa-logs.sh e2e-artifacts
+
+      - name: Upload screenshots and logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-fxa-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f e2e-remote e2e-fxa-dns 2>/dev/null || true
+          docker volume rm e2e-remote-data 2>/dev/null || true
+          docker compose -p portcullis-firefox-sync-fxa down -v 2>/dev/null || true
+          docker compose down -v
+          sudo rm -rf /tmp/e2e-remote
 
   # AI support end to end (contract §15, plan 4 Task 30): the whole stack +
   # the Hub (same-named Hub branch) with one local template source = the

@@ -9,6 +9,12 @@
 # the dns tool and mail-cert through DOMAINS_FAKEDNS_REMOTE); the remote
 # mail server (e2e-mail-remote.sh) is a container on the template's egress
 # network (portcullis-stalwart_egress, pinned by the CI copy).
+#
+# Also e2e-fxa's (.github/ci/e2e-fxa-*.sh), with three knobs (defaults =
+# e2e-mail's): MAIL_CI_EXTRA_TEMPLATES (templates of the checkout added to
+# the Hub's source, space-separated), E2E_HOSTS_IP (the address the e2e
+# hostnames get in /etc/hosts; 127.0.0.1) and E2E_HOSTS_EXTRA (more
+# hostnames for that line).
 set -euo pipefail
 CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
 EXTRA=team-b.test
@@ -53,14 +59,22 @@ chmod 644 /tmp/pebble.minica.pem
 # checkout (stalwart: the adapter built here, the resolver on the fake DNS
 # through the runner's :8053, egress pinned at 172.30.88.0/24 with stalwart
 # at .2) plus the CI-only mail-fake, a local source (never pulled).
+EXTRA_TPL="${MAIL_CI_EXTRA_TEMPLATES:-}"
+[[ "$EXTRA_TPL" =~ ^[a-z0-9\ -]*$ ]] || fail "MAIL_CI_EXTRA_TEMPLATES: template ids only"
+HOSTS_IP="${E2E_HOSTS_IP:-127.0.0.1}"
+[[ "$HOSTS_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || fail "E2E_HOSTS_IP isn't an IPv4 address"
 MAIL_CI_DNS_PROBE="$EXTRA" MAIL_CI_EGRESS="172.30.88.0/24 172.30.88.128/25 172.30.88.2" \
   bash .github/ci/mail-templates-checkout.sh "$RUNNER_TEMP/templates" "$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')"
 docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+for t in $EXTRA_TPL; do [ -f "$RUNNER_TEMP/templates/$t/manifest.yaml" ] || TPL_MISSING="$t"; done
+[ -z "${TPL_MISSING:-}" ] || fail "MAIL_CI_EXTRA_TEMPLATES: $TPL_MISSING isn't in the templates checkout"
+# shellcheck disable=SC2016  # $0 is the container's: the extra templates
 docker run --rm --network none -v portcullis_hub_data:/data -v "$RUNNER_TEMP/templates:/tpl:ro" -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
   mkdir -p /data/repos/portcullis &&
   cp -r /tpl/stalwart /src/mail-fake /data/repos/portcullis/ &&
+  for t in $0; do cp -r "/tpl/$t" /data/repos/portcullis/ || exit 1; done &&
   printf "sources:\n  - name: portcullis\n    url: \"\"\n    path: /data/repos/portcullis\n" > /data/state.yaml &&
-  chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+  chown -R 10001:10001 /data && chmod 600 /data/state.yaml' "$EXTRA_TPL"
 ./portcullis vault init  # first: its stack_prepare gives LLDAP its key seed
 docker compose up -d postgres lldap
 ./portcullis pki setup --with-server-cert
@@ -86,7 +100,7 @@ for i in $(seq 1 40); do
 done
 # mail.<d> (no HTTPS router: Traefik's default TLS options) and the
 # read-only admin view, for e2e_mail's admin_view_end_to_end.
-echo "127.0.0.1 $E2E_DOMAIN auth.$E2E_DOMAIN enroll.$E2E_DOMAIN hub.$E2E_DOMAIN people.$E2E_DOMAIN mail.$E2E_DOMAIN mail-admin.$E2E_DOMAIN" | sudo tee -a /etc/hosts >/dev/null
+echo "$HOSTS_IP $E2E_DOMAIN auth.$E2E_DOMAIN enroll.$E2E_DOMAIN hub.$E2E_DOMAIN people.$E2E_DOMAIN mail.$E2E_DOMAIN mail-admin.$E2E_DOMAIN${E2E_HOSTS_EXTRA:+ $E2E_HOSTS_EXTRA}" | sudo tee -a /etc/hosts >/dev/null
 SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
 hub() { local m="$1" p="$2"; shift 2
         curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
