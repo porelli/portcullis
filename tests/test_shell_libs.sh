@@ -5838,7 +5838,8 @@ expect_eq "nothing else mounts LLDAP's seed" "$(grep -c '^ *- \./secrets/lldap' 
 
 # ── the CA bundle's Let's Encrypt staging roots (X1 RSA, X2 ECDSA), pinned by SHA-256 ──
 CAB="$WORK/cab"; mkdir -p "$CAB/root/certs" "$CAB/bin" "$CAB/src"
-cp "$HERE/fixtures/le-staging/letsencrypt-stg-root-x1.pem" "$HERE/fixtures/le-staging/letsencrypt-stg-root-x2.pem" "$CAB/src/"
+# The fixtures are .txt: .gitignore keeps every *.pem out of the repo.
+for x in x1 x2; do cp "$HERE/fixtures/le-staging/letsencrypt-stg-root-$x.txt" "$CAB/src/letsencrypt-stg-root-$x.pem"; done
 # curl stub: serves the fixture named by the URL's last path part ($CAB_BAD=x2 serves junk for X2).
 cat > "$CAB/bin/curl" <<'CURL'
 #!/usr/bin/env bash
