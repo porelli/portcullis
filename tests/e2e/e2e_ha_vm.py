@@ -74,6 +74,7 @@ E2E_ARTIFACTS. Secrets never reach argv or the log.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1389,8 +1390,22 @@ def no_agent_token_file(h: str) -> bool:
     return "agent-token-file" not in u and "agent-token" not in u
 
 
+def token_password(token: str) -> str:
+    """The basic-auth password of a k3s secure token K10<ca hash>::server:<pw>
+    (VM run 11: the whole token sent as the password answers 401 before and
+    after a rotation, so "old 401" passed for the wrong reason and "new 200"
+    never could). Anything else is refused, never guessed."""
+    head, sep, pw = token.strip().partition("::server:")
+    assert sep and head.startswith("K10") and pw, "the server token isn't a k3s secure token (K10…::server:…)"
+    return pw
+
+
 def server_token(h: str) -> str:
-    return secret_read(h, "sudo cat /var/lib/rancher/k3s/server/token").strip()
+    """The server token's password (masked), what /v1-k3s/server-bootstrap
+    takes as user "server"'s basic-auth password."""
+    pw = token_password(secret_read(h, "sudo cat /var/lib/rancher/k3s/server/token"))
+    mask(pw)
+    return pw
 
 
 def node_cred(h: str) -> str:
@@ -1506,8 +1521,12 @@ def ha_vm_revoke_restarts() -> None:
 
     def rotated(h, old):
         new = server_token(h)
+        assert new != old, "the server token hasn't changed yet"
         assert k3s_bootstrap_status(h, "server", old) == 401, "the old server token still answers (want 401)"
         assert k3s_bootstrap_status(h, "server", new) == 200, "the new server token doesn't answer 200"
+        # Every live server holds the same new token (compared by sha256).
+        dig = {v: hashlib.sha256(server_token(v).encode()).hexdigest()[:12] for v in live_server_vms()}
+        assert len(set(dig.values())) == 1, f"the servers' tokens differ after the rotation (sha256 prefixes): {dig}"
         return True
     wait_for("the k3s tokens rotated (old 401, new 200)", lambda: rotated(ref, old_token), 300, 5)
     restart_cycle(survivors, next(h for h in survivors if h != OPERATOR_VM), expect_ready=3)

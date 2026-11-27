@@ -255,5 +255,18 @@ class SshLost(unittest.TestCase):
         finally:
             m.SSH = old
 
+
+class TokenPassword(unittest.TestCase):
+    """The k3s secure token's basic-auth password (VM run 11 sent the whole
+    token: 401 before and after a rotation)."""
+
+    def test_secure(self):
+        self.assertEqual(m.token_password("K10" + "a" * 64 + "::server:s3cr3t\n"), "s3cr3t")
+
+    def test_refused(self):
+        for bad in ("s3cr3t", "K10abc::node:x", "K10abc::server:", "X10abc::server:x"):
+            with self.subTest(bad), self.assertRaisesRegex(AssertionError, "isn't a k3s secure token"):
+                m.token_password(bad)
+
 if __name__ == "__main__":
     unittest.main()
