@@ -121,7 +121,42 @@ def sh(*argv: str, inp: str | None = None, timeout: float = 120, check: bool = T
 
 def vm(h: str, command: str, inp: str | None = None, timeout: float = 120, check: bool = True, mux: bool = True) -> str:
     opts = SSH if mux else SSH + ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
-    return sh(*opts, h, command, inp=inp, timeout=timeout, check=check)
+    r = subprocess.run([*opts, h, command], input=inp, capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode == 255:
+        # ssh's own failure, not the command's (VM run 10: vm4 reset under
+        # the rejoin, an empty "exit 255"): say so, with what a fresh
+        # connection sees now.
+        raise AssertionError(redact(f"lost SSH to {h} (exit 255: the connection, not the command): {ssh_probe(h)}; "
+                                    f"{(r.stderr or r.stdout).strip()[-300:]}"))
+    if check and r.returncode != 0:
+        raise AssertionError(redact(f"{' '.join(opts[:3])} {h}: exit {r.returncode}: {(r.stderr or r.stdout).strip()[-400:]}"))
+    return r.stdout
+
+
+def ssh_probe(h: str) -> str:
+    """What a fresh SSH connection to h sees: its boot id, or the error."""
+    try:
+        r = subprocess.run([*SSH, "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=10", h,
+                            "cat /proc/sys/kernel/random/boot_id"], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "a fresh connection timed out"
+    if r.returncode == 0:
+        return f"a fresh connection answers (boot {r.stdout.strip()[:8]})"
+    return f"a fresh connection fails (exit {r.returncode}: {r.stderr.strip()[-160:]})"
+
+
+def ssh_ready(h: str, what: str, timeout: float = 180) -> str:
+    """Before a remote step: h answers SSH on a fresh connection within
+    timeout, else a named failure. Its boot id."""
+    end = time.time() + timeout
+    last = ""
+    while True:
+        last = ssh_probe(h)
+        if last.startswith("a fresh connection answers"):
+            return last.split("boot ")[1].rstrip(")")
+        if time.time() > end:
+            raise AssertionError(f"{h} doesn't answer SSH before {what} ({timeout:.0f} s): {last}")
+        time.sleep(5)
 
 
 def host(h: str, *args: str, timeout: float = 60, check: bool = True) -> str:
@@ -1163,6 +1198,7 @@ def ha_vm_interrupted_removal() -> None:
     Node, no leftover op); then it joins again with a fresh code."""
     agent = VM_NODE[EDGE_VM]
     note(f"ha_vm_interrupted_removal: removing {agent}, the Hub restarted mid-way, then the removal again")
+    state["removal_boot"] = ssh_ready(EDGE_VM, "its removal")
     logf = tempfile.NamedTemporaryFile("w+", prefix="remove-", dir=D, delete=False)
     p = subprocess.Popen([*SSH, OPERATOR_VM, f"~/e2e-ha/pc node remove {agent}"], stdin=subprocess.PIPE, stdout=logf,
                          stderr=subprocess.STDOUT, text=True)
@@ -1192,6 +1228,13 @@ def ha_vm_interrupted_removal() -> None:
     lst = pc("node", "list")
     assert agent not in [ln.split()[0] for ln in lst.splitlines()[1:] if ln.split()], f"{agent} still listed after its removal: {lst}"
     note(f"ha_vm_interrupted_removal: {agent} removed cleanly after the interrupted first run")
+    # A cooperative removal never resets the machine (VM run 10: SNR's
+    # agent, killed by the uninstall with its watchdog armed, reset vm4 60 s
+    # later; the nodeagent now stops the watchdog). Watched past the
+    # watchdog's 60 s.
+    time.sleep(75)
+    b1 = ssh_ready(EDGE_VM, "the reset check after its removal")
+    assert b1 == state["removal_boot"], f"{EDGE_VM} reset after its removal (boot {state['removal_boot']} → {b1}): the watchdog SNR's agent armed"
     rejoin(EDGE_VM, "agent", VMS[EDGE_VM]["site"], f"--public-endpoint {VMS[EDGE_VM]['public']}:51830")
 
 
@@ -1640,13 +1683,16 @@ def rejoin(vmn: str, role: str, site: str, extra: str = "") -> str:
     (join.sh --code-file), the public address named as setup does; the
     maps follow. The new id."""
     new_id = fresh_id(vmn)
+    ssh_ready(vmn, "its wipe")
     wipe_node(vmn)
     out = pc("node", "add", new_id, "--role", role, "--class", "cloud", "--site", site, extra, timeout=120)
     codes = [ln.strip() for ln in out.splitlines() if ln.startswith("pcj")]
     assert codes, f"node add {new_id} printed no join code"
     mask(codes[0])
+    ssh_ready(vmn, "its join code")
     vm(vmn, "sudo install -m 0600 -o root -g root /dev/stdin /root/e2e-join-code", inp=codes[0] + "\n")
     del out, codes
+    ssh_ready(vmn, "its join")
     vm(vmn, f"curl -fsSL https://{DOMAIN}/node/join.sh -o /tmp/join.sh && sudo sh /tmp/join.sh --code-file /root/e2e-join-code; "
             "rc=$?; sudo rm -f /root/e2e-join-code /tmp/join.sh; exit $rc", timeout=600)
     wait_for(f"{new_id} Ready", lambda: node_ready(new_id), 450, 5)

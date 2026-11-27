@@ -215,5 +215,45 @@ class ScenarioSelection(unittest.TestCase):
             with self.subTest(k=k):
                 self.assertEqual(self.run_main(six[:k]), self.expect(six[:k]))
 
+
+class SshLost(unittest.TestCase):
+    """vm(): ssh's own exit 255 is named a lost connection with what a fresh
+    connection sees (VM run 10's bare "exit 255"); a command's failure keeps
+    its own message; ssh_ready fails named when the host never answers."""
+
+    def fake(self, body):
+        d = tempfile.mkdtemp()
+        f = Path(d) / "ssh"
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o700)
+        return [str(f)]
+
+    def test_255_named(self):
+        old = m.SSH
+        try:
+            m.SSH = self.fake('case "$*" in *boot_id*) echo "abcdef1234"; exit 0;; esac; exit 255')
+            with self.assertRaisesRegex(AssertionError, r"lost SSH to vm4 \(exit 255.*answers \(boot abcdef12\)"):
+                m.vm("vm4", "true")
+        finally:
+            m.SSH = old
+
+    def test_command_failure_kept(self):
+        old = m.SSH
+        try:
+            m.SSH = self.fake('echo "no such unit" >&2; exit 5')
+            with self.assertRaisesRegex(AssertionError, r"vm4: exit 5: no such unit"):
+                m.vm("vm4", "systemctl restart x")
+        finally:
+            m.SSH = old
+
+    def test_ready_times_out(self):
+        old = m.SSH
+        try:
+            m.SSH = self.fake('echo "Connection timed out" >&2; exit 255')
+            with self.assertRaisesRegex(AssertionError, r"vm4 doesn't answer SSH before its join .*fails \(exit 255: Connection timed out\)"):
+                m.ssh_ready("vm4", "its join", timeout=0)
+        finally:
+            m.SSH = old
+
 if __name__ == "__main__":
     unittest.main()
