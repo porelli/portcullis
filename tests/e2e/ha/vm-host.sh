@@ -20,6 +20,12 @@
 #                                    range and DHCP dropped both ways
 #                         drop443    inbound TCP 443 not from pcmesh (the
 #                                    public ingress; the mesh stays)
+#                         natmesh:<cidr>  a real NAT in front of the mesh
+#                                    port: NEW inbound UDP 51830 from outside
+#                                    <cidr> dropped, replies to the node's
+#                                    own dials kept (conntrack; the mangle
+#                                    table's chain E2EHAM: raw runs before
+#                                    conntrack)
 #                         dropmesh:<cidr>  inbound UDP 51830 from outside
 #                                    <cidr> (the site's LAN) dropped: the
 #                                    node's mesh port closed to the other
@@ -37,6 +43,7 @@
 set -euo pipefail
 umask 022
 CHAIN=E2EHA
+MCHAIN=E2EHAM
 ETC=/etc/e2e-ha
 IMG=/var/lib/e2e-ha/longhorn.img
 DM=e2e-lh
@@ -54,6 +61,9 @@ net_flush() {
   done
   ipt -F "$CHAIN" 2>/dev/null || true
   ipt -X "$CHAIN" 2>/dev/null || true
+  while iptables -w -t mangle -D PREROUTING -j "$MCHAIN" 2>/dev/null; do :; done
+  iptables -w -t mangle -F "$MCHAIN" 2>/dev/null || true
+  iptables -w -t mangle -X "$MCHAIN" 2>/dev/null || true
 }
 
 net_rules() {
@@ -77,6 +87,10 @@ net_rules() {
         ipt -A "$CHAIN" -j DROP ;;
       drop443) ipt -A "$CHAIN" ! -i pcmesh -p tcp --dport 443 -m addrtype --dst-type LOCAL -j DROP ;;
       dropmesh:*) ipt -A "$CHAIN" ! -i pcmesh ! -s "${spec#dropmesh:}" -p udp --dport 51830 -j DROP ;;
+      natmesh:*)
+        iptables -w -t mangle -N "$MCHAIN" 2>/dev/null || true
+        iptables -w -t mangle -A "$MCHAIN" ! -i pcmesh ! -s "${spec#natmesh:}" -p udp --dport 51830 -m conntrack --ctstate NEW -j DROP
+        iptables -w -t mangle -C PREROUTING -j "$MCHAIN" 2>/dev/null || iptables -w -t mangle -I PREROUTING 1 -j "$MCHAIN" ;;
       *) echo "e2e-ha-host: unknown fault $spec" >&2; exit 2 ;;
     esac
   done
@@ -125,7 +139,7 @@ state() {
   [ ! -s "$ETC/net" ] || net="$(tr '\n' ' ' < "$ETC/net" | sed 's/ $//')"
   disk="$(disk_state)"
   printf '{"boot_id":"%s","dark":%s,"net":"%s","disk":"%s","live_rules":%s}\n' "$boot" "$dark" "$net" "$disk" \
-    "$(ipt -S "$CHAIN" 2>/dev/null | grep -c -- '-A ' || true)"
+    "$(( $(ipt -S "$CHAIN" 2>/dev/null | grep -c -- '-A ' || true) + $(iptables -w -t mangle -S "$MCHAIN" 2>/dev/null | grep -c -- '-A ' || true) ))"
 }
 
 install_self() {

@@ -344,6 +344,10 @@ jobs:
       # closure, the per-job check (tests/e2e/scenarios.py; stdlib only).
       - name: e2e scenario filter unit tests (scenarios.py)
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_scenarios.py
+      # e2e-ha-vm's pure helpers: the writer log's one-history check, etcd
+      # member names, redaction, the WireGuard route parse, victim rotation.
+      - name: e2e-ha-vm helper unit tests (e2e_ha_vm.py)
+        run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_ha_vm.py
       # The local runner's ::add-mask:: (never written, values *** after).
       - name: local CI runner masking unit tests (steps.py)
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_local_steps.py

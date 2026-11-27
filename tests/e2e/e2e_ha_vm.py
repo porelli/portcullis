@@ -153,8 +153,10 @@ def secret_read(h: str, command: str, timeout: float = 30) -> str:
     return out
 
 
-def pc(*args: str, timeout: float = 600, check: bool = True) -> str:
-    return vm("vm1", "~/e2e-ha/pc " + " ".join(args), timeout=timeout, check=check)
+def pc(*args: str, inp: str | None = None, timeout: float = 600, check: bool = True) -> str:
+    """./portcullis on vm1 (through its harness wrapper); inp on its stdin
+    (a typed confirmation, never argv)."""
+    return vm("vm1", "~/e2e-ha/pc " + " ".join(args), inp=inp, timeout=timeout, check=check)
 
 
 # ── kubectl over an SSH tunnel to a surviving API server ──
@@ -322,6 +324,7 @@ def wait_for(what, fn, timeout, every=2):
 # ── VM node faults ──
 
 cut: dict[str, str] = {}   # node → the fault kind applied ("partition", "dark", …)
+last_cut: dict[str, float] = {}  # node → when a drill last cut it (nodeadm's 20 min remediation back-off)
 
 
 def boot_id(h: str) -> str:
@@ -333,13 +336,15 @@ def node_vm(node: str) -> str:
 
 
 def partition(node: str) -> float:
-    """Every packet but SSH dropped both ways on the node: a real
-    partition, so it loses the API and its peers and self-fences."""
+    """Every packet but SSH (and the machine's own metadata / DHCP) dropped
+    both ways on the node: a real partition, so it loses the API and its
+    peers and self-fences."""
     h = node_vm(node)
     assert h != OPERATOR_VM, f"refusing to cut {node}: vm1 is the operator and fixture host"
     retarget_api(avoid={node})
     host(h, "net set partition")
     cut[node] = "partition"
+    last_cut[node] = time.time()
     return time.time()
 
 
@@ -350,7 +355,7 @@ def power_off(node: str) -> float:
     b0 = boot_id(h)
     host(h, "dark", check=False)  # it reboots at once; the SSH call may not return cleanly
     cut[node] = "dark"
-    # The node is down (a new boot id behind the dark flag, or unreachable).
+    last_cut[node] = time.time()
     for _ in range(60):
         b = boot_id(h)
         if b and b != b0:
@@ -542,8 +547,9 @@ class Session:
 
 
 def signin_loop(s: Session, total: int, actions: list) -> int:
-    """`total` sign-ins; actions = [(i, fn)] run at request i. Returns the
-    number failed."""
+    """`total` sign-ins; actions = [(i, fn)] run at request i. Each failure
+    is recorded with its time and the page it ended on (no query string).
+    Returns the number failed."""
     failed, fails = 0, []
     acts = dict(actions)
     t0 = time.time()
@@ -552,7 +558,7 @@ def signin_loop(s: Session, total: int, actions: list) -> int:
             acts[i]()
         if not s.signin():
             failed += 1
-            fails.append((i, round(time.time() - t0, 1)))
+            fails.append((i, round(time.time() - t0, 1), s.page.url.split("?")[0][:120]))
         time.sleep(0.2)
     note(f"  {failed} of {total} sign-ins failed in {time.time() - t0:.0f} s: {fails[:10]}")
     return failed
@@ -620,55 +626,46 @@ def storage_servers() -> list[str]:
 
 
 def victim_server(avoid: set[str]) -> str:
-    """A main storage server not in `avoid` and not the kubectl tunnel's."""
-    avoid = set(avoid) | {VM_NODE[OPERATOR_VM]}
-    for n in storage_servers():
-        if n not in avoid:
-            return n
-    raise AssertionError(f"no storage server outside {sorted(avoid)}")
+    return fresh_victim(avoid, need_fence=False)
 
 
 def ha_vm_partition() -> None:
-    marker_setup()
-    psql(pg_primary(), "DROP TABLE IF EXISTS e2e_ha_rows; CREATE TABLE e2e_ha_rows (n int PRIMARY KEY, at timestamptz DEFAULT now());")
-    w = Writer()
-    w.start()
-    victim = ""
+    """The minority self-fences within T_fence; a writer on it fails; the
+    test app's data afterwards is the majority's. A writer (the test app on
+    the replicated tier) runs on the victim; the victim is partitioned (every
+    packet but SSH dropped, kept across its reboot). Pass: it reboots by its
+    watchdog within T_fence (150 s); the app runs on the majority; the
+    minority writer's last line in the data is no later than its fence (it
+    failed: nothing it wrote after the cut survives as acknowledged history
+    beyond the fence), the log is one history (no gap, repeat or overlap of
+    writers) and the marker's md5 is unchanged."""
+    victim = fresh_victim()
+    p0 = writer_start(victim)
+    h = node_vm(victim)
+    b0 = boot_id(h)
+    note(f"ha_vm_partition: partitioning {victim} ({h}) with the writer {p0['metadata']['name']} on it")
+    t = partition(victim)
     try:
-        wait_for("the writer's first rows", lambda: len(w.committed) >= 5, 60, 1)
-        victim = victim_server(set())
-        h = node_vm(victim)
-        b0 = boot_id(h)
-        # A pod on the minority side: a shell on the victim's own node that
-        # tries to reach the API/pg must fail while it is partitioned.
-        note(f"ha_vm_partition: partitioning {victim} ({h}); a writer on the minority side must fail")
-        t = partition(victim)
-        # The minority self-fences (softdog) within T_fence (150 s) + a
-        # margin for detection and the reboot.
         tf = self_fenced(h, b0, 240)
         note(f"ha_vm_partition: {victim} self-fenced (rebooted) {tf - t:.0f} s after the partition")
-        # A writer on the minority failed while it was cut: a psql into a pg
-        # pod that sat on the victim is refused (the node is gone). The
-        # majority keeps a primary and the writer resumes there.
-        wait_for("the majority keeps writing", lambda: w.resumed_after(tf) >= 0, 120, 2)
-        assert w.failures > 0, "no write failed during the partition (the writer never hit the minority)"
+        assert tf - t <= 150 + 10, f"self-fenced {tf - t:.0f} s after the partition (T_fence 150 s)"
+        p1 = writer_elsewhere(p0, victim, 420)
+        t_mv = time.time()
+        time.sleep(8)
+        rows = writer_log(p1["metadata"]["name"])
     finally:
-        w.stop.set()
-        w.join(15)
-        if victim:
-            heal(victim)
+        heal(victim)
+    old = [r for r in rows if r[2] == p0["metadata"]["name"]]
+    new = [r for r in rows if r[2] == p1["metadata"]["name"]]
+    assert old and new, f"the log lacks a writer (old {len(old)} lines, new {len(new)})"
+    log_consistent(rows)
+    assert old[-1][1] <= int(tf) + 2, f"the minority writer's line at {old[-1][1]} survives past its fence at {int(tf)}"
+    note(f"ha_vm_partition: the writer ran on {p1['spec']['nodeName']} {t_mv - t:.0f} s after the cut; the minority's last kept line "
+         f"{old[-1][1] - int(t):+d} s from the cut, the majority's first {new[0][1] - int(t):+d} s; {len(rows)} lines, one history")
+    writer_stop()
     settle()
-    # The data checksums equal the majority's: every committed row present,
-    # and the replicated-tier marker unchanged.
-    want = {n for n, _ in w.committed}
-    got = {int(x) for x in psql(pg_primary(), "SELECT n FROM e2e_ha_rows;").split()}
-    lost = sorted(want - got)
     md5 = marker_read()
-    note(f"ha_vm_partition: {len(want)} rows committed, {len(lost)} lost, {w.failures} writes failed on the minority; "
-         f"marker md5 {md5} ({'equal' if md5 == state['marker_md5'] else 'CHANGED'})")
-    assert not lost, f"committed rows lost after the partition: {lost[:20]}"
     assert md5 == state["marker_md5"], f"the marker changed: {md5} != {state['marker_md5']}"
-    psql(pg_primary(), "DROP TABLE e2e_ha_rows;")
 
 
 def marker_app(prefer: str) -> dict:
@@ -692,45 +689,40 @@ def marker_app(prefer: str) -> dict:
                      "template": {"metadata": {"labels": {"app": "e2e-marker-app"}}, "spec": pod}}}
 
 
-def marker_app_pod() -> dict | None:
-    return next((p for p in Kj("-n", MARKER_NS, "get", "pods", "-l", "app=e2e-marker-app")["items"]
-                 if not p["metadata"].get("deletionTimestamp")), None)
-
-
 def ha_vm_power_off() -> None:
-    marker_setup()
-    victim = victim_server(set())
-    K("apply", "-f", "-", inp=json.dumps(marker_app(victim)))
-    p0 = wait_for(f"the stateful app Ready on {victim}", lambda: (lambda p: p if p and ready(p) and p["spec"].get("nodeName") == victim else None)(marker_app_pod()), 300, 5)
+    """A node powered off (sysrq reboot held dark): its stateful app runs
+    elsewhere within 4 min, its data one history and the marker unchanged;
+    Postgres' committed rows all there."""
+    victim = fresh_victim()
+    p0 = writer_start(victim)
     psql(pg_primary(), "DROP TABLE IF EXISTS e2e_ha_rows; CREATE TABLE e2e_ha_rows (n int PRIMARY KEY, at timestamptz DEFAULT now());")
     w = Writer()
     w.start()
     try:
-        wait_for("the writer's first rows", lambda: len(w.committed) >= 5, 60, 1)
-        note(f"ha_vm_power_off: powering off {victim} ({node_vm(victim)}), the stateful app's node")
+        wait_for("the Postgres writer's first rows", lambda: len(w.committed) >= 5, 60, 1)
+        note(f"ha_vm_power_off: powering off {victim} ({node_vm(victim)}), the writer's node")
         t = power_off(victim)
         tn = not_ready_at(victim, t, timeout=120)
-
-        def elsewhere():
-            p = marker_app_pod()
-            return p if p and p["metadata"]["uid"] != p0["metadata"]["uid"] and ready(p) and p["spec"].get("nodeName") != victim else None
-        p1 = wait_for("the stateful app Running elsewhere", elsewhere, 330, 3)
+        p1 = writer_elsewhere(p0, victim, 330)
         d = time.time() - t
-        md5 = K("-n", MARKER_NS, "exec", p1["metadata"]["name"], "--", "md5sum", "/data/marker").split()[0]
-        note(f"ha_vm_power_off: {victim} off → NotReady after {tn - t:.0f} s → the stateful app Ready on "
-             f"{p1['spec']['nodeName']} {d:.0f} s after the power-off; marker {'equal' if md5 == state['marker_md5'] else 'CHANGED'}")
-        assert md5 == state["marker_md5"], f"the stateful app's data changed: {md5} != {state['marker_md5']}"
+        time.sleep(5)
+        rows = writer_log(p1["metadata"]["name"])
+        log_consistent(rows)
+        note(f"ha_vm_power_off: {victim} off → NotReady after {tn - t:.0f} s → the app Ready on {p1['spec']['nodeName']} "
+             f"{d:.0f} s after the power-off; {len(rows)} lines, one history")
         assert d <= 240, f"the stateful app took {d:.0f} s to run elsewhere (> 4 min)"
     finally:
         w.stop.set()
         w.join(15)
         heal(victim)
-        K("-n", MARKER_NS, "delete", "deployment", "marker-app", "--wait=false", ok=False)
+        writer_stop()
     settle()
     want = {n for n, _ in w.committed}
     got = {int(x) for x in psql(pg_primary(), "SELECT n FROM e2e_ha_rows;").split()}
     assert not (want - got), f"committed rows lost: {sorted(want - got)[:20]}"
     psql(pg_primary(), "DROP TABLE e2e_ha_rows;")
+    md5 = marker_read()
+    assert md5 == state["marker_md5"], f"the marker changed: {md5} != {state['marker_md5']}"
 
 
 def lh_node_disks(node: str) -> list[dict]:
@@ -742,38 +734,53 @@ def lh_node_disks(node: str) -> list[dict]:
 
 
 def ha_vm_disk_kill() -> None:
-    marker_setup()
-    victim = victim_server(set())
+    """A storage node's Longhorn disk killed (device-mapper error: every
+    I/O fails) under a writing app with a replica on it: Longhorn fails that
+    replica and rebuilds one on another node, the volume healthy again, the
+    app kept writing (one history), the marker unchanged (≤ 10 min).
+    Longhorn sees a dead disk through its replicas' I/O, not its node disk
+    conditions (run 3: the conditions stayed Ready on an idle volume)."""
+    app_node = fresh_victim(need_fence=False)
+    p0 = writer_start(app_node)
+    vol = lh_volume_of_claim(MARKER_NS, MARKER_PVC)
+    reps = wait_for("the volume's replicas running", lambda: (lambda r: r if len(r) >= 2 and all(x.get("status", {}).get("currentState") == "running" for x in r) else None)(lh_replicas(vol)), 300, 5)
+    nodes = [r["spec"]["nodeID"] for r in reps]
+    victim = next((n for n in nodes if n not in (app_node, VM_NODE[OPERATOR_VM])), None) or \
+        next((n for n in nodes if n != VM_NODE[OPERATOR_VM]), None)
+    assert victim, f"every replica of the test volume is on vm1: {nodes}"
     h = node_vm(victim)
-    before = [v["metadata"]["name"] for v in longhorn_volumes()
-              if any(r.get("hostId") == victim for r in (v.get("status", {}).get("conditions") and [] or []))]
-    note(f"ha_vm_disk_kill: killing {victim}'s Longhorn disk ({h})")
+    dead = next(r["metadata"]["name"] for r in reps if r["spec"]["nodeID"] == victim)
+    note(f"ha_vm_disk_kill: the writer on {app_node}; replicas on {nodes}; killing {victim}'s disk (replica {dead[:28]}…)")
+    t = time.time()
     host(h, "disk", "kill")
+    last_cut[victim] = t
     try:
-        # Longhorn sees the disk's replicas fail and rebuilds elsewhere; a
-        # volume attached before stays healthy (2 replicas over 3 storage
-        # nodes: the lost one is rebuilt on the third).
         def rebuilt():
-            ds = lh_node_disks(victim)
-            # The node's disk is unschedulable / not ready (I/O errors).
-            bad = any(any(c.get("type") == "Ready" and c.get("status") != "True" for c in (d.get("conditions") or []))
-                      or d.get("storageScheduled", 0) == 0 and not d.get("conditions") for d in ds)
-            return True if not ds else bad
-        wait_for(f"Longhorn marks {victim}'s disk failed", lambda: True if not lh_node_disks(victim) else any(
-            any(c.get("type") in ("Ready", "Schedulable") and c.get("status") != "True" for c in (d.get("conditions") or []))
-            for d in lh_node_disks(victim)), 180, 5)
-        longhorn_healthy(600)
-        md5 = marker_read()
-        note(f"ha_vm_disk_kill: {victim}'s disk failed, volumes rebuilt healthy; marker md5 {md5} "
-             f"({'equal' if md5 == state['marker_md5'] else 'CHANGED'})")
-        assert md5 == state["marker_md5"], f"the marker changed: {md5} != {state['marker_md5']}"
+            rs = lh_replicas(vol)
+            failed = any(r["metadata"]["name"] == dead and (r["spec"].get("failedAt") or r.get("status", {}).get("currentState") != "running") for r in rs) \
+                or not any(r["metadata"]["name"] == dead for r in rs)
+            live = [r for r in rs if r["spec"]["nodeID"] != victim and r.get("status", {}).get("currentState") == "running" and not r["spec"].get("failedAt")]
+            v = lh("get", "volumes.longhorn.io", vol)
+            healthy = v.get("status", {}).get("robustness") == "healthy"
+            return failed and len(live) >= 2 and healthy
+        wait_for("the dead disk's replica replaced on another node and the volume healthy", rebuilt, 600, 10)
+        d = time.time() - t
+        p = writer_pod()
+        rows = writer_log(p["metadata"]["name"])
+        log_consistent(rows)
+        assert rows[-1][1] >= int(t) + 10, "the app stopped writing after the disk died"
+        note(f"ha_vm_disk_kill: {victim}'s replica failed and rebuilt elsewhere, the volume healthy {d:.0f} s after the kill; "
+             f"the app kept writing ({len(rows)} lines, one history)")
     finally:
-        # A reboot brings the disk back (fsck at boot via e2e-ha-disk).
+        writer_stop()
+        # The disk comes back at the node's boot (e2e-ha-disk: fsck, then the
+        # linear table again).
         vm(h, "sudo systemctl reboot", check=False, timeout=30, mux=False)
-    # settle() retargets the API and waits; the disk unit mounts it again.
     time.sleep(30)
     retarget_api()
     settle()
+    md5 = marker_read()
+    assert md5 == state["marker_md5"], f"the marker changed: {md5} != {state['marker_md5']}"
 
 
 def ha_vm_disk_full() -> None:
@@ -802,47 +809,46 @@ def ha_vm_disk_full() -> None:
 
 
 def ha_vm_lose_small() -> None:
-    # The third server / third voter (vm3 here; the arm64 small node in the
-    # D9 design, cloud in this bundle): lost, quorum holds (2/3).
+    """The third server lost (D9's small third voter; a cloud server in
+    this bundle): quorum holds (2/3), a write through the Hub succeeds, and
+    sign-in keeps working: 60 sign-ins across the outage, at most 3 failed,
+    each failure's page and time recorded."""
     small = next((v["node"] for v in INV["vms"] if v.get("vm") == "vm3"), SERVERS[-1])
     s: Session = state["session"]
-    note(f"ha_vm_lose_small: powering off {small} ({node_vm(small)})")
+    note(f"ha_vm_lose_small: powering off {small} ({node_vm(small)}) under 60 sign-ins")
     t = power_off(small)
     try:
+        failed = signin_loop(s, 60, [])
         not_ready_at(small, t, timeout=120)
-        # etcd quorum holds (2 of 3): the API still answers, and a write
-        # succeeds (a throwaway group through the Hub).
         wait_for("the API still serves (quorum 2/3)", lambda: bool(K("get", "--raw", "/readyz", ok=False, timeout=10)), 60, 2)
         g = "e2e-ha-small-" + str(int(time.time()) % 100000)
         code, _ = hub("POST", "/api/directory/groups", {"name": g})
         assert code in (200, 201), f"a write failed with the third server down: {code}"
         hub("DELETE", f"/api/directory/groups/{g}", {"confirm": g})
-        # sign-in keeps working.
-        assert s.signin(), "sign-in failed with the third server down"
-        note(f"ha_vm_lose_small: {small} down → API, a write and sign-in all work (quorum 2/3)")
+        assert failed <= 3, f"{failed} of 60 sign-ins failed with the third server down (> 3)"
+        note(f"ha_vm_lose_small: {small} down → the API, a write and sign-in work (quorum 2/3; {failed} of 60 sign-ins failed)")
     finally:
         heal(small)
     settle()
     wait_for(f"{small} Ready again", lambda: node_ready(small), 300, 5)
 
 
-def rollout_restart(kind: str, name: str, ns: str = NS) -> None:
-    K("-n", ns, "rollout", "restart", f"{kind}/{name}")
+def rollout_restart(name: str, ns: str = NS) -> None:
+    K("-n", ns, "rollout", "restart", f"{workload_kind(name, ns)}/{name}")
 
 
 def ha_vm_rolling_upgrade() -> None:
+    """A rolling restart of Keycloak, group-gate and forward-auth (each by
+    its real kind: in HA group-gate is a StatefulSet) under 300 sign-ins:
+    at most 5 fail."""
     s: Session = state["session"]
-    sts = {p["metadata"]["labels"].get("portcullis.io/component") for p in pods(NS, "portcullis.io/component")}
-    restarts = [
-        (20, lambda: rollout_restart("statefulset", "keycloak")),
-        (120, lambda: rollout_restart("deployment", "group-gate")),
-        (200, lambda: rollout_restart("deployment", "forward-auth")),
-    ]
-    note("ha_vm_rolling_upgrade: a rolling restart of Keycloak, group-gate and forward-auth under 300 sign-ins")
-    failed = signin_loop(s, 300, restarts)
-    # Let every rollout finish before settle.
-    for kind, name in (("statefulset", "keycloak"), ("deployment", "group-gate"), ("deployment", "forward-auth")):
-        K("-n", NS, "rollout", "status", f"{kind}/{name}", "--timeout=300s", timeout=320, ok=False)
+    names = ("keycloak", "group-gate", "forward-auth")
+    kinds = {n: workload_kind(n) for n in names}
+    note(f"ha_vm_rolling_upgrade: a rolling restart of {', '.join(f'{k}/{n}' for n, k in kinds.items())} under 300 sign-ins")
+    failed = signin_loop(s, 300, [(20, lambda: rollout_restart("keycloak")), (120, lambda: rollout_restart("group-gate")),
+                                  (200, lambda: rollout_restart("forward-auth"))])
+    for n, k in kinds.items():
+        K("-n", NS, "rollout", "status", f"{k}/{n}", "--timeout=300s", timeout=320, ok=False)
     assert failed <= 5, f"{failed} of 300 sign-ins failed during the rolling upgrade (> 5)"
 
 
@@ -874,7 +880,7 @@ def ha_vm_site_uplink_down() -> None:
         wait_for(f"{edge_node}'s address removed", lambda: all(published().get(n) == rest for n in names), 180, 2)
         note(f"ha_vm_site_uplink_down: {edge_addr} removed, {rest} kept; main keeps serving")
         # main keeps serving sign-in on its own address.
-        assert served_fp(main_addrs[0], f"auth.{DOMAIN}"), "main stopped serving"
+        assert e2e_ha.served_fp(main_addrs[0], f"auth.{DOMAIN}"), "main stopped serving"
         # Step 2: main's ingress 443 dropped too; vm4 serves sign-in through
         # Traefik → main over pcmesh (its 443 is back up).
         host(edge_h, "net", "clear")
@@ -1090,74 +1096,58 @@ def _walk_items(o):
 
 
 def ha_vm_etcd_remove_member() -> None:
-    # A cooperative server removal (node remove) takes its etcd member out
-    # (nodeadm drives a surviving nodeagent's etcd remove-member). Add a
-    # fresh server, then remove it, and check etcd is back to 3 members.
-    before = etcd_members()
-    assert len(before) == 3, f"etcd starts with {len(before)} members: {before}"
-    node = "vm2"  # a server we can rejoin afterwards
-    note(f"ha_vm_etcd_remove_member: removing server {VM_NODE[node]} cooperatively")
-    out = pc("node", "remove", VM_NODE[node], inp=VM_NODE[node] + "\n", timeout=900)
-    print(redact(out[-1500:]), flush=True)
-    wait_for("etcd down to 2 members", lambda: len(etcd_members()) == 2, 300, 5)
-    note(f"ha_vm_etcd_remove_member: etcd members {sorted(before)} → {sorted(etcd_members())}")
-    # Rejoin it (settle expects 3 servers).
-    _rejoin_server(node)
-
-
-def etcd_members() -> list[str]:
-    """etcd member names via a server's nodeagent (the JSON API on 2382) or,
-    simpler, k3s' etcd snapshot of the member list from a server."""
-    out = vm(_tunnel["server"], "sudo k3s kubectl get nodes -l node-role.kubernetes.io/control-plane=true -o name", check=False)
-    # etcd membership follows the control-plane Nodes that are Ready+etcd.
-    members = []
-    for n in Kj("get", "nodes", "-l", "node-role.kubernetes.io/control-plane=true")["items"]:
-        if "etcd" in [r for r in (n["metadata"]["labels"].get("node-role.kubernetes.io/etcd") and ["etcd"] or [])] or \
-           n["metadata"]["labels"].get("node-role.kubernetes.io/etcd") == "true":
-            members.append(n["metadata"]["name"])
-    return members or [n["metadata"]["name"] for n in Kj("get", "nodes", "-l", "node-role.kubernetes.io/etcd=true")["items"]]
-
-
-def _rejoin_server(vmn: str) -> None:
-    v = VMS[vmn]
-    id_ = v["node"]
-    out = pc("node", "add", id_, "--role", "server", "--class", "cloud", "--site", "main", timeout=120)
-    codes = [ln.strip() for ln in out.splitlines() if ln.startswith("pcj")]
-    assert codes, f"node add {id_} printed no join code"
-    mask(codes[0])
-    # The code onto the node's root 0600 file through stdin (join.sh
-    # --code-file); never argv, never a file here, never printed.
-    vm(vmn, "sudo install -m 0600 -o root -g root /dev/stdin /root/e2e-join-code", inp=codes[0] + "\n")
-    del out, codes
-    vm(vmn, f"curl -fsSL https://{DOMAIN}/node/join.sh -o /tmp/join.sh && sudo sh /tmp/join.sh --code-file /root/e2e-join-code; "
-            "sudo rm -f /root/e2e-join-code /tmp/join.sh", timeout=600, check=False)
-    wait_for(f"{id_} Ready again", lambda: node_ready(id_), 450, 5)
+    """(carry) A server's etcd member removed by the cluster (nodeadm →
+    a surviving server's nodeagent POST /v1/etcd/remove-member), judged on
+    the REAL member list (k3s' etcd JSON API) around revoke_restarts' server
+    revoke: three members → the revoked one gone (two) → three again with
+    the fresh server. (A cooperative removal below three servers is refused
+    by design: `removing <node> would leave fewer than 3 servers`.)"""
+    needs("etcd_revoke", "etcd_rejoin")
+    ev = state["etcd_revoke"]
+    assert len(ev["before"]) == 3 and member_of(ev["node"], ev["before"]), f"etcd before the revoke: {ev['before']}"
+    assert len(ev["after"]) == 2 and not member_of(ev["node"], ev["after"]), f"etcd after the revoke: {ev['after']}"
+    assert len(state["etcd_rejoin"]) == 3, f"etcd after the rejoin: {state['etcd_rejoin']}"
+    note(f"ha_vm_etcd_remove_member: {ev['before']} → {ev['after']} → {state['etcd_rejoin']}")
 
 
 def ha_vm_interrupted_removal() -> None:
-    # A server removal interrupted by a restart resumes and finishes
-    # cleanly. Start `node remove`, kill it partway (its drain started),
-    # then run it again: it resumes and the node leaves.
-    node = "vm3"
-    id_ = VM_NODE[node]
-    note(f"ha_vm_interrupted_removal: removing {id_}, interrupting it, then resuming")
-    p = subprocess.Popen([*SSH, "vm1", f"~/e2e-ha/pc node remove {id_}"],
-                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    p.stdin.write(id_ + "\n")
-    p.stdin.flush()
-    # Let the removal get underway (the cordon/drain), then interrupt it.
-    wait_for(f"{id_} cordoned (removal underway)", lambda: Kj("get", "node", id_)["spec"].get("unschedulable") is True, 120, 2)
-    p.terminate()
+    """A removal interrupted and resumed (redesign, controller ruling: a
+    server removal below 3 servers is refused by design, so the agent):
+    `node remove` of the agent, the Hub restarted while it runs, the
+    operation's state read, `node remove` again → the node gone cleanly (its
+    Node, no leftover op); then it joins again with a fresh code."""
+    agent = VM_NODE[EDGE_VM]
+    note(f"ha_vm_interrupted_removal: removing {agent}, the Hub restarted mid-way, then the removal again")
+    logf = tempfile.NamedTemporaryFile("w+", prefix="remove-", dir=D, delete=False)
+    p = subprocess.Popen([*SSH, OPERATOR_VM, f"~/e2e-ha/pc node remove {agent}"], stdin=subprocess.PIPE, stdout=logf,
+                         stderr=subprocess.STDOUT, text=True)
+    p.stdin.write(agent + "\n")
+    p.stdin.close()
     try:
-        p.wait(15)
-    except Exception:  # noqa: BLE001
-        p.kill()
-    note(f"ha_vm_interrupted_removal: interrupted; resuming")
-    out = pc("node", "remove", id_, inp=id_ + "\n", timeout=900)
-    print(redact(out[-1500:]), flush=True)
-    wait_for(f"{id_} gone", lambda: not any(n["metadata"]["name"] == id_ for n in Kj("get", "nodes")["items"]), 300, 5)
-    note(f"ha_vm_interrupted_removal: {id_} removed cleanly after the interruption")
-    _rejoin_server(node)
+        def underway() -> bool:
+            # A CLI that already ended refused or failed: its output says why.
+            assert p.poll() is None, f"node remove {agent} ended early (exit {p.returncode}): {redact(open(logf.name).read())[-600:]}"
+            return Kj("get", "node", agent)["spec"].get("unschedulable") is True
+        wait_for(f"{agent} cordoned (removal underway)", underway, 240, 2)
+        hubp = next(x for x in pods(NS, "portcullis.io/component=hub") if ready(x))
+        K("-n", NS, "delete", "pod", hubp["metadata"]["name"], "--wait=false")
+        note(f"  the Hub {hubp['metadata']['name']} restarted while the removal ran")
+        p.wait(900)
+    finally:
+        if p.poll() is None:
+            p.terminate()
+    first = redact(open(logf.name).read())
+    os.unlink(logf.name)
+    note(f"  the first removal ended (exit {p.returncode}): {first.strip().splitlines()[-1][:200] if first.strip() else '(no output)'}")
+    wait_for("the Hub answering again", lambda: hub("GET", "/api/directory/users/e2e-ha-pub")[0] in (200, 404), 600, 5)
+    if any(n["metadata"]["name"] == agent for n in Kj("get", "nodes")["items"]):
+        out = pc("node", "remove", agent, inp=agent + "\n", timeout=900, check=False)
+        note(f"  the removal again: {redact(out).strip().splitlines()[-1][:200] if out.strip() else '(no output)'}")
+    wait_for(f"{agent} gone", lambda: not any(n["metadata"]["name"] == agent for n in Kj("get", "nodes")["items"]), 400, 5)
+    lst = pc("node", "list")
+    assert agent not in [ln.split()[0] for ln in lst.splitlines()[1:] if ln.split()], f"{agent} still listed after its removal: {lst}"
+    note(f"ha_vm_interrupted_removal: {agent} removed cleanly after the interrupted first run")
+    rejoin(EDGE_VM, "agent", VMS[EDGE_VM]["site"], f"--public-endpoint {VMS[EDGE_VM]['public']}:51830")
 
 
 SINGLETONS = {"frontdoor": (NS, "portcullis.io/component=frontdoor"),
@@ -1397,73 +1387,248 @@ def restart_cycle(survivor_vms: list[str], reboot_vm: str, expect_ready: int) ->
 
 
 def ha_vm_revoke_restarts() -> None:
+    """The agent-token fix's proof (2026-11-22): revoke the agent, then a
+    server (two rotations). After each: every surviving server restarted
+    one at a time, then together, then one host rebooted, each back with no
+    fatal; passwd byte-equal (by sha256), node == server, no
+    --agent-token-file; the old server token 401, the new 200; the revoked
+    node can't return. Before the agent's revoke, it restarts on its node
+    identity; after the server's, a fresh server joins with a new code. The
+    server revoke's etcd member removal is recorded for
+    ha_vm_etcd_remove_member (the real member list)."""
     survivors = live_server_vms()
     assert len(survivors) == 3, f"need three servers: {survivors}"
     s: Session = state["session"]
-    # Old credentials to 401-check after each rotation (a surviving server's
-    # token before the revoke; its node credential).
-    ref = survivors[0]
+    ref = next(h for h in survivors if h != "vm3")
     old_token = server_token(ref)
-    old_node = node_cred(ref)
-    assert old_token and old_node, "couldn't read the server token / node credential"
-
-    # 1) Revoke the agent (vm4).
+    assert old_token, "couldn't read the server token"
+    # The agent restarts on its node identity (its bootstrap token is gone
+    # once it joined).
     agent_id = VM_NODE[EDGE_VM]
+    vm(EDGE_VM, "sudo systemctl restart k3s-agent", timeout=120, mux=False)
+    wait_for(f"{agent_id} Ready after a restart on its node identity", lambda: node_ready(agent_id), 180, 5)
+    # 1) Revoke the agent.
     note(f"ha_vm_revoke_restarts: revoking the agent {agent_id}")
     pc("node", "revoke", agent_id, inp=agent_id + "\n", timeout=900)
     wait_for("the agent's Node gone", lambda: not any(n["metadata"]["name"] == agent_id for n in Kj("get", "nodes")["items"]), 300, 5)
-    # Its node-password Secret is gone (GC'd with the Node).
-    assert not K("-n", "kube-system", "get", "secret", f"{agent_id}.node-password.k3s", "--ignore-not-found", "-o", "name", ok=False).strip(), \
-        "the revoked agent's node-password Secret is still there"
-    # The old server token and node credential 401 (both rotations have run);
-    # the current ones 200.
-    def creds_rotated():
-        new_token = server_token(ref)
-        c_old = k3s_bootstrap_status(ref, "server", old_token)
-        c_new = k3s_bootstrap_status(ref, "server", new_token)
-        assert c_old == 401, f"the old server token still answers {c_old} (want 401)"
-        assert c_new == 200, f"the new server token answers {c_new} (want 200)"
+
+    def rotated(h, old):
+        new = server_token(h)
+        assert k3s_bootstrap_status(h, "server", old) == 401, "the old server token still answers (want 401)"
+        assert k3s_bootstrap_status(h, "server", new) == 200, "the new server token doesn't answer 200"
         return True
-    wait_for("the k3s tokens rotated (old 401, new 200)", creds_rotated, 300, 5)
-    survivors2 = [h for h in survivors]  # all three servers survive an agent revoke
-    restart_cycle(survivors2, next(h for h in survivors2 if h != OPERATOR_VM), expect_ready=3)
-    # The revoked agent can't come back with what it holds.
-    vm(EDGE_VM, "sudo systemctl restart k3s-agent 2>/dev/null; true", check=False, timeout=30, mux=False)
-    time.sleep(20)
-    assert not any(n["metadata"]["name"] == agent_id for n in Kj("get", "nodes")["items"]), \
-        "the revoked agent re-registered its Node"
+    wait_for("the k3s tokens rotated (old 401, new 200)", lambda: rotated(ref, old_token), 300, 5)
+    restart_cycle(survivors, next(h for h in survivors if h != OPERATOR_VM), expect_ready=3)
+    vm(EDGE_VM, "sudo systemctl restart k3s-agent 2>/dev/null; true", check=False, timeout=60, mux=False)
+    time.sleep(30)
+    assert not any(n["metadata"]["name"] == agent_id for n in Kj("get", "nodes")["items"]), "the revoked agent re-registered its Node"
     assert not K("-n", "kube-system", "get", "secret", f"{agent_id}.node-password.k3s", "--ignore-not-found", "-o", "name", ok=False).strip(), \
         "the revoked agent re-created its node-password Secret"
     assert s.signin(), "sign-in failed after the agent revoke"
-    note(f"ha_vm_revoke_restarts: agent {agent_id} revoked, rotations proven, survivors healthy, the revoked agent can't return")
-
-    # 2) Revoke a server (vm3). Two rotations; two servers survive.
+    note(f"ha_vm_revoke_restarts: agent {agent_id} revoked; rotations proven; the survivors restarted, together and rebooted, healthy; it can't return")
+    # 2) Revoke a server (vm3), two rotations; the real etcd member list.
     srv_id = VM_NODE["vm3"]
-    if VM_NODE[_tunnel["server"]] == srv_id:
-        retarget_api(avoid={srv_id})
-    old_token2 = server_token([h for h in survivors if h != "vm3"][0])
-    note(f"ha_vm_revoke_restarts: revoking the server {srv_id}")
+    before = etcd_member_names(ref)
+    old_token2 = server_token(ref)
+    note(f"ha_vm_revoke_restarts: revoking the server {srv_id} (etcd members {before})")
     pc("node", "revoke", srv_id, inp=srv_id + "\n", timeout=900)
     wait_for("the server's Node gone", lambda: not any(n["metadata"]["name"] == srv_id for n in Kj("get", "nodes")["items"]), 400, 5)
-    ref2 = [h for h in survivors if h != "vm3"][0]
-
-    def creds_rotated2():
-        new_token = server_token(ref2)
-        assert k3s_bootstrap_status(ref2, "server", old_token2) == 401, "the old server token still answers (want 401)"
-        assert k3s_bootstrap_status(ref2, "server", old_node) in (401, 0), "the old node credential still answers"
-        assert k3s_bootstrap_status(ref2, "server", new_token) == 200, "the new server token doesn't answer 200"
-        return True
-    wait_for("the server revoke's rotations (old 401, new 200)", creds_rotated2, 400, 5)
+    wait_for("the server revoke's rotations (old 401, new 200)", lambda: rotated(ref, old_token2), 400, 5)
+    after = wait_for("its etcd member removed", lambda: (lambda m: m if not member_of(srv_id, m) else None)(etcd_member_names(ref)), 300, 5)
+    state["etcd_revoke"] = {"node": srv_id, "before": before, "after": after}
     survivors3 = [h for h in survivors if h != "vm3"]
     restart_cycle(survivors3, next(h for h in survivors3 if h != OPERATOR_VM), expect_ready=2)
     assert s.signin(), "sign-in failed after the server revoke"
-    note(f"ha_vm_revoke_restarts: server {srv_id} revoked, two rotations, both survivors restart/reboot healthy")
+    note(f"ha_vm_revoke_restarts: server {srv_id} revoked, two rotations, etcd {before} → {after}; both survivors healthy")
+    # A fresh server joins with a new code; etcd back to three members.
+    new_id = rejoin("vm3", "server", "main")
+    state["etcd_rejoin"] = wait_for("etcd three members again", lambda: (lambda m: m if len(m) == 3 and member_of(new_id, m) else None)(etcd_member_names(ref)), 300, 5)
 
-    # 3) A surviving agent restarts on its node identity — there is no
-    # surviving agent after vm4's revoke, so instead a fresh node joins with
-    # a new code (vm3, wiped by the revoke, and vm4 re-enrolled).
-    _rejoin_server("vm3")
-    note(f"ha_vm_revoke_restarts: a new server joined with a fresh code; cluster back to 3")
+
+def fresh_victim(avoid=frozenset(), need_fence: bool = True) -> str:
+    """A main storage server (never vm1), the one cut longest ago. With
+    need_fence (the drill needs nodeadm to fence it): never one cut within
+    the remediation back-off (nodeadm/remediate.go remediationBackoff, 20
+    min; run 3's power_off reused vm2 4 min after the partition: no
+    fencing, the volume never detached); the run waits instead, and says so."""
+    cands = [n for n in storage_servers() if n not in avoid and n != VM_NODE[OPERATOR_VM]]
+    assert cands, f"no storage server outside vm1 and {sorted(avoid)}"
+    n = min(cands, key=lambda c: last_cut.get(c, 0.0))
+    if need_fence:
+        wait = last_cut.get(n, 0.0) + BACKOFF_S - time.time()
+        if wait > 0:
+            note(f"  {n} was cut {(time.time() - last_cut[n]) / 60:.0f} min ago: waiting {wait / 60:.1f} min for nodeadm's remediation back-off")
+            time.sleep(wait)
+    return n
+
+
+BACKOFF_S = 21 * 60
+
+
+WRITER = ('n=$(tail -n1 /data/log 2>/dev/null | cut -d" " -f1); n=${n:-0}; '
+          'while :; do n=$((n+1)); echo "$n $(date +%s) $HOSTNAME" >> /data/log && sync; sleep 1; done')
+
+
+def writer_app(prefer: str) -> dict:
+    """The stateful test app: a Deployment (1 replica, Recreate) on the
+    marker's replicated-tier claim that appends `seq epoch pod` to /data/log
+    every second (synced), on the storage servers but never vm1, preferring
+    `prefer`; HA pods' 30 s toleration of a dead node (§3.4)."""
+    d = marker_app(prefer)
+    c = d["spec"]["template"]["spec"]["containers"][0]
+    c["command"] = ["sh", "-c", WRITER]
+    d["metadata"]["name"] = "writer-app"
+    d["spec"]["selector"] = {"matchLabels": {"app": "e2e-writer"}}
+    d["spec"]["template"]["metadata"]["labels"] = {"app": "e2e-writer"}
+    return d
+
+
+def writer_pod() -> dict | None:
+    return next((p for p in Kj("-n", MARKER_NS, "get", "pods", "-l", "app=e2e-writer")["items"]
+                 if not p["metadata"].get("deletionTimestamp")), None)
+
+
+def writer_start(prefer: str) -> dict:
+    marker_setup()
+    K("apply", "-f", "-", inp=json.dumps(writer_app(prefer)))
+    p = wait_for(f"the writer Ready on {prefer}", lambda: (lambda p: p if p and ready(p) and p["spec"].get("nodeName") == prefer else None)(writer_pod()), 300, 5)
+    wait_for("the writer's first lines", lambda: len(writer_log(p["metadata"]["name"])) >= 3, 60, 2)
+    return p
+
+
+def writer_log(pod: str) -> list[tuple[int, int, str]]:
+    out = K("-n", MARKER_NS, "exec", pod, "--", "cat", "/data/log", ok=False, timeout=30)
+    rows = []
+    for ln in out.splitlines():
+        parts = ln.split()
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), parts[2]))
+    return rows
+
+
+def writer_elsewhere(old: dict, victim: str, timeout: float) -> dict:
+    def moved():
+        p = writer_pod()
+        return p if p and p["metadata"]["uid"] != old["metadata"]["uid"] and ready(p) and p["spec"].get("nodeName") != victim else None
+    return wait_for("the writer Running elsewhere", moved, timeout, 3)
+
+
+def log_consistent(rows: list[tuple[int, int, str]]) -> None:
+    """One history: seq strictly 1, 2, 3, … (a gap or a repeat = lost or
+    forked writes), each writer's lines contiguous, and the writers' time
+    spans never overlap (two writers never wrote at once)."""
+    assert rows, "the writer's log is empty"
+    seqs = [r[0] for r in rows]
+    bad = [(a, b) for a, b in zip(seqs, seqs[1:]) if b != a + 1]
+    assert not bad and seqs[0] == 1, f"the log isn't one history (breaks at {bad[:5]}, starts at {seqs[0]})"
+    spans: dict[str, list[int]] = {}
+    order: list[str] = []
+    for _, t, w in rows:
+        if w not in spans:
+            order.append(w)
+            spans[w] = [t, t]
+        spans[w][1] = t
+        assert w == order[-1], f"writer {w} wrote again after {order[-1]} took over"
+    for a, b in zip(order, order[1:]):
+        assert spans[a][1] <= spans[b][0], f"writers {a} and {b} overlap ({spans[a]} / {spans[b]})"
+
+
+def writer_stop() -> None:
+    K("-n", MARKER_NS, "delete", "deployment", "writer-app", "--wait=false", ok=False)
+
+
+def lh_volume_of_claim(ns: str, claim: str) -> str:
+    return Kj("-n", ns, "get", "pvc", claim)["spec"]["volumeName"]
+
+
+def lh_replicas(volume: str) -> list[dict]:
+    return [r for r in lh("get", "replicas.longhorn.io")["items"] if r["spec"].get("volumeName") == volume]
+
+
+def workload_kind(name: str, ns: str = NS) -> str:
+    for kind in ("statefulset", "deployment"):
+        if K("-n", ns, "get", kind, name, "--ignore-not-found", "-o", "name", ok=False).strip():
+            return kind
+    raise AssertionError(f"no StatefulSet or Deployment {name} in {ns}")
+
+
+def rename_node(vmn: str, new_id: str) -> None:
+    """vmn's node is now new_id (a removed or revoked name never re-enrols:
+    the rejoin takes a fresh id); every map follows."""
+    old = VM_NODE.get(vmn)
+    if old in NODE_VM:
+        del NODE_VM[old]
+    NODE_VM[new_id] = vmn
+    VM_NODE[vmn] = new_id
+    if old in SERVERS:
+        SERVERS[SERVERS.index(old)] = new_id
+
+
+def fresh_id(vmn: str) -> str:
+    base = VMS[vmn]["node"]
+    taken = {n["metadata"]["name"] for n in Kj("get", "nodes")["items"]}
+    for i in range(2, 20):
+        cand = f"{base}-{i}"
+        if cand not in taken:
+            return cand
+    raise AssertionError(f"no fresh id for {vmn}")
+
+
+def wipe_node(vmn: str) -> None:
+    """A node's k3s and nodeagent leftovers gone (after its removal or
+    revoke), without a reboot: what a fresh machine would be."""
+    vm(vmn, "sudo bash -c 'systemctl disable --now portcullis-nodeagent k3s k3s-agent >/dev/null 2>&1; "
+            "[ -x /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh >/dev/null 2>&1; "
+            "[ -x /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1; "
+            "ip link del pcmesh 2>/dev/null; rm -rf /usr/local/lib/portcullis /var/lib/portcullis /etc/rancher /var/lib/rancher "
+            "/etc/wireguard/pcmesh.conf /etc/wireguard/pcmesh.key /etc/systemd/system/portcullis-nodeagent.service; "
+            "systemctl daemon-reload; true'", timeout=300, mux=False)
+
+
+def rejoin(vmn: str, role: str, site: str, extra: str = "") -> str:
+    """vmn joined again under a fresh id (its old name is burned): the
+    code from node add on the node's stdin into a root 0600 file
+    (join.sh --code-file), the public address named as setup does; the
+    maps follow. The new id."""
+    new_id = fresh_id(vmn)
+    wipe_node(vmn)
+    out = pc("node", "add", new_id, "--role", role, "--class", "cloud", "--site", site, extra, timeout=120)
+    codes = [ln.strip() for ln in out.splitlines() if ln.startswith("pcj")]
+    assert codes, f"node add {new_id} printed no join code"
+    mask(codes[0])
+    vm(vmn, "sudo install -m 0600 -o root -g root /dev/stdin /root/e2e-join-code", inp=codes[0] + "\n")
+    del out, codes
+    vm(vmn, f"curl -fsSL https://{DOMAIN}/node/join.sh -o /tmp/join.sh && sudo sh /tmp/join.sh --code-file /root/e2e-join-code; "
+            "rc=$?; sudo rm -f /root/e2e-join-code /tmp/join.sh; exit $rc", timeout=600)
+    wait_for(f"{new_id} Ready", lambda: node_ready(new_id), 450, 5)
+    # The local images onto it, the peer list, the public address (as setup's join_node).
+    vm(OPERATOR_VM, "sudo bash -c 'refs=$(/usr/local/bin/k3s ctr -n k8s.io images ls -q | grep -E \"^localhost/portcullis-\" | sort -u); "
+                    "t=$(mktemp /var/tmp/e2e-imp.XXXXXX); /usr/local/bin/k3s ctr -n k8s.io images export --platform linux/amd64 $t $refs && "
+                    f"ssh -F /etc/e2e-ha/ssh_config {vmn} sudo k3s ctr -n k8s.io images import - < $t >/dev/null; rm -f $t; "
+                    f"grep -qx {vmn} /etc/e2e-ha/peers || echo {vmn} >> /etc/e2e-ha/peers'", timeout=600)
+    ann = json.dumps({"lan": [VMS[vmn]["private"]], "public": [VMS[vmn]["public"]]})
+    K("annotate", "node", new_id, "--overwrite", f"portcullis.io/addresses={ann}")
+    rename_node(vmn, new_id)
+    note(f"  {vmn} joined again as {new_id} ({role}, {site}) with a fresh code")
+    return new_id
+
+
+def etcd_member_names(h: str) -> list[str]:
+    """The REAL etcd member list (k3s' etcd JSON API on 2382, the server's
+    own etcd client certificate, paths only on argv)."""
+    out = vm(h, "sudo curl -s --max-time 10 --cacert /var/lib/rancher/k3s/server/tls/etcd/server-ca.crt "
+                "--cert /var/lib/rancher/k3s/server/tls/etcd/client.crt --key /var/lib/rancher/k3s/server/tls/etcd/client.key "
+                "-X POST -d '{}' https://127.0.0.1:2382/v3/cluster/member/list", timeout=30)
+    return sorted(m.get("name", "") for m in json.loads(out).get("members") or [])
+
+
+def member_of(node: str, members: list[str]) -> bool:
+    return any(m == node or m.startswith(node + "-") for m in members)
+
+
+def needs(*keys: str) -> None:
+    missing = [k for k in keys if k not in state]
+    assert not missing, f"needs {', '.join(missing)} (an earlier scenario failed)"
 
 
 def main() -> int:
@@ -1495,9 +1660,9 @@ def main() -> int:
         check("ha_vm_front_door_node: the front door's own node cut, a new front door leads, failover recovers", ha_vm_front_door_node)
         check("ha_vm_front_door_nodeadm_one_node: the front door and nodeadm on one node, cut", ha_vm_front_door_nodeadm_one_node)
         check("ha_vm_cert_renew_leader_move: the front door's certificate renewed across a Lease move", ha_vm_cert_renew_leader_move)
-        check("ha_vm_etcd_remove_member: a cooperative server removal takes its etcd member out", ha_vm_etcd_remove_member)
-        check("ha_vm_interrupted_removal: a server removal interrupted by a restart resumes cleanly", ha_vm_interrupted_removal)
+        check("ha_vm_interrupted_removal: a removal interrupted by a Hub restart resumes cleanly (the agent)", ha_vm_interrupted_removal)
         check("ha_vm_revoke_restarts: revoke an agent then a server; restarts, reboots and credentials all healthy", ha_vm_revoke_restarts)
+        check("ha_vm_etcd_remove_member: the revoked server's etcd member removed (the real member list)", ha_vm_etcd_remove_member)
 
         if "session" in state:
             state["session"].close()

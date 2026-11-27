@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Unit tests for tests/e2e/e2e_ha_vm.py's pure helpers (no VM, no cluster):
+the writer log's one-history judgement (ha_vm_partition, power_off,
+disk_kill), etcd member names (ha_vm_etcd_remove_member), the redaction of
+setup links and join codes, the WireGuard route parse (ha_vm_nat_relay) and
+the victim rotation's back-off wait. Run by CI unit-tests; stdlib only."""
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "e2e"))
+
+_d = tempfile.mkdtemp()
+os.chmod(_d, 0o700)
+(Path(_d) / "inventory.json").write_text(json.dumps({
+    "user": "ubuntu", "domain": "ha.example.test", "lan_cidr": "10.0.0.0/16",
+    "vms": [{"vm": "vm1", "node": "node-1", "role": "first", "site": "main", "public": "192.0.2.1", "private": "10.0.0.1"},
+            {"vm": "vm2", "node": "vm2", "role": "server", "site": "main", "public": "192.0.2.2", "private": "10.0.0.2"},
+            {"vm": "vm3", "node": "vm3", "role": "server", "site": "main", "public": "192.0.2.3", "private": "10.0.0.3"},
+            {"vm": "vm4", "node": "vm4", "role": "agent", "site": "edge", "public": "192.0.2.4", "private": "10.1.0.4"}]}))
+os.environ["E2E_HA_VM_DIR"] = _d
+os.environ.pop("E2E_SCENARIOS", None)
+import e2e_ha_vm as m  # noqa: E402
+
+
+class LogConsistent(unittest.TestCase):
+    def test_one_history_passes(self):
+        m.log_consistent([(1, 100, "a"), (2, 101, "a"), (3, 140, "b"), (4, 141, "b")])
+
+    def test_gap_fails(self):
+        with self.assertRaisesRegex(AssertionError, "one history"):
+            m.log_consistent([(1, 100, "a"), (3, 140, "b")])
+
+    def test_repeat_fails(self):  # a fork: two writers continued the same seq
+        with self.assertRaisesRegex(AssertionError, "one history"):
+            m.log_consistent([(1, 100, "a"), (2, 101, "a"), (2, 102, "b")])
+
+    def test_old_writer_back_fails(self):
+        with self.assertRaisesRegex(AssertionError, "wrote again"):
+            m.log_consistent([(1, 100, "a"), (2, 140, "b"), (3, 141, "a")])
+
+    def test_overlap_fails(self):  # two writers at once (b started before a's last line)
+        with self.assertRaisesRegex(AssertionError, "overlap"):
+            m.log_consistent([(1, 100, "a"), (2, 150, "a"), (3, 120, "b")])
+
+    def test_must_start_at_one(self):
+        with self.assertRaisesRegex(AssertionError, "starts at 5"):
+            m.log_consistent([(5, 100, "a"), (6, 101, "a")])
+
+    def test_empty_fails(self):
+        with self.assertRaises(AssertionError):
+            m.log_consistent([])
+
+
+class EtcdMembers(unittest.TestCase):
+    def test_member_of(self):
+        members = ["node-1-1a2b3c", "vm2-4d5e6f", "vm3-2-aa11bb"]
+        self.assertTrue(m.member_of("node-1", members))
+        self.assertTrue(m.member_of("vm3-2", members))
+        self.assertFalse(m.member_of("vm3", ["node-1-1a2b3c", "vm2-4d5e6f"]))
+        # a prefix that isn't a name boundary doesn't count
+        self.assertFalse(m.member_of("vm", members))
+
+
+class Redact(unittest.TestCase):
+    def test_links_and_codes(self):
+        text = "see https://enroll.ha.example.test/invite/AbCdEf0123456789_-xyzAbCdEf0123456789_-xyzAB and pcj2.QUJDREVGR0hJSktMTU5PUFFSU1RVVldY"
+        out = m.redact(text)
+        self.assertNotIn("AbCdEf0123456789", out)
+        self.assertNotIn("QUJDREVGR0hJSktM", out)
+        self.assertIn("/invite/<redacted>", out)
+        self.assertIn("<join code>", out)
+
+
+class WgRoute(unittest.TestCase):
+    def route(self, allowed: str, mesh: str) -> str:
+        real = m.vm
+        m.vm = lambda h, cmd, **kw: allowed
+        try:
+            return m.wg_route("vm4", mesh)
+        finally:
+            m.vm = real
+
+    def test_direct(self):
+        a = "keyA=\t10.215.0.1/32\nkeyB=\t10.215.0.2/32\nkeyC=\t10.215.0.3/32\n"
+        self.assertEqual(self.route(a, "10.215.0.2"), "10.215.0.2")
+
+    def test_through_the_gateway(self):
+        a = "keyA=\t10.215.0.1/32 10.215.0.2/32 10.42.1.0/24\nkeyC=\t10.215.0.3/32\n"
+        self.assertEqual(self.route(a, "10.215.0.2"), "10.215.0.1")
+
+    def test_absent(self):
+        self.assertEqual(self.route("keyA=\t10.215.0.1/32\n", "10.215.0.2"), "")
+
+
+class FreshVictim(unittest.TestCase):
+    def setUp(self):
+        self.real = (m.storage_servers, m.time.sleep, m.note)
+        self.slept = []
+        m.storage_servers = lambda: ["node-1", "vm2", "vm3"]
+        m.time.sleep = self.slept.append
+        m.note = lambda _t: None
+        m.last_cut.clear()
+
+    def tearDown(self):
+        m.storage_servers, m.time.sleep, m.note = self.real
+        m.last_cut.clear()
+
+    def test_never_vm1_and_least_recent(self):
+        m.last_cut.update({"vm2": m.time.time() - 3600})
+        self.assertEqual(m.fresh_victim(), "vm3")  # never cut beats long ago
+        self.assertEqual(self.slept, [])
+
+    def test_waits_out_the_backoff(self):
+        now = m.time.time()
+        m.last_cut.update({"vm2": now - 60, "vm3": now - 120})
+        self.assertEqual(m.fresh_victim(), "vm3")
+        self.assertEqual(len(self.slept), 1)
+        self.assertGreater(self.slept[0], m.BACKOFF_S - 130)
+
+    def test_no_wait_without_fencing(self):
+        now = m.time.time()
+        m.last_cut.update({"vm2": now - 60, "vm3": now - 120})
+        self.assertEqual(m.fresh_victim(need_fence=False), "vm3")
+        self.assertEqual(self.slept, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
