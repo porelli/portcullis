@@ -246,6 +246,16 @@ class SshLost(unittest.TestCase):
         finally:
             m.SSH = old
 
+    def test_timeout_named(self):  # VM run 12: a raw TimeoutExpired from a rebooting host
+        old = m.SSH
+        try:
+            m.SSH = self.fake('case "$*" in *boot_id*) echo "abcdef1234"; exit 0;; esac; sleep 5')
+            self.assertEqual(m.vm("vm2", "cat x", check=False, timeout=1), "")
+            with self.assertRaisesRegex(AssertionError, r"ssh vm2 timed out after 1 s: a fresh connection answers"):
+                m.vm("vm2", "cat x", timeout=1)
+        finally:
+            m.SSH = old
+
     def test_ready_times_out(self):
         old = m.SSH
         try:

@@ -122,7 +122,14 @@ def sh(*argv: str, inp: str | None = None, timeout: float = 120, check: bool = T
 
 def vm(h: str, command: str, inp: str | None = None, timeout: float = 120, check: bool = True, mux: bool = True) -> str:
     opts = SSH if mux else SSH + ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
-    r = subprocess.run([*opts, h, command], input=inp, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run([*opts, h, command], input=inp, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A host going down (VM run 12: the drill's own reboot, ssh hung
+        # while vm2 shut down) or not answering: never a raw traceback.
+        if check:
+            raise AssertionError(f"ssh {h} timed out after {timeout:.0f} s: {ssh_probe(h)}") from None
+        return ""
     if check and r.returncode == 255:
         # ssh's own failure, not the command's (VM run 10: vm4 reset under
         # the rejoin, an empty "exit 255"): say so, with what a fresh
@@ -1468,16 +1475,31 @@ def restart_cycle(survivor_vms: list[str], reboot_vm: str, expect_ready: int) ->
     cluster_healthy(expect_ready)
     for h in survivor_vms:
         no_fatal_since(h)
-    # Reboot one host.
+    # Reboot one host. Its shutdown takes ~80 s (k3s stopping), so nodeadm's
+    # remediation (NotReady + 30 s) can open and SNR fence it once more as it
+    # boots (VM run 12: a clean reboot, then a reset 37 s into the new boot,
+    # the remediation removed 2.5 min later): by design, nodeadm can't tell
+    # a planned reboot from a lost node. Waited for, bounded: a new boot
+    # within 5 min, then no SelfNodeRemediation for it, k3s active and the
+    # Node Ready within 10 min.
     b0 = boot_id(reboot_vm)
+    assert b0, f"{reboot_vm}'s boot id unreadable before its reboot: {ssh_probe(reboot_vm)}"
     vm(reboot_vm, "sudo systemctl reboot", check=False, timeout=30, mux=False)
-    for _ in range(90):
-        b = boot_id(reboot_vm)
-        if b and b != b0:
-            break
-        time.sleep(3)
-    wait_for(f"{reboot_vm} k3s active after reboot", lambda: vm(reboot_vm, "systemctl is-active k3s 2>/dev/null", check=False, timeout=15).strip() == "active", 300, 5)
-    no_fatal_since(reboot_vm, 6)
+    state["_b_first"] = wait_for(f"{reboot_vm} booted again (a new boot id)", lambda: (lambda b: b if b and b != b0 else None)(boot_id(reboot_vm)), 300, 5)
+    node = VM_NODE[reboot_vm]
+
+    def back():
+        try:
+            snr = Kj("-n", "portcullis-fencing", "get", "selfnoderemediations")
+        except Exception:  # noqa: BLE001  (the API moving: ask again)
+            return False
+        if any(x["metadata"]["name"] == node for x in snr.get("items", [])):
+            return False
+        return node_ready(node) and vm(reboot_vm, "systemctl is-active k3s 2>/dev/null", check=False, timeout=15).strip() == "active"
+    wait_for(f"{reboot_vm} back after its reboot (no remediation open, k3s active, Ready)", back, 600, 10)
+    b1 = boot_id(reboot_vm)
+    note(f"  {reboot_vm} rebooted and back ({'one boot' if b1 == state.get('_b_first') else 'a second boot: SNR fenced the slow reboot'})")
+    no_fatal_since(reboot_vm, 15)
     retarget_api()
     cluster_healthy(expect_ready)
     # passwd byte-equal, node == server, no agent-token-file.
