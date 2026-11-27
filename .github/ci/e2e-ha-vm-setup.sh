@@ -518,9 +518,30 @@ cluster() {
   pc up 2>&1 | redact | tail -5
   hub_ready
   t0=$(date +%s)
-  local rc=0
-  pc ha enable --yes 2>&1 | redact | tee "$D/ha-enable.log" | tail -60 || rc=$?
-  echo "ha enable: $(( $(date +%s) - t0 )) s (exit $rc)" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+  local rc=0 try wait_s at
+  : > "$D/ha-enable.log"
+  # ha enable is resumable, and step 9's fail-safe CAA switch refuses when
+  # it can't yet judge the public CAA (a settle point not reached, or a
+  # check that didn't come out clean), saying "run ./portcullis ha enable
+  # again [at <time>]": followed as the product says (VM run 5: refused at
+  # step 9, the same command a minute later ordered and finished). Up to 3
+  # runs, waiting until the time given (at most 20 min) or 60 s; any other
+  # failure stops at once.
+  for try in 1 2 3; do
+    rc=0
+    pc ha enable --yes 2>&1 | redact | tee -a "$D/ha-enable.log" | tail -60 || rc=$?
+    [ "$rc" != 0 ] || break
+    [ "$try" != 3 ] || break
+    tail -40 "$D/ha-enable.log" | grep -q "step 9 of 10" && tail -12 "$D/ha-enable.log" | grep -q -E "run \./portcullis ha enable again|run it again" || break
+    wait_s=60
+    at="$(tail -12 "$D/ha-enable.log" | grep -o -E "(after|at|until) [0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?( UTC|Z)?" | tail -1 | sed -E 's/^(after|at|until) //' || true)"
+    if [ -n "$at" ] && t_at="$(date -u -d "${at% UTC}" +%s 2>/dev/null)"; then
+      wait_s=$(( t_at - $(date +%s) + 5 )); [ "$wait_s" -ge 5 ] || wait_s=5; [ "$wait_s" -le 1200 ] || wait_s=1200
+    fi
+    echo "ha enable: step 9 asked to run it again (try $try): waiting ${wait_s} s, then again" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+    sleep "$wait_s"
+  done
+  echo "ha enable: $(( $(date +%s) - t0 )) s (exit $rc, $try run(s))" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
   mkdir -p "$ART"; cp "$D/ha-enable.log" "$ART/ha-enable.log"
   # The real-install carry (d1f38b3: a pod on a node-bound volume is
   # unplaceable off its node): step 10's N−1 as ha status reports it.
