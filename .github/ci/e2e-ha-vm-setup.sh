@@ -420,8 +420,32 @@ join_node() { # join_node <vm> <node add arguments…>
   done
   fi
   # Every local image (localhost/portcullis-*) onto the new node, then the
-  # wrapper keeps it in step (the peer list).
-  vm vm1 "sudo bash -c 'refs=\$(k3s ctr -n k8s.io images ls -q | grep -E \"^localhost/portcullis-\" | sort -u); [ -z \"\$refs\" ] || /usr/local/bin/k3s ctr -n k8s.io images export --platform linux/amd64 - \$refs | ssh -F /etc/e2e-ha/ssh_config $h sudo k3s ctr -n k8s.io images import - >/dev/null; grep -qx $h /etc/e2e-ha/peers || echo $h >> /etc/e2e-ha/peers'"
+  # wrapper keeps it in step (the peer list). Exported to a file, imported
+  # from a file: `ctr images export -` streamed into the peer's import failed
+  # there ("failed to ingest index.json: short read") and nothing noticed
+  # (VM run 7: nodeadm's and SNR's images never reached vm2 / vm3, and SNR's
+  # manager, scheduled there, couldn't pull; earlier runs had it on vm1 by
+  # chance). Every ref is then checked on the peer (fail closed).
+  vm vm1 "sudo bash -s $h" <<'COPY' || fail "the local images didn't reach $h (see above)"
+set -euo pipefail
+h="$1"; real=/usr/local/bin/k3s; S=(ssh -F /etc/e2e-ha/ssh_config "$h")
+refs="$("$real" ctr -n k8s.io images ls -q | grep -E '^localhost/portcullis-' | sort -u || true)"
+if [ -n "$refs" ]; then
+  t="$(mktemp /var/tmp/e2e-exp.XXXXXX)"; trap 'rm -f "$t"' EXIT
+  # shellcheck disable=SC2086
+  "$real" ctr -n k8s.io images export --platform linux/amd64 "$t" $refs
+  ok=""
+  for i in 1 2 3; do
+    if "${S[@]}" 'f=$(mktemp /var/tmp/e2e-imp.XXXXXX); cat > "$f"; sudo k3s ctr -n k8s.io images import "$f" >/dev/null; rc=$?; rm -f "$f"; exit $rc' < "$t"; then ok=1; break; fi
+    echo "the image import on $h failed (try $i of 3)" >&2; sleep 10
+  done
+  [ -n "$ok" ] || exit 1
+  have="$("${S[@]}" sudo k3s ctr -n k8s.io images ls -q < /dev/null)"
+  missing="$(comm -23 <(printf '%s\n' "$refs") <(printf '%s\n' "$have" | sort -u))"
+  [ -z "$missing" ] || { echo "missing on $h after the import: $missing" >&2; exit 1; }
+fi
+grep -qx "$h" /etc/e2e-ha/peers || echo "$h" >> /etc/e2e-ha/peers
+COPY
   # The node's public address (contract gap, see the job's comment): a
   # joined node behind a 1:1 NAT (Lightsail, EC2) reports none, so nodeadm
   # would publish only the first node's; the harness names it, as an admin
