@@ -7,6 +7,22 @@ _bool() {
   case "${1:-$2}" in true|TRUE|True|1|yes) echo true ;; *) echo false ;; esac
 }
 
+# _cfg_stg_root_sha NAME — the pinned SHA-256 of Let's Encrypt's staging
+# root NAME (x1: "(STAGING) Pretend Pear X1", RSA, until 2035; x2:
+# "(STAGING) Bogus Broccoli X2", ECDSA, until 2040).
+_cfg_stg_root_sha() {
+  case "$1" in
+    x1) echo 3a5e1171e5f5c2d41522d438f225602e4236a68fb29c32399a95921a4ae80e73 ;;
+    x2) echo 497c36c1b50c0daff30870d5908c9b97af29223d5510c5e6c24957d0cc502fb8 ;;
+    *) return 1 ;;
+  esac
+}
+# _cfg_sha256 FILE — the file's SHA-256 in hex (sha256sum, else shasum).
+_cfg_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
 # config_build_ca_bundle — certs/ca-bundle.crt for containers that talk to
 # Keycloak over HTTPS (forward-auth bind-mounts it as its system bundle):
 # system CAs + the internal PKI chain (if it exists yet) + the Let's
@@ -36,14 +52,25 @@ config_build_ca_bundle() {
     extra=" + internal PKI"
   fi
   if [ "$staging" = true ]; then
-    stg_ca="$certs/letsencrypt-stg-root-x1.pem"
-    [ -s "$stg_ca" ] || curl -sf --max-time 20 -o "$stg_ca" "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem" || true
-    if [ -s "$stg_ca" ]; then
-      cat "$stg_ca" >> "$bundle"
-      extra="$extra + LE staging root"
-    else
-      warn "could not download the Let's Encrypt staging root"
-    fi
+    # Both staging roots: RSA certificates chain to X1, ECDSA ones (mail's
+    # certificate is always ECDSA) to X2. Each file is pinned by its SHA-256;
+    # a download that doesn't match is removed and never trusted.
+    local name want got n=0
+    for name in x1 x2; do
+      stg_ca="$certs/letsencrypt-stg-root-$name.pem"
+      want="$(_cfg_stg_root_sha "$name")"
+      [ -s "$stg_ca" ] || curl -sf --max-time 20 -o "$stg_ca" "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-$name.pem" || true
+      got=""
+      [ -s "$stg_ca" ] && got="$(_cfg_sha256 "$stg_ca")"
+      if [ -n "$got" ] && [ "$got" = "$want" ]; then
+        cat "$stg_ca" >> "$bundle"
+        n=$((n + 1))
+      else
+        [ ! -e "$stg_ca" ] || rm -f "$stg_ca"
+        warn "could not get the Let's Encrypt staging root $name (missing, or its SHA-256 isn't the pinned one): containers won't trust staging certificates from it"
+      fi
+    done
+    [ "$n" -eq 0 ] || extra="$extra + LE staging roots ($n of 2)"
   fi
   chmod 644 "$bundle"
   ok "Wrote $bundle (system CAs$extra)"
@@ -307,7 +334,7 @@ at start-up).
 
 Options:
   --bundle-only   only rebuild certs/ca-bundle.crt (system CAs + internal
-                  PKI chain + LE staging root if ACME_STAGING=true)
+                  PKI chain + both LE staging roots if ACME_STAGING=true)
 EOF
 }
 

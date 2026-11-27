@@ -5836,6 +5836,32 @@ expect_eq "the SELinux overlay labels the seed for LLDAP alone (Z)" \
   "$(grep -c 'source: ./secrets/lldap/key-seed, target: /run/portcullis/lldap/key-seed, read_only: true, bind: {selinux: Z}' "$HERE/../docker-compose.podman-selinux.yml")" 1
 expect_eq "nothing else mounts LLDAP's seed" "$(grep -c '^ *- \./secrets/lldap' "$CY")" 1
 
+# ── the CA bundle's Let's Encrypt staging roots (X1 RSA, X2 ECDSA), pinned by SHA-256 ──
+CAB="$WORK/cab"; mkdir -p "$CAB/root/certs" "$CAB/bin" "$CAB/src"
+cp "$HERE/fixtures/le-staging/letsencrypt-stg-root-x1.pem" "$HERE/fixtures/le-staging/letsencrypt-stg-root-x2.pem" "$CAB/src/"
+# curl stub: serves the fixture named by the URL's last path part ($CAB_BAD=x2 serves junk for X2).
+cat > "$CAB/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done
+f="${url##*/}"
+if [ -n "${CAB_BAD:-}" ] && [ "$f" = "letsencrypt-stg-root-$CAB_BAD.pem" ]; then echo junk > "$out"; exit 0; fi
+cp "$CAB_SRC/$f" "$out"
+CURL
+chmod +x "$CAB/bin/curl"
+cab_run() { (export PATH="$CAB/bin:$PATH" CAB_SRC="$CAB/src" PORTCULLIS_ROOT="$CAB/root" ACME_STAGING=true; source "$HERE/../scripts/lib/common.sh"; source "$HERE/../scripts/lib/config.sh"; rm -f "$CAB/root/certs/"letsencrypt-stg-root-*.pem; config_build_ca_bundle) 2>&1; }
+CAB_OUT="$(cab_run)"
+expect_ok "CA bundle (staging): the X1 root is in it" grep -qF "$(sed -n 2p "$CAB/src/letsencrypt-stg-root-x1.pem")" "$CAB/root/certs/ca-bundle.crt"
+expect_ok "CA bundle (staging): the X2 root (ECDSA: mail's certificate) is in it" grep -qF "$(sed -n 2p "$CAB/src/letsencrypt-stg-root-x2.pem")" "$CAB/root/certs/ca-bundle.crt"
+case "$CAB_OUT" in *"LE staging roots (2 of 2)"*) t_pass "CA bundle (staging): both roots reported" ;; *) t_fail "CA bundle both roots: $CAB_OUT" ;; esac
+CAB_OUT="$(CAB_BAD=x2 cab_run)"
+expect_fail "CA bundle (staging): an X2 download with another SHA-256 is never trusted" grep -q junk "$CAB/root/certs/ca-bundle.crt"
+expect_eq "CA bundle (staging): the bad X2 file is removed" "$([ -e "$CAB/root/certs/letsencrypt-stg-root-x2.pem" ] && echo kept || echo removed)" removed
+case "$CAB_OUT" in *"staging root x2"*"pinned"*) t_pass "CA bundle (staging): the bad X2 download is named" ;; *) t_fail "CA bundle bad x2: $CAB_OUT" ;; esac
+expect_eq "CA bundle: the pins are the fixtures' SHA-256" \
+  "$(bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/config.sh'; echo \$(_cfg_sha256 '$CAB/src/letsencrypt-stg-root-x1.pem') \$(_cfg_sha256 '$CAB/src/letsencrypt-stg-root-x2.pem')")" \
+  "$(bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/config.sh'; echo \$(_cfg_stg_root_sha x1) \$(_cfg_stg_root_sha x2)")"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
