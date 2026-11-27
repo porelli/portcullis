@@ -1737,7 +1737,13 @@ case "$*" in
     [ -e "$f" ] || f="$GD_DIR/master"
     [ -s "$f" ] && [ "$(cat "$f")" != - ] || exit 0
     if [ -e "$GD_DIR/failed-over" ]; then [ -e "$GD_DIR/silent-after" ] && exit 0; cat "$GD_DIR/after"; else cat "$f"; echo; fi; echo 6379 ;;
-  *"-p 6379 info replication") [ -s "$GD_DIR/peer" ] || exit 1; cat "$GD_DIR/peer" ;;
+  *"-p 6379 info replication")
+    # Per pod (role-<pod>: that one's role), the failover's new master a
+    # master, else the other pod's own view (peer).
+    h="$*"; h="${h#*-h }"; h="${h%% *}"; h="${h%%.*}"
+    if [ -e "$GD_DIR/role-$h" ]; then [ -s "$GD_DIR/role-$h" ] || exit 1; printf 'role:%s\r\nmaster_repl_offset:7\r\n' "$(cat "$GD_DIR/role-$h")"; exit 0; fi
+    if [ -e "$GD_DIR/failed-over" ] && [ "$h" = "$(sed 's/\..*//' "$GD_DIR/after")" ]; then printf 'role:master\r\nmaster_repl_offset:7\r\n'; exit 0; fi
+    [ -s "$GD_DIR/peer" ] || exit 1; cat "$GD_DIR/peer" ;;
   *"sentinel failover portcullis-sessions") [ -e "$GD_DIR/no-failover" ] || touch "$GD_DIR/failed-over"; echo OK ;;
 esac
 GSTUB
@@ -1751,8 +1757,13 @@ guard() { # guard <master answer> <the other pod's INFO replication ("" = unreac
 }
 P0=sessions-0.sessions-pods.portcullis.svc.cluster.local P1=sessions-1.sessions-pods.portcullis.svc.cluster.local
 REP0="$(printf '# Replication\r\nrole:slave\r\nmaster_link_status:down\r\nmaster_repl_offset:133960\r\n')"
-expect_eq "sessions guard: the Sentinels name another master → this pod replicates from it" \
-  "$(guard "$P0" "")$(grep -c "^replicaof $P0 6379$" "$GD/conf")$(grep -c '^include /etc/valkey-ha/valkey.conf$' "$GD/conf")" "rc=011"
+expect_eq "sessions guard: the Sentinels name another master (it says role:master) → this pod replicates from it" \
+  "$(echo master > "$GD/role-sessions-0"; guard "$P0" ""; rm -f "$GD/role-sessions-0")$(grep -c "^replicaof $P0 6379$" "$GD/conf")$(grep -c '^include /etc/valkey-ha/valkey.conf$' "$GD/conf")" "rc=011"
+# Task 33 part B (VM run 6): never a replica of a replica.
+expect_eq "sessions guard: the named master says role:slave (a loop) → asked again, then refused (exit 1), no config, the named error" \
+  "$(echo slave > "$GD/role-sessions-0"; guard "$P0" ""; rm -f "$GD/role-sessions-0")$(test -e "$GD/conf" && echo conf || echo noconf)$(grep -c '^portcullis-sessions: the master the Sentinels name .* says role slave: refusing to start as its replica' "$GD/term")" "rc=1noconf1"
+expect_eq "sessions guard: the named master unreachable → never replicated from blindly: refused after the wait (exit 1), no config" \
+  "$(: > "$GD/role-sessions-0"; guard "$P0" ""; rm -f "$GD/role-sessions-0")$(test -e "$GD/conf" && echo conf || echo noconf)$(grep -c 'unknown (unreachable)' "$GD/term")" "rc=1noconf1"
 expect_eq "sessions guard: named itself (a fast restart, empty), the other pod a replica holding data (asked directly; its link down) → SENTINEL FAILOVER first, then a replica of the new master" \
   "$(guard "$P1" "$REP0" "$P0")$(grep -c 'sentinel failover portcullis-sessions' "$GD/calls")$(grep -c "^replicaof $P0 6379$" "$GD/conf")" "rc=011"
 expect_eq "sessions guard: named itself, the Sentinels never fail over (a replica they refuse) → asked first, then the master after the wait (sign-in over the sessions)" \
@@ -1779,11 +1790,46 @@ expect_eq "sessions guard: silent after the FAILOVER with the deadline falling b
 expect_eq "sessions guard: one Sentinel alone names another master (the others silent) → no two agreeing answers, refused (review M2)" \
   "$(printf '%s' - > "$GD/master-1"; printf '%s' - > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(test -e "$GD/conf" && echo conf || echo noconf)" "rc=1noconf"
 expect_eq "sessions guard: two of three Sentinels agree (the third names this pod) → the two decide: a replica of their master" \
-  "$(printf '%s' "$P1" > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(grep -c "^replicaof $P0 6379$" "$GD/conf")" "rc=01"
+  "$(printf '%s' "$P1" > "$GD/master-2"; echo master > "$GD/role-sessions-0"; guard "$P0" ""; rm -f "$GD"/master-[012] "$GD/role-sessions-0")$(grep -c "^replicaof $P0 6379$" "$GD/conf")" "rc=01"
 expect_eq "sessions guard: the three Sentinels disagree (two name different pods) → refused with the named error (the termination message the status and HA page show)" \
   "$(printf '%s' "$P1" > "$GD/master-1"; printf '%s' - > "$GD/master-2"; guard "$P0" ""; rm -f "$GD"/master-[012])$(grep -c '^portcullis-sessions: the Sentinels disagree on the master' "$GD/term")" "rc=11"
 t0="$(date +%s)"; guard "" "" >/dev/null
 expect_eq "sessions guard: the wait counts real seconds (GUARD_WAIT 3 → refused after 3-5 s, not 4 rounds of 2)" "$(( $(date +%s) - t0 >= 3 && $(date +%s) - t0 <= 6 ))" 1
+# The session store's liveness (Task 33 part B, VM run 6: a replication
+# loop left no master for 2 h): live.sh restarts a pod only on a definite
+# inconsistency, never on a master that's just unreachable.
+LV="$WORK/live"; rm -rf "$LV"; mkdir -p "$LV/bin"
+cat > "$LV/bin/valkey-cli" <<'LSTUB'
+#!/bin/sh
+# Answers from $LV_DIR: ping (NOAUTH or not), info-<host> (INFO replication;
+# absent = unreachable), s<n> (sentinel n's master).
+case "$*" in
+  *" ping") [ -e "$LV_DIR/dead" ] && exit 1; echo "NOAUTH Authentication required." ;;
+  *"-p 26379 sentinel get-master-addr-by-name portcullis-sessions")
+    h="$*"; h="${h#*-h sessions-sentinel-}"; f="$LV_DIR/s${h%%.*}"; [ -s "$f" ] || exit 0; cat "$f"; echo; echo 6379 ;;
+  *"info replication")
+    h="$*"; h="${h#*-h }"; h="${h%% *}"; h="${h%%.*}"; f="$LV_DIR/info-$h"; [ -e "$f" ] || exit 1; cat "$f" ;;
+esac
+LSTUB
+chmod +x "$LV/bin/valkey-cli"
+live() { # live <this pod's INFO> <its master's INFO ("" = unreachable)> [sentinels naming this pod: 0-3]
+  rm -f "$LV"/info-* "$LV"/s[012] "$LV/dead"
+  printf '%s' "$1" > "$LV/info-127"; [ -z "$2" ] || printf '%s' "$2" > "$LV/info-sessions-0"
+  for i in 0 1 2; do if [ "$i" -lt "${3:-0}" ]; then echo "sessions-1.sessions-pods.portcullis.svc.cluster.local"; else echo "sessions-0.sessions-pods.portcullis.svc.cluster.local"; fi > "$LV/s$i"; done
+  ( export PATH="$LV/bin:$PATH" LV_DIR="$LV" POD_NAMESPACE=portcullis POD_NAME=sessions-1
+    sh "$HERE/../charts/portcullis/files/sessions-ha/live.sh" ) >/dev/null 2>&1; echo $?
+}
+LREP="$(printf 'role:slave\r\nmaster_host:sessions-0.sessions-pods.portcullis.svc.cluster.local\r\nmaster_link_status:down\r\n')"
+LMASTER="$(printf 'role:master\r\nmaster_repl_offset:9\r\n')"
+expect_eq "sessions live: the process doesn't answer the PING → fails" "$(touch "$LV/dead"; ( export PATH="$LV/bin:$PATH" LV_DIR="$LV" POD_NAMESPACE=portcullis POD_NAME=sessions-1; sh "$HERE/../charts/portcullis/files/sessions-ha/live.sh" ) >/dev/null 2>&1; echo $?; rm -f "$LV/dead")" 1
+expect_eq "sessions live: a master → passes" "$(live "$LMASTER" "")" 0
+expect_eq "sessions live: a replica whose link is up → passes" "$(live "$(printf '%s' "$LREP" | sed 's/link_status:down/link_status:up/')" "$(printf 'role:slave\r\n')")" 0
+expect_eq "sessions live: a replica (link down) whose master says role:slave → fails (a loop: no master)" "$(live "$LREP" "$(printf 'role:slave\r\nmaster_link_status:down\r\n')")" 1
+expect_eq "sessions live: a replica whose master is unreachable (a failover under way) → passes (a restart would empty it)" "$(live "$LREP" "")" 0
+expect_eq "sessions live: a replica whose master is a master (just a slow link) → passes" "$(live "$LREP" "$LMASTER")" 0
+expect_eq "sessions live: a replica (link down, master unreachable) that two Sentinels name the master → fails" "$(live "$LREP" "" 2)" 1
+expect_eq "sessions live: one Sentinel alone naming it → passes (two must agree)" "$(live "$LREP" "" 1)" 0
+expect_eq "sessions live: the password never on valkey-cli's argv (VALKEYCLI_AUTH only)" "$(grep -c -E 'valkey-cli[^|]*(-a |--pass)' "$HERE/../charts/portcullis/files/sessions-ha/live.sh")" 0
 # sentinel-init (review M-b): two agreeing other Sentinels decide; a split
 # between them is a named error and the Valkey pods' own master decides;
 # exactly one answering with no Valkey reachable is followed; else sessions-0.

@@ -11,7 +11,8 @@
 #     disconnected too long for them), start as the master after all — the
 #     sessions are lost, sign-in isn't; if the other pod is unreachable or
 #     never replicated, start as the master (nothing to lose).
-#   - Otherwise replicate from the master named.
+#   - Otherwise replicate from the master named, once it says role:master
+#     itself (never a replica of a replica: asked again, then refused).
 # Writes /conf/valkey.conf: the CLI's config (secrets-sessions-ha, the ACL
 # users and masterauth) by include, this pod's announced name and, as a
 # replica, replicaof. Passwords only through VALKEYCLI_AUTH (the env, from
@@ -122,6 +123,34 @@ if [ "$m" = "$me" ]; then
     log "the master, the other pod holds no data (unreachable or never replicated)"
     m=""
   fi
+fi
+# Never a replica of a replica (Task 33 part B, VM run 6: each pod had
+# followed the master two Sentinels named at its own start, a failover fell
+# between the two starts, and each replicated from the other; no master,
+# and the Sentinels could never promote): the master named must say
+# role:master itself (asked directly). Until it does, the Sentinels are
+# asked again (they may name another pod by then) for at most $WAIT s;
+# then refused (crash loop: the next start asks anew). Named this pod
+# meanwhile: exit, so the next start takes the path above.
+role_of() { cli -h "$1" -p 6379 info replication 2>/dev/null | tr -d '\r' | sed -n 's/^role://p'; }
+if [ -n "$m" ]; then
+  start="$(date +%s)"
+  while :; do
+    r="$(role_of "$m")"
+    [ "$r" = master ] && break
+    if [ "$(elapsed)" -ge "$WAIT" ]; then
+      named "the master the Sentinels name ($m) says role ${r:-unknown (unreachable)}: refusing to start as its replica (never a replica of a replica)"
+      exit 1
+    fi
+    sleep 2
+    if n="$(ask_master)"; then
+      if [ "$n" = "$me" ]; then
+        named "the Sentinels now name this pod the master: restarting the guard (its own-master path)"
+        exit 1
+      fi
+      m="$n"
+    fi
+  done
 fi
 {
   echo "include /etc/valkey-ha/valkey.conf"

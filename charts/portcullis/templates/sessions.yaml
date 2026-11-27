@@ -8,8 +8,11 @@ small node), both pinned to the primary site, their headless Services
 oauth2-proxies find the master through the Sentinels (forward-auth*.yaml).
 A Valkey pod never elects itself: its init guard
 (files/sessions-ha/guard.sh) asks the Sentinels, fails over first when they
-still name it (a fast restart comes back empty), and its readiness is the
-replication's (ready.sh), with minReadySeconds 10. The configs are the
+still name it (a fast restart comes back empty), never replicates from a
+node that isn't role:master itself (Task 33 part B: a replication loop had
+left no master), and its readiness is the replication's (ready.sh), with
+minReadySeconds 10; its liveness (live.sh) restarts a replica stuck in a loop
+or named the master by two Sentinels, for 20 × 5 s, so the guard recovers it. The configs are the
 CLI's (Secret secrets-sessions-ha, ha.sh kube_sessions_ha_prepare: the ACL
 users as SHA-256, the replication and Sentinel users' password); the
 in-pod parts (announced names, replicaof, the monitor line) are written
@@ -47,7 +50,7 @@ spec:
 {{- else }}
 {{- $img := include "portcullis.image" (list . "sessions") }}
 {{- $pull := ternary "Never" "IfNotPresent" (hasPrefix "localhost/" $img) }}
-{{- $files := dict "guard.sh" (.Files.Get "files/sessions-ha/guard.sh") "ready.sh" (.Files.Get "files/sessions-ha/ready.sh") "sentinel-init.sh" (.Files.Get "files/sessions-ha/sentinel-init.sh") }}
+{{- $files := dict "guard.sh" (.Files.Get "files/sessions-ha/guard.sh") "ready.sh" (.Files.Get "files/sessions-ha/ready.sh") "live.sh" (.Files.Get "files/sessions-ha/live.sh") "sentinel-init.sh" (.Files.Get "files/sessions-ha/sentinel-init.sh") }}
 {{- $cm := printf "sessions-ha-scripts-%s" (toJson $files | sha256sum | trunc 10) }}
 {{- $env := list
   (dict "name" "POD_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
@@ -71,7 +74,7 @@ spec:
   "initContainers" (list $guard)
   "probes" (dict
     "readinessProbe" (dict "exec" (dict "command" (list "sh" "/scripts/ready.sh")) "periodSeconds" 2 "timeoutSeconds" 3 "failureThreshold" 2)
-    "livenessProbe" (dict "exec" (dict "command" (list "sh" "-c" "env -u VALKEYCLI_AUTH valkey-cli --no-auth-warning -h 127.0.0.1 ping 2>&1 | grep -q NOAUTH")) "periodSeconds" 5 "timeoutSeconds" 3 "failureThreshold" 20))
+    "livenessProbe" (dict "exec" (dict "command" (list "sh" "/scripts/live.sh")) "periodSeconds" 5 "timeoutSeconds" 10 "failureThreshold" 20))
   "mounts" (list
     (dict "name" "data" "mountPath" "/data")
     $confMnt
