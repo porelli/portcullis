@@ -623,7 +623,21 @@ const (
 // serial of its record not yet expired (Vault's form). No ConfigMap, or
 // another id: none. Unreadable or malformed: an error (fail closed: the
 // removal stops, and is retried, before anything is marked).
-func (s *Server) firstNodeSerials(ctx context.Context, id string) ([]string, error) {
+// firstNodeDoc is the CLI's record of the first node (nil: none).
+type firstNodeDoc struct {
+	V  int    `json:"v"`
+	ID string `json:"id"`
+	// MeshPub: the first node's pcmesh public key as the CLI read it on
+	// that host (nodeadm's enrolled key for a node it never enrolled; Task
+	// 33b third security review).
+	MeshPub string `json:"mesh_pub,omitempty"`
+	Serials []struct {
+		Serial   string    `json:"serial"`
+		NotAfter time.Time `json:"not_after"`
+	} `json:"serials"`
+}
+
+func (s *Server) firstNode(ctx context.Context) (*firstNodeDoc, error) {
 	cm, err := s.kube.CoreV1().ConfigMaps(s.cfg.CoreNS).Get(ctx, firstNodeCM, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil, nil
@@ -631,18 +645,19 @@ func (s *Server) firstNodeSerials(ctx context.Context, id string) ([]string, err
 	if err != nil {
 		return nil, fmt.Errorf("reading the ConfigMap %s: %w", firstNodeCM, err)
 	}
-	var doc struct {
-		V       int    `json:"v"`
-		ID      string `json:"id"`
-		Serials []struct {
-			Serial   string    `json:"serial"`
-			NotAfter time.Time `json:"not_after"`
-		} `json:"serials"`
-	}
+	var doc firstNodeDoc
 	dec := json.NewDecoder(strings.NewReader(cm.Data[firstNodeKey]))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&doc); err != nil || doc.V != 1 || !serverIDRe.MatchString(doc.ID) {
 		return nil, fmt.Errorf("the ConfigMap %s doesn't parse", firstNodeCM)
+	}
+	return &doc, nil
+}
+
+func (s *Server) firstNodeSerials(ctx context.Context, id string) ([]string, error) {
+	doc, err := s.firstNode(ctx)
+	if err != nil || doc == nil {
+		return nil, err
 	}
 	if doc.ID != id {
 		return nil, nil

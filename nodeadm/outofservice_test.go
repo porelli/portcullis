@@ -106,9 +106,12 @@ func revokeHarness(t *testing.T, fence, detach time.Duration) *harness {
 	h.agents.meshState = true // every survivor answers with its (empty) mesh state
 	h.agents.mu.Unlock()
 	putLease(t, h, "n2", time.Now().Add(-10*time.Minute))
+	// The enrolled mesh keys (key-<id>, what the fake nodeagents report).
 	h.putState(t, func(st *nodeadmState) {
-		st.Nodes["n2"] = &nodeRecord{Role: "server", Serial: "12:34", MeshIP: "10.215.0.2"}
-		st.Nodes["n4"] = &nodeRecord{Role: "agent", Serial: "12:44", MeshIP: "10.215.0.4"}
+		st.Nodes["n1"] = &nodeRecord{Role: "server", MeshIP: "10.215.0.1", Mesh: MeshReport{Pub: "key-n1"}}
+		st.Nodes["n2"] = &nodeRecord{Role: "server", Serial: "12:34", MeshIP: "10.215.0.2", Mesh: MeshReport{Pub: "key-n2"}}
+		st.Nodes["n3"] = &nodeRecord{Role: "server", MeshIP: "10.215.0.3", Mesh: MeshReport{Pub: "key-n3"}}
+		st.Nodes["n4"] = &nodeRecord{Role: "agent", Serial: "12:44", MeshIP: "10.215.0.4", Mesh: MeshReport{Pub: "key-n4"}}
 	})
 	return h
 }
@@ -211,6 +214,11 @@ func TestRevokeAgentNoOutOfService(t *testing.T) {
 // kept; proven cut off, the retry finishes.
 func TestRevokeNoTaintWithoutCutOffProof(t *testing.T) {
 	recent := time.Now().UTC().Add(time.Hour).Format(time.RFC3339) // after the revoke (vecNow)
+	// The revoke starts at vecNow (the harness clock), a whole second: the
+	// boundary is vecNow − handshakeSkew.
+	sameSec := vecNow.UTC().Format(time.RFC3339)
+	skewed := vecNow.Add(-3 * time.Second).UTC().Format(time.RFC3339)
+	after3 := vecNow.Add(3 * time.Second).UTC().Format(time.RFC3339)
 	for _, c := range []struct {
 		name, why string
 		setup     func(t *testing.T, h *harness)
@@ -236,10 +244,57 @@ func TestRevokeNoTaintWithoutCutOffProof(t *testing.T) {
 				h.agents.mu.Unlock()
 			},
 			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
-		{"a handshake after the start from a key no longer in the plan", "n3 saw a handshake at " + recent + " from key key-gone, which isn't a surviving node's",
+		{"a handshake after the start from a key no longer in the plan", "n3 saw a handshake at " + recent + " from key key-gone, which isn't a surviving node's enrolled key",
 			func(t *testing.T, h *harness) {
 				h.agents.mu.Lock()
 				h.agents.devPeers = map[string]string{"n3": `{"key-gone":{"latest_handshake":"` + recent + `","endpoint":null,"allowed_ips":[]}}`}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
+		{"a same-second handshake from the revoked key", "n3 saw a handshake at " + sameSec + " from key key-n2",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.devPeers = map[string]string{"n3": `{"key-n2":{"latest_handshake":"` + sameSec + `","endpoint":null,"allowed_ips":[]}}`}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
+		{"a handshake 3 s before the start (inside the skew)", "n3 saw a handshake at " + skewed + " from key key-x",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.devPeers = map[string]string{"n3": `{"key-x":{"latest_handshake":"` + skewed + `","endpoint":null,"allowed_ips":[]}}`}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
+		{"a handshake 3 s after the start", "n1 saw a handshake at " + after3 + " from key key-x",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.devPeers = map[string]string{"n1": `{"key-x":{"latest_handshake":"` + after3 + `","endpoint":null,"allowed_ips":[]}}`}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
+		{"a survivor reporting a mesh_pub that isn't its enrolled key", "n3 reports a mesh key that isn't its enrolled one (not proven)",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.pubs = map[string]string{"n3": "key-n2"} // vouching for the revoked key
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.pubs = nil; h.agents.mu.Unlock() }},
+		{"a survivor vouching for another key by its mesh_pub", "n3 saw a handshake at " + after3 + " from key key-x, which isn't a surviving node's enrolled key",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.pubs = map[string]string{"n1": "key-x"} // asked first
+				h.agents.devPeers = map[string]string{"n3": `{"key-x":{"latest_handshake":"` + after3 + `","endpoint":null,"allowed_ips":[]}}`}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.pubs, h.agents.devPeers = nil, nil
+				h.agents.mu.Unlock()
+			}},
+		{"the revoked node's enrolled key held by a survivor under other allowed IPs", "n1's WireGuard device still holds the revoked node's enrolled key key-n2",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.devPeers = map[string]string{"n1": `{"key-n2":{"latest_handshake":null,"endpoint":null,"allowed_ips":["10.215.0.77/32"]}}`}
 				h.agents.mu.Unlock()
 			},
 			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
@@ -365,6 +420,11 @@ func TestHealthAnswerVectorsCutOff(t *testing.T) {
 				t.Fatalf("strict decode: %v", err)
 			}
 			h := revokeHarness(t, 0, time.Second)
+			h.putState(t, func(st *nodeadmState) {
+				st.Nodes["n1"].Mesh.Pub = "c1wVmg+oSgt7CNxscBVVhrNfF8ov37hpOdtk57TYzxI="
+				st.Nodes["n2"].Mesh.Pub = "47iJcR3LLHiqWFVZTK1jQtJAZoLg2WT5srm2F2V3Nsw="
+				st.Nodes["n3"].Mesh.Pub = "0JgPr0SArMeTmpPu3/PtK5VHQor0553KrI79Wqr1XoE="
+			})
 			h.agents.mu.Lock()
 			h.agents.peers = map[string]string{"n1": string(ah.Peers)}
 			h.agents.devPeers = map[string]string{"n1": string(ah.DevicePeers)}
@@ -379,9 +439,59 @@ func TestHealthAnswerVectorsCutOff(t *testing.T) {
 			} else if !strings.Contains(why, want[i]) {
 				t.Fatalf("reasons %q, want %q", why, want[i])
 			}
-			if i == 1 && !strings.Contains(why, "n1 saw a handshake at 2026-11-28T09:59:58Z from key 47iJcR3LLHiqWFVZTK1jQtJAZoLg2WT5srm2F2V3Nsw=") {
+			if i == 1 && (!strings.Contains(why, "n1 saw a handshake at 2026-11-28T09:59:58Z from key 47iJcR3LLHiqWFVZTK1jQtJAZoLg2WT5srm2F2V3Nsw=") ||
+				!strings.Contains(why, "n1's WireGuard device still holds the revoked node's enrolled key 47iJcR3LLHiqWFVZTK1jQtJAZoLg2WT5srm2F2V3Nsw=")) {
 				t.Fatalf("the revoked key's handshake after the start isn't named: %s", why)
 			}
 		})
+	}
+}
+
+// TestHandshakeBoundary: only a handshake strictly before the start's
+// second minus handshakeSkew counts as before the revoke.
+func TestHandshakeBoundary(t *testing.T) {
+	h := revokeHarness(t, 0, time.Second)
+	start := vecNow.Add(700 * time.Millisecond) // sub-second precision
+	for _, c := range []struct {
+		at   time.Time
+		seen bool
+	}{
+		{vecNow.Add(-handshakeSkew - time.Second), false},
+		{vecNow.Add(-handshakeSkew), true},
+		{vecNow, true},
+		{start, true},
+	} {
+		h.agents.mu.Lock()
+		h.agents.devPeers = map[string]string{"n1": `{"key-x":{"latest_handshake":"` + c.at.UTC().Format(time.RFC3339) + `","endpoint":null,"allowed_ips":[]}}`}
+		h.agents.mu.Unlock()
+		why := strings.Join(h.s.cutOffReasons(context.Background(), &revokeOp{Node: "n2", Mesh: "10.215.0.2", Started: start}), "; ")
+		if got := strings.Contains(why, "from key key-x"); got != c.seen {
+			t.Errorf("a handshake at %s, the start %s: seen %v, want %v (%s)", c.at.Format(time.RFC3339), start.Format(time.RFC3339Nano), got, c.seen, why)
+		}
+	}
+}
+
+// TestFirstNodeEnrolledKey: the first node (never enrolled by nodeadm,
+// no record) is trusted by the key the CLI recorded in
+// portcullis-first-node, never by the key it reports.
+func TestFirstNodeEnrolledKey(t *testing.T) {
+	h := revokeHarness(t, 0, time.Second)
+	ctx := context.Background()
+	h.putState(t, func(st *nodeadmState) { delete(st.Nodes, "n1") })
+	op := &revokeOp{Node: "n2", Mesh: "10.215.0.2", Started: vecNow}
+	if why := strings.Join(h.s.cutOffReasons(ctx, op), "; "); !strings.Contains(why, "n1 has no enrolled mesh key (not proven)") {
+		t.Fatalf("no record, no ConfigMap: %s", why)
+	}
+	doc := `{"v":1,"id":"n1","mesh_pub":"key-n1","serials":[]}`
+	h.kube.CoreV1().ConfigMaps(coreNS).Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: firstNodeCM, Namespace: coreNS},
+		Data: map[string]string{firstNodeKey: doc}}, metav1.CreateOptions{})
+	if why := strings.Join(h.s.cutOffReasons(ctx, op), "; "); strings.Contains(why, "n1") {
+		t.Fatalf("the CLI's recorded key for n1 isn't trusted: %s", why)
+	}
+	h.agents.mu.Lock()
+	h.agents.pubs = map[string]string{"n1": "key-other"}
+	h.agents.mu.Unlock()
+	if why := strings.Join(h.s.cutOffReasons(ctx, op), "; "); !strings.Contains(why, "n1 reports a mesh key that isn't its enrolled one") {
+		t.Fatalf("a first node reporting another key: %s", why)
 	}
 }

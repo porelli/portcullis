@@ -234,6 +234,24 @@ func (s *Server) cutOffReasons(ctx context.Context, op *revokeOp) []string {
 	if err != nil {
 		why = append(why, "its mesh address is unknown")
 	}
+	// The keys nodeadm itself enrolled (third security review): never a
+	// key a node reports. The revoked node's is a denylist, whatever the
+	// rest says.
+	enrolled, err := s.enrolledKeys(ctx)
+	if err != nil {
+		return append(why, "the enrolled mesh keys are unreadable")
+	}
+	revokedKey := enrolled[id].pub
+	if revokedKey == "" {
+		why = append(why, "its enrolled mesh key is unknown (not proven)")
+	}
+	allowed := map[string]bool{}
+	for name, e := range enrolled {
+		if name != id && !e.removed && e.pub != "" {
+			allowed[e.pub] = true
+		}
+	}
+	boundary := op.Started.Truncate(time.Second).Add(-handshakeSkew)
 	cl, err := s.clusterNodes(ctx)
 	if err != nil {
 		return append(why, "the nodes are unreadable")
@@ -242,12 +260,6 @@ func (s *Server) cutOffReasons(ctx context.Context, op *revokeOp) []string {
 		LatestHandshake *string  `json:"latest_handshake"`
 		AllowedIPs      []string `json:"allowed_ips"`
 	}
-	type report struct {
-		name string
-		dev  map[string]devPeer
-	}
-	var reports []report
-	keys := map[string]bool{} // the surviving nodes' own mesh keys
 	for _, c := range cl {
 		if c.Name == id {
 			continue
@@ -263,8 +275,10 @@ func (s *Server) cutOffReasons(ctx context.Context, op *revokeOp) []string {
 			why = append(why, c.Name+"'s nodeagent doesn't answer")
 			continue
 		}
-		if h.MeshPub != "" {
-			keys[h.MeshPub] = true
+		if own := enrolled[c.Name].pub; own == "" {
+			why = append(why, c.Name+" has no enrolled mesh key (not proven)")
+		} else if h.MeshPub != own {
+			why = append(why, c.Name+" reports a mesh key that isn't its enrolled one (not proven)")
 		}
 		if isNullJSON(h.Peers) || isNullJSON(h.DevicePeers) {
 			why = append(why, c.Name+" reported no mesh state")
@@ -279,24 +293,64 @@ func (s *Server) cutOffReasons(ctx context.Context, op *revokeOp) []string {
 		if _, ok := plan[id]; ok {
 			why = append(why, "still a mesh peer of "+c.Name+" (its plan)")
 		}
-		reports = append(reports, report{c.Name, dev})
-	}
-	for _, r := range reports {
-		for _, k := range sortedKeys(r.dev) {
-			p := r.dev[k]
+		for _, k := range sortedKeys(dev) {
+			p := dev[k]
+			if revokedKey != "" && k == revokedKey {
+				why = append(why, fmt.Sprintf("%s's WireGuard device still holds the revoked node's enrolled key %s", c.Name, k))
+			}
 			for _, a := range p.AllowedIPs {
 				if pf, err := netip.ParsePrefix(a); err == nil && mesh.IsValid() && pf.Contains(mesh) {
-					why = append(why, fmt.Sprintf("%s's WireGuard device still has a peer for %s (key %s)", r.name, op.Mesh, k))
+					why = append(why, fmt.Sprintf("%s's WireGuard device still has a peer for %s (key %s)", c.Name, op.Mesh, k))
 				}
 			}
-			if p.LatestHandshake != nil && !keys[k] {
-				if t, err := time.Parse(time.RFC3339, *p.LatestHandshake); err != nil || t.After(op.Started) {
-					why = append(why, fmt.Sprintf("%s saw a handshake at %s from key %s, which isn't a surviving node's", r.name, *p.LatestHandshake, k))
+			if p.LatestHandshake != nil && (!allowed[k] || k == revokedKey) {
+				// Since the revoke: anything not strictly before the start's
+				// second minus handshakeSkew (WireGuard reports whole seconds).
+				if t, err := time.Parse(time.RFC3339, *p.LatestHandshake); err != nil || !t.Before(boundary) {
+					why = append(why, fmt.Sprintf("%s saw a handshake at %s from key %s, which isn't a surviving node's enrolled key", c.Name, *p.LatestHandshake, k))
 				}
 			}
 		}
 	}
 	return why
+}
+
+// handshakeSkew: a handshake counts as seen since the revoke unless it is
+// strictly before the revoke's start, truncated to the second WireGuard
+// reports, minus this (the nodes' clocks; third security review).
+const handshakeSkew = 5 * time.Second
+
+type enrolledKey struct {
+	pub     string
+	removed bool
+}
+
+// enrolledKeys: each node's mesh public key as nodeadm enrolled it (its
+// record's mesh report), the first node's from the CLI's
+// portcullis-first-node (which it never enrolled).
+func (s *Server) enrolledKeys(ctx context.Context) (map[string]enrolledKey, error) {
+	st, err := s.load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]enrolledKey{}
+	for name, r := range st.Nodes {
+		if r != nil {
+			out[name] = enrolledKey{pub: r.Mesh.Pub, removed: r.Removed}
+		}
+	}
+	doc, err := s.firstNode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if doc != nil && doc.MeshPub != "" {
+		e := out[doc.ID]
+		if e.pub == "" {
+			e.pub = doc.MeshPub
+		}
+		out[doc.ID] = e
+	}
+	return out, nil
 }
 
 func isNullJSON(b json.RawMessage) bool {

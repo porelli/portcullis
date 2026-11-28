@@ -664,11 +664,17 @@ KUBE_FIRST_NODE_CM=portcullis-first-node
 
 # kube_first_node_record <id> <certificate file> — the certificate's serial
 # (Vault's form: lowercase colon hex) and notAfter added to the ConfigMap
-# portcullis-first-node {"v":1,"id","serials":[{serial,not_after}]}, the
-# expired ones dropped. Another id there is refused (one first node per
-# install). nodeadm's removal of <id> revokes every listed serial.
+# portcullis-first-node {"v":1,"id","mesh_pub","serials":[{serial,not_after}]},
+# the expired ones dropped. Another id there is refused (one first node per
+# install). nodeadm's removal of <id> revokes every listed serial. mesh_pub
+# is this host's pcmesh public key (`wg show pcmesh public-key`; not a
+# secret): nodeadm's enrolled key for the first node, which it never
+# enrolled (Task 33b third security review: a revoked server's cut-off
+# proof trusts only enrolled keys, never a key a node reports).
 kube_first_node_record() {
-  local id="$1" crt="$2" serial na cur now
+  local id="$1" crt="$2" serial na cur now pub
+  pub="$(_ki_sudo wg show "$KUBE_MESH_IF" public-key 2>/dev/null)" || pub=""
+  [[ "$pub" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { warn "first node: $KUBE_MESH_IF's public key can't be read (wg show $KUBE_MESH_IF public-key): nothing installed"; return 1; }
   serial="$(openssl x509 -in "$crt" -noout -serial 2>/dev/null | sed -n 's/^serial=//p' | tr 'A-F' 'a-f' | sed 's/../&:/g; s/:$//')"
   na="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | sed -n 's/^notAfter=//p')"
   na="$(to_epoch "$na")"
@@ -677,12 +683,12 @@ kube_first_node_record() {
     case "$cur" in *NotFound*) cur='{}' ;; *) warn "first node: $KUBE_FIRST_NODE_CM can't be read"; return 1 ;; esac
   fi
   now="${KUBE_NODEAGENT_NOW:-$(date +%s)}"
-  printf '%s' "$cur" | ID="$id" S="$serial" NA="$na" NOW="$now" NS="$(kube_ns)" N="$KUBE_FIRST_NODE_CM" jq -e '
+  printf '%s' "$cur" | ID="$id" S="$serial" NA="$na" NOW="$now" NS="$(kube_ns)" N="$KUBE_FIRST_NODE_CM" PUB="$pub" jq -e '
       (.data["first-node.json"] // "{\"v\":1,\"serials\":[]}" | fromjson) as $d
       | select(($d.id // env.ID) == env.ID)
       | {apiVersion: "v1", kind: "ConfigMap",
          metadata: {name: env.N, namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
-         data: {"first-node.json": ({v: 1, id: env.ID,
+         data: {"first-node.json": ({v: 1, id: env.ID, mesh_pub: env.PUB,
            serials: ([($d.serials // [])[] | select((.not_after | fromdateiso8601) > (env.NOW | tonumber)) | select(.serial != env.S)]
                      + [{serial: env.S, not_after: (env.NA | tonumber | todateiso8601)}])} | tojson)}}' \
     | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \

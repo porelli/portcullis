@@ -8172,7 +8172,14 @@ if openssl x509 -req -in "$FN_DIR/req.csr" -CA "$FN_DIR/root/certs/node-ca.crt" 
   jq -n --rawfile c "$FN_DIR/leaf.crt" '{data: {certificate: $c}}' > "$out"; printf 200
 else printf 400; fi
 CSTUB
-chmod +x "$FN/bin/kubectl" "$FN/bin/curl" "$FN/bin/k3s" "$FN/agent.sh"
+# wg: this host's pcmesh public key (the first node's enrolled key for
+# nodeadm, Task 33b third security review); $FN/nowg: unreadable.
+cat > "$FN/bin/wg" <<'WSTUB'
+#!/usr/bin/env bash
+[ "$*" = "show pcmesh public-key" ] && [ ! -e "$FN_DIR/nowg" ] && { echo "c1wVmg+oSgt7CNxscBVVhrNfF8ov37hpOdtk57TYzxI="; exit 0; }
+exit 1
+WSTUB
+chmod +x "$FN/bin/kubectl" "$FN/bin/curl" "$FN/bin/k3s" "$FN/agent.sh" "$FN/bin/wg"
 fn_nodes() { # fn_nodes <name>=<ip>… → the cluster's Nodes
   local a; printf '{"items":[' > "$FN/nodes.json"
   for a in "$@"; do printf '{"metadata":{"name":"%s"},"status":{"addresses":[{"type":"InternalIP","address":"%s"}]}},' "${a%%=*}" "${a#*=}"; done | sed 's/,$//' >> "$FN/nodes.json"
@@ -8208,6 +8215,10 @@ expect_eq "first node: its certificate's serial in portcullis-first-node (id nod
   "$(jq -r '.data["first-node.json"] | fromjson | [.v, .id, (.serials | length), (.serials[0].serial == $s), (.serials[0].not_after | test("^[0-9-]+T[0-9:]+Z$"))] | map(tostring) | join(":")' \
      --arg s "$(openssl x509 -in "$FN/leaf.crt" -noout -serial | sed 's/^serial=//' | tr A-F a-f | sed 's/../&:/g; s/:$//')" "$FN/firstnode.json")" "1:node-1:1:true:true"
 expect_eq "first node: the image's mount unmounted with its snapshot removed (--rm, review M4)" "$(grep -c -- '^unmount --rm ' "$FN/unmounts")" 1
+# Task 33b third security review: the first node's pcmesh key recorded as
+# nodeadm's enrolled key for it; unreadable → nothing installed.
+expect_eq "first node: its pcmesh public key in portcullis-first-node (mesh_pub)" \
+  "$(jq -r '.data["first-node.json"] | fromjson | .mesh_pub' "$FN/firstnode.json")" "c1wVmg+oSgt7CNxscBVVhrNfF8ov37hpOdtk57TYzxI="
 rm -f "$FN/calls"
 OUT="$(fnode)"
 expect_eq "first node: adopted, the certificate fresh, the binary the image's → nothing done" "$(printf '%s' "$OUT" | tail -n1):$(grep -c '^agent ' "$FN/calls")" "rc=0:0"
@@ -8225,6 +8236,11 @@ expect_eq "first node: the serial can't be recorded → refused, the old binary 
   "$(printf '%s' "$OUT" | tail -n1):$(cmp -s "$FP/usr/local/lib/portcullis/nodeagent" "$FN/installed.before" && echo unchanged):$(grep -c '^agent adopt$' "$FN/calls"):$(find "$FP/usr/local/lib/portcullis" -name "*.new" -o -name "*.old" | grep -c .)" \
   "rc=1:unchanged:0:0"
 rm -f "$FN/apply-fails"
+touch "$FN/nowg"; rm -f "$FN/calls"
+OUT="$(fnode)"
+expect_eq "first node: pcmesh's public key unreadable → refused, the old binary in place, no adopt" \
+  "$(printf '%s' "$OUT" | tail -n1):$(cmp -s "$FP/usr/local/lib/portcullis/nodeagent" "$FN/installed.before" && echo unchanged):$(grep -c '^agent adopt$' "$FN/calls")" "rc=1:unchanged:0"
+rm -f "$FN/nowg"
 sed -i.bak 's/^  adopt) /  adopt) [ ! -f "$FN_DIR\/adopt-fails" ] || { echo "adopt refused" >\&2; exit 1; }; /' "$FN/agent.sh"
 cp "$FN/agent.sh" "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"; echo '# newer again' >> "$FN/rootfs/usr/local/lib/portcullis/nodeagent-amd64"
 touch "$FN/adopt-fails"; rm -f "$FN/calls"
