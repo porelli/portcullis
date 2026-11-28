@@ -2235,7 +2235,8 @@ _kube_exists() {
 # the record deleted.
 kube_vault_shrink_finish() {
   local id pod rc
-  [ -n "${_KUBE_VAULT_SHRINK// /}" ] || return 0
+  # Vault's autopilot after the release (HA; the last word of this step).
+  [ -n "${_KUBE_VAULT_SHRINK// /}" ] || { kube_vault_autopilot_up; return 0; }
   for id in $_KUBE_VAULT_SHRINK; do
     kube_ctl -n "$(kube_ns)" wait --for=delete "pod/$id" --timeout=180s >/dev/null 2>&1 || true
     # Only NotFound counts as gone (re-review 2 N-a): an unreadable API
@@ -2256,6 +2257,7 @@ kube_vault_shrink_finish() {
   done
   kube_ctl -n "$(kube_ns)" delete configmap "$KUBE_VAULT_SHRINK_CM" --ignore-not-found >/dev/null || fail "could not delete ConfigMap $KUBE_VAULT_SHRINK_CM (the wipe is done)"
   _KUBE_VAULT_SHRINK=""
+  kube_vault_autopilot_up
 }
 
 # ── cluster DNS in HA (plan Task 25, controller ruling 3; fix round 2) ──
@@ -3101,7 +3103,8 @@ ha_enable_step_vault() {
   vault_admin_env >/dev/null || fail "Vault's root token (secrets/vault-init.json) is needed to read its raft peers"
   info "Waiting for Vault's 3 raft voters..."
   _ha_until "${HA_VAULT_WAIT:-600}" "Vault's raft didn't list 3 voters" _ha_vault_voters3
-  ok "Vault: 3 raft voters."
+  kube_vault_autopilot_apply || fail "couldn't set Vault's raft autopilot (dead-server cleanup after $HA_VAULT_AUTOPILOT_THRESHOLD, min quorum $HA_VAULT_AUTOPILOT_MIN_QUORUM): run ./portcullis ha enable again"
+  ok "Vault: 3 raft voters; autopilot drops a dead one after $HA_VAULT_AUTOPILOT_THRESHOLD (min quorum $HA_VAULT_AUTOPILOT_MIN_QUORUM)."
 }
 
 # _ha_sentinel_ok — 2 Valkey pods and 3 Sentinels ready, and a Sentinel
@@ -3341,12 +3344,245 @@ _ha_no_active_vault_line() {
   esac
 }
 
+# ── replicas stuck on a gone server's local volume (Task 33b, ruling B) ──
+#
+# A StatefulSet member on a portcullis-core local-path volume can only
+# run where that volume is (its PV's required node affinity). Once that
+# server is gone for good (its Node absent, or listed in nodeadm's removed
+# nodes: revoked or removed), the member stays Pending forever and the set
+# keeps fewer replicas (e2e-ha-vm run 13: group-gate-1, mcp-gate-1 and
+# vault-2 on the revoked vm3). Nothing repairs it on its own (ruling:
+# nothing is deleted without a person): `status` warns, and
+# `ha repair-replicas` deletes, after a typed confirmation, exactly those
+# claims and volumes and then the Pending pods, so the StatefulSet makes
+# them again on a live node. The volume's data on the gone machine is
+# not touched (Retain); that member's own copy is lost (Vault's raft and
+# the others re-sync from the set).
+
+HA_REPAIR_RECORD_REL="secrets/kube/ha-repair.jsonl"
+
+# The stuck members from the four lists (pods, claims, volumes, nodes of
+# the cluster, StatefulSets) and nodeadm's removed names; one object per
+# stuck claim: set, pod, claim, volume, node, node_state (absent|removed),
+# local (a portcullis-core local-path hostPath volume), set_ready.
+_HA_STUCK_JQ='
+  ($nodes | map(.metadata.name)) as $live
+  | ($removed | split(" ") | map(select(. != ""))) as $listed
+  | ($pvcs | map({key: .metadata.name, value: .}) | from_entries) as $c
+  | ($pvs | map({key: .metadata.name, value: .}) | from_entries) as $v
+  | ($sets | map({key: .metadata.name, value: (.status.readyReplicas // 0)}) | from_entries) as $ready
+  | [ $pods[] | select(.status.phase == "Pending" and .metadata.deletionTimestamp == null)
+      | ((.metadata.ownerReferences // []) | map(select(.kind == "StatefulSet")) | .[0].name // null) as $set
+      | select($set != null)
+      | .metadata.name as $pod
+      | [.spec.volumes[]? | .persistentVolumeClaim.claimName // empty][] as $cn
+      | ($c[$cn] // null) as $pvc
+      | select($pvc != null and ($pvc.spec.volumeName // "") != "")
+      | ($v[$pvc.spec.volumeName] // null) as $pv
+      | select($pv != null)
+      | ($pv.spec.nodeAffinity.required.nodeSelectorTerms // []) as $terms
+      # Every term pins hostnames (a term without one could run anywhere).
+      | select(($terms | length) > 0 and ($terms | all((.matchExpressions // []) | any(.key == "kubernetes.io/hostname" and .operator == "In"))))
+      | [$terms[].matchExpressions[]
+         | select(.key == "kubernetes.io/hostname" and .operator == "In") | .values[]] as $hosts
+      | select(($hosts | length) > 0)
+      | select([$hosts[] | . as $h | (($live | index($h)) == null) or (($listed | index($h)) != null)] | all)
+      | {set: $set, pod: $pod, claim: $cn, volume: $pv.metadata.name, node: ($hosts | unique | join(",")),
+         node_state: (if [$hosts[] | . as $h | $listed | index($h)] | all(. != null) then "removed" else "absent" end),
+         local: (($pv.metadata.annotations["pv.kubernetes.io/provisioned-by"] // "") == "portcullis.io/local-path"
+                 and $pv.spec.hostPath != null and ($pv.spec.storageClassName // "") == "portcullis-core"),
+         set_ready: ($ready[$set] // 0)} ]'
+
+# kube_stuck_replicas_json — the stuck members (above) in the core
+# namespace; null when any list can't be read (fail closed: unknown).
+kube_stuck_replicas_json() {
+  local ns removed d out
+  ns="$(kube_ns)"
+  # The lists in files (a namespace's pods outgrow an argument: found live).
+  d="$(mktemp -d)" || { echo null; return 0; }
+  if kube_ctl -n "$ns" get pods -o json > "$d/pods" 2>/dev/null \
+    && kube_ctl -n "$ns" get pvc -o json > "$d/pvcs" 2>/dev/null \
+    && kube_ctl get pv -o json > "$d/pvs" 2>/dev/null \
+    && kube_ctl get nodes -o json > "$d/nodes" 2>/dev/null \
+    && kube_ctl -n "$ns" get statefulsets -o json > "$d/sets" 2>/dev/null; then
+    # nodeadm's removed names (absent before any removal: none listed).
+    removed="$(kube_ctl -n "$ns" get configmap "$KUBE_REMOVED_PARAMS" -o json 2>/dev/null | jq -r '.data.removedNodes // ""' 2>/dev/null)" || removed=""
+    out="$(jq -nc --slurpfile P "$d/pods" --slurpfile C "$d/pvcs" --slurpfile V "$d/pvs" --slurpfile N "$d/nodes" --slurpfile S "$d/sets" \
+      --arg removed "$removed" '($P[0].items) as $pods | ($C[0].items) as $pvcs | ($V[0].items) as $pvs | ($N[0].items) as $nodes | ($S[0].items) as $sets
+        | if ([$pods, $pvcs, $pvs, $nodes, $sets] | all(type == "array")) then '"$_HA_STUCK_JQ"' else null end' 2>/dev/null)" || out=null
+  else
+    out=null
+  fi
+  rm -rf "$d"
+  printf '%s\n' "${out:-null}"
+}
+
+# kube_stuck_replicas_lines <json> — status' lines (warnings: never a
+# problem, the cluster runs; the repair is a person's).
+kube_stuck_replicas_lines() {
+  local j="$1" set pod claim node
+  if [ "$j" = null ]; then
+    _st_line warn "kubernetes: couldn't check for replicas stuck on a gone server's local volume (the pods, claims, volumes or nodes unreadable)"
+    return 0
+  fi
+  while IFS=$'\t' read -r set pod claim node; do
+    [ -n "$pod" ] || continue
+    _st_line warn "kubernetes: $set's $pod is stuck: its volume $claim is on $node, a server that's gone (./portcullis ha repair-replicas)"
+  done < <(printf '%s' "$j" | jq -r '.[] | select(.local) | [.set, .pod, .claim, .node] | @tsv')
+}
+
+# ha_repair_replicas <yes> — `ha repair-replicas`.
+ha_repair_replicas() {
+  local yes="$1" j plan refused n reply ns line
+  ns="$(kube_ns)"
+  j="$(kube_stuck_replicas_json)"
+  [ "$j" != null ] || fail "can't read the pods, claims, volumes or nodes: nothing deleted"
+  # Refusals (each named, nothing of that pod deleted): not a local-path
+  # volume (a replicated one is never deleted), a set with no Ready
+  # member (its data would have no other copy).
+  refused="$(printf '%s' "$j" | jq -c '[.[] | select((.local | not) or .set_ready < 1)]')"
+  plan="$(printf '%s' "$j" | jq -c --argjson r "$refused" '[.[] | select(.local and .set_ready >= 1)] | map(select(.pod as $p | $r | map(.pod) | index($p) | not))')"
+  while IFS= read -r line; do
+    [ -n "$line" ] && warn "refused: $line"
+  done < <(printf '%s' "$refused" | jq -r '.[] | if (.local | not) then "\(.set)/\(.pod): \(.claim) isn'"'"'t a local-path volume (a replicated volume is never deleted)" else "\(.set)/\(.pod): the set has no Ready member (its data would have no other copy)" end')
+  n="$(printf '%s' "$plan" | jq length)"
+  if [ "$n" = 0 ]; then
+    if [ "$(printf '%s' "$refused" | jq length)" != 0 ]; then fail "nothing to repair that is allowed (see the refusals above)"; fi
+    ok "No replica is stuck on a gone server's local volume."
+    return 0
+  fi
+  echo "These replicas are stuck on a server that's gone; this deletes their claims and volumes, then the pods (the StatefulSet makes them again on a live node; that member's own copy of its data is lost, the set re-syncs):"
+  printf '%s' "$plan" | jq -r '.[] | "  \(.set)/\(.pod): claim \(.claim), volume \(.volume) on \(.node) (\(.node_state))" + (if .set == "vault" then "; Vault raft peer \(.pod) removed first" else "" end)'
+  if [ "$yes" != true ]; then
+    read -rp 'Type "repair" to continue: ' reply || reply=""
+    [ "$reply" = repair ] || { echo "Cancelled: nothing deleted."; return 1; }
+  fi
+  local set pod claim vol node rc=0 res
+  while IFS=$'\t' read -r set pod claim vol node; do
+    res=ok
+    _ha_repair_one "$ns" "$set" "$pod" "$claim" "$vol" "$node" || { res=failed; rc=1; }
+    _ha_repair_record "$set" "$pod" "$claim" "$vol" "$node" "$res"
+  done < <(printf '%s' "$plan" | jq -r '.[] | [.set, .pod, .claim, .volume, .node] | @tsv')
+  [ "$rc" = 0 ] || fail "a repair failed (see above; recorded in $HA_REPAIR_RECORD_REL): run ./portcullis ha repair-replicas again"
+  ok "Repaired $n replica(s) (recorded in $HA_REPAIR_RECORD_REL)."
+}
+
+# _ha_repair_one <ns> <set> <pod> <claim> <volume> <node> — re-checked
+# live first (the node still gone, the pod still Pending on that claim);
+# Vault's raft peer out first; the claim, the pod, the volume; the pod
+# made again by its StatefulSet on a live node.
+_ha_repair_one() {
+  local ns="$1" set="$2" pod="$3" claim="$4" vol="$5" node="$6" again i phase uid peers
+  again="$(kube_stuck_replicas_json)"
+  [ "$again" != null ] || { warn "$set/$pod: can't re-check it (the lists unreadable): nothing of it deleted"; return 1; }
+  again="$(printf '%s' "$again" | jq -c --arg p "$pod" --arg c "$claim" '[.[] | select(.pod == $p and .claim == $c and .local and .set_ready >= 1)] | length')"
+  [ "$again" = 1 ] || { warn "$set/$pod: no longer stuck on $claim (re-checked): left alone"; return 0; }
+  if [ "$set" = vault ]; then
+    vault_admin_env >/dev/null || { warn "$pod: Vault's root token (secrets/vault-init.json) is needed to remove its raft peer"; return 1; }
+    _K_VAULT_POD=""; kube_vault_pod_set
+    # Fail closed: an unreadable peer list deletes nothing (a new member
+    # must never join next to its own stale voter unknowingly).
+    peers="$(vexec operator raft list-peers -format=json 2>/dev/null)" \
+      && printf '%s' "$peers" | jq -e '.data.config.servers | type == "array"' >/dev/null 2>&1 \
+      || { warn "$pod: can't read Vault's raft peers: nothing of it deleted"; return 1; }
+    if printf '%s' "$peers" | jq -e --arg p "$pod" '.data.config.servers | map(.node_id) | index($p) != null' >/dev/null 2>&1; then
+      info "Vault: removing raft peer $pod (its volume was on $node)..."
+      vexec operator raft remove-peer "$pod" >/dev/null 2>&1 || { warn "couldn't remove Vault's raft peer $pod: nothing of it deleted"; return 1; }
+    fi
+  fi
+  info "$set/$pod: deleting claim $claim, the pod, volume $vol..."
+  # The claim by its uid: the StatefulSet makes a new one of the same name
+  # as soon as the old is gone (found live), so the wait is for that uid.
+  uid="$(kube_ctl -n "$ns" get pvc "$claim" -o jsonpath='{.metadata.uid}' 2>/dev/null)" && [ -n "$uid" ] \
+    || { warn "couldn't read claim $claim"; return 1; }
+  kube_ctl -n "$ns" delete pvc "$claim" --wait=false >/dev/null || { warn "couldn't delete claim $claim"; return 1; }
+  kube_ctl -n "$ns" delete pod "$pod" --wait=true --timeout=60s >/dev/null 2>&1 || true
+  for i in $(seq 1 30); do
+    [ "$(kube_ctl -n "$ns" get pvc "$claim" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)" = "$uid" ] || break
+    [ "$i" = 30 ] && { warn "claim $claim (uid $uid) still there 60 s after its delete"; return 1; }
+    sleep 2
+  done
+  kube_ctl delete pv "$vol" --ignore-not-found --wait=false >/dev/null || { warn "couldn't delete volume $vol"; return 1; }
+  # A pod made again while its old claim was going points at it: once
+  # more, so the StatefulSet makes the claim too.
+  for i in $(seq 1 45); do
+    phase="$(kube_ctl -n "$ns" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [ "$phase" = Running ]; then ok "$set/$pod: running again on $(kube_ctl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null)"; return 0; fi
+    if [ "$i" = 10 ] && [ "$(kube_ctl -n "$ns" get pvc "$claim" -o jsonpath='{.status.phase}' 2>/dev/null || true)" != Bound ]; then
+      kube_ctl -n "$ns" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+    fi
+    sleep 4
+  done
+  warn "$set/$pod: deleted and remade, not Running after 3 min (kubectl -n $ns describe pod $pod)"
+  return 1
+}
+
+# _ha_repair_record — one JSON line per repaired member (0600, the
+# operator's audit record; never a secret).
+_ha_repair_record() {
+  local f="$PORTCULLIS_ROOT/$HA_REPAIR_RECORD_REL"
+  (umask 077 && mkdir -p "$(dirname "$f")" \
+    && jq -cn --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg by "$(id -un 2>/dev/null || echo "?")" \
+      --arg s "$1" --arg p "$2" --arg c "$3" --arg v "$4" --arg n "$5" --arg r "$6" \
+      '{time: $t, by: $by, action: "repair-replicas", set: $s, pod: $p, claim: $c, volume: $v, node: $n, result: $r}' >> "$f") \
+    || warn "couldn't append to $HA_REPAIR_RECORD_REL"
+}
+
+# ── Vault: raft autopilot's dead-server cleanup (ruling B) ──
+# Autopilot's configuration is Vault state (sys/storage/raft/autopilot/
+# configuration, kept in raft), not the chart's: ha enable's Vault step and
+# every `up` under HA set it. Autopilot never goes below min_quorum
+# voters, so with three it drops a dead one only once a fourth is there;
+# ha repair-replicas removes the gone member's peer itself.
+HA_VAULT_AUTOPILOT_THRESHOLD="10m"
+HA_VAULT_AUTOPILOT_MIN_QUORUM=3
+
+# kube_vault_autopilot_apply — 0 once set and read back equal.
+kube_vault_autopilot_apply() {
+  vault_admin_env >/dev/null || return 1
+  _K_VAULT_POD=""; kube_vault_pod_set
+  vexec write sys/storage/raft/autopilot/configuration cleanup_dead_servers=true \
+    "dead_server_last_contact_threshold=$HA_VAULT_AUTOPILOT_THRESHOLD" "min_quorum=$HA_VAULT_AUTOPILOT_MIN_QUORUM" >/dev/null 2>&1 || return 1
+  kube_vault_autopilot_ok
+}
+
+# kube_vault_autopilot_up — `up` under HA, once Vault has its 3 voters:
+# set it (a warning when it can't: the next up tries again).
+kube_vault_autopilot_up() {
+  kube_ha_on || return 0
+  _ha_vault_voters3 2>/dev/null || return 0
+  kube_vault_autopilot_ok 2>/dev/null && return 0
+  kube_vault_autopilot_apply || warn "couldn't set Vault's raft autopilot (dead-server cleanup): ./portcullis up tries again"
+}
+
+# kube_vault_autopilot_json — status: true / false, null when unasked
+# (HA off, no root token, Vault unreadable).
+kube_vault_autopilot_json() {
+  kube_ha_on || { echo null; return 0; }
+  vault_admin_env >/dev/null 2>&1 || { echo null; return 0; }
+  _K_VAULT_POD=""; kube_vault_pod_set 2>/dev/null || { echo null; return 0; }
+  vexec read -format=json sys/storage/raft/autopilot/configuration >/dev/null 2>&1 || { echo null; return 0; }
+  if kube_vault_autopilot_ok; then echo true; else echo false; fi
+}
+
+# kube_vault_autopilot_ok — Vault's autopilot configuration is ours.
+kube_vault_autopilot_ok() {
+  local c
+  c="$(vexec read -format=json sys/storage/raft/autopilot/configuration 2>/dev/null)" || return 1
+  printf '%s' "$c" | TH="$HA_VAULT_AUTOPILOT_THRESHOLD" MQ="$HA_VAULT_AUTOPILOT_MIN_QUORUM" jq -e '
+    def secs: if type == "number" then . elif test("^[0-9]+$") then tonumber
+      else ([scan("([0-9]+)([hms])") | (.[0] | tonumber) * ({h: 3600, m: 60, s: 1}[.[1]])] | add) end;
+    .data.cleanup_dead_servers == true and (.data.min_quorum | tostring) == env.MQ
+    and ((.data.dead_server_last_contact_threshold | secs) == (env.TH | secs))' >/dev/null 2>&1
+}
+
 help_ha() {
   cat <<'HELP'
 Usage: portcullis ha <subcommand>
 
-  status   High availability: the checklist, quorum, nodes and guarantee
-  enable   Turn high availability on (experimental; resumable)
+  status            High availability: the checklist, quorum, nodes and guarantee
+  enable            Turn high availability on (experimental; resumable)
+  repair-replicas   Remake replicas stuck on a gone server's local volume
 
 Kubernetes only. Run 'portcullis ha <subcommand> --help' for details.
 HELP
@@ -3403,28 +3639,57 @@ Options:
 HELP
 }
 
+help_ha_repair_replicas() {
+  cat <<'HELP'
+Usage: portcullis ha repair-replicas [--yes]
+
+Kubernetes, high availability. A StatefulSet member (Vault, group-gate,
+mcp-gate, ...) on a local-path volume runs only on the server that holds
+the volume. Once that server is gone for good (its Node absent, or revoked
+or removed), the member stays Pending and the set keeps fewer replicas;
+`portcullis status` warns about each. This lists them, asks you to type
+"repair", then for each: removes Vault's raft peer of that member (vault
+only), deletes its claim, the Pending pod and the volume, so the
+StatefulSet makes them again on a live server. That member's own copy of
+its data is lost (the set re-syncs; the files on the gone machine are left
+alone). Refused, and named: a volume that isn't local-path (a replicated
+one is never deleted) and a set with no Ready member. Each repair is
+appended to secrets/kube/ha-repair.jsonl. Nothing is ever deleted without
+this command.
+
+Options:
+  --yes   don't ask (scripts); without a terminal --yes is required
+HELP
+}
+
 cmd_ha() {
   local sub="${1:-}" yes=false json=false
   [ $# -gt 0 ] && shift
   case "$sub" in
     ""|-h|--help|help) help_ha; [ -n "$sub" ] || exit 2; return 0 ;;
-    status|enable) ;;
+    status|enable|repair-replicas) ;;
     *) usage_error ha "unknown subcommand: $sub" ;;
   esac
   while [ $# -gt 0 ]; do
     case "$1" in
-      -h|--help) "help_ha_$sub"; return 0 ;;
-      --yes|-y) [ "$sub" = enable ] || usage_error "ha $sub" "unknown option: $1"; yes=true ;;
+      -h|--help) "help_ha_${sub//-/_}"; return 0 ;;
+      --yes|-y) [ "$sub" != status ] || usage_error "ha $sub" "unknown option: $1"; yes=true ;;
       --json) [ "$sub" = status ] || usage_error "ha $sub" "unknown option: $1"; json=true ;;
       -*) usage_error "ha $sub" "unknown option: $1" ;;
       *) usage_error "ha $sub" "unexpected argument: $1" ;;
     esac
     shift
   done
+  if [ "$sub" = repair-replicas ] && [ "$yes" != true ] && [ ! -t 0 ]; then
+    usage_error "ha repair-replicas" "no terminal to confirm on: pass --yes to repair without asking"
+  fi
   need_env
   _rt_is_kube || fail "$HA_TEXT_NEEDS_KUBE (CONTAINER_RUNTIME is $(runtime_name)): Docker and Podman installs don't change"
   case "$sub" in
     status) ha_status "$json" ;;
     enable) ha_enable "$yes" ;;
+    repair-replicas)
+      kube_ha_on || fail "high availability is off: no replica can be stuck on another server"
+      ha_repair_replicas "$yes" ;;
   esac
 }

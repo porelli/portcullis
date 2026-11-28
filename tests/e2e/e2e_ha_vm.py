@@ -1433,15 +1433,25 @@ def k3s_bootstrap_status(h: str, cred_user: str, cred_pw: str, path: str = "serv
         return 0
 
 
+def pending_why(p: dict) -> str:
+    """A pod's name and why it isn't running: a gone server's local volume
+    named as such (VM run 13: group-gate-1, mcp-gate-1, vault-2 Pending on
+    the revoked vm3's volumes; ha repair-replicas remakes them)."""
+    msg = next((c.get("message", "") for c in p["status"].get("conditions", []) if c.get("type") == "PodScheduled" and c.get("status") == "False"), "")
+    name = p["metadata"]["name"]
+    if "didn't match PersistentVolume's node affinity" in msg:
+        return f"{name} (Pending only on a gone node's local volume: ./portcullis ha repair-replicas)"
+    return f"{name} ({p['status'].get('phase')}{': ' + msg[:120] if msg else ''})"
+
+
 def cluster_healthy(expect_ready: int) -> None:
     def ok():
         nodes = Kj("get", "nodes")["items"]
         rdy = [n["metadata"]["name"] for n in nodes
                if any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"]["conditions"])]
         assert len(rdy) >= expect_ready, f"{len(rdy)} Ready, want {expect_ready}: {[n['metadata']['name'] for n in nodes]}"
-        crash = [p["metadata"]["name"] for p in Kj("-n", NS, "get", "pods")["items"]
-                 if p["status"].get("phase") not in ("Running", "Succeeded")]
-        assert not crash, f"core pods not Running: {crash}"
+        crash = [p for p in Kj("-n", NS, "get", "pods")["items"] if p["status"].get("phase") not in ("Running", "Succeeded")]
+        assert not crash, f"core pods not Running: {[pending_why(p) for p in crash]}"
         return True
     wait_for(f"the cluster healthy ({expect_ready} Ready)", ok, 420, 10)
 
@@ -1569,6 +1579,23 @@ def ha_vm_revoke_restarts() -> None:
     wait_for("the server revoke's rotations (old 401, new 200)", lambda: rotated(ref, old_token2), 400, 5)
     after = wait_for("its etcd member removed", lambda: (lambda m: m if not member_of(srv_id, m) else None)(etcd_member_names(ref)), 300, 5)
     state["etcd_revoke"] = {"node": srv_id, "before": before, "after": after}
+    # Its StatefulSet members on vm3's local volumes stay Pending (run 13):
+    # status names them, ha repair-replicas remakes them on the survivors
+    # (ruling B), then every core pod runs.
+    def stuck():
+        out = pc("status", "--json", check=False, timeout=180)
+        try:
+            j = json.loads(out[out.index("{"):])
+        except ValueError:
+            return None
+        st = j.get("stuck_replicas")
+        return st if st else None
+    st = wait_for("status names the replicas stuck on the revoked server's local volumes", stuck, 300, 15)
+    assert all(x["node"] == srv_id for x in st), f"stuck replicas on other nodes than {srv_id}: {st}"
+    note(f"  status: stuck on {srv_id}'s local volumes: {sorted(x['pod'] for x in st)}")
+    out = pc("ha", "repair-replicas", "--yes", timeout=900)
+    note(f"  ha repair-replicas: {redact(out).strip().splitlines()[-1][:200] if out.strip() else '(no output)'}")
+    wait_for("no replica stuck after the repair", lambda: (lambda o: (lambda j: j.get("stuck_replicas") == [])(json.loads(o[o.index("{"):])) if "{" in o else False)(pc("status", "--json", check=False, timeout=180)), 300, 15)
     survivors3 = [h for h in survivors if h != "vm3"]
     restart_cycle(survivors3, next(h for h in survivors3 if h != OPERATOR_VM), expect_ready=2)
     assert s.signin(), "sign-in failed after the server revoke"

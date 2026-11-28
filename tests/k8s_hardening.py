@@ -331,6 +331,7 @@ def check_frontdoor():
         if len(objs) != 1 or objs[0]["metadata"].get("annotations", {}).get("helm.sh/resource-policy") != "keep" or objs[0].get("data"):
             F.add(f"ha: {sec} must be rendered once, empty, with helm.sh/resource-policy: keep")
     check_secret_access(docs + storage_docs(), ha=True)
+    check_volume_deleters(docs + storage_docs(), ha=True)
 
 
 # The Hub's own: no reader mounts them (contract §4, §20.1 "Core volumes").
@@ -969,6 +970,7 @@ def main():
                 if set(rule["verbs"]) - {"get", "list", "watch"}:
                     F.add(f"Traefik's Role in {r['metadata']['namespace']}: {rule['verbs']} (read-only)")
     check_secret_access(docs + storage_docs())
+    check_volume_deleters(docs + storage_docs())
     check_edge(docs)
     check_edge(K.render(yaml.safe_load((K.ROOT / "tests" / "k8s-ci-values-ha.yaml").read_text())))
     check_frontdoor()
@@ -1550,6 +1552,52 @@ def check_traefik_config_writers(docs):
         if ok is None or (ok[0] is not None and (names is None or not names <= ok[0])):
             F.add(f"ha: {k[0]} may write the Traefik configuration source {k[2]} in {k[1]}"
                   f"{'' if names is None else ' ' + str(sorted(names))} (only the CLI may: see TRAEFIK_CONFIG_WRITERS)")
+
+
+# Who may delete a volume claim or a volume (Task 33b, ruling B: a gone
+# server's local claims are deleted only by a person, `ha repair-replicas`
+# with the CLI's own identity): the Hub its instances' claims in the apps
+# namespace, the local-path provisioner the volumes it made; no in-cluster
+# identity may delete a claim of the core namespace.
+VOLUME_DELETE_VERBS = {"delete", "deletecollection", "*"}
+VOLUME_DELETERS = {
+    f"{K.NS}/portcullis-hub": {(K.APPS_NS, "persistentvolumeclaims")},
+    "portcullis-storage/portcullis-local-path": {("*", "persistentvolumes")},
+}
+
+
+def volume_deleters(docs):
+    """{"ns/sa": {(namespace or "*", resource)}} — who may delete claims or volumes."""
+    roles = {(d["kind"], d["metadata"].get("namespace", ""), d["metadata"]["name"]): d
+             for d in docs if d.get("kind") in ("Role", "ClusterRole")}
+    out = {}
+    for b in docs:
+        if b.get("kind") not in ("RoleBinding", "ClusterRoleBinding"):
+            continue
+        ref = b["roleRef"]
+        bns = b["metadata"].get("namespace", "")
+        role = roles.get((ref["kind"], bns if ref["kind"] == "Role" else "", ref["name"]))
+        if role is None:
+            continue
+        where = bns if b["kind"] == "RoleBinding" else "*"
+        for r in role.get("rules", []):
+            if not (set(r.get("apiGroups", [])) & {"", "*"}) or not (set(r.get("verbs", [])) & VOLUME_DELETE_VERBS):
+                continue
+            res = set(r.get("resources", []))
+            got = {x for x in ("persistentvolumeclaims", "persistentvolumes") if x in res or "*" in res}
+            for s in b.get("subjects", []):
+                key = f"{s.get('namespace', bns)}/{s['name']}" if s["kind"] == "ServiceAccount" else f"{s['kind']}:{s['name']}"
+                for x in got:
+                    out.setdefault(key, set()).add((where, x))
+    return out
+
+
+def check_volume_deleters(docs, ha=False):
+    got = volume_deleters(docs)
+    for sa in sorted(set(got) | set(VOLUME_DELETERS)):
+        if got.get(sa, set()) != VOLUME_DELETERS.get(sa, set()):
+            F.add(f"{'ha: ' if ha else ''}volume delete rights of {sa}: {sorted(got.get(sa, set()))} (want {sorted(VOLUME_DELETERS.get(sa, set()))}; "
+                  "a gone server's claims are deleted only by ha repair-replicas)")
 
 
 def check_secret_access(docs, ha=False):

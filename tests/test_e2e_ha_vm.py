@@ -278,5 +278,18 @@ class TokenPassword(unittest.TestCase):
             with self.subTest(bad), self.assertRaisesRegex(AssertionError, "isn't a k3s secure token"):
                 m.token_password(bad)
 
+
+class PendingWhy(unittest.TestCase):
+    """A core pod not running, named with its cause (VM run 13)."""
+
+    def test_gone_local_volume(self):
+        p = {"metadata": {"name": "vault-2"}, "status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False",
+             "message": "0/2 nodes are available: 2 node(s) didn't match PersistentVolume's node affinity."}]}}
+        self.assertEqual(m.pending_why(p), "vault-2 (Pending only on a gone node's local volume: ./portcullis ha repair-replicas)")
+
+    def test_other(self):
+        p = {"metadata": {"name": "x-1"}, "status": {"phase": "Failed", "conditions": []}}
+        self.assertEqual(m.pending_why(p), "x-1 (Failed)")
+
 if __name__ == "__main__":
     unittest.main()

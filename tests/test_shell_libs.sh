@@ -8853,6 +8853,91 @@ else
   t_fail "vault chart probes: helm or the images values not available"
 fi
 
+# ── Replicas stuck on a gone server's local volume (Task 33b, ruling B:
+# a status warning and `ha repair-replicas`, nothing deleted without a
+# person). Fixture tests/fixtures/ha-stuck-replicas.json: vault-2 on the
+# removed vm3, mcp-gate-1 on vm4 (its Node still listed, but revoked:
+# nodeadm's removed names), a replicated (Longhorn) claim whose set has no
+# Ready member, a Pending pod on the live vm2, a running vault-0, a volume
+# with a second term that pins no hostname (it could run elsewhere).
+RR="$WORK/repair"; rm -rf "$RR"; mkdir -p "$RR"
+RRFX="$HERE/fixtures/ha-stuck-replicas.json"
+rr_setup='kube_ha_on() { true; }; vault_admin_env() { true; }; kube_vault_pod_set() { :; }
+  kube_ctl() { local a="$*" f="'"$RRFX"'" o="'"$RR"'/order"
+    case "$a" in
+      "-n portcullis get pods -o json") [ ! -e "'"$RR"'/unreadable" ] || return 1; jq "{items: .pods}" "$f" ;;
+      "-n portcullis get pvc -o json") jq "{items: .pvcs}" "$f" ;;
+      "get pv -o json") jq "{items: .pvs}" "$f" ;;
+      "get nodes -o json") jq "{items: .nodes}" "$f" ;;
+      "-n portcullis get statefulsets -o json") jq "{items: .sets}" "$f" ;;
+      "-n portcullis get configmap portcullis-removed-nodes -o json") jq "{data: {removedNodes: .removed}}" "$f" ;;
+      "-n portcullis delete pvc "*) echo "delete pvc $5" >> "$o" ;;
+      "-n portcullis delete pod "*) echo "delete pod $5" >> "$o" ;;
+      "-n portcullis get pvc "*" -o jsonpath={.metadata.uid}") if grep -qx "delete pvc $5" "'"$RR"'/order" 2>/dev/null; then echo "new-$5"; else echo "old-$5"; fi ;;
+      "-n portcullis get pvc "*" -o jsonpath={.status.phase}") echo Bound ;;
+      "delete pv "*) echo "delete pv $3" >> "$o" ;;
+      "-n portcullis get pod "*" -o jsonpath={.status.phase}") echo Running ;;
+      "-n portcullis get pod "*" -o jsonpath={.spec.nodeName}") echo vm2 ;;
+      *) echo "unexpected kubectl $a" >&2; return 98 ;;
+    esac; }
+  vexec() { case "$*" in
+      "operator raft list-peers -format=json") echo "{\"data\":{\"config\":{\"servers\":[{\"node_id\":\"vault-0\"},{\"node_id\":\"vault-1\"},{\"node_id\":\"vault-2\"}]}}}" ;;
+      "operator raft remove-peer vault-2") echo "remove-peer vault-2" >> "'"$RR"'/order" ;;
+      *) return 1 ;;
+    esac; }'
+OUT="$(kt "$(printf '%s\n' "for l in \$(sed -n 's/^for _lib in \\(.*\\); do\$/\\1/p' '$HERE/../portcullis'); do . '$HERE/../scripts/lib/'\$l.sh; done" "$rr_setup" 'kube_stuck_replicas_json')")"
+expect_eq "stuck replicas: the members on gone servers (removed vm3, revoked vm4), the Longhorn one flagged, none on a live node" \
+  "$(printf '%s' "$OUT" | sed '$d' | jq -c '[.[] | [.pod, .node, .node_state, .local, .set_ready]]')" \
+  '[["vault-2","vm3","removed",true,2],["mcp-gate-1","vm4","removed",true,1],["lh-1","vm3","removed",false,0]]'
+OUT="$(kt "$(printf '%s\n' "for l in \$(sed -n 's/^for _lib in \\(.*\\); do\$/\\1/p' '$HERE/../portcullis'); do . '$HERE/../scripts/lib/'\$l.sh; done" "$rr_setup" 'touch '"$RR"'/unreadable; kube_stuck_replicas_json')")"
+expect_eq "stuck replicas: an unreadable list is null (unknown, never 'none')" "$(printf '%s' "$OUT" | sed '$d')" null
+rm -f "$RR/unreadable"
+OUT="$(kt "$(printf '%s\n' "for l in \$(sed -n 's/^for _lib in \\(.*\\); do\$/\\1/p' '$HERE/../portcullis'); do . '$HERE/../scripts/lib/'\$l.sh; done" "$rr_setup" 'kube_stuck_replicas_lines "$(kube_stuck_replicas_json | jq -c "map(select(.local))")"; kube_stuck_replicas_lines null')")"
+case "$OUT" in *"vault's vault-2 is stuck: its volume data-vault-2 is on vm3, a server that's gone (./portcullis ha repair-replicas)"*"mcp-gate's mcp-gate-1 is stuck"*"couldn't check for replicas stuck"*)
+  case "$OUT" in *lh-1*|*live-1*) t_fail "stuck lines name a replicated or live one: $OUT" ;; *) t_pass "stuck lines: a warning per stuck member, the command named; unreadable said" ;; esac ;;
+  *) t_fail "stuck lines: $OUT" ;; esac
+# The repair: --yes (scripts); the plan printed; Vault's raft peer out
+# before its claim; claim → pod → volume per member; the Longhorn one
+# refused and untouched; one record line each.
+rm -f "$RR/order"; mkdir -p "$HE/root/secrets/kube"; rm -f "$HE/root/secrets/kube/ha-repair.jsonl"
+hacli "" "$rr_setup" repair-replicas --yes
+expect_eq "ha repair-replicas --yes: exit 0" "$RC" 0
+expect_eq "ha repair-replicas: Vault's peer first, then claim, pod, volume per member; nothing of the refused or live ones" \
+  "$(cat "$RR/order")" "$(printf 'remove-peer vault-2\ndelete pvc data-vault-2\ndelete pod vault-2\ndelete pv pv-v2\ndelete pvc data-mcp-gate-1\ndelete pod mcp-gate-1\ndelete pv pv-m1')"
+case "$OUT$ERR" in *"vault/vault-2: claim data-vault-2, volume pv-v2 on vm3 (removed); Vault raft peer vault-2 removed first"*"refused: lh/lh-1: data-lh-1 isn't a local-path volume"*|*"refused: lh/lh-1: data-lh-1 isn't a local-path volume"*"vault/vault-2: claim data-vault-2"*)
+  t_pass "ha repair-replicas: lists what it deletes; the replicated volume refused, named" ;; *) t_fail "ha repair-replicas output: $OUT $ERR" ;; esac
+expect_eq "ha repair-replicas: one record line per member (by, set, pod, claim, volume, node, result)" \
+  "$(jq -c '[.action, .set, .pod, .claim, .volume, .node, .result]' "$HE/root/secrets/kube/ha-repair.jsonl" 2>/dev/null | tr '\n' ' ')" \
+  '["repair-replicas","vault","vault-2","data-vault-2","pv-v2","vm3","ok"] ["repair-replicas","mcp-gate","mcp-gate-1","data-mcp-gate-1","pv-m1","vm4","ok"] '
+# Without a terminal and --yes: exit 2, nothing asked or deleted.
+rm -f "$RR/order"; hacli "" "$rr_setup" repair-replicas
+case "$RC:$ERR" in "2:"*"no terminal to confirm on: pass --yes"*) t_pass "ha repair-replicas: no terminal without --yes → exit 2" ;; *) t_fail "ha repair-replicas no tty: $RC $ERR" ;; esac
+expect_eq "ha repair-replicas: nothing deleted without a confirmation" "$(cat "$RR/order" 2>/dev/null)" ""
+# Unreadable lists: fail closed, nothing deleted.
+touch "$RR/unreadable"; hacli "" "$rr_setup" repair-replicas --yes; rm -f "$RR/unreadable"
+case "$RC:$ERR" in "1:"*"nothing deleted"*) t_pass "ha repair-replicas: unreadable lists fail closed" ;; *) t_fail "ha repair-replicas unreadable: $RC $ERR" ;; esac
+expect_eq "ha repair-replicas unreadable: no delete" "$(cat "$RR/order" 2>/dev/null)" ""
+# Vault's peer list unreadable: vault-2 fails closed (nothing of it
+# deleted, the run fails); the other member is still repaired.
+rr_nopeers="$rr_setup"'
+  vexec() { return 1; }'
+rm -f "$RR/order"; hacli "" "$rr_nopeers" repair-replicas --yes
+case "$RC:$OUT$ERR" in "1:"*"vault-2: can't read Vault's raft peers: nothing of it deleted"*) t_pass "ha repair-replicas: Vault's peers unreadable → vault-2 untouched, exit 1" ;; *) t_fail "ha repair-replicas no peers: $RC $OUT $ERR" ;; esac
+expect_eq "ha repair-replicas no peers: only mcp-gate-1 deleted" "$(cat "$RR/order" 2>/dev/null)" "$(printf 'delete pvc data-mcp-gate-1\ndelete pod mcp-gate-1\ndelete pv pv-m1')"
+# Vault's autopilot (dead-server cleanup): ours only with all three values;
+# Vault's Go duration read back.
+rr_libs="for l in \$(sed -n 's/^for _lib in \\(.*\\); do\$/\\1/p' '$HERE/../portcullis'); do . '$HERE/../scripts/lib/'\$l.sh; done"
+# (the threshold: s:<Go duration string> or n:<seconds number>)
+for c in 'true 3 s:10m0s 0' 'true 3 n:600 0' 'false 3 s:10m0s 1' 'true 2 s:10m0s 1' 'true 3 s:5m 1'; do
+  read -r a1 a2 a3 a4 <<< "$c"
+  case "$a3" in s:*) a3j="\"${a3#s:}\"" ;; *) a3j="${a3#n:}" ;; esac
+  set -- "$a1" "$a2" "$a3j" "$a4"
+  printf '{"data":{"cleanup_dead_servers":%s,"min_quorum":%s,"dead_server_last_contact_threshold":%s}}' "$1" "$2" "$3" > "$RR/ap.json"
+  OUT="$(kt "$rr_libs
+vexec() { cat '$RR/ap.json'; }; kube_vault_autopilot_ok")"
+  expect_eq "vault autopilot ok? cleanup=$1 min_quorum=$2 threshold=$3" "${OUT##*rc=}" "$4"
+done
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

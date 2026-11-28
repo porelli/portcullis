@@ -106,6 +106,7 @@ Kubernetes:
   node revoke                 Cut a lost or compromised node off now (asks for its typed id)
   ha status                   High availability: the checklist, quorum, nodes and guarantee
   ha enable                   Turn high availability on (experimental; resumable)
+  ha repair-replicas          Remake replicas stuck on a gone server's local volume
 
 YubiKey and browser certificates:
   cert enroll                 New key + YubiKey certificate on a YubiKey

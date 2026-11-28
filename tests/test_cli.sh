@@ -86,9 +86,9 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 62 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 62
+expect_eq "help lists 63 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 63
 # plan Tasks 30 / 31 (Task 30 review M6): the cluster-node and HA commands.
-for c in "node add" "node list" "node remove" "node revoke" "ha status" "ha enable"; do
+for c in "node add" "node list" "node remove" "node revoke" "ha status" "ha enable" "ha repair-replicas"; do
   case "$HELP" in *"  $c  "*) t_pass "help lists $c" ;; *) t_fail "help misses $c" ;; esac
 done
 while IFS= read -r c; do
@@ -220,6 +220,8 @@ ha status now|unexpected argument: now
 ha status --yes|unknown option: --yes
 ha enable --force|unknown option: --force
 ha enable --json|unknown option: --json
+ha repair-replicas --json|unknown option: --json
+ha repair-replicas now|unexpected argument: now
 signin reset-core|no terminal to confirm on: pass --yes
 vpn init extra|unexpected argument: extra
 vpn init --builtin|--builtin needs a value

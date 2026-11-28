@@ -1,0 +1,31 @@
+{"pods":[
+  {"metadata":{"name":"vault-2","ownerReferences":[{"kind":"StatefulSet","name":"vault"}]},"status":{"phase":"Pending"},"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-vault-2"}}]}},
+  {"metadata":{"name":"vault-0","ownerReferences":[{"kind":"StatefulSet","name":"vault"}]},"status":{"phase":"Running"},"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-vault-0"}}]}},
+  {"metadata":{"name":"mcp-gate-1","ownerReferences":[{"kind":"StatefulSet","name":"mcp-gate"}]},"status":{"phase":"Pending"},"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-mcp-gate-1"}}]}},
+  {"metadata":{"name":"lh-1","ownerReferences":[{"kind":"StatefulSet","name":"lh"}]},"status":{"phase":"Pending"},"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-lh-1"}}]}},
+  {"metadata":{"name":"live-1","ownerReferences":[{"kind":"StatefulSet","name":"live"}]},"status":{"phase":"Pending"},"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-live-1"}}]}},
+  {"metadata":{"name":"two-1","ownerReferences":[{"kind":"StatefulSet","name":"two"}]},"status":{"phase":"Pending"},"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-two-1"}}]}}],
+ "pvcs":[
+  {"metadata":{"name":"data-vault-2"},"spec":{"volumeName":"pv-v2"}},
+  {"metadata":{"name":"data-vault-0"},"spec":{"volumeName":"pv-v0"}},
+  {"metadata":{"name":"data-mcp-gate-1"},"spec":{"volumeName":"pv-m1"}},
+  {"metadata":{"name":"data-lh-1"},"spec":{"volumeName":"pv-lh"}},
+  {"metadata":{"name":"data-live-1"},"spec":{"volumeName":"pv-live"}},
+  {"metadata":{"name":"data-two-1"},"spec":{"volumeName":"pv-two"}}],
+ "pvs":[
+  {"metadata":{"name":"pv-v2","annotations":{"pv.kubernetes.io/provisioned-by":"portcullis.io/local-path"}},"spec":{"storageClassName":"portcullis-core","hostPath":{"path":"/x"},"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["vm3"]}]}]}}}},
+  {"metadata":{"name":"pv-v0","annotations":{"pv.kubernetes.io/provisioned-by":"portcullis.io/local-path"}},"spec":{"storageClassName":"portcullis-core","hostPath":{"path":"/x"},"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["node-1"]}]}]}}}},
+  {"metadata":{"name":"pv-m1","annotations":{"pv.kubernetes.io/provisioned-by":"portcullis.io/local-path"}},"spec":{"storageClassName":"portcullis-core","hostPath":{"path":"/x"},"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["vm4"]}]}]}}}},
+  {"metadata":{"name":"pv-lh","annotations":{"pv.kubernetes.io/provisioned-by":"driver.longhorn.io"}},"spec":{"storageClassName":"portcullis-core-replicated","csi":{"driver":"driver.longhorn.io"},"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["vm3"]}]}]}}}},
+  {"metadata":{"name":"pv-live","annotations":{"pv.kubernetes.io/provisioned-by":"portcullis.io/local-path"}},"spec":{"storageClassName":"portcullis-core","hostPath":{"path":"/x"},"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["vm2"]}]}]}}}},
+  {"metadata":{"name":"pv-two","annotations":{"pv.kubernetes.io/provisioned-by":"portcullis.io/local-path"}},"spec":{"storageClassName":"portcullis-core","hostPath":{"path":"/x"},"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["vm3"]}]},{"matchExpressions":[{"key":"topology.kubernetes.io/zone","operator":"In","values":["a"]}]}]}}}}],
+ "nodes":[
+  {"metadata":{"name":"node-1"}},
+  {"metadata":{"name":"vm2"}},
+  {"metadata":{"name":"vm4"}}],
+ "sets":[
+  {"metadata":{"name":"vault"},"status":{"readyReplicas":2}},
+  {"metadata":{"name":"mcp-gate"},"status":{"readyReplicas":1}},
+  {"metadata":{"name":"lh"},"status":{"readyReplicas":0}},
+  {"metadata":{"name":"two"},"status":{"readyReplicas":1}}],
+ "removed":"vm3 vm4"}

@@ -273,6 +273,10 @@ status_run() {
     # round 1, M1): missing, unreadable or under 14 days is a problem.
     if kube_ha_on; then
       kx="$(printf '%s' "$kx" | jq -c --argjson f "$(dns_frontdoor_cert_json)" '. + {frontdoor_cert: $f}')"
+      # Replicas stuck on a gone server's local volume, Vault's autopilot
+      # (ha.sh; warnings, never a problem).
+      kx="$(printf '%s' "$kx" | jq -c --argjson st "$(kube_stuck_replicas_json | jq -c 'if . == null then null else map(select(.local)) end')" \
+        --argjson ap "$(kube_vault_autopilot_json)" '. + {stuck_replicas: $st, vault_autopilot: $ap}')"
       dns_frontdoor_cert_lines "$(printf '%s' "$kx" | jq -c '.frontdoor_cert')" >/dev/null || problems=1
     fi
   else
@@ -451,7 +455,12 @@ status_run() {
     fi
     kube_cluster_check_lines "$(printf '%s' "$kx" | jq -c '.cluster_check')" || true
     kube_backup_status_lines "$(printf '%s' "$kx" | jq -c '.backup_destination')" || true
-    if kube_ha_on; then dns_frontdoor_cert_lines "$(printf '%s' "$kx" | jq -c '.frontdoor_cert')" || true; fi
+    if kube_ha_on; then
+      dns_frontdoor_cert_lines "$(printf '%s' "$kx" | jq -c '.frontdoor_cert')" || true
+      kube_stuck_replicas_lines "$(printf '%s' "$kx" | jq -c '.stuck_replicas')"
+      [ "$(printf '%s' "$kx" | jq -r '.vault_autopilot')" != false ] \
+        || _st_line warn "vault: raft autopilot doesn't drop dead voters (cleanup_dead_servers): ./portcullis up sets it"
+    fi
   fi
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
   if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi
@@ -496,6 +505,10 @@ status_textfile() {
     "portcullis_vpn_mode_restricted \(if ((.vpn.mode // "apps") == "apps") then 0 else 1 end)",
     g("portcullis_ssh_ca_ok"; "1 if SSH access is on and enroll reports no Vault difference (mounts, caps, CAs, host role); absent while SSH access is off or the Hub does not answer."),
     (if (.ssh.enabled // false) != true then empty else "portcullis_ssh_ca_ok \(if ((.ssh.problems // []) | length) == 0 then 1 else 0 end)" end),
+    g("portcullis_kube_stuck_replicas"; "Replicas stuck Pending on a gone server'"'"'s local volume (ha repair-replicas; absent: not HA or unreadable)."),
+    (if (.stuck_replicas | type) == "array" then "portcullis_kube_stuck_replicas \(.stuck_replicas | map(.pod) | unique | length)" else empty end),
+    g("portcullis_kube_stuck_replica"; "1 for each replica stuck on a gone server'"'"'s local volume."),
+    ((.stuck_replicas // [])[] | "portcullis_kube_stuck_replica{set=\"\(.set | esc)\",pod=\"\(.pod | esc)\",node=\"\(.node | esc)\"} 1"),
     g("portcullis_dns_check"; "1 if the DNS check (address, caa, dnssec, foreign) of the name has no Warning or Problem (absent: DNS checks unavailable)."),
     (if .dns == null then empty else ([.dns.main] + [.dns.domains[]])[] | . as $d | ($d.checks | to_entries[] | "portcullis_dns_check{name=\"\($d.name | esc)\",check=\"\(.key)\"} \(.value)") end),
     g("portcullis_dnssec_state"; "1 for the current DNSSEC state of the name."),
