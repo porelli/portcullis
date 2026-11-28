@@ -12,5 +12,15 @@
     {"name": "agent upgrade", "call": "agent_upgrade", "via": "n1", "via_mesh": "10.215.0.1",
      "amd64": "6d69c45e689c1cf75bb37cd3188768ca55cbf50cf2f698b182853c0b035db615", "arm64": "6d69c45e689c1cf75bb37cd3188768ca55cbf50cf2f698b182853c0b035db615",
      "method": "POST", "path": "/v1/agent/upgrade", "body": "{\"amd64\":\"6d69c45e689c1cf75bb37cd3188768ca55cbf50cf2f698b182853c0b035db615\",\"arm64\":\"6d69c45e689c1cf75bb37cd3188768ca55cbf50cf2f698b182853c0b035db615\"}"}
+  ],
+  "health_answers": [
+    {"name": "a survivor's device without the revoked node", "answer": {"id": "n1", "version": "v", "mesh_ip": "10.215.0.1", "mesh_pub": "c1wVmg+oSgt7CNxscBVVhrNfF8ov37hpOdtk57TYzxI=", "k3s": "active", "time": "2026-11-28T10:00:00Z",
+     "peers": {"n3": {"latest_handshake": "2026-11-28T09:59:50Z", "endpoint": "192.0.2.13:51830"}},
+     "device_peers": {"0JgPr0SArMeTmpPu3/PtK5VHQor0553KrI79Wqr1XoE=": {"latest_handshake": "2026-11-28T09:59:50Z", "endpoint": "192.0.2.13:51830", "allowed_ips": ["10.215.0.3/32"]}}}},
+    {"name": "a survivor's device still holding the revoked node's key, out of the plan", "answer": {"id": "n1", "version": "v", "mesh_ip": "10.215.0.1", "mesh_pub": "c1wVmg+oSgt7CNxscBVVhrNfF8ov37hpOdtk57TYzxI=", "k3s": "active", "time": "2026-11-28T10:00:00Z",
+     "peers": {},
+     "device_peers": {"47iJcR3LLHiqWFVZTK1jQtJAZoLg2WT5srm2F2V3Nsw=": {"latest_handshake": "2026-11-28T09:59:58Z", "endpoint": null, "allowed_ips": ["10.215.0.2/32"]}}}},
+    {"name": "a survivor's device unreadable", "answer": {"id": "n1", "version": "v", "mesh_ip": "10.215.0.1", "mesh_pub": "c1wVmg+oSgt7CNxscBVVhrNfF8ov37hpOdtk57TYzxI=", "k3s": "active", "time": "2026-11-28T10:00:00Z",
+     "peers": {}, "device_peers": null}}
   ]
 }

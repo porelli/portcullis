@@ -244,6 +244,10 @@ type AgentHealth struct {
 	// strict decode refused every real answer, so every join stayed
 	// mesh_pending (found live, Task 30).
 	Peers json.RawMessage `json:"peers,omitempty"`
+	// DevicePeers: pcmesh's actual WireGuard peers by public key (handshake,
+	// endpoint, allowed IPs), null when the device can't be read. A
+	// revoked server's cut-off proof requires it (outofservice.go).
+	DevicePeers json.RawMessage `json:"device_peers,omitempty"`
 }
 
 func rfc3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }

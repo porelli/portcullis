@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -100,6 +102,9 @@ func revokeHarness(t *testing.T, fence, detach time.Duration) *harness {
 	h.agents.onRotate = h.bootFollows
 	h.s.timing.Fence, h.s.timing.Detach, h.s.timing.Cutoff = fence, detach, 300*time.Millisecond
 	h.s.cutOffCheck = nil // the real evidence
+	h.agents.mu.Lock()
+	h.agents.meshState = true // every survivor answers with its (empty) mesh state
+	h.agents.mu.Unlock()
 	putLease(t, h, "n2", time.Now().Add(-10*time.Minute))
 	h.putState(t, func(st *nodeadmState) {
 		st.Nodes["n2"] = &nodeRecord{Role: "server", Serial: "12:34", MeshIP: "10.215.0.2"}
@@ -217,13 +222,60 @@ func TestRevokeNoTaintWithoutCutOffProof(t *testing.T) {
 		{"fresh lease", "its Node lease was renewed",
 			func(t *testing.T, h *harness) { putLease(t, h, "n2", time.Now()) },
 			func(t *testing.T, h *harness) { putLease(t, h, "n2", time.Now().Add(-10*time.Minute)) }},
-		{"recent handshake", "still a mesh peer of n1 (a handshake at " + recent + ", after the revoke)",
+		{"still in a survivor's plan", "still a mesh peer of n1 (its plan)",
 			func(t *testing.T, h *harness) {
 				h.agents.mu.Lock()
-				h.agents.peers = map[string]string{"n1": `{"n2":{"latest_handshake":"` + recent + `","endpoint":null}}`}
+				h.agents.peers = map[string]string{"n1": `{"n2":{"latest_handshake":null,"endpoint":null}}`}
 				h.agents.mu.Unlock()
 			},
 			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.peers = nil; h.agents.mu.Unlock() }},
+		{"still a device peer for its mesh address", "n1's WireGuard device still has a peer for 10.215.0.2 (key key-n2)",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.devPeers = map[string]string{"n1": `{"key-n2":{"latest_handshake":null,"endpoint":null,"allowed_ips":["10.215.0.2/32"]}}`}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
+		{"a handshake after the start from a key no longer in the plan", "n3 saw a handshake at " + recent + " from key key-gone, which isn't a surviving node's",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.devPeers = map[string]string{"n3": `{"key-gone":{"latest_handshake":"` + recent + `","endpoint":null,"allowed_ips":[]}}`}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
+		{"peers missing", "n1 reported no mesh state",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.peers = map[string]string{"n1": ""}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.peers = nil; h.agents.mu.Unlock() }},
+		{"peers null", "n1 reported no mesh state",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.peers = map[string]string{"n1": "null"}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.peers = nil; h.agents.mu.Unlock() }},
+		{"device_peers missing", "n3 reported no mesh state",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.devPeers = map[string]string{"n3": ""}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
+		{"device_peers null", "n3 reported no mesh state",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.devPeers = map[string]string{"n3": "null"}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.devPeers = nil; h.agents.mu.Unlock() }},
+		{"a missing Lease", "its Node lease is missing (not proven)",
+			func(t *testing.T, h *harness) {
+				h.kube.CoordinationV1().Leases("kube-node-lease").Delete(context.Background(), "n2", metav1.DeleteOptions{})
+			},
+			func(t *testing.T, h *harness) { putLease(t, h, "n2", time.Now().Add(-10*time.Minute)) }},
 		{"survivor silent", "n3's nodeagent doesn't answer",
 			func(t *testing.T, h *harness) {
 				h.agents.mu.Lock()
@@ -259,6 +311,76 @@ func TestRevokeNoTaintWithoutCutOffProof(t *testing.T) {
 			}
 			if got := ev.list(); got != "oos:n2 delete:n2" {
 				t.Fatalf("events %q", got)
+			}
+		})
+	}
+}
+
+// TestRevokeMissingNodeNeverTainted (second security review): a Node that
+// isn't there (nodeadm deletes it only at node_deleted, after this step)
+// is never proven cut off and never tainted: the revoke goes on without a
+// taint or a force-detach.
+func TestRevokeMissingNodeNeverTainted(t *testing.T) {
+	h := revokeHarness(t, 50*time.Millisecond, time.Second)
+	ctx := context.Background()
+	if why := h.s.cutOffReasons(ctx, &revokeOp{Node: "gone", Mesh: "10.215.0.9", Started: vecNow}); !strings.Contains(strings.Join(why, "; "), "its Node is missing (not deleted by this revoke: not proven)") {
+		t.Fatalf("a missing Node: reasons %v", why)
+	}
+	ev := watchOutOfService(t, h, false)
+	h.kube.CoreV1().Nodes().Delete(ctx, "n2", metav1.DeleteOptions{})
+	ev.mu.Lock()
+	ev.got = nil
+	ev.mu.Unlock()
+	h.internal(clientHub, "DELETE", "/v1/nodes/n2?mode=revoke", nil)
+	if strings.Contains(ev.list(), "oos:") {
+		t.Fatalf("events %q: a missing Node was tainted", ev.list())
+	}
+}
+
+// TestHealthAnswerVectorsCutOff: the shared health answers
+// (testdata/nodeagent_call_vectors.json health_answers, byte copy in the
+// Hub's nodeagent) decode strictly into AgentHealth and judge as the
+// nodeagent means them: a device without the revoked node confirms; its
+// key still a device peer (out of the plan, a handshake after the revoke)
+// and an unreadable device (null) don't.
+func TestHealthAnswerVectorsCutOff(t *testing.T) {
+	b, err := os.ReadFile("testdata/nodeagent_call_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Answers []struct {
+			Name   string          `json:"name"`
+			Answer json.RawMessage `json:"answer"`
+		} `json:"health_answers"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil || len(f.Answers) != 3 {
+		t.Fatalf("health_answers: %v", err)
+	}
+	want := []string{"", "n1's WireGuard device still has a peer for 10.215.0.2", "n1 reported no mesh state"}
+	for i, a := range f.Answers {
+		t.Run(a.Name, func(t *testing.T) {
+			var ah AgentHealth
+			if err := strictJSON(a.Answer, &ah); err != nil {
+				t.Fatalf("strict decode: %v", err)
+			}
+			h := revokeHarness(t, 0, time.Second)
+			h.agents.mu.Lock()
+			h.agents.peers = map[string]string{"n1": string(ah.Peers)}
+			h.agents.devPeers = map[string]string{"n1": string(ah.DevicePeers)}
+			// n3's own key is the one n1's device has (the first answer).
+			h.agents.pubs = map[string]string{"n1": ah.MeshPub, "n3": "0JgPr0SArMeTmpPu3/PtK5VHQor0553KrI79Wqr1XoE="}
+			h.agents.mu.Unlock()
+			why := strings.Join(h.s.cutOffReasons(context.Background(), &revokeOp{Node: "n2", Mesh: "10.215.0.2", Started: vecNow}), "; ")
+			if want[i] == "" {
+				if strings.Contains(why, "n1") {
+					t.Fatalf("a confirming answer counted against: %s", why)
+				}
+			} else if !strings.Contains(why, want[i]) {
+				t.Fatalf("reasons %q, want %q", why, want[i])
+			}
+			if i == 1 && !strings.Contains(why, "n1 saw a handshake at 2026-11-28T09:59:58Z from key 47iJcR3LLHiqWFVZTK1jQtJAZoLg2WT5srm2F2V3Nsw=") {
+				t.Fatalf("the revoked key's handshake after the start isn't named: %s", why)
 			}
 		})
 	}

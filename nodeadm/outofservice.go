@@ -31,6 +31,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/netip"
 
 	"fmt"
 	"net/http"
@@ -56,15 +57,22 @@ func isOutOfService(t corev1.Taint) bool {
 // outOfService is the revoke's out_of_service step (servers only).
 func (s *Server) outOfService(ctx context.Context, op *revokeOp) error {
 	id := op.Node
+	// No Node (it never registered, or it went by hand — nodeadm deletes it
+	// only at node_deleted, after this step): nothing can carry the taint,
+	// so nothing is force-detached; the revoke goes on (its volumes, if
+	// any, stay attached to the gone name, never to two writers).
+	if _, err := s.kube.CoreV1().Nodes().Get(ctx, id, metav1.GetOptions{}); apierrors.IsNotFound(err) {
+		s.log.Warn("revocation: no Node to put out of service: no taint, nothing force-detached", "node", id)
+		return nil
+	}
 	if err := s.waitCutOff(ctx, op); err != nil {
 		return err
 	}
 	for try := 0; ; try++ {
 		n, err := s.kube.CoreV1().Nodes().Get(ctx, id, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
-			// No Node (it never registered, or it was deleted by hand):
-			// nothing can carry the taint, and a wait would never end.
-			s.log.Warn("revocation: no Node to put out of service", "node", id)
+			// Gone during the proof: not tainted.
+			s.log.Warn("revocation: the Node went during the cut-off proof: no taint", "node", id)
 			return nil
 		}
 		if err != nil {
@@ -180,13 +188,22 @@ func (s *Server) waitCutOff(ctx context.Context, op *revokeOp) error {
 	}
 }
 
-// cutOffReasons: what still shows node op.Node may write (none: cut off).
+// cutOffReasons: what still shows node op.Node may write, or what isn't
+// proven (none: cut off). Fail closed throughout (second security
+// review): a missing Node lease or Node is "not proven"; the survivors'
+// WireGuard devices are the load-bearing evidence (kubelet timestamps
+// alone are weak): every other node's nodeagent must answer with its
+// plan peers and its device peers (by public key), no device may hold a
+// peer for the revoked node's mesh address, and none may have seen a
+// handshake since the revoke from a key that isn't a surviving node's own
+// (that covers the revoked key after it left the plan).
 func (s *Server) cutOffReasons(ctx context.Context, op *revokeOp) []string {
 	id := op.Node
 	var why []string
 	n, err := s.kube.CoreV1().Nodes().Get(ctx, id, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
+		why = append(why, "its Node is missing (not deleted by this revoke: not proven)")
 	case err != nil:
 		why = append(why, "its Node is unreadable")
 	default:
@@ -199,6 +216,7 @@ func (s *Server) cutOffReasons(ctx context.Context, op *revokeOp) []string {
 	l, err := s.kube.CoordinationV1().Leases("kube-node-lease").Get(ctx, id, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
+		why = append(why, "its Node lease is missing (not proven)")
 	case err != nil:
 		why = append(why, "its Node lease is unreadable")
 	default:
@@ -212,10 +230,24 @@ func (s *Server) cutOffReasons(ctx context.Context, op *revokeOp) []string {
 			why = append(why, fmt.Sprintf("its Node lease was renewed %s ago", age.Round(time.Second)))
 		}
 	}
+	mesh, err := netip.ParseAddr(op.Mesh)
+	if err != nil {
+		why = append(why, "its mesh address is unknown")
+	}
 	cl, err := s.clusterNodes(ctx)
 	if err != nil {
 		return append(why, "the nodes are unreadable")
 	}
+	type devPeer struct {
+		LatestHandshake *string  `json:"latest_handshake"`
+		AllowedIPs      []string `json:"allowed_ips"`
+	}
+	type report struct {
+		name string
+		dev  map[string]devPeer
+	}
+	var reports []report
+	keys := map[string]bool{} // the surviving nodes' own mesh keys
 	for _, c := range cl {
 		if c.Name == id {
 			continue
@@ -231,24 +263,52 @@ func (s *Server) cutOffReasons(ctx context.Context, op *revokeOp) []string {
 			why = append(why, c.Name+"'s nodeagent doesn't answer")
 			continue
 		}
-		var peers map[string]struct {
-			LatestHandshake *string `json:"latest_handshake"`
+		if h.MeshPub != "" {
+			keys[h.MeshPub] = true
 		}
-		if len(h.Peers) > 0 {
-			if err := json.Unmarshal(h.Peers, &peers); err != nil {
-				why = append(why, c.Name+"'s mesh peers are unreadable")
-				continue
-			}
+		if isNullJSON(h.Peers) || isNullJSON(h.DevicePeers) {
+			why = append(why, c.Name+" reported no mesh state")
+			continue
 		}
-		if p, ok := peers[id]; ok {
-			w := "still a mesh peer of " + c.Name
-			if p.LatestHandshake != nil {
-				if t, err := time.Parse(time.RFC3339, *p.LatestHandshake); err == nil && t.After(op.Started) {
-					w += " (a handshake at " + *p.LatestHandshake + ", after the revoke)"
+		var plan map[string]json.RawMessage
+		var dev map[string]devPeer
+		if json.Unmarshal(h.Peers, &plan) != nil || plan == nil || json.Unmarshal(h.DevicePeers, &dev) != nil || dev == nil {
+			why = append(why, c.Name+"'s mesh state is unreadable")
+			continue
+		}
+		if _, ok := plan[id]; ok {
+			why = append(why, "still a mesh peer of "+c.Name+" (its plan)")
+		}
+		reports = append(reports, report{c.Name, dev})
+	}
+	for _, r := range reports {
+		for _, k := range sortedKeys(r.dev) {
+			p := r.dev[k]
+			for _, a := range p.AllowedIPs {
+				if pf, err := netip.ParsePrefix(a); err == nil && mesh.IsValid() && pf.Contains(mesh) {
+					why = append(why, fmt.Sprintf("%s's WireGuard device still has a peer for %s (key %s)", r.name, op.Mesh, k))
 				}
 			}
-			why = append(why, w)
+			if p.LatestHandshake != nil && !keys[k] {
+				if t, err := time.Parse(time.RFC3339, *p.LatestHandshake); err != nil || t.After(op.Started) {
+					why = append(why, fmt.Sprintf("%s saw a handshake at %s from key %s, which isn't a surviving node's", r.name, *p.LatestHandshake, k))
+				}
+			}
 		}
 	}
 	return why
+}
+
+func isNullJSON(b json.RawMessage) bool {
+	t := strings.TrimSpace(string(b))
+	return t == "" || t == "null"
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -106,7 +106,10 @@ type fakeAgents struct {
 	fail      map[string]error  // "rotate"/"apply"/... or "etcd": the call fails (its error echoes the token)
 	effect    map[string]bool   // the failing call took effect first (an answer lost)
 	upgrades  []string          // id:amd64[:4]:arm64[:4] (UpgradeAgent; fail "upgrade:<id>")
-	peers     map[string]string // id → its health's peers JSON (unset: none)
+	peers     map[string]string // id → its health's peers JSON (unset: none, or {} with meshState)
+	devPeers  map[string]string // id → its health's device_peers JSON (likewise)
+	meshState bool              // every health answer carries peers / device_peers ({} by default) and mesh_pub key-<id>
+	pubs      map[string]string // id → its mesh_pub (overrides key-<id>)
 }
 
 func (f *fakeAgents) Health(_ context.Context, id, meshIP string) (*AgentHealth, error) {
@@ -116,8 +119,17 @@ func (f *fakeAgents) Health(_ context.Context, id, meshIP string) (*AgentHealth,
 		return nil, errors.New("nodeagent " + id + " /v1/health: unreachable")
 	}
 	h := &AgentHealth{ID: id, MeshIP: meshIP, K3s: "absent"}
+	if f.meshState {
+		h.MeshPub, h.Peers, h.DevicePeers = "key-"+id, json.RawMessage("{}"), json.RawMessage("{}")
+	}
 	if p, ok := f.peers[id]; ok {
 		h.Peers = json.RawMessage(p)
+	}
+	if p, ok := f.devPeers[id]; ok {
+		h.DevicePeers = json.RawMessage(p)
+	}
+	if p, ok := f.pubs[id]; ok {
+		h.MeshPub = p
 	}
 	return h, nil
 }
