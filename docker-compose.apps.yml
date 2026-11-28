@@ -29,7 +29,7 @@ services:
   # No client cert needed. Redirects to Keycloak if not logged in.
   # ============================================================
   grafana:
-    image: docker.io/grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    image: docker.io/grafana/grafana:13.3.2@sha256:81556409ba48b2b922e0adb69a2511337d8ba7578f11962eefa6149a2d815101
     networks:
       - portcullis-proxy
     labels:
@@ -62,7 +62,7 @@ services:
   # Management API and dashboard protected by WebAuthn.
   # ============================================================
   coturn:
-    image: docker.io/coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
+    image: docker.io/coturn/coturn:4.19.2@sha256:ccdbc51e6f072130b0fc9eebda21f8d026d0a25581746c52557e887818011a3f
     network_mode: host
     volumes:
       - coturn-data:/var/lib/coturn
@@ -80,7 +80,7 @@ services:
       --log-file=stdout
 
   netbird-management:
-    image: docker.io/netbirdio/management:0.82.0@sha256:07c8f979fcc980678cc64e584cf6b7b27204ceb4c871531b29e2dce39592e9ff
+    image: docker.io/netbirdio/management:0.83.2@sha256:e9336e426dbdcd8fc8c65cde3183ffaf4007ed9f128d868e9e4f4f8b923bec84
     command: >
       --port 8011
       --log-level info
@@ -106,7 +106,7 @@ services:
       traefik.http.services.netbird-api.loadbalancer.server.port: "8011"
 
   netbird-signal:
-    image: docker.io/netbirdio/signal:0.82.0@sha256:0c0c38bbef7dcdfa1822b6d59844615db55dc7303b664e7aed498151edc0dbfb
+    image: docker.io/netbirdio/signal:0.83.2@sha256:075086a1b38cca814ec0699ec9aa509b6a0f078453f19ebac52934593fd5d6de
     networks:
       - portcullis-proxy
     labels:
@@ -119,7 +119,7 @@ services:
       traefik.http.services.netbird-signal.loadbalancer.server.scheme: h2c
 
   netbird-dashboard:
-    image: docker.io/netbirdio/dashboard:v2.96.0@sha256:340b13c00b84349572a2acc5605e907cb09250a9e6461c757097eabdb8e02f2c
+    image: docker.io/netbirdio/dashboard:v2.99.0@sha256:8005cb3bfbb1433de117af5070b27b175f10730f8acb548e398ab6d20cddf9f4
     environment:
       NETBIRD_MGMT_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
       NETBIRD_MGMT_GRPC_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
@@ -143,7 +143,7 @@ services:
   # PUBLIC — no authentication at all
   # ============================================================
   docs:
-    image: docker.io/library/nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
+    image: docker.io/library/nginx:1.31.10-alpine@sha256:7fc0fb4af7bf006aeb31aea88069976060f8f0a0a86b667126742cc17f4e31ae
     networks:
       - portcullis-proxy
     labels:
