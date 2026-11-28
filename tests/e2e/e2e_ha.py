@@ -999,6 +999,11 @@ def seed_echo() -> None:
     """An instance of the CI template echo (the phases' ha step seeded the
     source), for the N−1 view (GET /api/instances/{id}/availability)."""
     import e2e_ops
+    # The drill before may have cut the Hub's node (k3d run 46103037926:
+    # ha_dns_failover_nodeadm_node cut server-0, the Hub's replacement got
+    # its Lease and listened 80 s into n_minus_1, past HubAPI's retries).
+    wait_for("a Ready Hub (after the last drill's node cut)",
+             lambda: any(ready(p) for p in pods(NS, "portcullis.io/component=hub")), 600, 5)
     if hub("GET", "/api/instances/echo-ha")[0] == 200:
         return
     acc = e2e_ops.accepted(hub.ok("POST", "/api/instances", {"template": "echo", "id": "echo-ha", "label": "Echo HA",
