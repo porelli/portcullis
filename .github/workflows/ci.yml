@@ -6173,6 +6173,12 @@ jobs:
       - name: HA scenarios (tests/e2e/e2e_ha.py)
         timeout-minutes: 80
         run: bash .github/ci/e2e-ha-k3d-phases.sh scenarios
+      # tests/ha_admission_vectors.json live (Task 33b ruling): the HA pod,
+      # node-label, front-door-status and removed-node policies judged by a
+      # real API server, after the scenarios (it binds test params of its own).
+      - name: HA admission vectors (tests/ha_admission_vectors.json, live)
+        timeout-minutes: 15
+        run: bash .github/ci/e2e-ha-admission.sh ha
       - name: Sites (5 servers over main, edge and tb)
         timeout-minutes: 90
         run: bash .github/ci/e2e-ha-k3d-install.sh sites && bash .github/ci/e2e-ha-k3d-phases.sh sites

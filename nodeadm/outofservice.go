@@ -32,6 +32,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/netip"
+	"slices"
 
 	"fmt"
 	"net/http"
@@ -171,6 +172,12 @@ func (s *Server) waitCutOff(ctx context.Context, op *revokeOp) error {
 			since = time.Time{}
 		} else if since.IsZero() {
 			since = now
+		}
+		// Still in a survivor's plan: the Hub cuts the mesh peer only on
+		// nodeadm's answer past the token apply (ruling A after Task 33b VM
+		// run 16), so waiting can't help: answer now (cutoff_pending).
+		if planned := slices.IndexFunc(why, func(w string) bool { return strings.HasPrefix(w, "still a mesh peer of ") }); planned >= 0 {
+			return errKind(http.StatusConflict, kindCutoffPending, "waiting for %s to be cut off: %s; the Hub removes its mesh peer on this answer and nodeadm finishes the revoke once it is cut off (else power the machine off or cut its network; retried: ./portcullis node revoke %s)", id, strings.Join(why, "; "), id)
 		}
 		if !since.IsZero() && now.Sub(since) >= s.timing.Fence {
 			s.log.Info("revocation: the server is cut off (NotReady, its lease stale, no mesh peer) for T_fence", "node", id)
