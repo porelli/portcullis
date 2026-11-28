@@ -7920,6 +7920,7 @@ case "$*" in
     # An interrupt once the code is in the CLI's temporary file.
     [ ! -f "$ND/term" ] || kill -TERM "$NODE_CLI_PID" ;;
   "--context ci -n portcullis exec -i pod/hub-abc -c hub -- hub servers list")
+    [ ! -f "$ND/hang-list" ] || exec sleep 300
     # $ND/lists: one answer per call (the last one repeats).
     if [ -s "$ND/lists" ]; then head -n1 "$ND/lists"; [ "$(wc -l < "$ND/lists")" -le 1 ] || sed -i.bak 1d "$ND/lists"; exit 0; fi
     echo '{"servers":[{"id":"primary","state":"ready"},{"id":"nas","kind":"worker","state":"ready"},{"id":"n4","kind":"cluster-node","role":"agent","class":"cloud","site":"edge","mesh_ip":"10.215.0.4","state":"enrolling"},{"id":"n6","kind":"cluster-node","role":"agent","state":"revoked"},{"id":"n7","kind":"cluster-node","role":"server","state":"revoked","revoke_confirmed":true},{"id":"n8","kind":"cluster-node","role":"server","state":"revoked","revoke_confirmed":true,"error":"revoked; waiting for quorum to remove its etcd member"}]}' ;;
@@ -7929,6 +7930,8 @@ case "$*" in
     # broken: the exec breaks under the restarts (no "command terminated");
     # refuse-revoke: the Hub's own refusal.
     [ ! -f "$ND/broken" ] || { echo "error: error reading from error stream: read tcp 10.215.0.1:4: connection reset by peer" >&2; exit 1; }
+    # hang: the exec into a Hub on the node being revoked never ends (VM run 15).
+    [ ! -f "$ND/hang" ] || exec sleep 300
     [ ! -f "$ND/broken-once" ] || { rm -f "$ND/broken-once"; echo "error: unable to upgrade connection: container not found" >&2; exit 1; }
     [ ! -f "$ND/standby-once" ] || { rm -f "$ND/standby-once"; echo '{"error":"this Hub is standing by: another Hub is the active writer"}' >&2; echo "command terminated with exit code 3" >&2; exit 1; }
     [ ! -f "$ND/lists-after-revoke" ] || mv "$ND/lists-after-revoke" "$ND/lists"
@@ -8051,6 +8054,26 @@ printf '%s\n' "$L_READY" "${L_READY/ready/offline}" > "$ND/lists"; printf '%s\n'
 nodecli "n4"$'\n' revoke n4
 case "$RC:$ERR" in "0:"*"lists n4 as offline: asking it to revoke n4 again"*"n4 revoked"*) t_pass "node revoke: offline → asked again" ;; *) t_fail "revoke offline: $RC $ERR" ;; esac
 rm -f "$ND/lists" "$ND/lists-after-revoke" "$ND/broken-once"
+# Task 33b VM run 15 (controller ruling): the revoke's exec never ends
+# (the Hub ran on the node being revoked): bounded by NODE_REVOKE_WAIT in
+# all, then what's pending and how to check, exit 1, no stray process.
+touch "$ND/hang"
+printf '%s\n' "$L_READY" "$L_GOING" > "$ND/lists"
+t0=$SECONDS
+NODE_REVOKE_WAIT=6 nodecli "n4"$'\n' revoke n4
+el=$((SECONDS - t0))
+case "$RC:$ERR" in "1:"*"didn't answer the revoke within the wait"*"isn't confirmed revoked after"*"last listed it as: revoked (goes on in nodeadm)"*"./portcullis node list"*"isn't known to be revoked"*)
+  t_pass "node revoke: a hanging exec → bounded, the pending state and the checks named, exit 1" ;; *) t_fail "revoke hang: $RC $ERR" ;; esac
+[ "$el" -le 20 ] && t_pass "node revoke: the hanging exec ended within the wait (${el} s)" || t_fail "node revoke: hung ${el} s"
+expect_eq "node revoke: no stray hanging exec left (killed)" "$(pgrep -fx 'sleep 300' | wc -l | tr -d ' ')" 0
+# The Hub's list hanging too: still bounded.
+touch "$ND/hang-list"
+t0=$SECONDS
+NODE_REVOKE_WAIT=2 nodecli "n4"$'\n' revoke n4
+el=$((SECONDS - t0))
+case "$RC:$ERR" in "1:"*"isn't confirmed revoked after"*"last listed it as: not answered"*) t_pass "node revoke: a hanging list → bounded, exit 1" ;; *) t_fail "revoke hang list: $RC $ERR" ;; esac
+[ "$el" -le 20 ] && t_pass "node revoke: hanging lists bounded (${el} s)" || t_fail "node revoke: hung ${el} s on the list"
+rm -f "$ND/hang" "$ND/hang-list" "$ND/lists"
 # Fix round 2 (nit 2): the admission probes' node identity is reserved.
 for rid in portcullis-admission-probe portcullis-admission-x; do
   nodecli "" add "$rid"

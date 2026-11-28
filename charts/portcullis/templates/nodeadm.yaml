@@ -75,6 +75,11 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims", "persistentvolumes"]
     verbs: ["list"]
+  # A revoked server's volumes detached before its Node goes (Task 33b VM
+  # run 15, ruling A: nodeadm/outofservice.go waits for them; read-only).
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["list"]
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters"]
     verbs: ["get", "list"]

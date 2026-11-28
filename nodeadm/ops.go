@@ -98,12 +98,14 @@ type revokeOp struct {
 // (server_rotated2 does nothing); applied2 then gives the token to the
 // servers that were down.
 var revokeSteps = []string{"created", "marked", "tokens_deleted", "server_rotated", "applied",
-	"node_deleted", "published", "etcd_removed", "server_rotated2", "applied2", "done"}
+	"out_of_service", "node_deleted", "published", "etcd_removed", "server_rotated2", "applied2", "done"}
 
 // revokeStepsVersion: an op recorded under another step list restarts from
 // marked (every step is idempotent; fail closed, fix round 6). 4: the
-// agent token steps are gone (agent-token fix).
-const revokeStepsVersion = 4
+// agent token steps are gone (agent-token fix). 5: out_of_service (a
+// server's Node put out of service after T_fence, its volumes detached,
+// before node_deleted: Task 33b VM run 15, ruling A).
+const revokeStepsVersion = 5
 
 func stepIndex(s string) int { return slices.Index(revokeSteps, s) }
 
@@ -362,11 +364,11 @@ func (s *Server) runRevoke(ctx context.Context, id string) error {
 func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 	id := op.Node
 	next := revokeSteps[stepIndex(op.Step)+1]
-	// etcd's quorum gates only the steps that delete the Node or change etcd
-	// membership; the certificate revoke, the mark and the bootstrap token
+	// etcd's quorum gates only the steps that delete the Node (and put it
+	// out of service first) or change etcd membership; the certificate revoke, the mark and the bootstrap token
 	// deletes never wait for it (fix round 4). A refusal parks the op
 	// before node_deleted with quorum_minimum, resumed by reconcile.
-	if op.Role == "server" && (next == "node_deleted" || next == "etcd_removed") {
+	if op.Role == "server" && (next == "out_of_service" || next == "node_deleted" || next == "etcd_removed") {
 		if err := s.revokeQuorum(ctx, id); err != nil {
 			return err
 		}
@@ -383,6 +385,13 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 				return fmt.Errorf("deleting bootstrap token %s: %w", t, err)
 			}
 			s.log.Info("bootstrap token deleted", "node", id, "token_id", t)
+		}
+	case "out_of_service":
+		// Servers only (the ruling); an agent's Node is deleted as before.
+		if op.Role == "server" {
+			if err := s.outOfService(ctx, op); err != nil {
+				return err
+			}
 		}
 	case "node_deleted":
 		if err := s.clearRemediation(ctx, id); err != nil {

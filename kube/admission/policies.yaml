@@ -2086,6 +2086,17 @@ spec:
 # on a Node otherwise admissible by both policies; the rules run in order
 # and the API server reports the first refusal, so params lacking the key
 # never confirm a probe.
+# nodeadm's own Node writes (Task 33b VM run 15, controller ruling A): its
+# ServiceAccount (the literal is params nodeadmServiceAccount =
+# KUBE_NODEADM_SA, tests/k8s_hardening.py) is matched here only for its
+# taints. It may put exactly node.kubernetes.io/out-of-service=
+# nodeshutdown:NoExecute, only on a node it lists removed (a revoked
+# server's Node, after T_fence, so Kubernetes force-detaches its volumes:
+# nodeadm/outofservice.go), never lift it, and change no taint but its
+# own two (portcullis.io/small=true:NoSchedule,
+# nodeadm.portcullis/unlabelled=true:NoSchedule); everything else of its
+# writes (labels, annotations, cordon) isn't judged here. The node
+# identities' rules don't apply to it.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -2117,8 +2128,12 @@ spec:
       - certificatesigningrequests
   matchConditions:
   - name: node-identities
-    expression: "'system:nodes' in request.userInfo.groups || request.userInfo.username.startsWith('system:node:')"
+    expression: >-
+      'system:nodes' in request.userInfo.groups || request.userInfo.username.startsWith('system:node:')
+      || request.userInfo.username == 'system:serviceaccount:portcullis-nodeadm:nodeadm'
   variables:
+  - name: nodeadm
+    expression: "request.userInfo.username == 'system:serviceaccount:portcullis-nodeadm:nodeadm'"
   - name: keyed
     expression: "has(params.data) && has(params.data.removedNodes) && has(params.data.generation)"
   - name: removed
@@ -2127,8 +2142,21 @@ spec:
     expression: "request.userInfo.username.startsWith('system:node:') ? request.userInfo.username.substring(12) : ''"
   - name: csr
     expression: "request.resource.group == 'certificates.k8s.io'"
+  # A Node's taints as key=value:effect (nodeadm's rule).
+  - name: newTaintKeys
+    expression: >-
+      !variables.csr && has(object.spec) && has(object.spec.taints)
+      ? object.spec.taints.map(t, t.key + '=' + (has(t.value) ? t.value : '') + ':' + t.effect) : []
+  - name: oldTaintKeys
+    expression: >-
+      !variables.csr && request.operation == 'UPDATE' && has(oldObject.spec) && has(oldObject.spec.taints)
+      ? oldObject.spec.taints.map(t, t.key + '=' + (has(t.value) ? t.value : '') + ':' + t.effect) : []
+  - name: oos
+    expression: "'node.kubernetes.io/out-of-service=nodeshutdown:NoExecute'"
+  - name: nodeadmOwn
+    expression: "['portcullis.io/small=true:NoSchedule', 'nodeadm.portcullis/unlabelled=true:NoSchedule', 'node.kubernetes.io/out-of-service=nodeshutdown:NoExecute']"
   validations:
-  - expression: variables.keyed
+  - expression: variables.nodeadm || variables.keyed
     message: "the removed-node params (ConfigMap portcullis-removed-nodes) lack removedNodes: every node identity's Node and CSR write is refused"
   - expression: >-
       !has(object.metadata.annotations) || !('portcullis.io/removed-nodes-generation' in object.metadata.annotations)
@@ -2136,13 +2164,25 @@ spec:
     messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
   - expression: "!variables.self.startsWith('portcullis-admission-') || request.dryRun"
     message: the admission probe identity writes only in a dry run
-  - expression: "variables.csr || (!(object.metadata.name in variables.removed) && !(variables.self in variables.removed))"
+  - expression: "variables.nodeadm || variables.csr || (!(object.metadata.name in variables.removed) && !(variables.self in variables.removed))"
     messageExpression: >-
       'node ' + (variables.self in variables.removed ? variables.self : object.metadata.name)
       + ' was removed from the cluster: its kubelet identity can neither register nor update a Node (a removed name is freed when a new node enrols under it, a revoked one never)'
   - expression: >-
-      !variables.csr || (!(variables.self in variables.removed)
+      variables.nodeadm || !variables.csr || (!(variables.self in variables.removed)
         && !(has(object.spec.username) && object.spec.username.startsWith('system:node:') && object.spec.username.substring(12) in variables.removed))
     messageExpression: >-
       'node ' + (variables.self in variables.removed ? variables.self : object.spec.username.substring(12))
       + ' was removed from the cluster: its kubelet identity can file no certificate signing request'
+  # nodeadm (ruling A): no taint changed but its own two, and the
+  # out-of-service taint only put (never lifted), exactly, on a Node it
+  # lists removed; a CSR or a Node create by nodeadm carries none of it.
+  - expression: >-
+      !variables.nodeadm || variables.csr
+      || (request.operation == 'UPDATE' && size(variables.newTaintKeys) <= 64 && size(variables.oldTaintKeys) <= 64
+          && variables.newTaintKeys.filter(k, !(k in variables.nodeadmOwn)).all(k, k in variables.oldTaintKeys)
+          && variables.oldTaintKeys.filter(k, !(k in variables.nodeadmOwn)).all(k, k in variables.newTaintKeys)
+          && (!(variables.oos in variables.oldTaintKeys) || variables.oos in variables.newTaintKeys)
+          && (!(variables.oos in variables.newTaintKeys) || variables.oos in variables.oldTaintKeys
+              || (variables.keyed && object.metadata.name in variables.removed)))
+    message: "nodeadm may change only its own taints (portcullis.io/small, nodeadm.portcullis/unlabelled) and put node.kubernetes.io/out-of-service=nodeshutdown:NoExecute only on a node it lists removed"

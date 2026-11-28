@@ -934,7 +934,11 @@ Revoke (a lost or compromised machine): its certificate revoked, its
 tokens deleted, the cluster's k3s tokens rotated, its Node and etcd member
 removed; no drain. Asks for the node's id, typed (read from stdin), and
 refuses on a mismatch. While etcd lacks quorum the removal is parked (the
-security steps done) and the Hub finishes it later.
+security steps done) and the Hub finishes it later. A server's revoke
+waits until T_fence (150 s) has passed, then puts its Node out of
+service so its volumes detach, before the Node goes. Waits for the Hub
+at most 10 min in all (NODE_REVOKE_WAIT, seconds), then says what is
+still pending and exits 1 (the Hub finishes a revoke it recorded).
 HELP
 }
 
@@ -1113,6 +1117,25 @@ _node_server() {
   printf '%s' "$1" | jq -c --arg id "$2" 'first(.servers[]? | select(.id == $id)) // empty' 2>/dev/null
 }
 
+# _node_revoke_exec <id> <hub pod> — the revoke's exec (the typed id as
+# the confirm body on stdin).
+_node_revoke_exec() {
+  # kubectl the function's own child (a here-string, no pipeline), so
+  # _kube_bounded's kill reaches it.
+  kube_ctl -n "$(kube_ns)" exec -i "$2" -c hub -- hub servers revoke "$1" <<< "$(jq -nc --arg id "$1" '{confirm: $id}')"
+}
+
+# NODE_REVOKE_WAIT: how long `node revoke` waits for the Hub in all (the
+# send and the outcome; 10 min), from _NODE_REVOKE_T0 (SECONDS).
+NODE_REVOKE_WAIT="${NODE_REVOKE_WAIT:-600}"
+# _node_revoke_left [cap] — the seconds left of it (at least 1, at most cap).
+_node_revoke_left() {
+  local left=$(( NODE_REVOKE_WAIT - (SECONDS - ${_NODE_REVOKE_T0:-$SECONDS}) ))
+  [ "$left" -gt 0 ] || left=1
+  [ -z "${1:-}" ] || [ "$left" -le "$1" ] || left="$1"
+  echo "$left"
+}
+
 # _node_revoke_send <id> — `hub servers revoke <id>` (the typed id as the
 # confirm body); its answer in _NODE_OUT. 0 answered, 1 the Hub's own
 # refusal (its text on stderr), 2 not answered: the exec broke before the
@@ -1120,9 +1143,17 @@ _node_server() {
 # kubectl), or that command's exit 3 (the Hub not running, its answer cut,
 # a 5xx: a new Hub pod standing by, nodeadm unreachable — found live).
 _node_revoke_send() {
-  local errf rc=0
+  local errf rc=0 ref
   errf="$(mktemp)" || fail "no temporary file"
-  _NODE_OUT="$(jq -nc --arg id "$1" '{confirm: $id}' | kube_ctl -n "$(kube_ns)" exec -i "$(_node_hub_ref)" -c hub -- hub servers revoke "$1" 2> "$errf")" || rc=$?
+  ref="$(_node_hub_ref)"
+  # Bounded (Task 33b VM run 15: the exec into a Hub on the node being
+  # revoked never ended): what's left of NODE_REVOKE_WAIT.
+  # Three quarters of what's left: the rest polls the Hub's list.
+  _NODE_OUT="$(_kube_bounded "$(( $(_node_revoke_left) * 3 / 4 + 1 ))" _node_revoke_exec "$1" "$ref" 2> "$errf")" || rc=$?
+  # Killed by _kube_bounded (TERM): not answered within the wait.
+  if [ "$rc" = 143 ]; then
+    echo "the Hub didn't answer the revoke within the wait" >&2; rm -f "$errf"; return 2
+  fi
   if [ "$rc" = 0 ]; then rm -f "$errf"; return 0; fi
   if grep -qx 'command terminated with exit code 3' "$errf"; then
     grep -vE '^command terminated with exit code [0-9]+$' "$errf" | head -n 3 >&2; rm -f "$errf"; return 2
@@ -1145,10 +1176,16 @@ _node_revoke_send() {
 # may have restarted mid-call (its Lease lost while the servers restarted,
 # found live) and recorded nothing. 0 revoked, 1 not.
 _node_revoke_outcome() {
-  local id="$1" listed="$2" i out s miss=0 last=-100 rc
+  local id="$1" listed="$2" i out s miss=0 last=-100 rc seen="not answered"
   info "The connection to the Hub broke during the revoke (the servers restart for the token rotation): asking the Hub how it ended..." >&2
-  for ((i = 0; i < 600; i++)); do
-    if ! out="$(_node_hub list </dev/null 2>/dev/null)" || ! printf '%s' "$out" | jq -e '.servers | type == "array"' >/dev/null 2>&1; then
+  for ((i = 0; ; i++)); do
+    # Bounded (VM run 15): NODE_REVOKE_WAIT in all, then what's pending.
+    if [ $(( SECONDS - ${_NODE_REVOKE_T0:-$SECONDS} )) -ge "$NODE_REVOKE_WAIT" ]; then
+      warn "node revoke: $id isn't confirmed revoked after $NODE_REVOKE_WAIT s; the Hub last listed it as: $seen."
+      warn "  The Hub keeps a revoke it recorded and asks nodeadm again every 30 s. Check: ./portcullis node list (\"revoked\" without \"goes on\" = done), ./portcullis status; run ./portcullis node revoke $id again if it isn't listed revoked."
+      return 1
+    fi
+    if ! out="$(_kube_bounded "$(_node_revoke_left 60)" _node_hub list </dev/null 2>/dev/null)" || ! printf '%s' "$out" | jq -e '.servers | type == "array"' >/dev/null 2>&1; then
       miss=$((miss + 1))
       [ $((miss % 100)) != 10 ] || warn "node revoke: the Hub doesn't answer ($((miss * ${NODE_POLL:-3})) s); still asking"
     else
@@ -1158,6 +1195,7 @@ _node_revoke_outcome() {
         [ "$listed" = 1 ] || { warn "node revoke: the Hub doesn't list $id"; return 1; }
         ok "$id revoked (the Hub no longer lists it)" >&2; return 0
       fi
+      seen="$(printf '%s' "$s" | jq -r '.state + (if .state == "revoked" and (.revoke_confirmed | not) then " (goes on in nodeadm)" else "" end) + (if (.error // "") != "" then ": " + .error else "" end)')"
       case "$(printf '%s' "$s" | jq -r '[.state, (.revoke_confirmed // false | tostring), (.error // "")] | join("|")')" in
         "revoked|true|revoked; waiting for quorum"*)
           warn "$(printf '%s' "$s" | jq -r .error)"
@@ -1183,8 +1221,6 @@ _node_revoke_outcome() {
     fi
     sleep "${NODE_POLL:-3}"
   done
-  warn "node revoke: the outcome for $id isn't known after 30 min: ./portcullis node list"
-  return 1
 }
 
 _node_remove() {
@@ -1208,7 +1244,8 @@ _node_remove() {
     # terminated with exit code N") is its refusal; anything else is a
     # broken call, and the outcome is asked of the Hub (Task 30 fix round 1).
     local rc=0 listed=0
-    [ -z "$(_node_server "$(_node_hub list </dev/null 2>/dev/null || true)" "$id")" ] || listed=1
+    _NODE_REVOKE_T0=$SECONDS
+    [ -z "$(_node_server "$(_kube_bounded "$(_node_revoke_left 60)" _node_hub list </dev/null 2>/dev/null || true)" "$id")" ] || listed=1
     _node_revoke_send "$id" || rc=$?
     [ "$rc" != 1 ] || fail "the Hub refused to revoke $id"
     if [ "$rc" = 2 ]; then

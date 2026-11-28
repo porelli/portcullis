@@ -105,11 +105,17 @@ type Timing struct {
 	// RemovedConfirm: a removed name confirmed in force on every API
 	// server before its Node is deleted (90 s; removedparams.go).
 	RemovedConfirm time.Duration
+	// Fence: a revoked server's Node is put out of service only this long
+	// after its revoke started (T_fence, fenceTime: the machine has reset
+	// itself by then); Detach: its VolumeAttachments gone after that (5 min).
+	Fence  time.Duration
+	Detach time.Duration
 }
 
 func defaultTiming() Timing {
 	return Timing{Poll: 2 * time.Second, PDBRefusal: 120 * time.Second, DrainMax: 10 * time.Minute,
-		NodeReady: 5 * time.Minute, LonghornEvict: 10 * time.Minute, NodeGone: 5 * time.Minute, RemovedConfirm: 90 * time.Second}
+		NodeReady: 5 * time.Minute, LonghornEvict: 10 * time.Minute, NodeGone: 5 * time.Minute, RemovedConfirm: 90 * time.Second,
+		Fence: fenceTime, Detach: 5 * time.Minute}
 }
 
 // Server is nodeadm.

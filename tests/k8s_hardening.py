@@ -990,6 +990,7 @@ def main():
     check_core_exec()
     check_placement_twins()
     check_token_literal()
+    check_nodeadm_taint_rule()
     check_ingress_allowlists(K.render({"ha": {"enabled": True}}) + docs)
     check_ingress_health()
     # Every PVC a pod claims is rendered, with and without the optional
@@ -1034,6 +1035,8 @@ NODEADM_CLUSTER_RULES = [
     {"apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"]},
     # Task 33a fix round 1: the volumes' node affinity (the snapshot's N−1 input).
     {"apiGroups": [""], "resources": ["persistentvolumeclaims", "persistentvolumes"], "verbs": ["list"]},
+    # Task 33b VM run 15 (ruling A): a revoked server's volumes detached.
+    {"apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["list"]},
     {"apiGroups": ["postgresql.cnpg.io"], "resources": ["clusters"], "verbs": ["get", "list"]},
     {"apiGroups": ["longhorn.io"], "resources": ["volumes", "nodes", "replicas"], "verbs": ["get", "list"]},
     {"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["get", "list"]},
@@ -1248,6 +1251,84 @@ def check_token_literal():
     conds = [c["expression"] for c in pol["spec"].get("matchConditions", [])]
     if not sa or conds != [f"request.userInfo.username == '{sa.group(1)}'"]:
         F.add(f"portcullis-nodeadm-tokens matchConditions {conds} != the CLI's KUBE_NODEADM_SA {sa and sa.group(1)}")
+
+
+# portcullis-removed-nodes' nodeadm rule (Task 33b VM run 15, controller
+# ruling A): nodeadm's ServiceAccount (the CLI's KUBE_NODEADM_SA literal)
+# may put exactly the out-of-service taint, only on a node it lists
+# removed, never lift it, and change no taint but its own two. Pinned
+# whole (the variables and the rule), with mutation tests.
+NODEADM_TAINT_VARS = {
+    "nodeadm": "request.userInfo.username == '{sa}'",
+    "oos": "'node.kubernetes.io/out-of-service=nodeshutdown:NoExecute'",
+    "nodeadmOwn": "['portcullis.io/small=true:NoSchedule', 'nodeadm.portcullis/unlabelled=true:NoSchedule', 'node.kubernetes.io/out-of-service=nodeshutdown:NoExecute']",
+}
+NODEADM_TAINT_RULE = (
+    "!variables.nodeadm || variables.csr || (request.operation == 'UPDATE' && size(variables.newTaintKeys) <= 64 && size(variables.oldTaintKeys) <= 64 "
+    "&& variables.newTaintKeys.filter(k, !(k in variables.nodeadmOwn)).all(k, k in variables.oldTaintKeys) "
+    "&& variables.oldTaintKeys.filter(k, !(k in variables.nodeadmOwn)).all(k, k in variables.newTaintKeys) "
+    "&& (!(variables.oos in variables.oldTaintKeys) || variables.oos in variables.newTaintKeys) "
+    "&& (!(variables.oos in variables.newTaintKeys) || variables.oos in variables.oldTaintKeys "
+    "|| (variables.keyed && object.metadata.name in variables.removed)))")
+
+
+def nodeadm_taint_problems(pol, sa):
+    out = []
+    norm = lambda e: " ".join(str(e).split())
+    conds = [norm(c["expression"]) for c in pol["spec"].get("matchConditions", [])]
+    want = [f"'system:nodes' in request.userInfo.groups || request.userInfo.username.startsWith('system:node:') || request.userInfo.username == '{sa}'"]
+    if conds != want:
+        out.append(f"portcullis-removed-nodes matchConditions {conds} != the node identities or nodeadm ({sa})")
+    vs = {v["name"]: norm(v["expression"]) for v in pol["spec"].get("variables", [])}
+    for k, e in NODEADM_TAINT_VARS.items():
+        if vs.get(k) != e.format(sa=sa):
+            out.append(f"portcullis-removed-nodes variable {k}: {vs.get(k)!r}")
+    rules = [norm(v["expression"]) for v in pol["spec"].get("validations", [])]
+    if NODEADM_TAINT_RULE not in rules:
+        out.append("portcullis-removed-nodes lacks nodeadm's taint rule (ruling A), exactly")
+    # The node identities' rules never let nodeadm off but where it is
+    # judged by its own rule (the keyed / removed-name / CSR rules).
+    let_off = [r for r in rules if r.startswith("variables.nodeadm ||")]
+    if len(let_off) != 3:
+        out.append(f"portcullis-removed-nodes: {len(let_off)} rules exempt nodeadm (want 3: keyed, the removed name, the CSR)")
+    return out
+
+
+def check_nodeadm_taint_rule():
+    pol = next(d for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "policies.yaml").read_text())
+               if d and d.get("kind") == "ValidatingAdmissionPolicy" and d["metadata"]["name"] == "portcullis-removed-nodes")
+    sa = re.search(r'^KUBE_NODEADM_SA="([^"]+)"', (K.ROOT / "scripts" / "lib" / "kube_install.sh").read_text(), re.M).group(1)
+    for p in nodeadm_taint_problems(pol, sa):
+        F.add(p)
+
+    def rule_sub(a, b):
+        def m(p):
+            for v in p["spec"]["validations"]:
+                if " ".join(v["expression"].split()) == NODEADM_TAINT_RULE:
+                    v["expression"] = NODEADM_TAINT_RULE.replace(a, b)
+        return m
+
+    def var_set(k, e):
+        def m(p):
+            next(v for v in p["spec"]["variables"] if v["name"] == k)["expression"] = e
+        return m
+
+    def exempt_all(p):
+        for v in p["spec"]["validations"]:
+            if not v["expression"].lstrip().startswith(("!variables.nodeadm", "variables.nodeadm")):
+                v["expression"] = "variables.nodeadm || " + v["expression"]
+
+    for what, mutate in (
+            ("the removed-name condition dropped", rule_sub(" && object.metadata.name in variables.removed", "")),
+            ("lifting the taint allowed", rule_sub("(!(variables.oos in variables.oldTaintKeys) || variables.oos in variables.newTaintKeys) && ", "")),
+            ("another taint key nodeadm may change", var_set("nodeadmOwn", "['portcullis.io/small=true:NoSchedule', 'nodeadm.portcullis/unlabelled=true:NoSchedule', 'example.com/x=:NoExecute', 'node.kubernetes.io/out-of-service=nodeshutdown:NoExecute']")),
+            ("the out-of-service effect widened", var_set("oos", "'node.kubernetes.io/out-of-service=nodeshutdown:NoSchedule'")),
+            ("another ServiceAccount", var_set("nodeadm", "request.userInfo.username == 'system:serviceaccount:portcullis:portcullis-hub'")),
+            ("nodeadm exempt from every rule", exempt_all)):
+        bad = copy.deepcopy(pol)
+        mutate(bad)
+        if not nodeadm_taint_problems(bad, sa):
+            F.add(f"nodeadm_taint_problems misses {what} (mutation test)")
 
 
 # portcullis-ingress-pods' allowlists hold the chart's Traefik pod: its

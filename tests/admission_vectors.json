@@ -14530,6 +14530,14 @@
      "topology.kubernetes.io/zone": "main",
      "portcullis.io/site": "cloud-1"
     }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
    }
   },
   "as": "nodeadm",
@@ -15027,7 +15035,12 @@
     }
    },
    "spec": {
-    "taints": []
+    "taints": [
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
    }
   },
   "as": "nodeadm",
@@ -15125,5 +15138,349 @@
   },
   "op": "delete",
   "ha": true
+ },
+ {
+  "name": "nodeadm taints (Task 33b ruling A): nodeadm putting the out-of-service taint on a node it lists removed",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "node.kubernetes.io/out-of-service",
+      "value": "nodeshutdown",
+      "effect": "NoExecute"
+     },
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "nodeadm",
+  "want": "allow",
+  "reason_contains": "",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "op": "update"
+ },
+ {
+  "name": "nodeadm taints (Task 33b ruling A): nodeadm putting the out-of-service taint on a node it doesn't list removed is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "node.kubernetes.io/out-of-service",
+      "value": "nodeshutdown",
+      "effect": "NoExecute"
+     },
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may change only its own taints (portcullis.io/small, nodeadm.portcullis/unlabelled) and put node.kubernetes.io/out-of-service=nodeshutdown:NoExecute only on a node it lists removed",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "op": "update"
+ },
+ {
+  "name": "nodeadm taints (Task 33b ruling A): nodeadm putting another NoExecute taint on a removed node is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "example.com/evict",
+      "value": "x",
+      "effect": "NoExecute"
+     },
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may change only its own taints (portcullis.io/small, nodeadm.portcullis/unlabelled) and put node.kubernetes.io/out-of-service=nodeshutdown:NoExecute only on a node it lists removed",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "op": "update"
+ },
+ {
+  "name": "nodeadm taints (Task 33b ruling A): nodeadm putting the out-of-service key with another effect is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "node.kubernetes.io/out-of-service",
+      "value": "nodeshutdown",
+      "effect": "NoSchedule"
+     },
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may change only its own taints (portcullis.io/small, nodeadm.portcullis/unlabelled) and put node.kubernetes.io/out-of-service=nodeshutdown:NoExecute only on a node it lists removed",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "op": "update"
+ },
+ {
+  "name": "nodeadm taints (Task 33b ruling A): nodeadm lifting the out-of-service taint is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may change only its own taints (portcullis.io/small, nodeadm.portcullis/unlabelled) and put node.kubernetes.io/out-of-service=nodeshutdown:NoExecute only on a node it lists removed",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "node.kubernetes.io/out-of-service",
+      "value": "nodeshutdown",
+      "effect": "NoExecute"
+     }
+    ]
+   }
+  },
+  "op": "update"
+ },
+ {
+  "name": "nodeadm taints (Task 33b ruling A): nodeadm dropping a taint that isn't its own is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "nodeadm",
+  "want": "deny",
+  "reason_contains": "nodeadm may change only its own taints (portcullis.io/small, nodeadm.portcullis/unlabelled) and put node.kubernetes.io/out-of-service=nodeshutdown:NoExecute only on a node it lists removed",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "example.com/keep",
+      "value": "1",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "op": "update"
+ },
+ {
+  "name": "nodeadm taints (Task 33b ruling A): nodeadm setting its small taint",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "portcullis.io/small",
+      "value": "true",
+      "effect": "NoSchedule"
+     },
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "nodeadm",
+  "want": "allow",
+  "reason_contains": "",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "op": "update"
+ },
+ {
+  "name": "nodeadm taints (Task 33b ruling A): nodeadm annotating a node it lists removed",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    },
+    "annotations": {
+     "nodeadm.portcullis/addresses": "{}"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "node.kubernetes.io/not-ready",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "nodeadm",
+  "want": "allow",
+  "reason_contains": "",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "vector-removed",
+    "labels": {
+     "kubernetes.io/hostname": "vector-removed"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "op": "update"
  }
 ]
