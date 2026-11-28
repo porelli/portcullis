@@ -110,12 +110,15 @@ type Timing struct {
 	// itself by then); Detach: its VolumeAttachments gone after that (5 min).
 	Fence  time.Duration
 	Detach time.Duration
+	// Cutoff: how much longer than Fence a revoke waits for the server to
+	// be proven cut off before it parks (cutoff_pending; 1 min).
+	Cutoff time.Duration
 }
 
 func defaultTiming() Timing {
 	return Timing{Poll: 2 * time.Second, PDBRefusal: 120 * time.Second, DrainMax: 10 * time.Minute,
 		NodeReady: 5 * time.Minute, LonghornEvict: 10 * time.Minute, NodeGone: 5 * time.Minute, RemovedConfirm: 90 * time.Second,
-		Fence: fenceTime, Detach: 5 * time.Minute}
+		Fence: fenceTime, Detach: 5 * time.Minute, Cutoff: time.Minute}
 }
 
 // Server is nodeadm.
@@ -157,8 +160,11 @@ type Server struct {
 	remUnknown []string // the last round's unknown Nodes (snapshot errors)
 	// upMu / upgraded: the nodes whose nodeagent this process saw take its
 	// binaries (node → their sums), so each is asked once per process.
-	upMu     sync.Mutex
-	upgraded map[string]string
+	// cutOffCheck replaces cutOffReasons (tests of other steps only: the
+	// harness proves every revoked node cut off unless a test uses the real one).
+	cutOffCheck func(context.Context, *revokeOp) []string
+	upMu        sync.Mutex
+	upgraded    map[string]string
 	// probe confirms the removed-node params (removedparams.go);
 	// removedMu serialises their writes, removedProven is the last
 	// generation/resourceVersion every API server confirmed.

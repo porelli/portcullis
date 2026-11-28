@@ -102,10 +102,11 @@ type fakeAgents struct {
 	tokens    []string        // every new_token seen
 	targets   map[string]ProbeTargets
 	onRotate  func(id, step, tok string)
-	etcdRm    []string         // via:node:mesh
-	fail      map[string]error // "rotate"/"apply"/... or "etcd": the call fails (its error echoes the token)
-	effect    map[string]bool  // the failing call took effect first (an answer lost)
-	upgrades  []string         // id:amd64[:4]:arm64[:4] (UpgradeAgent; fail "upgrade:<id>")
+	etcdRm    []string          // via:node:mesh
+	fail      map[string]error  // "rotate"/"apply"/... or "etcd": the call fails (its error echoes the token)
+	effect    map[string]bool   // the failing call took effect first (an answer lost)
+	upgrades  []string          // id:amd64[:4]:arm64[:4] (UpgradeAgent; fail "upgrade:<id>")
+	peers     map[string]string // id → its health's peers JSON (unset: none)
 }
 
 func (f *fakeAgents) Health(_ context.Context, id, meshIP string) (*AgentHealth, error) {
@@ -114,7 +115,11 @@ func (f *fakeAgents) Health(_ context.Context, id, meshIP string) (*AgentHealth,
 	if f.down[id] {
 		return nil, errors.New("nodeagent " + id + " /v1/health: unreachable")
 	}
-	return &AgentHealth{ID: id, MeshIP: meshIP, K3s: "absent"}, nil
+	h := &AgentHealth{ID: id, MeshIP: meshIP, K3s: "absent"}
+	if p, ok := f.peers[id]; ok {
+		h.Peers = json.RawMessage(p)
+	}
+	return h, nil
 }
 
 func (f *fakeAgents) PutProbeTargets(_ context.Context, id, _ string, t ProbeTargets) error {
@@ -377,6 +382,9 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 	s.now = func() time.Time { return h.now.Load().(time.Time) }
 	s.rand = rand.Reader
 	s.log = slog.New(slog.NewTextHandler(&lockedBuf{b: h.logs}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// Revokes in the other steps' tests: the revoked node proven cut off
+	// (outofservice_test.go uses the real evidence).
+	s.cutOffCheck = func(context.Context, *revokeOp) []string { return nil }
 	s.timing = Timing{Poll: 5 * time.Millisecond, PDBRefusal: 60 * time.Millisecond, DrainMax: 2 * time.Second,
 		NodeReady: time.Second, LonghornEvict: 200 * time.Millisecond, RemovedConfirm: 50 * time.Millisecond}
 	if err := s.pki.setCA(vs.PKI.CAPEM); err != nil {

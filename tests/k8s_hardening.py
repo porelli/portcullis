@@ -1054,6 +1054,8 @@ NODEADM_CORE_RULES = [
     {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["portcullis-nodeadm"], "verbs": ["get", "update"]},
 ]
 NODEADM_KUBE_SYSTEM_RULES = [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "delete"]}]
+# Task 33b security review: a revoked server's Node lease, read-only.
+NODEADM_NODE_LEASE_RULES = [{"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get"]}]
 NODEADM_LONGHORN_RULES = [{"apiGroups": ["longhorn.io"], "resources": ["nodes"], "verbs": ["get", "patch"]}]
 # Fix round 1 (Task 24): nodeadm creates / removes SNR's remediation requests.
 NODEADM_FENCING_RULES = [{"apiGroups": ["self-node-remediation.medik8s.io"], "resources": ["selfnoderemediations"], "verbs": ["create", "delete"]}]
@@ -1120,7 +1122,8 @@ def check_nodeadm():
                         if b["roleRef"]["name"] == r["metadata"]["name"] and b["metadata"]["namespace"] == r["metadata"]["namespace"]
                         for s in b.get("subjects", []))}
         want = {(K.NS, "portcullis-nodeadm"): NODEADM_CORE_RULES, ("kube-system", "portcullis-nodeadm"): NODEADM_KUBE_SYSTEM_RULES,
-                ("default", "portcullis-nodeadm"): NODEADM_DEFAULT_RULES}
+                ("default", "portcullis-nodeadm"): NODEADM_DEFAULT_RULES,
+                ("kube-node-lease", "portcullis-nodeadm"): NODEADM_NODE_LEASE_RULES}
         if ha:
             want[("longhorn-system", "portcullis-nodeadm")] = NODEADM_LONGHORN_RULES
             want[("portcullis-fencing", "portcullis-nodeadm")] = NODEADM_FENCING_RULES

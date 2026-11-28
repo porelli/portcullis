@@ -7936,6 +7936,8 @@ case "$*" in
     [ ! -f "$ND/standby-once" ] || { rm -f "$ND/standby-once"; echo '{"error":"this Hub is standing by: another Hub is the active writer"}' >&2; echo "command terminated with exit code 3" >&2; exit 1; }
     [ ! -f "$ND/lists-after-revoke" ] || mv "$ND/lists-after-revoke" "$ND/lists"
     [ ! -f "$ND/refuse-revoke" ] || { echo "server n4 is enrolling: stop its operation first" >&2; echo "command terminated with exit code 1" >&2; exit 1; }
+    # cutoff: nodeadm hasn't proven n4 cut off yet (Task 33b security review).
+    [ ! -f "$ND/cutoff" ] || { echo '{"status":"revoked","server":"n4","parked":true,"warning":"waiting for n4 to be cut off: its Node is Ready; power the machine off (or cut its network) and nodeadm finishes the revoke","detail":"revoked; waiting for n4 to be cut off: its Node is Ready; power the machine off"}'; exit 0; }
     echo '{"status":"revoked","server":"n4"}' ;;
   *) echo "unexpected kubectl $*" >&2; exit 98 ;;
 esac
@@ -8074,6 +8076,20 @@ el=$((SECONDS - t0))
 case "$RC:$ERR" in "1:"*"isn't confirmed revoked after"*"last listed it as: not answered"*) t_pass "node revoke: a hanging list → bounded, exit 1" ;; *) t_fail "revoke hang list: $RC $ERR" ;; esac
 [ "$el" -le 20 ] && t_pass "node revoke: hanging lists bounded (${el} s)" || t_fail "node revoke: hung ${el} s on the list"
 rm -f "$ND/hang" "$ND/hang-list" "$ND/lists"
+# Task 33b security review: a server not yet proven cut off: the Hub's
+# parked answer polled on within the wait (never "revoked" before it is),
+# done once nodeadm finishes; still waiting at the bound → exit 1, the
+# way out named.
+L_CUT='{"servers":[{"id":"n4","kind":"cluster-node","state":"revoked","error":"revoked; waiting for n4 to be cut off: its Node is Ready; power the machine off"}]}'
+touch "$ND/cutoff"
+printf '%s\n' "$L_READY" "$L_CUT" "$L_CUT" "$L_DONE" > "$ND/lists"
+nodecli "n4"$'\n' revoke n4
+case "$RC:$ERR" in "0:"*"waiting for n4 to be cut off: its Node is Ready"*"n4 revoked"*) t_pass "node revoke: not yet cut off → polled until done" ;; *) t_fail "revoke cutoff: $RC $ERR" ;; esac
+case "$ERR" in *"connection to the Hub broke"*) t_fail "node revoke cutoff: said the connection broke" ;; *) t_pass "node revoke cutoff: no broken-connection line" ;; esac
+printf '%s\n' "$L_READY" "$L_CUT" > "$ND/lists"
+NODE_REVOKE_WAIT=2 nodecli "n4"$'\n' revoke n4
+case "$RC:$ERR" in "1:"*"last listed it as: revoked (goes on in nodeadm): revoked; waiting for n4 to be cut off"*"power that machine off"*"isn't known to be revoked"*) t_pass "node revoke: still not cut off at the bound → exit 1, the way out" ;; *) t_fail "revoke cutoff bound: $RC $ERR" ;; esac
+rm -f "$ND/cutoff" "$ND/lists"
 # Fix round 2 (nit 2): the admission probes' node identity is reserved.
 for rid in portcullis-admission-probe portcullis-admission-x; do
   nodecli "" add "$rid"

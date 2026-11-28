@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,6 +52,36 @@ func watchOutOfService(t *testing.T, h *harness, detach bool) *oosEvents {
 	return ev
 }
 
+func putLease(t *testing.T, h *harness, node string, renewed time.Time) {
+	t.Helper()
+	d := int32(40)
+	rt := metav1.NewMicroTime(renewed)
+	l := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: node, Namespace: "kube-node-lease"},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &node, LeaseDurationSeconds: &d, RenewTime: &rt}}
+	ctx := context.Background()
+	h.kube.CoordinationV1().Leases("kube-node-lease").Delete(ctx, node, metav1.DeleteOptions{})
+	if _, err := h.kube.CoordinationV1().Leases("kube-node-lease").Create(ctx, l, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setReady(t *testing.T, h *harness, node string, ready bool) {
+	t.Helper()
+	ctx := context.Background()
+	n, err := h.kube.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := corev1.ConditionFalse
+	if ready {
+		st = corev1.ConditionTrue
+	}
+	n.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: st}}
+	if _, err := h.kube.CoreV1().Nodes().UpdateStatus(ctx, n, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func attachVolume(t *testing.T, h *harness, node, pv string) {
 	t.Helper()
 	va := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{Name: "csi-" + pv},
@@ -59,11 +91,16 @@ func attachVolume(t *testing.T, h *harness, node, pv string) {
 	}
 }
 
+// revokeHarness: n2 (the server to revoke) is down: NotReady, its Node
+// lease stale (renewed 10 min ago), no survivor lists it a mesh peer.
 func revokeHarness(t *testing.T, fence, detach time.Duration) *harness {
 	agent := nodeSpec{"n4", "agent", "cloud", "edge", "10.215.0.4", nil, nil, true, false}
-	h := newHarness(t, append(append([]nodeSpec{}, baseNodes...), agent)...)
+	n2 := nodeSpec{"n2", "server", "home", "main", "10.215.0.2", []string{"192.0.2.12"}, nil, false, false}
+	h := newHarness(t, baseNodes[0], n2, baseNodes[2], agent)
 	h.agents.onRotate = h.bootFollows
-	h.s.timing.Fence, h.s.timing.Detach = fence, detach
+	h.s.timing.Fence, h.s.timing.Detach, h.s.timing.Cutoff = fence, detach, 300*time.Millisecond
+	h.s.cutOffCheck = nil // the real evidence
+	putLease(t, h, "n2", time.Now().Add(-10*time.Minute))
 	h.putState(t, func(st *nodeadmState) {
 		st.Nodes["n2"] = &nodeRecord{Role: "server", Serial: "12:34", MeshIP: "10.215.0.2"}
 		st.Nodes["n4"] = &nodeRecord{Role: "agent", Serial: "12:44", MeshIP: "10.215.0.4"}
@@ -73,8 +110,9 @@ func revokeHarness(t *testing.T, fence, detach time.Duration) *harness {
 
 // TestRevokePutsServerOutOfServiceFirst (Task 33b VM run 15, ruling A): a
 // server's revoke puts its Node out of service (exactly the taint), only
-// after T_fence since the revoke started, and deletes the Node only once
-// no VolumeAttachment names it (another node's attachment is no matter).
+// once it has been proven cut off for T_fence, and deletes the Node only
+// once no VolumeAttachment names it (another node's attachment is no
+// matter).
 func TestRevokePutsServerOutOfServiceFirst(t *testing.T) {
 	h := revokeHarness(t, 300*time.Millisecond, 5*time.Second)
 	attachVolume(t, h, "n2", "pvc-hub-state")
@@ -88,10 +126,10 @@ func TestRevokePutsServerOutOfServiceFirst(t *testing.T) {
 		t.Fatalf("events %q, want the taint, then the Node delete", got)
 	}
 	if el := time.Since(start); el < 300*time.Millisecond {
-		t.Fatalf("the taint came %v after the revoke started, before T_fence", el)
+		t.Fatalf("the taint came %v after the revoke started, before T_fence of proof", el)
 	}
-	if !strings.Contains(h.logs.String(), "waiting for T_fence") {
-		t.Fatal("the T_fence wait isn't logged")
+	if !strings.Contains(h.logs.String(), "is cut off (NotReady, its lease stale, no mesh peer) for T_fence") {
+		t.Fatal("the cut-off proof isn't logged")
 	}
 	l, _ := h.kube.StorageV1().VolumeAttachments().List(context.Background(), metav1.ListOptions{})
 	if len(l.Items) != 1 || l.Items[0].Spec.NodeName != "n1" {
@@ -150,11 +188,78 @@ func TestRevokeKeepsNodeWhileAttached(t *testing.T) {
 // before (the ruling is for servers).
 func TestRevokeAgentNoOutOfService(t *testing.T) {
 	h := revokeHarness(t, time.Hour, time.Hour)
+	setReady(t, h, "n2", true) // every server up: an agent's revoke applies its tokens to all
 	ev := watchOutOfService(t, h, false)
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n4?mode=revoke", nil); w.Code != 204 {
 		t.Fatalf("revoke n4: %d %s", w.Code, w.Body)
 	}
 	if got := ev.list(); got != "delete:n4" {
 		t.Fatalf("events %q: want only the Node delete", got)
+	}
+}
+
+// TestRevokeNoTaintWithoutCutOffProof (security review of ruling A): a
+// server still Ready, one whose Node lease is fresh, one still a mesh
+// peer of a survivor (a handshake after the revoke), and one whose
+// survivor's nodeagent doesn't answer are never put out of service: the
+// revoke parks with cutoff_pending naming why, the Node and its volumes
+// kept; proven cut off, the retry finishes.
+func TestRevokeNoTaintWithoutCutOffProof(t *testing.T) {
+	recent := time.Now().UTC().Add(time.Hour).Format(time.RFC3339) // after the revoke (vecNow)
+	for _, c := range []struct {
+		name, why string
+		setup     func(t *testing.T, h *harness)
+		heal      func(t *testing.T, h *harness)
+	}{
+		{"still Ready", "its Node is Ready",
+			func(t *testing.T, h *harness) { setReady(t, h, "n2", true) },
+			func(t *testing.T, h *harness) { setReady(t, h, "n2", false) }},
+		{"fresh lease", "its Node lease was renewed",
+			func(t *testing.T, h *harness) { putLease(t, h, "n2", time.Now()) },
+			func(t *testing.T, h *harness) { putLease(t, h, "n2", time.Now().Add(-10*time.Minute)) }},
+		{"recent handshake", "still a mesh peer of n1 (a handshake at " + recent + ", after the revoke)",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.peers = map[string]string{"n1": `{"n2":{"latest_handshake":"` + recent + `","endpoint":null}}`}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.peers = nil; h.agents.mu.Unlock() }},
+		{"survivor silent", "n3's nodeagent doesn't answer",
+			func(t *testing.T, h *harness) {
+				h.agents.mu.Lock()
+				h.agents.down = map[string]bool{"n3": true}
+				h.agents.mu.Unlock()
+			},
+			func(t *testing.T, h *harness) { h.agents.mu.Lock(); h.agents.down = nil; h.agents.mu.Unlock() }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := revokeHarness(t, 50*time.Millisecond, 2*time.Second)
+			attachVolume(t, h, "n2", "pvc-hub-state")
+			ev := watchOutOfService(t, h, true)
+			c.setup(t, h)
+			w := h.internal(clientHub, "DELETE", "/v1/nodes/n2?mode=revoke", nil)
+			if w.Code != 409 || !strings.Contains(w.Body.String(), "waiting for n2 to be cut off") || !strings.Contains(w.Body.String(), c.why) {
+				t.Fatalf("revoke: %d %s; want 409 cutoff_pending naming %q", w.Code, w.Body, c.why)
+			}
+			if !strings.Contains(w.Body.String(), kindCutoffPending) || !strings.Contains(w.Body.String(), "power the machine off") {
+				t.Fatalf("the answer lacks its kind or the way out: %s", w.Body)
+			}
+			if got := ev.list(); got != "" {
+				t.Fatalf("events %q: the node was tainted or deleted without proof", got)
+			}
+			if op := h.state(t).Ops["n2"]; op == nil || op.Step != "applied" || op.LastKind != kindCutoffPending {
+				t.Fatalf("op %+v: want it parked before out_of_service", op)
+			}
+			if r := h.state(t).Nodes["n2"]; r == nil || !r.Removed {
+				t.Fatalf("the security steps aren't done: %+v", r)
+			}
+			c.heal(t, h)
+			if w := h.internal(clientHub, "DELETE", "/v1/nodes/n2?mode=revoke", nil); w.Code != 204 {
+				t.Fatalf("revoke once cut off: %d %s", w.Code, w.Body)
+			}
+			if got := ev.list(); got != "oos:n2 delete:n2" {
+				t.Fatalf("events %q", got)
+			}
+		})
 	}
 }

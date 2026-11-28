@@ -141,6 +141,36 @@ subjects:
     kind: User
     name: system:node:portcullis-admission-probe
 ---
+# A revoked server's Node lease (Task 33b security review of ruling A:
+# the out-of-service taint only once its lease is stale; read-only).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-nodeadm
+  namespace: kube-node-lease
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-nodeadm
+  namespace: kube-node-lease
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-nodeadm
+subjects:
+  - kind: ServiceAccount
+    name: nodeadm
+    namespace: {{ $nns }}
+---
 # The API servers nodeadm probes one by one (Task 30 fix round 2).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

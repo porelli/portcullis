@@ -934,11 +934,14 @@ Revoke (a lost or compromised machine): its certificate revoked, its
 tokens deleted, the cluster's k3s tokens rotated, its Node and etcd member
 removed; no drain. Asks for the node's id, typed (read from stdin), and
 refuses on a mismatch. While etcd lacks quorum the removal is parked (the
-security steps done) and the Hub finishes it later. A server's revoke
-waits until T_fence (150 s) has passed, then puts its Node out of
-service so its volumes detach, before the Node goes. Waits for the Hub
-at most 10 min in all (NODE_REVOKE_WAIT, seconds), then says what is
-still pending and exits 1 (the Hub finishes a revoke it recorded).
+security steps done) and the Hub finishes it later. A server's Node is
+put out of service (its volumes detached) before it goes, but only once
+nodeadm has seen it cut off for T_fence (150 s) in a row: NotReady, its
+Node lease stale, and out of every other node's mesh. Until then the
+revoke says "waiting for <id> to be cut off": power that machine off (or
+cut its network) and nodeadm finishes on its own. Waits for the Hub at
+most 10 min in all (NODE_REVOKE_WAIT, seconds), then says what is still
+pending and exits 1 (the Hub finishes a revoke it recorded).
 HELP
 }
 
@@ -1177,12 +1180,13 @@ _node_revoke_send() {
 # found live) and recorded nothing. 0 revoked, 1 not.
 _node_revoke_outcome() {
   local id="$1" listed="$2" i out s miss=0 last=-100 rc seen="not answered"
-  info "The connection to the Hub broke during the revoke (the servers restart for the token rotation): asking the Hub how it ended..." >&2
+  [ "${3:-}" = cutoff ] || info "The connection to the Hub broke during the revoke (the servers restart for the token rotation): asking the Hub how it ended..." >&2
   for ((i = 0; ; i++)); do
     # Bounded (VM run 15): NODE_REVOKE_WAIT in all, then what's pending.
     if [ $(( SECONDS - ${_NODE_REVOKE_T0:-$SECONDS} )) -ge "$NODE_REVOKE_WAIT" ]; then
       warn "node revoke: $id isn't confirmed revoked after $NODE_REVOKE_WAIT s; the Hub last listed it as: $seen."
       warn "  The Hub keeps a revoke it recorded and asks nodeadm again every 30 s. Check: ./portcullis node list (\"revoked\" without \"goes on\" = done), ./portcullis status; run ./portcullis node revoke $id again if it isn't listed revoked."
+      case "$seen" in *"to be cut off"*) warn "  Still waiting for $id to be cut off: power that machine off (or cut its network); nodeadm then finishes the revoke on its own." ;; esac
       return 1
     fi
     if ! out="$(_kube_bounded "$(_node_revoke_left 60)" _node_hub list </dev/null 2>/dev/null)" || ! printf '%s' "$out" | jq -e '.servers | type == "array"' >/dev/null 2>&1; then
@@ -1201,6 +1205,10 @@ _node_revoke_outcome() {
           warn "$(printf '%s' "$s" | jq -r .error)"
           ok "$id revoked (parked: the Hub finishes the removal once etcd has quorum)" >&2; return 0 ;;
         revoked\|true\|*) ok "$id revoked" >&2; return 0 ;;
+        # Not yet proven cut off (a server: NotReady, its lease stale, out
+        # of the mesh): nodeadm's reasons and the way out, then polled on.
+        "revoked|false|revoked; waiting for $id to be cut off"*)
+          [ $((i % 20)) != 0 ] || info "  $(printf '%s' "$s" | jq -r '.error | sub("^revoked; "; "")')" >&2 ;;
         revoked\|*) [ $((i % 20)) != 0 ] || info "  the revocation of $id goes on in nodeadm..." >&2 ;;
         # Mid-operation (fix round 2, nit 3): a revoke now is refused
         # (the Hub's 409) or would turn a removal into a revoke: wait.
@@ -1254,6 +1262,14 @@ _node_remove() {
       return 0
     fi
     out="$_NODE_OUT"
+    # A server not yet proven cut off (Task 33b security review): accepted,
+    # not done; its outcome polled within the wait.
+    if printf '%s' "$out" | jq -e --arg id "$id" '.parked == true and ((.detail // "") | startswith("revoked; waiting for \($id) to be cut off"))' >/dev/null 2>&1; then
+      info "$(printf '%s' "$out" | jq -r '.warning // empty')" >&2
+      _node_revoke_outcome "$id" 1 cutoff || fail "$id isn't known to be revoked (see above)"
+      kube_api_endpoints_refresh || true
+      return 0
+    fi
     if printf '%s' "$out" | jq -e '.parked == true' >/dev/null 2>&1; then
       warn "$(printf '%s' "$out" | jq -r '.warning // empty')"
       warn "$(printf '%s' "$out" | jq -r '.detail // empty')"
